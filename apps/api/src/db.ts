@@ -68,6 +68,13 @@ interface UserRow extends UserSummary {
   password_hash: string;
 }
 
+interface SessionRuntimeTarget {
+  id: string;
+  name: string;
+  tmuxSessionName: string;
+  tmuxBackend: TmuxBackend;
+}
+
 function now(): string {
   return new Date().toISOString();
 }
@@ -198,23 +205,35 @@ export class CockpitDatabase {
   }
 
   seedAdmin(username: string, password: string): void {
-    const row = this.database
-      .prepare("SELECT id FROM users WHERE username = ?")
-      .get(username) as { id: string } | undefined;
-
-    const passwordHash = hashPassword(password);
-    if (row) {
-      this.database
-        .prepare("UPDATE users SET password_hash = ?, role = 'admin' WHERE id = ?")
-        .run(passwordHash, row.id);
+    const userCount = this.database.prepare("SELECT COUNT(*) as count FROM users").get() as { count: number };
+    if (userCount.count > 0) {
       return;
     }
 
+    const passwordHash = hashPassword(password);
     this.database
       .prepare(
         "INSERT INTO users (id, username, password_hash, role, created_at) VALUES (?, ?, ?, 'admin', ?)"
       )
       .run(randomUUID(), username, passwordHash, now());
+  }
+
+  createUser(username: string, password: string, role: UserSummary["role"] = "admin"): UserSummary {
+    const existing = this.database
+      .prepare("SELECT id, username, role FROM users WHERE username = ?")
+      .get(username) as UserSummary | undefined;
+    if (existing) {
+      return existing;
+    }
+
+    const id = randomUUID();
+    this.database
+      .prepare(
+        "INSERT INTO users (id, username, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)"
+      )
+      .run(id, username, hashPassword(password), role, now());
+
+    return { id, username, role };
   }
 
   authenticateUser(username: string, password: string): UserSummary | null {
@@ -284,6 +303,23 @@ export class CockpitDatabase {
     return row ? this.mapSession(row) : null;
   }
 
+  getSessionRuntimeTarget(id: string): SessionRuntimeTarget | null {
+    const row = this.database.prepare("SELECT * FROM cockpit_sessions WHERE id = ?").get(id) as
+      | SessionRow
+      | undefined;
+
+    if (!row) {
+      return null;
+    }
+
+    return {
+      id: row.id,
+      name: row.name,
+      tmuxSessionName: row.tmux_session_name,
+      tmuxBackend: row.tmux_backend
+    };
+  }
+
   upsertSession(input: {
     name: string;
     tmuxSessionName: string;
@@ -339,6 +375,14 @@ export class CockpitDatabase {
     this.database
       .prepare("UPDATE cockpit_sessions SET updated_at = ?, last_activity_at = ? WHERE id = ?")
       .run(timestamp, timestamp, sessionId);
+  }
+
+  updateSessionTerminalUrl(sessionId: string, terminalUrl: string | null): CockpitSession {
+    this.database
+      .prepare("UPDATE cockpit_sessions SET terminal_url = ?, updated_at = ? WHERE id = ?")
+      .run(terminalUrl, now(), sessionId);
+
+    return this.getSessionById(sessionId)!;
   }
 
   createJob(input: {
@@ -513,7 +557,6 @@ export class CockpitDatabase {
       id: row.id,
       name: row.name,
       status: "active",
-      tmuxSessionName: row.tmux_session_name,
       tmuxBackend: row.tmux_backend,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
@@ -563,4 +606,3 @@ export class CockpitDatabase {
     };
   }
 }
-
