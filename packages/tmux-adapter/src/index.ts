@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import * as childProcess from "node:child_process";
 
 export interface CommandSpec {
   executable: string;
@@ -24,6 +24,10 @@ export interface TmuxAdapter {
   launchCommand(sessionName: string, windowName: string, command: CommandSpec): LaunchResult;
 }
 
+export const __tmuxTestHarness = {
+  spawnSync: childProcess.spawnSync
+};
+
 const SAFE_NAME = /^[a-z0-9][a-z0-9-_]{1,31}$/i;
 
 function assertSafeName(value: string, label: string): void {
@@ -33,12 +37,12 @@ function assertSafeName(value: string, label: string): void {
 }
 
 function tmuxAvailable(): boolean {
-  const result = spawnSync("tmux", ["-V"], { encoding: "utf8" });
+  const result = __tmuxTestHarness.spawnSync("tmux", ["-V"], { encoding: "utf8" });
   return result.status === 0;
 }
 
 function runTmux(args: string[]): void {
-  const result = spawnSync("tmux", args, { encoding: "utf8" });
+  const result = __tmuxTestHarness.spawnSync("tmux", args, { encoding: "utf8" });
   if (result.status !== 0) {
     const detail = result.stderr.trim() || result.stdout.trim() || "tmux command failed";
     throw new Error(detail);
@@ -72,7 +76,7 @@ class LocalTmuxAdapter implements TmuxAdapter {
   ensureSession(name: string): SessionHandle {
     assertSafeName(name, "session name");
 
-    const existing = spawnSync("tmux", ["has-session", "-t", name], { encoding: "utf8" });
+    const existing = __tmuxTestHarness.spawnSync("tmux", ["has-session", "-t", name], { encoding: "utf8" });
     if (existing.status !== 0) {
       runTmux(["new-session", "-d", "-s", name, "-n", "main"]);
     }
@@ -81,7 +85,7 @@ class LocalTmuxAdapter implements TmuxAdapter {
   }
 
   listSessions(): string[] {
-    const result = spawnSync("tmux", ["list-sessions", "-F", "#{session_name}"], {
+    const result = __tmuxTestHarness.spawnSync("tmux", ["list-sessions", "-F", "#{session_name}"], {
       encoding: "utf8"
     });
 

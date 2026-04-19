@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { formatOutput, request } from "./lib";
 
 interface UserSummary {
   id: string;
@@ -28,6 +29,28 @@ interface JobRecord {
   subjectId: string | null;
   output: Record<string, unknown> | null;
   createdAt: string;
+}
+
+interface ExecutionReview {
+  actorId: string | null;
+  verdict: string;
+  summary: string;
+  details: Record<string, unknown>;
+}
+
+interface ExecutionPlan {
+  id: string;
+  targetType: string;
+  targetId: string;
+  status: string;
+  riskClass: string;
+  planHash: string;
+  planSummary: string;
+  plannerReview: ExecutionReview;
+  safetyReview: ExecutionReview;
+  policyReview: ExecutionReview;
+  preExecutionHook: ExecutionReview;
+  postExecutionHook: ExecutionReview;
 }
 
 interface ApprovalRecord {
@@ -61,38 +84,8 @@ interface AgentManifest {
 
 interface SessionDetail {
   session: CockpitSession;
+  plans: ExecutionPlan[];
   jobs: JobRecord[];
-}
-
-const apiBase = import.meta.env.VITE_API_BASE || "/api";
-
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${apiBase}${path}`, {
-    credentials: "include",
-    headers: {
-      "Content-Type": "application/json",
-      ...(init?.headers || {})
-    },
-    ...init
-  });
-
-  if (!response.ok) {
-    const body = (await response.json().catch(() => ({}))) as { message?: string };
-    throw new Error(body.message || `Request failed with status ${response.status}`);
-  }
-
-  return (await response.json()) as T;
-}
-
-function formatOutput(output: Record<string, unknown> | null): string {
-  if (!output) {
-    return "No structured output recorded yet.";
-  }
-
-  const lines = Object.entries(output).map(([key, value]) =>
-    `${key}: ${typeof value === "string" ? value : JSON.stringify(value)}`
-  );
-  return lines.join("\n");
 }
 
 export default function App() {
@@ -380,6 +373,26 @@ export default function App() {
                 </p>
               ) : null}
               <h3>Job timeline</h3>
+              <h3>Execution plans</h3>
+              <ul className="list">
+                {sessionDetail.plans.map((plan) => (
+                  <li key={plan.id}>
+                    <strong>
+                      {plan.targetType} · {plan.status} · {plan.riskClass}
+                    </strong>
+                    <p>{plan.planSummary}</p>
+                    <small>hash {plan.planHash.slice(0, 12)}</small>
+                    <p>
+                      Planner {plan.plannerReview.verdict} · Safety {plan.safetyReview.verdict} · Policy {plan.policyReview.verdict}
+                    </p>
+                    <p>
+                      Pre-hook {plan.preExecutionHook.verdict} · Post-hook {plan.postExecutionHook.verdict}
+                    </p>
+                  </li>
+                ))}
+                {sessionDetail.plans.length === 0 ? <li>No execution plans recorded yet.</li> : null}
+              </ul>
+              <h3>Job timeline</h3>
               <ul className="list">
                 {sessionDetail.jobs.map((job) => (
                   <li key={job.id}>
@@ -399,14 +412,14 @@ export default function App() {
       <section className="grid three-column">
         <article className="panel">
           <h2>Runbooks</h2>
-          <p>Bounded placeholders keep privileged execution behind future local helpers.</p>
+          <p>Every runbook request now flows through planner, safety review, policy validation, and hooks.</p>
           <ul className="list">
             {runbooks.map((runbook) => (
               <li key={runbook.id}>
                 <strong>{runbook.name}</strong>
                 <p>{runbook.summary}</p>
                 <button disabled={busy} onClick={() => executeRunbook(runbook.id)}>
-                  {runbook.requiresApproval ? "Queue for approval" : "Execute placeholder"}
+                  {runbook.requiresApproval ? "Plan and queue approval" : "Plan and execute"}
                 </button>
               </li>
             ))}
@@ -415,6 +428,7 @@ export default function App() {
 
         <article className="panel">
           <h2>Agents</h2>
+          <p>Agent launches use the same plan, safety, and hook pipeline before the bounded executor runs.</p>
           <label className="stack">
             Prompt
             <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={4} />
@@ -425,7 +439,7 @@ export default function App() {
                 <strong>{agent.name}</strong>
                 <p>{agent.description}</p>
                 <button disabled={busy || !selectedSession} onClick={() => launchAgent(agent.id)}>
-                  Launch in selected session
+                  Plan and launch in selected session
                 </button>
               </li>
             ))}

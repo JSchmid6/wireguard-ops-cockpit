@@ -1,0 +1,43 @@
+FROM node:20-bookworm AS build
+
+WORKDIR /workspace
+
+COPY package.json package-lock.json tsconfig.base.json ./
+COPY packages/domain/package.json packages/domain/package.json
+COPY packages/domain/tsconfig.json packages/domain/tsconfig.json
+COPY packages/tmux-adapter/package.json packages/tmux-adapter/package.json
+COPY packages/tmux-adapter/tsconfig.json packages/tmux-adapter/tsconfig.json
+COPY apps/api/package.json apps/api/package.json
+COPY apps/api/tsconfig.json apps/api/tsconfig.json
+COPY apps/web/package.json apps/web/package.json
+COPY apps/web/tsconfig.json apps/web/tsconfig.json
+
+RUN npm ci
+
+COPY packages/domain/src packages/domain/src
+COPY packages/tmux-adapter/src packages/tmux-adapter/src
+COPY apps/api/src apps/api/src
+
+RUN npm run build -w @wireguard-ops-cockpit/domain \
+ && npm run build -w @wireguard-ops-cockpit/tmux-adapter \
+ && npm run build -w @wireguard-ops-cockpit/api
+
+FROM node:20-bookworm-slim AS runtime
+
+WORKDIR /workspace
+ENV NODE_ENV=production
+
+COPY --from=build /workspace/package.json ./package.json
+COPY --from=build /workspace/node_modules ./node_modules
+COPY --from=build /workspace/packages/domain/package.json ./packages/domain/package.json
+COPY --from=build /workspace/packages/domain/dist ./packages/domain/dist
+COPY --from=build /workspace/packages/tmux-adapter/package.json ./packages/tmux-adapter/package.json
+COPY --from=build /workspace/packages/tmux-adapter/dist ./packages/tmux-adapter/dist
+COPY --from=build /workspace/apps/api/package.json ./apps/api/package.json
+COPY --from=build /workspace/apps/api/dist ./apps/api/dist
+
+RUN mkdir -p /data
+
+EXPOSE 3001
+
+CMD ["node", "apps/api/dist/index.js"]

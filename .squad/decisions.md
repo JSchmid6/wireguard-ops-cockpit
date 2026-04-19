@@ -41,3 +41,25 @@ Only explicitly justified MCP servers and tools may be enabled. Prefer read-only
 ### Consequence
 
 Any request for live infrastructure control via MCP should be rejected or deferred to the local control plane.
+
+## Decision 004 - Host execution uses multi-agent planning with deterministic gates
+
+### Context
+
+The platform needs to support agent-assisted repair and maintenance on the target VPS without turning a single agent into an unrestricted host administrator.
+
+### Decision
+
+Host-affecting execution will follow a layered model:
+
+- a `planner-agent` proposes a structured action plan
+- a `safety-agent` reviews the plan for policy and damage risk
+- a deterministic policy gate performs the authoritative allow or deny decision
+- hard hooks run before, during, and after execution
+- only a bounded executor may mutate the host through activated runbooks or helpers
+
+Agent-generated runbooks may be proposed later, but activation must stay a separate reviewed and approved lifecycle.
+
+### Consequence
+
+The repository should document the execution-control model explicitly, keep runbook activation separate from incident execution, and bind approvals and audit records to exact plans rather than free-form prompts.

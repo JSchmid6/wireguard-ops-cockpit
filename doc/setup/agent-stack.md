@@ -34,6 +34,38 @@ Owns security review and hardening:
 - privilege boundaries for runbooks and host integration
 - dependency and supply-chain checks
 
+### 4. `quality-engineer`
+
+Owns regression resistance and test quality:
+
+- focused unit and integration test strategy
+- meaningful coverage around high-risk paths
+- CI build/test guardrails
+- cleanup of flaky or duplicated tests
+
+### 5. `platform-delivery`
+
+Owns delivery structure and deployment readiness:
+
+- Docker Compose packaging for app services
+- CI/CD layout and release checks
+- runtime configuration and secrets injection boundaries
+- boring, reproducible build and deploy paths
+
+## Local execution pattern
+
+For host-facing execution, use a layered local pattern rather than a single privileged agent:
+
+1. `planner-agent` proposes a structured repair or maintenance plan
+2. `safety-agent` reviews the plan for security and system-damage risk
+3. a deterministic policy gate validates allowlists, parameters, targets, and approval state
+4. pre/post execution hooks enforce hard stop conditions
+5. a bounded executor runs the registered runbook or helper
+
+This keeps LLM reasoning useful without turning any single agent into the privilege boundary.
+
+The detailed control flow lives in `doc/services/execution-control-model.md`.
+
 ## Model guidance
 
 Use the strongest available reasoning model for the `security-champion` role whenever your GitHub Copilot plan and interface allow explicit model choice.
@@ -89,3 +121,5 @@ This gives Squad and Copilot a project-specific baseline before code generation 
 ## Working rule for this project
 
 Cloud-side agents build and review the repository. Local controlled services perform host operations later through explicit runbooks and approvals.
+
+Agents may eventually propose new runbooks, but runbook activation must remain a separate reviewed and approved lifecycle.

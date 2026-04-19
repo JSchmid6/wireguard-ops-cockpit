@@ -1,7 +1,7 @@
 export type UserRole = "admin";
 export type TmuxBackend = "tmux" | "disabled";
 export type SessionStatus = "active";
-export type JobKind = "session.ensure" | "runbook" | "agent";
+export type JobKind = "session.ensure" | "execution.plan" | "runbook" | "agent";
 export type JobStatus =
   | "pending"
   | "pending_approval"
@@ -10,6 +10,10 @@ export type JobStatus =
   | "rejected"
   | "failed";
 export type ApprovalStatus = "pending" | "approved" | "rejected";
+export type PlanTargetType = "runbook" | "agent";
+export type PlanStatus = "blocked" | "pending_approval" | "ready" | "executed" | "rejected";
+export type ExecutionRiskClass = "low" | "moderate" | "high";
+export type PlanReviewVerdict = "pending" | "passed" | "blocked" | "approval_required" | "not_run";
 
 export interface UserSummary {
   id: string;
@@ -69,6 +73,37 @@ export interface AuditRecord {
   createdAt: string;
 }
 
+export interface ExecutionReview {
+  actorId: string | null;
+  verdict: PlanReviewVerdict;
+  summary: string;
+  details: Record<string, unknown>;
+}
+
+export interface ExecutionPlan {
+  id: string;
+  sessionId: string | null;
+  targetType: PlanTargetType;
+  targetId: string;
+  requestedBy: string;
+  status: PlanStatus;
+  riskClass: ExecutionRiskClass;
+  requiresApproval: boolean;
+  approvalId: string | null;
+  executedJobId: string | null;
+  planHash: string;
+  planSummary: string;
+  normalizedInput: Record<string, unknown>;
+  plannerReview: ExecutionReview;
+  safetyReview: ExecutionReview;
+  policyReview: ExecutionReview;
+  preExecutionHook: ExecutionReview;
+  runtimeHook: ExecutionReview;
+  postExecutionHook: ExecutionReview;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface RunbookDefinition {
   id: string;
   name: string;
@@ -89,5 +124,6 @@ export interface AgentManifest {
 
 export interface SessionDetail {
   session: CockpitSession;
+  plans: ExecutionPlan[];
   jobs: JobRecord[];
 }

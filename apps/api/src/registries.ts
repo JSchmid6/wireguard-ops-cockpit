@@ -1,6 +1,17 @@
 import path from "node:path";
 import type { AgentManifest, RunbookDefinition } from "@wireguard-ops-cockpit/domain";
 
+export const INTERNAL_EXECUTION_AGENTS = {
+  planner: {
+    id: "planner-agent",
+    name: "Planner agent"
+  },
+  safety: {
+    id: "safety-agent",
+    name: "Safety agent"
+  }
+} as const;
+
 export const RUNBOOKS: RunbookDefinition[] = [
   {
     id: "disk-health-check",

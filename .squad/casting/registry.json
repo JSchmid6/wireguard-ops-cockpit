@@ -1,0 +1,60 @@
+{
+  "agents": {
+    "squad": {
+      "persistent_name": "The Architect",
+      "universe": "The Matrix",
+      "created_at": "2026-04-19T00:00:00Z",
+      "legacy_named": false,
+      "status": "active"
+    },
+    "architect": {
+      "persistent_name": "Morpheus",
+      "universe": "The Matrix",
+      "created_at": "2026-04-19T00:00:00Z",
+      "legacy_named": false,
+      "status": "active"
+    },
+    "builder": {
+      "persistent_name": "Neo",
+      "universe": "The Matrix",
+      "created_at": "2026-04-19T00:00:00Z",
+      "legacy_named": false,
+      "status": "active"
+    },
+    "shield": {
+      "persistent_name": "Trinity",
+      "universe": "The Matrix",
+      "created_at": "2026-04-19T00:00:00Z",
+      "legacy_named": false,
+      "status": "active"
+    },
+    "verifier": {
+      "persistent_name": "Oracle",
+      "universe": "The Matrix",
+      "created_at": "2026-04-19T00:00:00Z",
+      "legacy_named": false,
+      "status": "active"
+    },
+    "harbor": {
+      "persistent_name": "Tank",
+      "universe": "The Matrix",
+      "created_at": "2026-04-19T00:00:00Z",
+      "legacy_named": false,
+      "status": "active"
+    },
+    "ralph": {
+      "persistent_name": "Dozer",
+      "universe": "The Matrix",
+      "created_at": "2026-04-19T00:00:00Z",
+      "legacy_named": false,
+      "status": "active"
+    },
+    "scribe": {
+      "persistent_name": "Switch",
+      "universe": "The Matrix",
+      "created_at": "2026-04-19T00:00:00Z",
+      "legacy_named": false,
+      "status": "active"
+    }
+  }
+}
