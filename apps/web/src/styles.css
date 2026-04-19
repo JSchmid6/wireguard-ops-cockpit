@@ -1,0 +1,145 @@
+:root {
+  color-scheme: dark;
+  font-family: Inter, system-ui, sans-serif;
+  background: #0f172a;
+  color: #e2e8f0;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: linear-gradient(180deg, #020617 0%, #0f172a 100%);
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+button {
+  border: 1px solid #38bdf8;
+  background: #082f49;
+  color: #e0f2fe;
+  border-radius: 0.5rem;
+  padding: 0.65rem 0.9rem;
+  cursor: pointer;
+}
+
+button.selected {
+  background: #0369a1;
+}
+
+input,
+textarea {
+  width: 100%;
+  border-radius: 0.5rem;
+  border: 1px solid #334155;
+  background: #020617;
+  color: inherit;
+  padding: 0.65rem 0.75rem;
+}
+
+.app-shell {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 2rem;
+}
+
+.topbar,
+.grid {
+  display: grid;
+  gap: 1rem;
+}
+
+.topbar {
+  grid-template-columns: 1fr auto;
+  align-items: center;
+}
+
+.two-column {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.three-column {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.panel {
+  background: rgba(15, 23, 42, 0.88);
+  border: 1px solid rgba(56, 189, 248, 0.18);
+  border-radius: 1rem;
+  padding: 1.25rem;
+  margin-top: 1rem;
+}
+
+.stack {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.inline-form {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: 1fr auto;
+}
+
+.list,
+.audit-list {
+  list-style: none;
+  padding: 0;
+  margin: 1rem 0 0;
+  display: grid;
+  gap: 0.8rem;
+}
+
+.list li,
+.audit-list li {
+  border: 1px solid #1e293b;
+  border-radius: 0.75rem;
+  padding: 0.85rem;
+  background: rgba(2, 6, 23, 0.75);
+}
+
+.actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+.login-panel {
+  max-width: 30rem;
+  margin: 4rem auto 0;
+}
+
+.error {
+  color: #fda4af;
+  margin-top: 1rem;
+}
+
+pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: #020617;
+  border-radius: 0.75rem;
+  padding: 0.75rem;
+}
+
+small {
+  display: block;
+  margin-top: 0.25rem;
+  color: #94a3b8;
+}
+
+@media (max-width: 1100px) {
+  .two-column,
+  .three-column,
+  .topbar {
+    grid-template-columns: 1fr;
+  }
+}
+
