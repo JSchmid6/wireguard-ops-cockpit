@@ -1,0 +1,27 @@
+{
+  "name": "@wireguard-ops-cockpit/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx watch src/index.ts",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@wireguard-ops-cockpit/domain": "*",
+    "@wireguard-ops-cockpit/tmux-adapter": "*",
+    "better-sqlite3": "^11.9.1",
+    "fastify": "^5.3.2"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.15.3",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.3"
+  }
+}
+

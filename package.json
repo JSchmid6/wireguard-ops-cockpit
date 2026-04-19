@@ -1,0 +1,16 @@
+{
+  "name": "wireguard-ops-cockpit",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w @wireguard-ops-cockpit/domain && npm run build -w @wireguard-ops-cockpit/tmux-adapter && npm run build -w @wireguard-ops-cockpit/api && npm run build -w @wireguard-ops-cockpit/web",
+    "test": "npm run test -w @wireguard-ops-cockpit/api && npm run test -w @wireguard-ops-cockpit/web",
+    "dev:api": "npm run dev -w @wireguard-ops-cockpit/api",
+    "dev:web": "npm run dev -w @wireguard-ops-cockpit/web",
+    "check": "npm run build && npm run test"
+  }
+}
+

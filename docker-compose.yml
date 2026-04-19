@@ -1,0 +1,33 @@
+services:
+  api:
+    image: node:20-bookworm
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      - api-node-modules:/workspace/node_modules
+      - api-data:/workspace/data
+    env_file:
+      - .env
+    command: sh -c "npm install && npm run dev:api"
+    ports:
+      - "3001:3001"
+
+  web:
+    image: node:20-bookworm
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      - web-node-modules:/workspace/node_modules
+    env_file:
+      - .env
+    command: sh -c "npm install && npm run dev:web -- --host 0.0.0.0"
+    ports:
+      - "5173:5173"
+    depends_on:
+      - api
+
+volumes:
+  api-node-modules:
+  web-node-modules:
+  api-data:
+
