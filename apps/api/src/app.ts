@@ -1,3 +1,4 @@
+import { createHmac, randomBytes } from "node:crypto";
 import Fastify from "fastify";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import type { AgentManifest, RunbookDefinition, UserSummary } from "@wireguard-ops-cockpit/domain";
@@ -9,7 +10,18 @@ import { AGENTS, RUNBOOKS, buildAgentCommand, findAgent, findRunbook } from "./r
 
 interface AppOptions {
   config?: AppConfig;
+  bootstrapUsers?: Array<{ username: string; password: string; role?: "admin" }>;
 }
+
+interface LoginAttemptState {
+  count: number;
+  windowStartedAt: number;
+  blockedUntil: number;
+}
+
+const MAX_LOGIN_ATTEMPTS = 5;
+const LOGIN_WINDOW_MS = 10 * 60 * 1000;
+const LOGIN_BLOCK_MS = 15 * 60 * 1000;
 
 function slugify(value: string): string {
   return value
@@ -20,12 +32,13 @@ function slugify(value: string): string {
     .slice(0, 24);
 }
 
-function terminalUrl(baseUrl: string | null, tmuxSessionName: string): string | null {
+function terminalUrl(baseUrl: string | null, sessionId: string, signingSecret: Buffer): string | null {
   if (!baseUrl) {
     return null;
   }
 
-  return `${baseUrl.replace(/\/$/, "")}/session/${encodeURIComponent(tmuxSessionName)}`;
+  const token = createHmac("sha256", signingSecret).update(sessionId).digest("hex");
+  return `${baseUrl.replace(/\/$/, "")}/attach?session=${encodeURIComponent(sessionId)}&token=${encodeURIComponent(token)}`;
 }
 
 function runbookOutput(runbook: RunbookDefinition, sessionName: string | null, actor: UserSummary) {
@@ -70,11 +83,20 @@ async function requireActor(
 
 export async function createApp(options: AppOptions = {}) {
   const config = options.config || loadConfig();
+  if (config.nodeEnv === "production" && config.adminPassword === "change-me-now") {
+    throw new Error("COCKPIT_ADMIN_PASSWORD must be changed before running in production");
+  }
+
   const database = new CockpitDatabase(config.dbPath);
   const tmux = createTmuxAdapter(config.tmuxMode);
+  const terminalSigningSecret = randomBytes(32);
+  const loginAttempts = new Map<string, LoginAttemptState>();
 
   database.initialize();
   database.seedAdmin(config.adminUsername, config.adminPassword);
+  for (const user of options.bootstrapUsers || []) {
+    database.createUser(user.username, user.password, user.role || "admin");
+  }
 
   const app = Fastify({ logger: false });
 
@@ -93,11 +115,40 @@ export async function createApp(options: AppOptions = {}) {
       return reply.code(400).send({ message: "username and password are required" });
     }
 
+    const loginKey = `${request.ip}:${body.username.toLowerCase()}`;
+    const existingAttempt = loginAttempts.get(loginKey);
+    const currentTime = Date.now();
+    if (existingAttempt && existingAttempt.blockedUntil > currentTime) {
+      return reply.code(429).send({ message: "too many login attempts, try again later" });
+    }
+
     const actor = database.authenticateUser(body.username, body.password);
     if (!actor) {
+      const nextAttempt =
+        existingAttempt && currentTime - existingAttempt.windowStartedAt <= LOGIN_WINDOW_MS
+          ? { ...existingAttempt, count: existingAttempt.count + 1 }
+          : { count: 1, windowStartedAt: currentTime, blockedUntil: 0 };
+
+      if (nextAttempt.count >= MAX_LOGIN_ATTEMPTS) {
+        nextAttempt.blockedUntil = currentTime + LOGIN_BLOCK_MS;
+      }
+
+      loginAttempts.set(loginKey, nextAttempt);
+      database.createAudit({
+        actorId: null,
+        action: "auth.login_failed",
+        targetType: "user",
+        targetId: null,
+        details: {
+          username: body.username,
+          sourceIp: request.ip,
+          blockedUntil: nextAttempt.blockedUntil || null
+        }
+      });
       return reply.code(401).send({ message: "invalid credentials" });
     }
 
+    loginAttempts.delete(loginKey);
     const token = database.issueAuthSession(actor.id, config.sessionTtlHours);
     database.createAudit({
       actorId: actor.id,
@@ -167,23 +218,29 @@ export async function createApp(options: AppOptions = {}) {
 
     const tmuxSessionName = `cockpit-${sessionSlug}`;
     const ensured = tmux.ensureSession(tmuxSessionName);
-    const session = database.upsertSession({
+    let session = database.upsertSession({
       name: sessionSlug,
       tmuxSessionName,
       tmuxBackend: ensured.backend,
-      terminalUrl: terminalUrl(config.ttydBaseUrl, tmuxSessionName)
+      terminalUrl: null
     });
+    session = database.updateSessionTerminalUrl(
+      session.id,
+      terminalUrl(config.ttydBaseUrl, session.id, terminalSigningSecret)
+    );
     database.recordSessionActivity(session.id);
 
     const job = database.createJob({
       sessionId: session.id,
       kind: "session.ensure",
-      subjectId: session.tmuxSessionName,
+      subjectId: session.id,
       status: "completed",
       requiresApproval: false,
       output: {
         summary: "Cockpit session ensured.",
-        backend: ensured.backend
+        backend: ensured.backend,
+        sessionId: session.id,
+        requestedBy: actor.username
       },
       completedAt: new Date().toISOString()
     });
@@ -195,7 +252,6 @@ export async function createApp(options: AppOptions = {}) {
       targetId: session.id,
       details: {
         sessionName: session.name,
-        tmuxSessionName: session.tmuxSessionName,
         tmuxBackend: session.tmuxBackend
       }
     });
@@ -258,7 +314,12 @@ export async function createApp(options: AppOptions = {}) {
         requiresApproval: true,
         output: {
           summary: `${runbook.name} is waiting for human approval.`,
-          integration: "placeholder"
+          integration: "placeholder",
+          requestedBy: actor.username,
+          requestedByUserId: actor.id,
+          sessionId: session?.id || null,
+          sessionName: session?.name || null,
+          runbookId: runbook.id
         }
       });
 
@@ -282,7 +343,8 @@ export async function createApp(options: AppOptions = {}) {
         details: {
           runbookId: runbook.id,
           sessionId: session?.id || null,
-          approvalId: approval.id
+          approvalId: approval.id,
+          requestedBy: actor.username
         }
       });
 
@@ -494,4 +556,3 @@ export async function createApp(options: AppOptions = {}) {
 
   return app;
 }
-

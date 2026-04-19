@@ -27,7 +27,6 @@ export interface CockpitSession {
   id: string;
   name: string;
   status: SessionStatus;
-  tmuxSessionName: string;
   tmuxBackend: TmuxBackend;
   createdAt: string;
   updatedAt: string;
@@ -92,4 +91,3 @@ export interface SessionDetail {
   session: CockpitSession;
   jobs: JobRecord[];
 }
-

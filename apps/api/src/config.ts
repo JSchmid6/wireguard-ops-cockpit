@@ -12,6 +12,7 @@ export interface AppConfig {
   tmuxMode: "auto" | "disabled";
   ttydBaseUrl: string | null;
   repoRoot: string;
+  nodeEnv: string;
 }
 
 function currentDirectory(): string {
@@ -20,6 +21,9 @@ function currentDirectory(): string {
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const repoRoot = path.resolve(currentDirectory(), "../../..");
+  const nodeEnv = env.NODE_ENV || "development";
+  const cookieSecure =
+    env.COCKPIT_COOKIE_SECURE === undefined ? nodeEnv === "production" : env.COCKPIT_COOKIE_SECURE === "true";
 
   return {
     apiHost: env.COCKPIT_API_HOST || "127.0.0.1",
@@ -28,10 +32,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     adminUsername: env.COCKPIT_ADMIN_USERNAME || "admin",
     adminPassword: env.COCKPIT_ADMIN_PASSWORD || "change-me-now",
     sessionTtlHours: Number(env.COCKPIT_SESSION_TTL_HOURS || "12"),
-    cookieSecure: env.COCKPIT_COOKIE_SECURE === "true",
+    cookieSecure,
     tmuxMode: env.COCKPIT_TMUX_MODE === "disabled" ? "disabled" : "auto",
     ttydBaseUrl: env.COCKPIT_TTYD_BASE_URL?.trim() || null,
-    repoRoot
+    repoRoot,
+    nodeEnv
   };
 }
-
