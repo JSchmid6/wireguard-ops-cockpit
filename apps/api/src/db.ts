@@ -7,8 +7,13 @@ import type {
   ApprovalStatus,
   AuditRecord,
   CockpitSession,
+  ExecutionPlan,
+  ExecutionReview,
+  ExecutionRiskClass,
   JobRecord,
   JobStatus,
+  PlanStatus,
+  PlanTargetType,
   TerminalBridge,
   TmuxBackend,
   UserSummary
@@ -21,6 +26,7 @@ interface SessionRow {
   id: string;
   name: string;
   status: string;
+  owner_id: string | null;
   tmux_session_name: string;
   tmux_backend: TmuxBackend;
   terminal_url: string | null;
@@ -64,6 +70,30 @@ interface AuditRow {
   created_at: string;
 }
 
+interface ExecutionPlanRow {
+  id: string;
+  session_id: string | null;
+  target_type: PlanTargetType;
+  target_id: string;
+  requested_by: string;
+  status: PlanStatus;
+  risk_class: ExecutionRiskClass;
+  requires_approval: number;
+  approval_id: string | null;
+  executed_job_id: string | null;
+  plan_hash: string;
+  plan_summary: string;
+  normalized_input_json: string;
+  planner_review_json: string;
+  safety_review_json: string;
+  policy_review_json: string;
+  pre_execution_hook_json: string;
+  runtime_hook_json: string;
+  post_execution_hook_json: string;
+  created_at: string;
+  updated_at: string;
+}
+
 interface UserRow extends UserSummary {
   password_hash: string;
 }
@@ -97,6 +127,14 @@ function stringifyJsonValue(value: Record<string, unknown> | null | undefined): 
     return null;
   }
 
+  return JSON.stringify(value);
+}
+
+function parseReviewValue(value: string): ExecutionReview {
+  return JSON.parse(value) as ExecutionReview;
+}
+
+function stringifyReviewValue(value: ExecutionReview): string {
   return JSON.stringify(value);
 }
 
@@ -154,12 +192,14 @@ export class CockpitDatabase {
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL UNIQUE,
         status TEXT NOT NULL,
+        owner_id TEXT,
         tmux_session_name TEXT NOT NULL,
         tmux_backend TEXT NOT NULL,
         terminal_url TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
-        last_activity_at TEXT NOT NULL
+        last_activity_at TEXT NOT NULL,
+        FOREIGN KEY (owner_id) REFERENCES users(id)
       );
 
       CREATE TABLE IF NOT EXISTS jobs (
@@ -191,6 +231,34 @@ export class CockpitDatabase {
         FOREIGN KEY (decided_by) REFERENCES users(id)
       );
 
+      CREATE TABLE IF NOT EXISTS execution_plans (
+        id TEXT PRIMARY KEY,
+        session_id TEXT,
+        target_type TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        requested_by TEXT NOT NULL,
+        status TEXT NOT NULL,
+        risk_class TEXT NOT NULL,
+        requires_approval INTEGER NOT NULL,
+        approval_id TEXT,
+        executed_job_id TEXT,
+        plan_hash TEXT NOT NULL,
+        plan_summary TEXT NOT NULL,
+        normalized_input_json TEXT NOT NULL,
+        planner_review_json TEXT NOT NULL,
+        safety_review_json TEXT NOT NULL,
+        policy_review_json TEXT NOT NULL,
+        pre_execution_hook_json TEXT NOT NULL,
+        runtime_hook_json TEXT NOT NULL,
+        post_execution_hook_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (session_id) REFERENCES cockpit_sessions(id),
+        FOREIGN KEY (approval_id) REFERENCES approvals(id),
+        FOREIGN KEY (executed_job_id) REFERENCES jobs(id),
+        FOREIGN KEY (requested_by) REFERENCES users(id)
+      );
+
       CREATE TABLE IF NOT EXISTS audits (
         id TEXT PRIMARY KEY,
         actor_id TEXT,
@@ -202,6 +270,13 @@ export class CockpitDatabase {
         FOREIGN KEY (actor_id) REFERENCES users(id)
       );
     `);
+
+    const cockpitSessionColumns = this.database
+      .prepare("PRAGMA table_info(cockpit_sessions)")
+      .all() as Array<{ name: string }>;
+    if (!cockpitSessionColumns.some((column) => column.name === "owner_id")) {
+      this.database.exec("ALTER TABLE cockpit_sessions ADD COLUMN owner_id TEXT REFERENCES users(id)");
+    }
   }
 
   seedAdmin(username: string, password: string): void {
@@ -295,10 +370,28 @@ export class CockpitDatabase {
     return rows.map((row) => this.mapSession(row));
   }
 
+  listSessionsForActor(actorId: string): CockpitSession[] {
+    const rows = this.database
+      .prepare(
+        "SELECT * FROM cockpit_sessions WHERE owner_id = ? ORDER BY datetime(last_activity_at) DESC, datetime(created_at) DESC"
+      )
+      .all(actorId) as SessionRow[];
+
+    return rows.map((row) => this.mapSession(row));
+  }
+
   getSessionById(id: string): CockpitSession | null {
     const row = this.database.prepare("SELECT * FROM cockpit_sessions WHERE id = ?").get(id) as
       | SessionRow
       | undefined;
+
+    return row ? this.mapSession(row) : null;
+  }
+
+  getSessionByIdForActor(id: string, actorId: string): CockpitSession | null {
+    const row = this.database
+      .prepare("SELECT * FROM cockpit_sessions WHERE id = ? AND owner_id = ?")
+      .get(id, actorId) as SessionRow | undefined;
 
     return row ? this.mapSession(row) : null;
   }
@@ -320,8 +413,26 @@ export class CockpitDatabase {
     };
   }
 
+  getSessionRuntimeTargetForActor(id: string, actorId: string): SessionRuntimeTarget | null {
+    const row = this.database
+      .prepare("SELECT * FROM cockpit_sessions WHERE id = ? AND owner_id = ?")
+      .get(id, actorId) as SessionRow | undefined;
+
+    if (!row) {
+      return null;
+    }
+
+    return {
+      id: row.id,
+      name: row.name,
+      tmuxSessionName: row.tmux_session_name,
+      tmuxBackend: row.tmux_backend
+    };
+  }
+
   upsertSession(input: {
     name: string;
+    ownerId: string;
     tmuxSessionName: string;
     tmuxBackend: TmuxBackend;
     terminalUrl: string | null;
@@ -332,13 +443,18 @@ export class CockpitDatabase {
     const timestamp = now();
 
     if (existing) {
+      if (existing.owner_id && existing.owner_id !== input.ownerId) {
+        throw new Error("session name already belongs to another operator");
+      }
+
       this.database
         .prepare(
           `UPDATE cockpit_sessions
-           SET tmux_session_name = ?, tmux_backend = ?, terminal_url = ?, updated_at = ?, last_activity_at = ?
+           SET owner_id = ?, tmux_session_name = ?, tmux_backend = ?, terminal_url = ?, updated_at = ?, last_activity_at = ?
            WHERE id = ?`
         )
         .run(
+          input.ownerId,
           input.tmuxSessionName,
           input.tmuxBackend,
           input.terminalUrl,
@@ -353,12 +469,13 @@ export class CockpitDatabase {
     this.database
       .prepare(
         `INSERT INTO cockpit_sessions
-         (id, name, status, tmux_session_name, tmux_backend, terminal_url, created_at, updated_at, last_activity_at)
-         VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?)`
+         (id, name, status, owner_id, tmux_session_name, tmux_backend, terminal_url, created_at, updated_at, last_activity_at)
+         VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         id,
         input.name,
+        input.ownerId,
         input.tmuxSessionName,
         input.tmuxBackend,
         input.terminalUrl,
@@ -433,6 +550,126 @@ export class CockpitDatabase {
     return rows.map((row) => this.mapJob(row));
   }
 
+  createExecutionPlan(input: {
+    sessionId: string | null;
+    targetType: PlanTargetType;
+    targetId: string;
+    requestedBy: string;
+    status: PlanStatus;
+    riskClass: ExecutionRiskClass;
+    requiresApproval: boolean;
+    approvalId?: string | null;
+    executedJobId?: string | null;
+    planHash: string;
+    planSummary: string;
+    normalizedInput: Record<string, unknown>;
+    plannerReview: ExecutionReview;
+    safetyReview: ExecutionReview;
+    policyReview: ExecutionReview;
+    preExecutionHook: ExecutionReview;
+    runtimeHook: ExecutionReview;
+    postExecutionHook: ExecutionReview;
+  }): ExecutionPlan {
+    const id = randomUUID();
+    const timestamp = now();
+
+    this.database
+      .prepare(
+        `INSERT INTO execution_plans
+         (id, session_id, target_type, target_id, requested_by, status, risk_class, requires_approval, approval_id,
+          executed_job_id, plan_hash, plan_summary, normalized_input_json, planner_review_json, safety_review_json,
+          policy_review_json, pre_execution_hook_json, runtime_hook_json, post_execution_hook_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        id,
+        input.sessionId,
+        input.targetType,
+        input.targetId,
+        input.requestedBy,
+        input.status,
+        input.riskClass,
+        input.requiresApproval ? 1 : 0,
+        input.approvalId || null,
+        input.executedJobId || null,
+        input.planHash,
+        input.planSummary,
+        JSON.stringify(input.normalizedInput),
+        stringifyReviewValue(input.plannerReview),
+        stringifyReviewValue(input.safetyReview),
+        stringifyReviewValue(input.policyReview),
+        stringifyReviewValue(input.preExecutionHook),
+        stringifyReviewValue(input.runtimeHook),
+        stringifyReviewValue(input.postExecutionHook),
+        timestamp,
+        timestamp
+      );
+
+    return this.getExecutionPlan(id)!;
+  }
+
+  getExecutionPlan(id: string): ExecutionPlan | null {
+    const row = this.database.prepare("SELECT * FROM execution_plans WHERE id = ?").get(id) as
+      | ExecutionPlanRow
+      | undefined;
+    return row ? this.mapExecutionPlan(row) : null;
+  }
+
+  listExecutionPlansForSession(sessionId: string): ExecutionPlan[] {
+    const rows = this.database
+      .prepare("SELECT * FROM execution_plans WHERE session_id = ? ORDER BY datetime(created_at) DESC")
+      .all(sessionId) as ExecutionPlanRow[];
+    return rows.map((row) => this.mapExecutionPlan(row));
+  }
+
+  updateExecutionPlan(
+    planId: string,
+    input: {
+      status?: PlanStatus;
+      approvalId?: string | null;
+      executedJobId?: string | null;
+      planSummary?: string;
+      normalizedInput?: Record<string, unknown>;
+      plannerReview?: ExecutionReview;
+      safetyReview?: ExecutionReview;
+      policyReview?: ExecutionReview;
+      preExecutionHook?: ExecutionReview;
+      runtimeHook?: ExecutionReview;
+      postExecutionHook?: ExecutionReview;
+    }
+  ): ExecutionPlan {
+    const current = this.getExecutionPlan(planId);
+    if (!current) {
+      throw new Error("execution plan not found");
+    }
+
+    this.database
+      .prepare(
+        `UPDATE execution_plans
+         SET status = ?, approval_id = ?, executed_job_id = ?, plan_summary = ?, normalized_input_json = ?,
+             planner_review_json = ?, safety_review_json = ?, policy_review_json = ?, pre_execution_hook_json = ?,
+             runtime_hook_json = ?, post_execution_hook_json = ?, updated_at = ?
+         WHERE id = ?`
+      )
+      .run(
+        input.status ?? current.status,
+        input.approvalId !== undefined ? input.approvalId : current.approvalId,
+        input.executedJobId !== undefined ? input.executedJobId : current.executedJobId,
+        input.planSummary ?? current.planSummary,
+        JSON.stringify(input.normalizedInput ?? current.normalizedInput),
+        stringifyReviewValue(input.plannerReview ?? current.plannerReview),
+        stringifyReviewValue(input.safetyReview ?? current.safetyReview),
+        stringifyReviewValue(input.policyReview ?? current.policyReview),
+        stringifyReviewValue(input.preExecutionHook ?? current.preExecutionHook),
+        stringifyReviewValue(input.runtimeHook ?? current.runtimeHook),
+        stringifyReviewValue(input.postExecutionHook ?? current.postExecutionHook),
+        now(),
+        planId
+      );
+
+    return this.getExecutionPlan(planId)!;
+  }
+
   updateJob(
     jobId: string,
     input: {
@@ -470,6 +707,16 @@ export class CockpitDatabase {
       ? this.database.prepare("SELECT * FROM approvals WHERE status = ? ORDER BY datetime(created_at) DESC")
       : this.database.prepare("SELECT * FROM approvals ORDER BY datetime(created_at) DESC");
     const rows = (status ? statement.all(status) : statement.all()) as ApprovalRow[];
+    return rows.map((row) => this.mapApproval(row));
+  }
+
+  listApprovalsForActor(actorId: string, status?: ApprovalStatus): ApprovalRecord[] {
+    const statement = status
+      ? this.database.prepare(
+          "SELECT * FROM approvals WHERE requested_by = ? AND status = ? ORDER BY datetime(created_at) DESC"
+        )
+      : this.database.prepare("SELECT * FROM approvals WHERE requested_by = ? ORDER BY datetime(created_at) DESC");
+    const rows = (status ? statement.all(actorId, status) : statement.all(actorId)) as ApprovalRow[];
     return rows.map((row) => this.mapApproval(row));
   }
 
@@ -543,6 +790,13 @@ export class CockpitDatabase {
     return rows.map((row) => this.mapAudit(row));
   }
 
+  listAuditsForActor(actorId: string, limit = 50): AuditRecord[] {
+    const rows = this.database
+      .prepare("SELECT * FROM audits WHERE actor_id = ? ORDER BY datetime(created_at) DESC LIMIT ?")
+      .all(actorId, limit) as AuditRow[];
+    return rows.map((row) => this.mapAudit(row));
+  }
+
   getAudit(id: string): AuditRecord | null {
     const row = this.database.prepare("SELECT * FROM audits WHERE id = ?").get(id) as AuditRow | undefined;
     return row ? this.mapAudit(row) : null;
@@ -603,6 +857,32 @@ export class CockpitDatabase {
       targetId: row.target_id,
       details: parseJsonValue(row.details_json) || {},
       createdAt: row.created_at
+    };
+  }
+
+  private mapExecutionPlan(row: ExecutionPlanRow): ExecutionPlan {
+    return {
+      id: row.id,
+      sessionId: row.session_id,
+      targetType: row.target_type,
+      targetId: row.target_id,
+      requestedBy: row.requested_by,
+      status: row.status,
+      riskClass: row.risk_class,
+      requiresApproval: row.requires_approval === 1,
+      approvalId: row.approval_id,
+      executedJobId: row.executed_job_id,
+      planHash: row.plan_hash,
+      planSummary: row.plan_summary,
+      normalizedInput: JSON.parse(row.normalized_input_json) as Record<string, unknown>,
+      plannerReview: parseReviewValue(row.planner_review_json),
+      safetyReview: parseReviewValue(row.safety_review_json),
+      policyReview: parseReviewValue(row.policy_review_json),
+      preExecutionHook: parseReviewValue(row.pre_execution_hook_json),
+      runtimeHook: parseReviewValue(row.runtime_hook_json),
+      postExecutionHook: parseReviewValue(row.post_execution_hook_json),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
     };
   }
 }

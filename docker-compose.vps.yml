@@ -1,0 +1,47 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    environment:
+      NODE_ENV: production
+      COCKPIT_API_HOST: 0.0.0.0
+      COCKPIT_API_PORT: 3001
+      COCKPIT_DB_PATH: /data/cockpit.sqlite
+      COCKPIT_ADMIN_USERNAME: ${COCKPIT_ADMIN_USERNAME:-admin}
+      COCKPIT_ADMIN_PASSWORD: ${COCKPIT_ADMIN_PASSWORD:?set COCKPIT_ADMIN_PASSWORD in .env}
+      COCKPIT_SESSION_TTL_HOURS: ${COCKPIT_SESSION_TTL_HOURS:-12}
+      COCKPIT_COOKIE_SECURE: ${COCKPIT_COOKIE_SECURE:-false}
+      COCKPIT_TMUX_MODE: ${COCKPIT_TMUX_MODE:-disabled}
+      COCKPIT_TTYD_BASE_URL: ${COCKPIT_TTYD_BASE_URL:-}
+    volumes:
+      - cockpit-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3001/api/health').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+      args:
+        VITE_API_BASE: ${VITE_API_BASE:-/api}
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${COCKPIT_BIND_IP:-127.0.0.1}:${COCKPIT_WEB_PORT:-8080}:8080"
+    restart: unless-stopped
+
+volumes:
+  cockpit-data:

@@ -41,6 +41,7 @@ Read these first:
 4. `doc/setup/copilot-squad-adoption.md`
 5. `doc/migration/copilot-cloud-agent-brief.md`
 6. `doc/setup/agent-stack.md`
+7. `doc/services/execution-control-model.md`
 
 ## Quick start
 
@@ -66,12 +67,29 @@ Default login comes from `.env`:
 - username: `admin`
 - password: `change-me-now`
 
+## Execution plan integration notes
+
+- runbook execution and agent launch now create a persisted execution plan before dispatch
+- session detail exposes planner, safety, policy, and hook state for each plan
+- approval dispatch revalidates the exact approved plan hash, session binding, and requester binding before bounded execution continues
+
+## Upgrade note for existing SQLite state
+
+- the API adds `cockpit_sessions.owner_id` automatically when an older database is opened
+- legacy sessions with `owner_id = NULL` stay fail-closed and do not appear in `/api/sessions` until they are claimed again
+- reclaim a legacy session by creating or resuming the same session name after login as the intended operator, or migrate `owner_id` explicitly outside the app before rollout
+
 ## Build and test
 
 ```bash
 npm run build
 npm run test
+npm run coverage
+npm run check
 ```
+
+`npm run test` covers the shared tmux adapter plus the API and web workspaces. `npm run check` is the same build-and-test gate used by CI.
+`npm run coverage` enforces workspace-specific coverage thresholds for the tmux adapter, API, and web UI and is also run in CI.
 
 ## Docker Compose development
 
@@ -88,6 +106,31 @@ Notes:
 - `tmux` behavior inside containers is intentionally local to the app runtime
 - host-coupled privileged helpers are still out of scope
 
+## VPS deployment handover
+
+For a host-local bring-up path that a Copilot instance on the VPS can execute, use the production-oriented files below instead of the dev compose stack:
+
+- `.env.vps.example`
+- `docker-compose.vps.yml`
+- `Dockerfile.api`
+- `Dockerfile.web`
+- `doc/setup/vps-handover.md`
+
+Minimal flow:
+
+```bash
+cp .env.vps.example .env
+docker compose --env-file .env -f docker-compose.vps.yml build --pull
+docker compose --env-file .env -f docker-compose.vps.yml up -d
+```
+
+Important notes:
+
+- set `COCKPIT_BIND_IP` to the WireGuard IP on the VPS before startup
+- keep `COCKPIT_TMUX_MODE=disabled` unless you have a separate local host integration path ready
+- set `COCKPIT_COOKIE_SECURE=true` only when the stack is behind HTTPS
+- the web service is the only published port; the API stays on the internal Compose network
+
 ## Terminal bridge
 
 Set `COCKPIT_TTYD_BASE_URL` to expose a terminal attachment URL in the UI. The app does not spawn a web terminal bridge itself in this first pass; it only models the integration seam explicitly.
@@ -97,6 +140,7 @@ Set `COCKPIT_TTYD_BASE_URL` to expose a terminal attachment URL in the UI. The a
 The repository includes both:
 
 - `.github/workflows/copilot-setup-steps.yml` for GitHub Copilot cloud agent
+- `.github/workflows/ci.yml` for repository build/test validation on push and pull request
 - `.devcontainer/` for Codespaces and reproducible local container development
 - `.github/agents/`, `.github/skills/`, and `.squad/` for agent and Squad bootstrap
 

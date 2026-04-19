@@ -1,12 +1,26 @@
-import { createHmac, randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import Fastify from "fastify";
 import type { FastifyReply, FastifyRequest } from "fastify";
-import type { AgentManifest, RunbookDefinition, UserSummary } from "@wireguard-ops-cockpit/domain";
+import type {
+  AgentManifest,
+  ExecutionPlan,
+  ExecutionReview,
+  ExecutionRiskClass,
+  RunbookDefinition,
+  UserSummary
+} from "@wireguard-ops-cockpit/domain";
 import { createTmuxAdapter } from "@wireguard-ops-cockpit/tmux-adapter";
 import { AUTH_COOKIE, clearAuthCookie, parseCookies, serializeAuthCookie } from "./auth.js";
 import { loadConfig, type AppConfig } from "./config.js";
 import { CockpitDatabase } from "./db.js";
-import { AGENTS, RUNBOOKS, buildAgentCommand, findAgent, findRunbook } from "./registries.js";
+import {
+  AGENTS,
+  INTERNAL_EXECUTION_AGENTS,
+  RUNBOOKS,
+  buildAgentCommand,
+  findAgent,
+  findRunbook
+} from "./registries.js";
 
 interface AppOptions {
   config?: AppConfig;
@@ -39,6 +53,62 @@ function terminalUrl(baseUrl: string | null, sessionId: string, signingSecret: B
 
   const token = createHmac("sha256", signingSecret).update(sessionId).digest("hex");
   return `${baseUrl.replace(/\/$/, "")}/attach?session=${encodeURIComponent(sessionId)}&token=${encodeURIComponent(token)}`;
+}
+
+function createPlanHash(payload: Record<string, unknown>): string {
+  return createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+}
+
+function recomputePlanHash(plan: ExecutionPlan): string {
+  return createPlanHash({
+    targetType: plan.targetType,
+    targetId: plan.targetId,
+    sessionId: plan.sessionId,
+    requestedBy: plan.requestedBy,
+    normalizedInput: plan.normalizedInput,
+    riskClass: plan.riskClass
+  });
+}
+
+function review(
+  actorId: string | null,
+  verdict: ExecutionReview["verdict"],
+  summary: string,
+  details: Record<string, unknown> = {}
+): ExecutionReview {
+  return {
+    actorId,
+    verdict,
+    summary,
+    details
+  };
+}
+
+function normalizePrompt(value: string | undefined) {
+  const basePrompt = (value || "Inspect the current maintenance context and report back.").trim();
+  const withoutControlChars = basePrompt.replace(/[\u0000-\u001f\u007f]+/g, " ");
+  const compact = withoutControlChars.replace(/\s+/g, " ").trim();
+  const normalized = (compact || "Inspect the current maintenance context and report back.").slice(0, 240);
+
+  return {
+    prompt: normalized,
+    removedControlChars: withoutControlChars !== basePrompt,
+    truncated: normalized.length < compact.length
+  };
+}
+
+function planJobOutput(plan: ExecutionPlan, summary: string) {
+  return {
+    summary,
+    planId: plan.id,
+    planHash: plan.planHash,
+    targetType: plan.targetType,
+    targetId: plan.targetId,
+    riskClass: plan.riskClass,
+    plannerVerdict: plan.plannerReview.verdict,
+    safetyVerdict: plan.safetyReview.verdict,
+    policyVerdict: plan.policyReview.verdict
+  };
 }
 
 function runbookOutput(runbook: RunbookDefinition, sessionName: string | null, actor: UserSummary) {
@@ -91,6 +161,331 @@ export async function createApp(options: AppOptions = {}) {
   const tmux = createTmuxAdapter(config.tmuxMode);
   const terminalSigningSecret = randomBytes(32);
   const loginAttempts = new Map<string, LoginAttemptState>();
+
+  function createRunbookPlan(
+    actor: UserSummary,
+    runbook: RunbookDefinition,
+    session: { id: string; name: string } | null
+  ) {
+    const riskClass: ExecutionRiskClass = runbook.requiresApproval || runbook.privilegedHelperRequested ? "high" : "low";
+    const normalizedInput = {
+      runbookId: runbook.id,
+      sessionId: session?.id || null,
+      sessionName: session?.name || null
+    };
+
+    const plannerReview = review(
+      INTERNAL_EXECUTION_AGENTS.planner.id,
+      "passed",
+      `${INTERNAL_EXECUTION_AGENTS.planner.name} normalized ${runbook.name} into a bounded runbook request.`,
+      {
+        integration: runbook.integration,
+        privilegedHelperRequested: runbook.privilegedHelperRequested,
+        sessionLinked: Boolean(session)
+      }
+    );
+    const safetyReview = review(
+      INTERNAL_EXECUTION_AGENTS.safety.id,
+      runbook.requiresApproval ? "approval_required" : "passed",
+      runbook.requiresApproval
+        ? `${INTERNAL_EXECUTION_AGENTS.safety.name} escalated ${runbook.name} for human approval before any host-facing step can run.`
+        : `${INTERNAL_EXECUTION_AGENTS.safety.name} found the placeholder runbook bounded to a low-risk contract.`,
+      {
+        requiresApproval: runbook.requiresApproval,
+        requestedBy: actor.username,
+        riskClass
+      }
+    );
+    const policyReview = review(
+      null,
+      "passed",
+      "Deterministic policy gate confirmed the runbook is allowlisted and the request stayed within the manifest contract.",
+      {
+        runbookId: runbook.id,
+        targetType: "runbook"
+      }
+    );
+    const preExecutionHook = review(
+      null,
+      "passed",
+      session
+        ? "Pre-exec hook bound the runbook request to the selected cockpit session."
+        : "Pre-exec hook accepted the runbook request without a linked tmux session.",
+      {
+        sessionId: session?.id || null
+      }
+    );
+    const runtimeHook = review(
+      null,
+      runbook.requiresApproval ? "not_run" : "pending",
+      runbook.requiresApproval
+        ? "Runtime hook is waiting for approval before dispatch."
+        : "Runtime hook is armed for bounded placeholder dispatch.",
+      {}
+    );
+    const postExecutionHook = review(
+      null,
+      runbook.requiresApproval ? "not_run" : "pending",
+      runbook.requiresApproval
+        ? "Post-exec verification will run only after approval and dispatch."
+        : "Post-exec verification will confirm the placeholder output and audit trail.",
+      {}
+    );
+
+    return database.createExecutionPlan({
+      sessionId: session?.id || null,
+      targetType: "runbook",
+      targetId: runbook.id,
+      requestedBy: actor.id,
+      status: runbook.requiresApproval ? "pending_approval" : "ready",
+      riskClass,
+      requiresApproval: runbook.requiresApproval,
+      planHash: createPlanHash({
+        targetType: "runbook",
+        targetId: runbook.id,
+        sessionId: session?.id || null,
+        requestedBy: actor.id,
+        normalizedInput,
+        riskClass
+      }),
+      planSummary: `${runbook.name} will run through planner, safety review, policy validation, and hooks before the bounded executor can continue.`,
+      normalizedInput,
+      plannerReview,
+      safetyReview,
+      policyReview,
+      preExecutionHook,
+      runtimeHook,
+      postExecutionHook
+    });
+  }
+
+  function createAgentPlan(actor: UserSummary, agent: AgentManifest, sessionId: string, prompt?: string) {
+    const normalizedPrompt = normalizePrompt(prompt);
+    const riskClass: ExecutionRiskClass = agent.requiresApproval || agent.privilegedHelperRequested ? "high" : "moderate";
+    const normalizedInput = {
+      sessionId,
+      prompt: normalizedPrompt.prompt,
+      promptLength: normalizedPrompt.prompt.length
+    };
+
+    const plannerReview = review(
+      INTERNAL_EXECUTION_AGENTS.planner.id,
+      "passed",
+      `${INTERNAL_EXECUTION_AGENTS.planner.name} reduced the agent request to a bounded launch contract for ${agent.name}.`,
+      {
+        integration: agent.integration,
+        promptLength: normalizedPrompt.prompt.length,
+        truncated: normalizedPrompt.truncated
+      }
+    );
+    const safetyReview = review(
+      INTERNAL_EXECUTION_AGENTS.safety.id,
+      agent.requiresApproval ? "approval_required" : "passed",
+      agent.requiresApproval
+        ? `${INTERNAL_EXECUTION_AGENTS.safety.name} requires explicit approval before ${agent.name} can request any privileged helper.`
+        : `${INTERNAL_EXECUTION_AGENTS.safety.name} accepted the prompt because the launch path stays inside the allowlisted demo agent contract.`,
+      {
+        removedControlChars: normalizedPrompt.removedControlChars,
+        truncated: normalizedPrompt.truncated,
+        requiresApproval: agent.requiresApproval
+      }
+    );
+    const policyReview = review(
+      null,
+      "passed",
+      "Deterministic policy gate confirmed the agent manifest is allowlisted and no browser-supplied shell command crosses the boundary.",
+      {
+        agentId: agent.id,
+        targetType: "agent"
+      }
+    );
+    const preExecutionHook = review(
+      null,
+      "passed",
+      normalizedPrompt.removedControlChars || normalizedPrompt.truncated
+        ? "Pre-exec hook normalized the agent prompt before dispatching the bounded launch request."
+        : "Pre-exec hook accepted the agent prompt without modifications.",
+      {
+        removedControlChars: normalizedPrompt.removedControlChars,
+        truncated: normalizedPrompt.truncated,
+        sessionId
+      }
+    );
+    const runtimeHook = review(
+      null,
+      agent.requiresApproval ? "not_run" : "pending",
+      agent.requiresApproval
+        ? "Runtime hook is waiting for approval before dispatch."
+        : "Runtime hook is ready to observe the bounded demo agent launch.",
+      {}
+    );
+    const postExecutionHook = review(
+      null,
+      agent.requiresApproval ? "not_run" : "pending",
+      agent.requiresApproval
+        ? "Post-exec verification will only run after approval."
+        : "Post-exec verification will capture the launch result and keep the session auditable.",
+      {}
+    );
+
+    return database.createExecutionPlan({
+      sessionId,
+      targetType: "agent",
+      targetId: agent.id,
+      requestedBy: actor.id,
+      status: agent.requiresApproval ? "pending_approval" : "ready",
+      riskClass,
+      requiresApproval: agent.requiresApproval,
+      planHash: createPlanHash({
+        targetType: "agent",
+        targetId: agent.id,
+        sessionId,
+        requestedBy: actor.id,
+        normalizedInput,
+        riskClass
+      }),
+      planSummary: `${agent.name} will launch only after planner and safety review, deterministic policy validation, and hook checks have passed.`,
+      normalizedInput,
+      plannerReview,
+      safetyReview,
+      policyReview,
+      preExecutionHook,
+      runtimeHook,
+      postExecutionHook
+    });
+  }
+
+  function executeRunbookPlan(plan: ExecutionPlan, actor: UserSummary, runbook: RunbookDefinition) {
+    const session = plan.sessionId ? database.getSessionByIdForActor(plan.sessionId, plan.requestedBy) : null;
+    if (plan.sessionId && !session) {
+      throw new Error("session not found for runbook plan");
+    }
+    const job = database.createJob({
+      sessionId: plan.sessionId,
+      kind: "runbook",
+      subjectId: runbook.id,
+      status: "completed",
+      requiresApproval: false,
+      output: {
+        ...runbookOutput(runbook, session?.name || null, actor),
+        planId: plan.id,
+        planHash: plan.planHash
+      },
+      completedAt: new Date().toISOString()
+    });
+
+    const updatedPlan = database.updateExecutionPlan(plan.id, {
+      status: "executed",
+      executedJobId: job.id,
+      runtimeHook: review(
+        null,
+        "passed",
+        "Runtime hook observed the bounded runbook placeholder complete without crossing the host boundary.",
+        { jobId: job.id }
+      ),
+      postExecutionHook: review(
+        null,
+        "passed",
+        "Post-exec hook recorded the placeholder result and kept the action fully auditable.",
+        { jobId: job.id }
+      )
+    });
+
+    if (plan.sessionId) {
+      database.recordSessionActivity(plan.sessionId);
+    }
+
+    database.createAudit({
+      actorId: actor.id,
+      action: "execution.plan.executed",
+      targetType: "execution-plan",
+      targetId: plan.id,
+      details: {
+        targetType: plan.targetType,
+        targetId: plan.targetId,
+        executedJobId: job.id
+      }
+    });
+    database.createAudit({
+      actorId: actor.id,
+      action: "runbook.executed",
+      targetType: "runbook",
+      targetId: runbook.id,
+      details: { runbookId: runbook.id, sessionId: plan.sessionId }
+    });
+
+    return { plan: updatedPlan, job };
+  }
+
+  function executeAgentPlan(plan: ExecutionPlan, actor: UserSummary, agent: AgentManifest) {
+    const session = plan.sessionId ? database.getSessionRuntimeTargetForActor(plan.sessionId, plan.requestedBy) : null;
+    if (!session) {
+      throw new Error("session not found for agent plan");
+    }
+
+    const prompt =
+      typeof plan.normalizedInput.prompt === "string"
+        ? plan.normalizedInput.prompt
+        : "Inspect the current maintenance context and report back.";
+    const command = buildAgentCommand(config.repoRoot, prompt);
+    const launch = tmux.launchCommand(session.tmuxSessionName, "agent-demo", command);
+    const job = database.createJob({
+      sessionId: session.id,
+      kind: "agent",
+      subjectId: agent.id,
+      status: "completed",
+      requiresApproval: false,
+      output: {
+        ...agentOutput(agent, prompt, launch.started, launch.note),
+        planId: plan.id,
+        planHash: plan.planHash
+      },
+      completedAt: new Date().toISOString()
+    });
+
+    const updatedPlan = database.updateExecutionPlan(plan.id, {
+      status: "executed",
+      executedJobId: job.id,
+      runtimeHook: review(
+        null,
+        "passed",
+        "Runtime hook observed the bounded demo-agent launch complete through the tmux adapter contract.",
+        { jobId: job.id, started: launch.started, backend: launch.backend }
+      ),
+      postExecutionHook: review(
+        null,
+        "passed",
+        "Post-exec hook captured the launch outcome and preserved the audit trail for operator takeover.",
+        { jobId: job.id }
+      )
+    });
+
+    database.recordSessionActivity(session.id);
+    database.createAudit({
+      actorId: actor.id,
+      action: "execution.plan.executed",
+      targetType: "execution-plan",
+      targetId: plan.id,
+      details: {
+        targetType: plan.targetType,
+        targetId: plan.targetId,
+        executedJobId: job.id
+      }
+    });
+    database.createAudit({
+      actorId: actor.id,
+      action: "agent.launched",
+      targetType: "agent",
+      targetId: agent.id,
+      details: {
+        sessionId: session.id,
+        tmuxBackend: launch.backend,
+        planId: plan.id
+      }
+    });
+
+    return { plan: updatedPlan, job };
+  }
 
   database.initialize();
   database.seedAdmin(config.adminUsername, config.adminPassword);
@@ -201,7 +596,7 @@ export async function createApp(options: AppOptions = {}) {
       return;
     }
 
-    return { sessions: database.listSessions() };
+    return { sessions: database.listSessionsForActor(actor.id) };
   });
 
   app.post("/api/sessions", async (request, reply) => {
@@ -218,12 +613,22 @@ export async function createApp(options: AppOptions = {}) {
 
     const tmuxSessionName = `cockpit-${sessionSlug}`;
     const ensured = tmux.ensureSession(tmuxSessionName);
-    let session = database.upsertSession({
-      name: sessionSlug,
-      tmuxSessionName,
-      tmuxBackend: ensured.backend,
-      terminalUrl: null
-    });
+    let session;
+    try {
+      session = database.upsertSession({
+        name: sessionSlug,
+        ownerId: actor.id,
+        tmuxSessionName,
+        tmuxBackend: ensured.backend,
+        terminalUrl: null
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("another operator")) {
+        return reply.code(409).send({ message: "session name already belongs to another operator" });
+      }
+
+      throw error;
+    }
     session = database.updateSessionTerminalUrl(
       session.id,
       terminalUrl(config.ttydBaseUrl, session.id, terminalSigningSecret)
@@ -266,13 +671,14 @@ export async function createApp(options: AppOptions = {}) {
     }
 
     const { sessionId } = request.params as { sessionId: string };
-    const session = database.getSessionById(sessionId);
+    const session = database.getSessionByIdForActor(sessionId, actor.id);
     if (!session) {
       return reply.code(404).send({ message: "session not found" });
     }
 
     return {
       session,
+      plans: database.listExecutionPlansForSession(sessionId),
       jobs: database.listJobsForSession(sessionId)
     };
   });
@@ -299,28 +705,35 @@ export async function createApp(options: AppOptions = {}) {
     }
 
     const body = (request.body || {}) as { sessionId?: string };
-    const session = body.sessionId ? database.getSessionById(body.sessionId) : null;
+    const session = body.sessionId ? database.getSessionByIdForActor(body.sessionId, actor.id) : null;
 
     if (body.sessionId && !session) {
       return reply.code(404).send({ message: "session not found" });
     }
 
+    const plan = createRunbookPlan(actor, runbook, session);
+
+    database.createAudit({
+      actorId: actor.id,
+      action: "execution.plan.created",
+      targetType: "execution-plan",
+      targetId: plan.id,
+      details: {
+        targetType: plan.targetType,
+        targetId: plan.targetId,
+        sessionId: session?.id || null,
+        riskClass: plan.riskClass
+      }
+    });
+
     if (runbook.requiresApproval) {
       const pendingJob = database.createJob({
         sessionId: session?.id || null,
-        kind: "runbook",
-        subjectId: runbook.id,
+        kind: "execution.plan",
+        subjectId: plan.id,
         status: "pending_approval",
         requiresApproval: true,
-        output: {
-          summary: `${runbook.name} is waiting for human approval.`,
-          integration: "placeholder",
-          requestedBy: actor.username,
-          requestedByUserId: actor.id,
-          sessionId: session?.id || null,
-          sessionName: session?.name || null,
-          runbookId: runbook.id
-        }
+        output: planJobOutput(plan, `${runbook.name} is waiting for human approval before dispatch.`)
       });
 
       const approval = database.createApproval({
@@ -332,17 +745,19 @@ export async function createApp(options: AppOptions = {}) {
       const job = database.updateJob(pendingJob.id, {
         status: "pending_approval",
         approvalId: approval.id,
-        output: pendingJob.output
+        output: planJobOutput(plan, `${runbook.name} is waiting for human approval before dispatch.`)
+      });
+      const updatedPlan = database.updateExecutionPlan(plan.id, {
+        approvalId: approval.id,
+        status: "pending_approval"
       });
 
       database.createAudit({
         actorId: actor.id,
-        action: "runbook.requested",
-        targetType: "runbook",
-        targetId: runbook.id,
+        action: "execution.plan.pending_approval",
+        targetType: "execution-plan",
+        targetId: updatedPlan.id,
         details: {
-          runbookId: runbook.id,
-          sessionId: session?.id || null,
           approvalId: approval.id,
           requestedBy: actor.username
         }
@@ -352,32 +767,11 @@ export async function createApp(options: AppOptions = {}) {
         database.recordSessionActivity(session.id);
       }
 
-      return reply.code(202).send({ job, approval });
+      return reply.code(202).send({ plan: updatedPlan, job, approval });
     }
 
-    const job = database.createJob({
-      sessionId: session?.id || null,
-      kind: "runbook",
-      subjectId: runbook.id,
-      status: "completed",
-      requiresApproval: false,
-      output: runbookOutput(runbook, session?.name || null, actor),
-      completedAt: new Date().toISOString()
-    });
-
-    if (session) {
-      database.recordSessionActivity(session.id);
-    }
-
-    database.createAudit({
-      actorId: actor.id,
-      action: "runbook.executed",
-      targetType: "runbook",
-      targetId: runbook.id,
-      details: { runbookId: runbook.id, sessionId: session?.id || null }
-    });
-
-    return reply.code(201).send({ job });
+    const executed = executeRunbookPlan(plan, actor, runbook);
+    return reply.code(201).send(executed);
   });
 
   app.get("/api/approvals", async (request, reply) => {
@@ -387,7 +781,7 @@ export async function createApp(options: AppOptions = {}) {
     }
 
     const { status } = (request.query || {}) as { status?: "pending" | "approved" | "rejected" };
-    return { approvals: database.listApprovals(status) };
+    return { approvals: database.listApprovalsForActor(actor.id, status) };
   });
 
   app.post("/api/approvals/:approvalId/decision", async (request, reply) => {
@@ -399,6 +793,10 @@ export async function createApp(options: AppOptions = {}) {
     const { approvalId } = request.params as { approvalId: string };
     const approval = database.getApproval(approvalId);
     if (!approval) {
+      return reply.code(404).send({ message: "approval not found" });
+    }
+
+    if (approval.requestedBy !== actor.id) {
       return reply.code(404).send({ message: "approval not found" });
     }
 
@@ -420,6 +818,146 @@ export async function createApp(options: AppOptions = {}) {
     const job = database.getJob(approval.jobId);
     if (!job) {
       return reply.code(500).send({ message: "approval job not found" });
+    }
+
+    database.createAudit({
+      actorId: actor.id,
+      action: "approval.decided",
+      targetType: "approval",
+      targetId: updatedApproval.id,
+      details: {
+        decision: updatedApproval.status,
+        jobId: updatedApproval.jobId,
+        planHash: job.subjectId && job.kind === "execution.plan" ? database.getExecutionPlan(job.subjectId)?.planHash || null : null
+      }
+    });
+
+    if (job.kind === "execution.plan") {
+      const plan = job.subjectId ? database.getExecutionPlan(job.subjectId) : null;
+      if (!plan) {
+        return reply.code(500).send({ message: "execution plan not found" });
+      }
+
+      if (body.decision === "approved") {
+        const recomputedHash = recomputePlanHash(plan);
+        if (recomputedHash !== plan.planHash) {
+          const blockedPlan = database.updateExecutionPlan(plan.id, {
+            status: "blocked",
+            preExecutionHook: review(
+              null,
+              "blocked",
+              "Pre-exec hook detected a plan hash mismatch and refused to dispatch the approved action.",
+              {
+                expectedPlanHash: recomputedHash,
+                planHash: plan.planHash
+              }
+            )
+          });
+          const blockedJob = database.updateJob(job.id, {
+            status: "failed",
+            approvalId: updatedApproval.id,
+            completedAt: new Date().toISOString(),
+            output: {
+              ...planJobOutput(blockedPlan, "Execution plan integrity check failed before dispatch."),
+              approvalDecision: "approved",
+              integrityError: "plan hash mismatch"
+            }
+          });
+
+          return reply.code(409).send({
+            message: "plan integrity check failed",
+            approval: updatedApproval,
+            plan: blockedPlan,
+            job: blockedJob
+          });
+        }
+
+        if (plan.targetType === "runbook") {
+          const runbook = findRunbook(plan.targetId);
+          if (!runbook) {
+            return reply.code(500).send({ message: "runbook not found for approved plan" });
+          }
+
+          const executed = executeRunbookPlan(
+            database.updateExecutionPlan(plan.id, {
+              approvalId: updatedApproval.id,
+              preExecutionHook: review(
+                null,
+                "passed",
+                "Pre-exec hook revalidated the exact approved plan hash immediately before dispatch.",
+                { planHash: plan.planHash }
+              )
+            }),
+            actor,
+            runbook
+          );
+          const planJob = database.updateJob(job.id, {
+            status: "completed",
+            approvalId: updatedApproval.id,
+            completedAt: new Date().toISOString(),
+            output: {
+              ...planJobOutput(executed.plan, "Execution plan approved and dispatched."),
+              approvalDecision: "approved",
+              executedJobId: executed.job.id
+            }
+          });
+
+          return { approval: updatedApproval, plan: executed.plan, job: executed.job, planJob };
+        }
+
+        const agent = findAgent(plan.targetId);
+        if (!agent) {
+          return reply.code(500).send({ message: "agent not found for approved plan" });
+        }
+
+        const executed = executeAgentPlan(
+          database.updateExecutionPlan(plan.id, {
+            approvalId: updatedApproval.id,
+            preExecutionHook: review(
+              null,
+              "passed",
+              "Pre-exec hook revalidated the exact approved plan hash immediately before dispatch.",
+              { planHash: plan.planHash }
+            )
+          }),
+          actor,
+          agent
+        );
+        const planJob = database.updateJob(job.id, {
+          status: "completed",
+          approvalId: updatedApproval.id,
+          completedAt: new Date().toISOString(),
+          output: {
+            ...planJobOutput(executed.plan, "Execution plan approved and dispatched."),
+            approvalDecision: "approved",
+            executedJobId: executed.job.id
+          }
+        });
+
+        return { approval: updatedApproval, plan: executed.plan, job: executed.job, planJob };
+      }
+
+      const rejectedPlan = database.updateExecutionPlan(plan.id, {
+        status: "rejected",
+        approvalId: updatedApproval.id,
+        postExecutionHook: review(
+          null,
+          "blocked",
+          "Post-exec hook recorded a human rejection before any bounded executor was allowed to run.",
+          { approvalId: updatedApproval.id }
+        )
+      });
+      const rejectedJob = database.updateJob(job.id, {
+        status: "rejected",
+        approvalId: updatedApproval.id,
+        completedAt: new Date().toISOString(),
+        output: {
+          ...planJobOutput(rejectedPlan, "Execution plan rejected before dispatch."),
+          approvalDecision: "rejected"
+        }
+      });
+
+      return { approval: updatedApproval, plan: rejectedPlan, job: rejectedJob };
     }
 
     let updatedJob;
@@ -452,17 +990,6 @@ export async function createApp(options: AppOptions = {}) {
       database.recordSessionActivity(updatedJob.sessionId);
     }
 
-    database.createAudit({
-      actorId: actor.id,
-      action: "approval.decided",
-      targetType: "approval",
-      targetId: updatedApproval.id,
-      details: {
-        decision: updatedApproval.status,
-        jobId: updatedApproval.jobId
-      }
-    });
-
     return { approval: updatedApproval, job: updatedJob };
   });
 
@@ -492,40 +1019,55 @@ export async function createApp(options: AppOptions = {}) {
       return reply.code(400).send({ message: "sessionId is required" });
     }
 
-    const session = database.getSessionById(body.sessionId);
+    const session = database.getSessionRuntimeTargetForActor(body.sessionId, actor.id);
     if (!session) {
       return reply.code(404).send({ message: "session not found" });
     }
 
-    const prompt = (body.prompt || "Inspect the current maintenance context and report back.")
-      .trim()
-      .slice(0, 240);
-    const command = buildAgentCommand(config.repoRoot, prompt);
-    const launch = tmux.launchCommand(session.tmuxSessionName, "agent-demo", command);
-    database.recordSessionActivity(session.id);
-
-    const job = database.createJob({
-      sessionId: session.id,
-      kind: "agent",
-      subjectId: agent.id,
-      status: "completed",
-      requiresApproval: false,
-      output: agentOutput(agent, prompt, launch.started, launch.note),
-      completedAt: new Date().toISOString()
-    });
+    const plan = createAgentPlan(actor, agent, session.id, body.prompt);
 
     database.createAudit({
       actorId: actor.id,
-      action: "agent.launched",
-      targetType: "agent",
-      targetId: agent.id,
+      action: "execution.plan.created",
+      targetType: "execution-plan",
+      targetId: plan.id,
       details: {
+        targetType: plan.targetType,
+        targetId: plan.targetId,
         sessionId: session.id,
-        tmuxBackend: launch.backend
+        riskClass: plan.riskClass
       }
     });
 
-    return reply.code(201).send({ job });
+    if (agent.requiresApproval) {
+      const pendingJob = database.createJob({
+        sessionId: session.id,
+        kind: "execution.plan",
+        subjectId: plan.id,
+        status: "pending_approval",
+        requiresApproval: true,
+        output: planJobOutput(plan, `${agent.name} is waiting for human approval before launch.`)
+      });
+      const approval = database.createApproval({
+        jobId: pendingJob.id,
+        requestedBy: actor.id,
+        reason: `${agent.name} requires explicit approval before launch.`
+      });
+      const job = database.updateJob(pendingJob.id, {
+        status: "pending_approval",
+        approvalId: approval.id,
+        output: planJobOutput(plan, `${agent.name} is waiting for human approval before launch.`)
+      });
+      const updatedPlan = database.updateExecutionPlan(plan.id, {
+        approvalId: approval.id,
+        status: "pending_approval"
+      });
+
+      return reply.code(202).send({ plan: updatedPlan, job, approval });
+    }
+
+    const executed = executeAgentPlan(plan, actor, agent);
+    return reply.code(201).send(executed);
   });
 
   app.get("/api/audits", async (request, reply) => {
@@ -535,7 +1077,7 @@ export async function createApp(options: AppOptions = {}) {
     }
 
     const { limit } = (request.query || {}) as { limit?: string };
-    return { audits: database.listAudits(Number(limit || "50")) };
+    return { audits: database.listAuditsForActor(actor.id, Number(limit || "50")) };
   });
 
   app.get("/api/dashboard", async (request, reply) => {
@@ -546,11 +1088,11 @@ export async function createApp(options: AppOptions = {}) {
 
     return {
       user: actor,
-      sessions: database.listSessions(),
+      sessions: database.listSessionsForActor(actor.id),
       runbooks: RUNBOOKS,
       agents: AGENTS,
-      approvals: database.listApprovals("pending"),
-      audits: database.listAudits(20)
+      approvals: database.listApprovalsForActor(actor.id, "pending"),
+      audits: database.listAuditsForActor(actor.id, 20)
     };
   });
 

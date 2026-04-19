@@ -30,12 +30,14 @@ The web application must never be the system's privilege boundary. It is only a 
 - Starts approved agent processes inside a prepared `tmux` pane or window.
 - Supports local custom agents, Copilot CLI workflows, and future GitHub Copilot Squad-oriented task execution.
 - Injects task context, repo path, environment variables, and policy hints.
+- Supports a layered execution pattern where a `planner-agent` proposes work and a `safety-agent` reviews it before any privileged dispatch.
 
 ### 5. Runbook executor
 
 - Executes only predeclared tasks such as package updates, service restarts, backup checks, and Nextcloud maintenance flows.
 - Uses narrow `sudoers` entries or service-specific helpers for privileged operations.
 - Returns structured status, logs, and artifacts back to the Control API.
+- Runs only after deterministic policy validation, required approvals, and pre-exec hooks have passed.
 
 ### 6. Audit and state store
 
@@ -96,6 +98,17 @@ The web application must never be the system's privilege boundary. It is only a 
 3. Runbook executor runs a bounded helper.
 4. Logs, exit status, and resulting artifacts are attached to the job record.
 
+### Multi-agent controlled repair
+
+1. Operator or monitor opens a task session.
+2. Agent runner starts the `planner-agent` in the task-scoped `tmux` session.
+3. The planner emits a structured plan instead of free-form shell text.
+4. A `safety-agent` reviews that plan and may veto, downgrade, or escalate it.
+5. The Control API validates the exact plan through a deterministic policy gate.
+6. Required approvals and pre-exec hooks run before dispatch.
+7. The runbook executor performs only the registered helper path.
+8. Post-exec hooks and health checks determine whether the incident is resolved.
+
 ## Custom agent support
 
 - Agents must register a manifest that defines:
@@ -111,6 +124,7 @@ The web application must never be the system's privilege boundary. It is only a 
   - custom wrappers
   - GitHub Copilot-driven sessions
   - future Copilot Squad task delegation patterns
+- Agent-authored runbook proposals should be versioned and reviewable, but must remain non-executable until a separate activation flow approves them.
 
 ## GitHub Copilot and Squad alignment
 
@@ -118,6 +132,7 @@ The web application must never be the system's privilege boundary. It is only a 
 - Add `.github/workflows/copilot-setup-steps.yml` early so Copilot cloud agent receives deterministic tooling.
 - Treat Copilot cloud agent and Copilot Squad as accelerators for repository work, not as unrestricted host administrators.
 - For host changes, require the platform to route execution back through local runbooks or session-controlled workers.
+- Treat the detailed multi-agent execution flow in `doc/services/execution-control-model.md` as the reference model for future host-facing automation.
 
 ## Security controls checklist
 

@@ -7,11 +7,12 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "node --test"
+    "test": "npm run build && node --test test/**/*.test.mjs",
+    "coverage": "npm run build && c8 --check-coverage --branches 90 --functions 100 --lines 100 --statements 100 --reporter text-summary --reporter json-summary node --test test/**/*.test.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.15.3",
+    "c8": "^11.0.0",
     "typescript": "^5.8.3"
   }
 }
-
