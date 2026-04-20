@@ -1,0 +1,19 @@
+[Unit]
+Description=WireGuard Ops Cockpit ttyd bridge
+After=network-online.target wireguard-ops-cockpit-api.service
+Wants=network-online.target wireguard-ops-cockpit-api.service
+
+[Service]
+Type=simple
+User=wgops
+Group=wgops
+WorkingDirectory=/opt/wireguard-ops-cockpit
+Environment=PATH=/opt/node-v20.19.1-linux-x64/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=COCKPIT_DB_PATH=/var/lib/wireguard-ops-cockpit/cockpit.sqlite
+EnvironmentFile=/opt/wireguard-ops-cockpit/.env
+ExecStart=/usr/bin/ttyd -i 127.0.0.1 -p 7681 -W -a -b /terminal /opt/wireguard-ops-cockpit/bin/ttyd-session-attach.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

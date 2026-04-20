@@ -138,7 +138,7 @@ function stringifyReviewValue(value: ExecutionReview): string {
   return JSON.stringify(value);
 }
 
-function terminalBridge(terminalUrl: string | null, tmuxBackend: TmuxBackend): TerminalBridge {
+function terminalBridge(terminalUrl: string | null, tmuxBackend: TmuxBackend, tmuxSessionName: string): TerminalBridge {
   if (terminalUrl) {
     return {
       terminalUrl,
@@ -152,7 +152,7 @@ function terminalBridge(terminalUrl: string | null, tmuxBackend: TmuxBackend): T
     status: "pending_integration",
     note:
       tmuxBackend === "tmux"
-        ? "The tmux session exists, but no ttyd base URL is configured yet."
+        ? `The tmux session exists on the host. Until a browser terminal is configured, attach manually with: sudo -u wgops tmux attach -t ${tmuxSessionName}`
         : "The session model is active, but tmux integration is disabled in this runtime."
   };
 }
@@ -811,11 +811,12 @@ export class CockpitDatabase {
       id: row.id,
       name: row.name,
       status: "active",
+      tmuxSessionName: row.tmux_session_name,
       tmuxBackend: row.tmux_backend,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
       lastActivityAt: row.last_activity_at,
-      terminal: terminalBridge(row.terminal_url, row.tmux_backend)
+      terminal: terminalBridge(row.terminal_url, row.tmux_backend, row.tmux_session_name)
     };
   }
 

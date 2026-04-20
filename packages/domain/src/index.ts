@@ -31,6 +31,7 @@ export interface CockpitSession {
   id: string;
   name: string;
   status: SessionStatus;
+  tmuxSessionName: string;
   tmuxBackend: TmuxBackend;
   createdAt: string;
   updatedAt: string;
@@ -108,8 +109,9 @@ export interface RunbookDefinition {
   id: string;
   name: string;
   summary: string;
+  requiresSession: boolean;
   requiresApproval: boolean;
-  integration: "placeholder";
+  integration: "placeholder" | "host-tmux";
   privilegedHelperRequested: boolean;
 }
 
@@ -119,7 +121,7 @@ export interface AgentManifest {
   description: string;
   requiresApproval: boolean;
   privilegedHelperRequested: boolean;
-  integration: "demo-local";
+  integration: "demo-local" | "control-plane";
 }
 
 export interface SessionDetail {

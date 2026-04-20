@@ -95,9 +95,9 @@ function makeServer(initiallyAuthenticated: boolean) {
     ],
     agents: [
       {
-        id: "demo-context-agent",
-        name: "Demo context agent",
-        description: "Summarizes the current maintenance context."
+        id: "planner-agent",
+        name: "Planner agent",
+        description: "Produces a structured repair or maintenance plan for the current task session."
       }
     ],
     approvals: [
@@ -286,7 +286,7 @@ describe("App", () => {
     expect(screen.getByText(/Signed in as/)).toBeTruthy();
     expect(screen.queryByText("authentication required")).toBeNull();
     expect(screen.getByText("Disk health check")).toBeTruthy();
-    expect(screen.getByText("Demo context agent")).toBeTruthy();
+    expect(screen.getByText("Planner agent")).toBeTruthy();
     expect(screen.getByText("Execution plans")).toBeTruthy();
     expect(await screen.findByText("Open terminal bridge")).toBeTruthy();
   });
@@ -341,7 +341,7 @@ describe("App", () => {
       expect(
         fetchMock.mock.calls.some(
           ([url, init]) =>
-            String(url) === "/api/agents/demo-context-agent/launch" &&
+            String(url) === "/api/agents/planner-agent/launch" &&
             String((init as RequestInit | undefined)?.body).includes("Investigate recent job history.")
         )
       ).toBe(true);
