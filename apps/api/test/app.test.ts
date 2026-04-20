@@ -19,6 +19,7 @@ function buildConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     cookieSecure: false,
     tmuxMode: "disabled",
     ttydBaseUrl: null,
+    terminalSigningSecret: "test-terminal-secret",
     repoRoot: process.cwd(),
     nodeEnv: "development",
     ...overrides
@@ -214,7 +215,8 @@ describe("control API", () => {
     const cookie = await login(app);
 
     const session = await createSession(app, cookie, "Terminal Attach");
-    expect(session.terminal.terminalUrl).toContain("https://ttyd.example/bridge/attach?session=");
+    expect(session.terminal.terminalUrl).toContain("https://ttyd.example/bridge/");
+    expect(session.terminal.terminalUrl).toContain("?arg=");
     expect(session.terminal.note).toContain("Browser terminal attachment");
   });
 
@@ -261,10 +263,10 @@ describe("control API", () => {
     });
     expect(response.json().job).toMatchObject({
       kind: "runbook",
-      status: "completed",
+      status: "running",
       requiresApproval: false
     });
-    expect(response.json().job.output.summary).toContain("safe placeholder");
+    expect(response.json().job.output.summary).toContain("dispatched to the host tmux executor");
 
     const detail = await app.inject({
       method: "GET",
@@ -307,7 +309,7 @@ describe("control API", () => {
 
     expect(decision.statusCode).toBe(200);
     expect(decision.json().plan.status).toBe("executed");
-    expect(decision.json().job.status).toBe("completed");
+    expect(decision.json().job.status).toBe("running");
     expect(decision.json().approval.status).toBe("approved");
   });
 
@@ -397,7 +399,7 @@ describe("control API", () => {
 
     const missingSession = await app.inject({
       method: "POST",
-      url: "/api/agents/demo-context-agent/launch",
+      url: "/api/agents/planner-agent/launch",
       headers: { cookie },
       payload: { prompt: "inspect current state" }
     });
@@ -407,7 +409,7 @@ describe("control API", () => {
     const session = await createSession(app, cookie, "Agent Debug");
     const launch = await app.inject({
       method: "POST",
-      url: "/api/agents/demo-context-agent/launch",
+      url: "/api/agents/planner-agent/launch",
       headers: { cookie },
       payload: {
         sessionId: session.id,
@@ -418,7 +420,7 @@ describe("control API", () => {
     expect(launch.statusCode).toBe(201);
     expect(launch.json().plan).toMatchObject({
       targetType: "agent",
-      targetId: "demo-context-agent",
+      targetId: "planner-agent",
       status: "executed",
       riskClass: "moderate"
     });

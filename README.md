@@ -8,8 +8,9 @@ The repository now includes a first working implementation slice:
 - a Node.js/Fastify control API
 - SQLite-backed state for users, sessions, jobs, approvals, and audits
 - explicit `tmux` session management
-- safe placeholder runbooks
-- a demo local agent launch contract
+- bounded host runbooks for disk checks, Nextcloud planning, and selected service restarts
+- a single public `planner-agent` with internal safety/policy/hook flow
+- a `ttyd`-backed browser terminal bridge for task-scoped `tmux` sessions
 
 ## Current implementation boundaries
 
@@ -19,7 +20,7 @@ This first pass keeps the trust boundaries explicit:
 - application login still matters even on WireGuard-only networks
 - `tmux` sessions are first-class
 - browser terminal attachment is represented through an external ttyd-compatible URL, not hidden shell access
-- privileged host behavior remains behind future local integration points
+- privileged host behavior runs only through bounded host helpers, approvals, and narrow `sudoers` rules
 
 ## Repository structure
 
@@ -104,7 +105,7 @@ Notes:
 
 - the compose setup is for repository development, not production deployment
 - `tmux` behavior inside containers is intentionally local to the app runtime
-- host-coupled privileged helpers are still out of scope
+- host-coupled privileged helpers are implemented only in the VPS host-runtime path, not in the dev compose stack
 
 ## VPS deployment handover
 
@@ -120,20 +121,24 @@ Minimal flow:
 
 ```bash
 cp .env.vps.example .env
-docker compose --env-file .env -f docker-compose.vps.yml build --pull
-docker compose --env-file .env -f docker-compose.vps.yml up -d
+sudo apt-get install -y tmux ttyd
+curl -fsSLO https://nodejs.org/dist/v20.19.1/node-v20.19.1-linux-x64.tar.xz
+sudo tar -C /opt -xf node-v20.19.1-linux-x64.tar.xz
+sudo systemctl enable --now wireguard-ops-cockpit-api wireguard-ops-cockpit-ttyd
+docker compose --env-file .env -f docker-compose.vps.yml up -d --build web
 ```
 
 Important notes:
 
 - set `COCKPIT_BIND_IP` to the WireGuard IP on the VPS before startup
-- keep `COCKPIT_TMUX_MODE=disabled` unless you have a separate local host integration path ready
+- set `COCKPIT_TMUX_MODE=auto` for the host runtime
+- set `COCKPIT_TTYD_BASE_URL=/terminal` and a unique `COCKPIT_TERMINAL_SIGNING_SECRET`
 - set `COCKPIT_COOKIE_SECURE=true` only when the stack is behind HTTPS
-- the web service is the only published port; the API stays on the internal Compose network
+- the dashboard stays bound to the WireGuard IP while API and ttyd stay on `127.0.0.1`
 
 ## Terminal bridge
 
-Set `COCKPIT_TTYD_BASE_URL` to expose a terminal attachment URL in the UI. The app does not spawn a web terminal bridge itself in this first pass; it only models the integration seam explicitly.
+Set `COCKPIT_TTYD_BASE_URL=/terminal` and run the host-side `wireguard-ops-cockpit-ttyd` service to expose browser attachment URLs in the UI. The bridge validates a signed session token and attaches only to registered cockpit `tmux` sessions.
 
 ## Cloud build readiness
 

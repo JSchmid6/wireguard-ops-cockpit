@@ -11,6 +11,7 @@ export interface AppConfig {
   cookieSecure: boolean;
   tmuxMode: "auto" | "disabled";
   ttydBaseUrl: string | null;
+  terminalSigningSecret: string;
   repoRoot: string;
   nodeEnv: string;
 }
@@ -35,6 +36,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     cookieSecure,
     tmuxMode: env.COCKPIT_TMUX_MODE === "disabled" ? "disabled" : "auto",
     ttydBaseUrl: env.COCKPIT_TTYD_BASE_URL?.trim() || null,
+    terminalSigningSecret: env.COCKPIT_TERMINAL_SIGNING_SECRET || "development-terminal-secret",
     repoRoot,
     nodeEnv
   };

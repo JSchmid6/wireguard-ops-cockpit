@@ -1,4 +1,4 @@
-import { createHash, createHmac, randomBytes } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import Fastify from "fastify";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import type {
@@ -14,11 +14,12 @@ import { AUTH_COOKIE, clearAuthCookie, parseCookies, serializeAuthCookie } from 
 import { loadConfig, type AppConfig } from "./config.js";
 import { CockpitDatabase } from "./db.js";
 import {
-  AGENTS,
   INTERNAL_EXECUTION_AGENTS,
   RUNBOOKS,
   buildAgentCommand,
+  buildRunbookDispatch,
   findAgent,
+  listAgents,
   findRunbook
 } from "./registries.js";
 
@@ -52,7 +53,7 @@ function terminalUrl(baseUrl: string | null, sessionId: string, signingSecret: B
   }
 
   const token = createHmac("sha256", signingSecret).update(sessionId).digest("hex");
-  return `${baseUrl.replace(/\/$/, "")}/attach?session=${encodeURIComponent(sessionId)}&token=${encodeURIComponent(token)}`;
+  return `${baseUrl.replace(/\/$/, "")}/?arg=${encodeURIComponent(sessionId)}&arg=${encodeURIComponent(token)}`;
 }
 
 function createPlanHash(payload: Record<string, unknown>): string {
@@ -111,13 +112,22 @@ function planJobOutput(plan: ExecutionPlan, summary: string) {
   };
 }
 
-function runbookOutput(runbook: RunbookDefinition, sessionName: string | null, actor: UserSummary) {
+function runbookDispatchOutput(
+  runbook: RunbookDefinition,
+  sessionName: string,
+  tmuxSessionName: string,
+  windowName: string,
+  actor: UserSummary,
+  note: string
+) {
   return {
-    summary: `${runbook.name} completed as a safe placeholder.`,
+    summary: `${runbook.name} dispatched to the host tmux executor.`,
     lines: [
-      "This runbook keeps privileged execution behind a future local integration point.",
       `Requested by ${actor.username}.`,
-      sessionName ? `Linked session: ${sessionName}.` : "No tmux session linked to this request."
+      `Linked session: ${sessionName}.`,
+      `tmux target: ${tmuxSessionName}:${windowName}.`,
+      note,
+      `Manual attach: sudo -u wgops tmux attach -t ${tmuxSessionName}`
     ]
   };
 }
@@ -156,10 +166,14 @@ export async function createApp(options: AppOptions = {}) {
   if (config.nodeEnv === "production" && config.adminPassword === "change-me-now") {
     throw new Error("COCKPIT_ADMIN_PASSWORD must be changed before running in production");
   }
+  if (config.nodeEnv === "production" && config.terminalSigningSecret === "development-terminal-secret") {
+    throw new Error("COCKPIT_TERMINAL_SIGNING_SECRET must be changed before running in production");
+  }
 
   const database = new CockpitDatabase(config.dbPath);
   const tmux = createTmuxAdapter(config.tmuxMode);
-  const terminalSigningSecret = randomBytes(32);
+  const agents = listAgents();
+  const terminalSigningSecret = Buffer.from(config.terminalSigningSecret, "utf8");
   const loginAttempts = new Map<string, LoginAttemptState>();
 
   function createRunbookPlan(
@@ -283,7 +297,7 @@ export async function createApp(options: AppOptions = {}) {
       agent.requiresApproval ? "approval_required" : "passed",
       agent.requiresApproval
         ? `${INTERNAL_EXECUTION_AGENTS.safety.name} requires explicit approval before ${agent.name} can request any privileged helper.`
-        : `${INTERNAL_EXECUTION_AGENTS.safety.name} accepted the prompt because the launch path stays inside the allowlisted demo agent contract.`,
+        : `${INTERNAL_EXECUTION_AGENTS.safety.name} accepted the prompt because the launch path stays inside the bounded local agent launcher contract.`,
       {
         removedControlChars: normalizedPrompt.removedControlChars,
         truncated: normalizedPrompt.truncated,
@@ -316,7 +330,7 @@ export async function createApp(options: AppOptions = {}) {
       agent.requiresApproval ? "not_run" : "pending",
       agent.requiresApproval
         ? "Runtime hook is waiting for approval before dispatch."
-        : "Runtime hook is ready to observe the bounded demo agent launch.",
+        : "Runtime hook is ready to observe the bounded local agent launch.",
       {}
     );
     const postExecutionHook = review(
@@ -357,21 +371,24 @@ export async function createApp(options: AppOptions = {}) {
 
   function executeRunbookPlan(plan: ExecutionPlan, actor: UserSummary, runbook: RunbookDefinition) {
     const session = plan.sessionId ? database.getSessionByIdForActor(plan.sessionId, plan.requestedBy) : null;
-    if (plan.sessionId && !session) {
+    if (!session) {
       throw new Error("session not found for runbook plan");
     }
+    const dispatch = buildRunbookDispatch(config.repoRoot, runbook);
+    const launch = tmux.launchCommand(session.tmuxSessionName, dispatch.windowName, dispatch.command);
     const job = database.createJob({
-      sessionId: plan.sessionId,
+      sessionId: session.id,
       kind: "runbook",
       subjectId: runbook.id,
-      status: "completed",
+      status: "running",
       requiresApproval: false,
       output: {
-        ...runbookOutput(runbook, session?.name || null, actor),
+        ...runbookDispatchOutput(runbook, session.name, session.tmuxSessionName, dispatch.windowName, actor, launch.note),
         planId: plan.id,
-        planHash: plan.planHash
-      },
-      completedAt: new Date().toISOString()
+        planHash: plan.planHash,
+        tmuxBackend: launch.backend,
+        tmuxWindowName: dispatch.windowName
+      }
     });
 
     const updatedPlan = database.updateExecutionPlan(plan.id, {
@@ -380,20 +397,18 @@ export async function createApp(options: AppOptions = {}) {
       runtimeHook: review(
         null,
         "passed",
-        "Runtime hook observed the bounded runbook placeholder complete without crossing the host boundary.",
-        { jobId: job.id }
+        "Runtime hook dispatched the runbook into the host tmux session through the bounded executor contract.",
+        { jobId: job.id, backend: launch.backend, windowName: dispatch.windowName }
       ),
       postExecutionHook: review(
         null,
-        "passed",
-        "Post-exec hook recorded the placeholder result and kept the action fully auditable.",
-        { jobId: job.id }
+        "pending",
+        "Post-exec verification is waiting for the operator or a future runtime callback to confirm the final outcome.",
+        { jobId: job.id, tmuxSessionName: session.tmuxSessionName, windowName: dispatch.windowName }
       )
     });
 
-    if (plan.sessionId) {
-      database.recordSessionActivity(plan.sessionId);
-    }
+    database.recordSessionActivity(session.id);
 
     database.createAudit({
       actorId: actor.id,
@@ -408,10 +423,15 @@ export async function createApp(options: AppOptions = {}) {
     });
     database.createAudit({
       actorId: actor.id,
-      action: "runbook.executed",
+      action: "runbook.dispatched",
       targetType: "runbook",
       targetId: runbook.id,
-      details: { runbookId: runbook.id, sessionId: plan.sessionId }
+      details: {
+        runbookId: runbook.id,
+        sessionId: session.id,
+        tmuxSessionName: session.tmuxSessionName,
+        tmuxWindowName: dispatch.windowName
+      }
     });
 
     return { plan: updatedPlan, job };
@@ -427,8 +447,8 @@ export async function createApp(options: AppOptions = {}) {
       typeof plan.normalizedInput.prompt === "string"
         ? plan.normalizedInput.prompt
         : "Inspect the current maintenance context and report back.";
-    const command = buildAgentCommand(config.repoRoot, prompt);
-    const launch = tmux.launchCommand(session.tmuxSessionName, "agent-demo", command);
+    const command = buildAgentCommand(config.repoRoot, agent, prompt);
+    const launch = tmux.launchCommand(session.tmuxSessionName, slugify(`agent-${agent.id}`), command);
     const job = database.createJob({
       sessionId: session.id,
       kind: "agent",
@@ -449,7 +469,7 @@ export async function createApp(options: AppOptions = {}) {
       runtimeHook: review(
         null,
         "passed",
-        "Runtime hook observed the bounded demo-agent launch complete through the tmux adapter contract.",
+        "Runtime hook observed the bounded local agent launch complete through the tmux adapter contract.",
         { jobId: job.id, started: launch.started, backend: launch.backend }
       ),
       postExecutionHook: review(
@@ -705,9 +725,12 @@ export async function createApp(options: AppOptions = {}) {
     }
 
     const body = (request.body || {}) as { sessionId?: string };
+    if (!body.sessionId) {
+      return reply.code(400).send({ message: "sessionId is required" });
+    }
     const session = body.sessionId ? database.getSessionByIdForActor(body.sessionId, actor.id) : null;
 
-    if (body.sessionId && !session) {
+    if (!session) {
       return reply.code(404).send({ message: "session not found" });
     }
 
@@ -736,11 +759,11 @@ export async function createApp(options: AppOptions = {}) {
         output: planJobOutput(plan, `${runbook.name} is waiting for human approval before dispatch.`)
       });
 
-      const approval = database.createApproval({
-        jobId: pendingJob.id,
-        requestedBy: actor.id,
-        reason: `${runbook.name} requires explicit approval before any host-facing integration exists.`
-      });
+        const approval = database.createApproval({
+          jobId: pendingJob.id,
+          requestedBy: actor.id,
+          reason: `${runbook.name} requires explicit approval before dispatching the bounded host helper.`
+        });
 
       const job = database.updateJob(pendingJob.id, {
         status: "pending_approval",
@@ -896,7 +919,7 @@ export async function createApp(options: AppOptions = {}) {
             approvalId: updatedApproval.id,
             completedAt: new Date().toISOString(),
             output: {
-              ...planJobOutput(executed.plan, "Execution plan approved and dispatched."),
+              ...planJobOutput(executed.plan, "Execution plan approved and dispatched into the host tmux executor."),
               approvalDecision: "approved",
               executedJobId: executed.job.id
             }
@@ -962,14 +985,13 @@ export async function createApp(options: AppOptions = {}) {
 
     let updatedJob;
     if (body.decision === "approved") {
-      const runbook = job.subjectId ? findRunbook(job.subjectId) : undefined;
       updatedJob = database.updateJob(job.id, {
         status: "completed",
         approvalId: updatedApproval.id,
         completedAt: new Date().toISOString(),
         output: {
           ...(job.output || {}),
-          ...(runbook ? runbookOutput(runbook, null, actor) : {}),
+          summary: "Execution was approved and dispatched.",
           approvalDecision: "approved"
         }
       });
@@ -999,7 +1021,7 @@ export async function createApp(options: AppOptions = {}) {
       return;
     }
 
-    return { agents: AGENTS };
+    return { agents };
   });
 
   app.post("/api/agents/:agentId/launch", async (request, reply) => {
@@ -1090,7 +1112,7 @@ export async function createApp(options: AppOptions = {}) {
       user: actor,
       sessions: database.listSessionsForActor(actor.id),
       runbooks: RUNBOOKS,
-      agents: AGENTS,
+      agents,
       approvals: database.listApprovalsForActor(actor.id, "pending"),
       audits: database.listAuditsForActor(actor.id, 20)
     };

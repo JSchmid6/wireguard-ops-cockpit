@@ -1,0 +1,24 @@
+[Unit]
+Description=WireGuard Ops Cockpit API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wgops
+Group=wgops
+WorkingDirectory=/opt/wireguard-ops-cockpit
+Environment=NODE_ENV=production
+Environment=PATH=/opt/node-v20.19.1-linux-x64/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=COCKPIT_API_HOST=127.0.0.1
+Environment=COCKPIT_API_PORT=3001
+Environment=COCKPIT_DB_PATH=/var/lib/wireguard-ops-cockpit/cockpit.sqlite
+Environment=COCKPIT_TMUX_MODE=auto
+EnvironmentFile=/opt/wireguard-ops-cockpit/.env
+ExecStart=/opt/node-v20.19.1-linux-x64/bin/node /opt/wireguard-ops-cockpit/apps/api/dist/index.js
+Restart=always
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

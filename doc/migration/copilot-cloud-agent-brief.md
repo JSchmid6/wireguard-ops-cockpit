@@ -1,10 +1,10 @@
 # Copilot cloud agent brief
 
-Use this brief when asking GitHub Copilot cloud agent to implement the first working version of this repository.
+Use this brief when asking GitHub Copilot cloud agent to extend this repository without regressing the current bounded execution model.
 
 ## Objective
 
-Build the **repository codebase and tests** for `wireguard-ops-cockpit` based on the existing planning docs, while keeping all host-privileged behavior behind explicit future integration points.
+Build or extend the **repository codebase and tests** for `wireguard-ops-cockpit` based on the existing planning docs, while preserving the current bounded host-runtime model and avoiding broad privilege shortcuts.
 
 ## Required inputs
 
@@ -25,7 +25,7 @@ Unless the user overrides it in the task:
 - create a small React web UI
 - create a Node.js/TypeScript backend
 - use SQLite for persistence
-- model persistent sessions and runbooks in code, but do not wire privileged host execution yet
+- preserve the existing host-runtime split: host API, host `tmux`, bounded helper scripts, and localhost terminal bridge
 - prepare the codebase for Docker Compose deployment
 
 ## Required boundaries
@@ -43,7 +43,7 @@ Do **not** do any of the following in the first implementation pass:
 1. repository scaffolding for UI and backend
 2. initial database schema and migrations
 3. session/job/audit domain model
-4. stubbed runbook registry with safe placeholders
+4. bounded runbook registry with explicit helper contracts
 5. custom-agent registry contract
 6. testable API and UI skeleton
 7. local developer instructions
@@ -76,8 +76,8 @@ Implement the repository skeleton for a WireGuard-only VPS operations cockpit wi
 
 - an authenticated web UI shell
 - a backend API for sessions, jobs, audits, and approvals
-- a runbook abstraction layer with no privileged host coupling yet
+- a runbook abstraction layer that stays inside the existing bounded host-helper pattern
 - a custom-agent manifest model
 - tests for the initial API/domain behavior
 
-The agent should prefer explicit placeholders and documented seams over pretending that host-level execution already exists.
+The agent should extend the existing bounded design rather than reintroducing placeholder behavior or broad host execution paths.

@@ -14,6 +14,7 @@ describe("loadConfig", () => {
     expect(config.cookieSecure).toBe(false);
     expect(config.tmuxMode).toBe("auto");
     expect(config.ttydBaseUrl).toBeNull();
+    expect(config.terminalSigningSecret).toBe("development-terminal-secret");
     expect(config.dbPath.endsWith(path.join("data", "cockpit.sqlite"))).toBe(true);
     expect(path.isAbsolute(config.repoRoot)).toBe(true);
   });
@@ -29,7 +30,8 @@ describe("loadConfig", () => {
       COCKPIT_SESSION_TTL_HOURS: "48",
       COCKPIT_COOKIE_SECURE: "false",
       COCKPIT_TMUX_MODE: "disabled",
-      COCKPIT_TTYD_BASE_URL: "https://ttyd.example/bridge  "
+      COCKPIT_TTYD_BASE_URL: "https://ttyd.example/bridge  ",
+      COCKPIT_TERMINAL_SIGNING_SECRET: "terminal-secret"
     });
 
     expect(config.nodeEnv).toBe("production");
@@ -42,5 +44,6 @@ describe("loadConfig", () => {
     expect(config.cookieSecure).toBe(false);
     expect(config.tmuxMode).toBe("disabled");
     expect(config.ttydBaseUrl).toBe("https://ttyd.example/bridge");
+    expect(config.terminalSigningSecret).toBe("terminal-secret");
   });
 });

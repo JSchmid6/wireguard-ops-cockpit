@@ -1,0 +1,3 @@
+Defaults:wgops !requiretty
+wgops ALL=(root) NOPASSWD: /opt/wireguard-ops-cockpit/bin/nextcloud-update-plan.sh
+wgops ALL=(root) NOPASSWD: /opt/wireguard-ops-cockpit/bin/restart-nextcloud-web-stack.sh
