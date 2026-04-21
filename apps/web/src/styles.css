@@ -5,6 +5,12 @@
   color: #e2e8f0;
 }
 
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
 * {
   box-sizing: border-box;
 }
@@ -13,11 +19,13 @@ body {
   margin: 0;
   min-height: 100vh;
   background: linear-gradient(180deg, #020617 0%, #0f172a 100%);
+  overflow-y: auto;
 }
 
 button,
 input,
-textarea {
+textarea,
+select {
   font: inherit;
 }
 
@@ -35,7 +43,8 @@ button.selected {
 }
 
 input,
-textarea {
+textarea,
+select {
   width: 100%;
   border-radius: 0.5rem;
   border: 1px solid #334155;
@@ -45,15 +54,19 @@ textarea {
 }
 
 .app-shell {
-  max-width: 1400px;
+  width: min(1600px, 100%);
   margin: 0 auto;
-  padding: 2rem;
+  min-height: 100vh;
+  padding: clamp(1rem, 2vw, 2rem);
+  display: grid;
+  gap: 1rem;
 }
 
 .topbar,
 .grid {
   display: grid;
   gap: 1rem;
+  align-items: start;
 }
 
 .topbar {
@@ -62,11 +75,11 @@ textarea {
 }
 
 .two-column {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(22rem, 1fr));
 }
 
 .three-column {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr));
 }
 
 .panel {
@@ -74,7 +87,18 @@ textarea {
   border: 1px solid rgba(56, 189, 248, 0.18);
   border-radius: 1rem;
   padding: 1.25rem;
-  margin-top: 1rem;
+  display: grid;
+  gap: 0.75rem;
+}
+
+.info-panel {
+  background: rgba(8, 47, 73, 0.8);
+}
+
+.panel-scroll {
+  max-height: min(36rem, 65vh);
+  overflow: auto;
+  padding-right: 0.35rem;
 }
 
 .stack {
@@ -86,6 +110,16 @@ textarea {
   display: grid;
   gap: 0.75rem;
   grid-template-columns: 1fr auto;
+}
+
+.schedule-form {
+  align-content: start;
+}
+
+.split-fields {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .list,
@@ -135,10 +169,25 @@ small {
   color: #94a3b8;
 }
 
+::-webkit-scrollbar {
+  width: 0.7rem;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(56, 189, 248, 0.35);
+  border-radius: 999px;
+}
+
 @media (max-width: 1100px) {
-  .two-column,
-  .three-column,
   .topbar {
+    grid-template-columns: 1fr;
+  }
+
+  .panel-scroll {
+    max-height: none;
+  }
+
+  .split-fields {
     grid-template-columns: 1fr;
   }
 }

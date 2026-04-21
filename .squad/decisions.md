@@ -63,3 +63,26 @@ Agent-generated runbooks may be proposed later, but activation must stay a separ
 ### Consequence
 
 The repository should document the execution-control model explicitly, keep runbook activation separate from incident execution, and bind approvals and audit records to exact plans rather than free-form prompts.
+
+## Decision 005 - Ambiguous work requires a deep interview before implementation
+
+### Context
+
+Feature requests often arrive as a mix of product intent, UI ideas, implementation guesses, and hidden assumptions. If the team starts coding too early, it risks solving the wrong problem or crossing architecture boundaries accidentally.
+
+### Decision
+
+Before implementation begins, the coordinator must check whether the request still has open questions around goals, constraints, acceptance criteria, or trust-boundary impact.
+
+If those questions remain open, the team runs a short deep interview first. Compass owns the first pass for product clarification. Architect, Guide, Shield, or Builder join only after the request is sharpened enough to define a coherent slice.
+
+The deep interview must produce:
+
+- the operator problem
+- explicit constraints and non-goals
+- acceptance criteria
+- the smallest coherent next implementation step
+
+### Consequence
+
+The squad should ask targeted clarification questions before coding when ambiguity is still material, and should treat discovery as part of delivery rather than as optional overhead.

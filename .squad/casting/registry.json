@@ -21,6 +21,27 @@
       "legacy_named": false,
       "status": "active"
     },
+    "canvas": {
+      "persistent_name": "Mouse",
+      "universe": "The Matrix",
+      "created_at": "2026-04-21T00:00:00Z",
+      "legacy_named": false,
+      "status": "active"
+    },
+    "compass": {
+      "persistent_name": "Niobe",
+      "universe": "The Matrix",
+      "created_at": "2026-04-21T00:00:00Z",
+      "legacy_named": false,
+      "status": "active"
+    },
+    "guide": {
+      "persistent_name": "Link",
+      "universe": "The Matrix",
+      "created_at": "2026-04-21T00:00:00Z",
+      "legacy_named": false,
+      "status": "active"
+    },
     "shield": {
       "persistent_name": "Trinity",
       "universe": "The Matrix",

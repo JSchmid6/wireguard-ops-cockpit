@@ -1,12 +1,14 @@
 import { createHash, createHmac } from "node:crypto";
 import Fastify from "fastify";
-import type { FastifyReply, FastifyRequest } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type {
   AgentManifest,
   ExecutionPlan,
   ExecutionReview,
   ExecutionRiskClass,
   RunbookDefinition,
+  ScheduledRunbook,
+  ScheduledRunbookMode,
   UserSummary
 } from "@wireguard-ops-cockpit/domain";
 import { createTmuxAdapter } from "@wireguard-ops-cockpit/tmux-adapter";
@@ -14,11 +16,13 @@ import { AUTH_COOKIE, clearAuthCookie, parseCookies, serializeAuthCookie } from 
 import { loadConfig, type AppConfig } from "./config.js";
 import { CockpitDatabase } from "./db.js";
 import {
+  computeRunbookVersionHash,
   INTERNAL_EXECUTION_AGENTS,
   RUNBOOKS,
   buildAgentCommand,
   buildRunbookDispatch,
   findAgent,
+  listScripts,
   listAgents,
   findRunbook
 } from "./registries.js";
@@ -98,6 +102,35 @@ function normalizePrompt(value: string | undefined) {
   };
 }
 
+function isHighRiskRunbook(runbook: RunbookDefinition) {
+  return runbook.requiresApproval || runbook.privilegedHelperRequested;
+}
+
+function validateWeekday(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 6;
+}
+
+function validateTimeUtc(value: unknown): value is string {
+  return typeof value === "string" && /^([01]\d|2[0-3]):([0-5]\d)$/.test(value);
+}
+
+function computeNextWeeklyRunAt(weekday: number, timeUtc: string, from = new Date()): string {
+  const [hoursText, minutesText] = timeUtc.split(":");
+  const hours = Number(hoursText);
+  const minutes = Number(minutesText);
+  const target = new Date(from);
+  target.setUTCSeconds(0, 0);
+  target.setUTCHours(hours, minutes, 0, 0);
+
+  let daysAhead = (weekday - from.getUTCDay() + 7) % 7;
+  if (daysAhead === 0 && target.getTime() <= from.getTime()) {
+    daysAhead = 7;
+  }
+
+  target.setUTCDate(from.getUTCDate() + daysAhead);
+  return target.toISOString();
+}
+
 function planJobOutput(plan: ExecutionPlan, summary: string) {
   return {
     summary,
@@ -109,6 +142,16 @@ function planJobOutput(plan: ExecutionPlan, summary: string) {
     plannerVerdict: plan.plannerReview.verdict,
     safetyVerdict: plan.safetyReview.verdict,
     policyVerdict: plan.policyReview.verdict
+  };
+}
+
+function scheduleJobOutput(schedule: ScheduledRunbook, summary: string) {
+  return {
+    summary,
+    scheduleId: schedule.id,
+    runbookId: schedule.runbookId,
+    effectiveMode: schedule.effectiveMode,
+    nextRunAt: schedule.nextRunAt
   };
 }
 
@@ -173,19 +216,27 @@ export async function createApp(options: AppOptions = {}) {
   const database = new CockpitDatabase(config.dbPath);
   const tmux = createTmuxAdapter(config.tmuxMode);
   const agents = listAgents();
+  const scripts = listScripts();
   const terminalSigningSecret = Buffer.from(config.terminalSigningSecret, "utf8");
   const loginAttempts = new Map<string, LoginAttemptState>();
+  const scheduleLocks = new Set<string>();
 
   function createRunbookPlan(
     actor: UserSummary,
     runbook: RunbookDefinition,
-    session: { id: string; name: string } | null
+    session: { id: string; name: string } | null,
+    options: { trigger: "manual" | "scheduled"; autoDispatch: boolean; scheduleId?: string } = {
+      trigger: "manual",
+      autoDispatch: true
+    }
   ) {
     const riskClass: ExecutionRiskClass = runbook.requiresApproval || runbook.privilegedHelperRequested ? "high" : "low";
     const normalizedInput = {
       runbookId: runbook.id,
       sessionId: session?.id || null,
-      sessionName: session?.name || null
+      sessionName: session?.name || null,
+      trigger: options.trigger,
+      scheduleId: options.scheduleId || null
     };
 
     const plannerReview = review(
@@ -231,18 +282,22 @@ export async function createApp(options: AppOptions = {}) {
     );
     const runtimeHook = review(
       null,
-      runbook.requiresApproval ? "not_run" : "pending",
+      runbook.requiresApproval ? "not_run" : options.autoDispatch ? "pending" : "not_run",
       runbook.requiresApproval
         ? "Runtime hook is waiting for approval before dispatch."
-        : "Runtime hook is armed for bounded placeholder dispatch.",
+        : options.autoDispatch
+          ? "Runtime hook is armed for bounded placeholder dispatch."
+          : "Runtime hook is waiting for an operator or schedule policy to dispatch the bounded executor.",
       {}
     );
     const postExecutionHook = review(
       null,
-      runbook.requiresApproval ? "not_run" : "pending",
+      runbook.requiresApproval ? "not_run" : options.autoDispatch ? "pending" : "not_run",
       runbook.requiresApproval
         ? "Post-exec verification will run only after approval and dispatch."
-        : "Post-exec verification will confirm the placeholder output and audit trail.",
+        : options.autoDispatch
+          ? "Post-exec verification will confirm the placeholder output and audit trail."
+          : "Post-exec verification will start only after a later bounded dispatch occurs.",
       {}
     );
 
@@ -262,7 +317,10 @@ export async function createApp(options: AppOptions = {}) {
         normalizedInput,
         riskClass
       }),
-      planSummary: `${runbook.name} will run through planner, safety review, policy validation, and hooks before the bounded executor can continue.`,
+      planSummary:
+        options.trigger === "scheduled"
+          ? `${runbook.name} was generated by a weekly schedule and will still pass planner, safety review, policy validation, and hooks before any bounded execution continues.`
+          : `${runbook.name} will run through planner, safety review, policy validation, and hooks before the bounded executor can continue.`,
       normalizedInput,
       plannerReview,
       safetyReview,
@@ -271,6 +329,194 @@ export async function createApp(options: AppOptions = {}) {
       runtimeHook,
       postExecutionHook
     });
+  }
+
+  function createPendingApprovalForPlan(plan: ExecutionPlan, actor: UserSummary, reason: string) {
+    const pendingJob = database.createJob({
+      sessionId: plan.sessionId,
+      kind: "execution.plan",
+      subjectId: plan.id,
+      status: "pending_approval",
+      requiresApproval: true,
+      output: planJobOutput(plan, reason)
+    });
+    const approval = database.createApproval({
+      jobId: pendingJob.id,
+      requestedBy: actor.id,
+      reason
+    });
+    const job = database.updateJob(pendingJob.id, {
+      status: "pending_approval",
+      approvalId: approval.id,
+      output: planJobOutput(plan, reason)
+    });
+    const updatedPlan = database.updateExecutionPlan(plan.id, {
+      approvalId: approval.id,
+      status: "pending_approval"
+    });
+
+    database.createAudit({
+      actorId: actor.id,
+      action: "execution.plan.pending_approval",
+      targetType: "execution-plan",
+      targetId: updatedPlan.id,
+      details: {
+        approvalId: approval.id,
+        requestedBy: actor.username
+      }
+    });
+
+    if (plan.sessionId) {
+      database.recordSessionActivity(plan.sessionId);
+    }
+
+    return { plan: updatedPlan, job, approval };
+  }
+
+  function createReadyPlanRecord(plan: ExecutionPlan, actor: UserSummary, summary: string) {
+    const job = database.createJob({
+      sessionId: plan.sessionId,
+      kind: "execution.plan",
+      subjectId: plan.id,
+      status: "completed",
+      requiresApproval: false,
+      output: planJobOutput(plan, summary),
+      completedAt: new Date().toISOString()
+    });
+
+    database.createAudit({
+      actorId: actor.id,
+      action: "execution.plan.ready",
+      targetType: "execution-plan",
+      targetId: plan.id,
+      details: {
+        jobId: job.id,
+        requestedBy: actor.username
+      }
+    });
+
+    if (plan.sessionId) {
+      database.recordSessionActivity(plan.sessionId);
+    }
+
+    return { plan, job };
+  }
+
+  function pauseSchedule(scheduleId: string, actorId: string | null, summary: string, details: Record<string, unknown>) {
+    const schedule = database.updateScheduledRunbook(scheduleId, {
+      status: "paused"
+    });
+    database.createAudit({
+      actorId,
+      action: "schedule.paused",
+      targetType: "scheduled-runbook",
+      targetId: schedule.id,
+      details: {
+        ...details,
+        summary
+      }
+    });
+    return schedule;
+  }
+
+  async function processDueScheduledRunbooks() {
+    const dueSchedules = database.listDueScheduledRunbooks(new Date().toISOString());
+
+    for (const schedule of dueSchedules) {
+      if (scheduleLocks.has(schedule.id)) {
+        continue;
+      }
+
+      scheduleLocks.add(schedule.id);
+      try {
+        const actor = database.getUserById(schedule.ownerId);
+        const runbook = findRunbook(schedule.runbookId);
+        const session = database.getSessionByIdForActor(schedule.sessionId, schedule.ownerId);
+
+        if (!actor || !runbook || !session) {
+          pauseSchedule(schedule.id, actor?.id || null, "Scheduled runbook paused because actor, runbook, or session no longer resolves.", {
+            actorFound: Boolean(actor),
+            runbookFound: Boolean(runbook),
+            sessionFound: Boolean(session)
+          });
+          continue;
+        }
+
+        const currentVersionHash = computeRunbookVersionHash(runbook);
+        if (currentVersionHash !== schedule.runbookVersionHash) {
+          pauseSchedule(schedule.id, actor.id, "Scheduled runbook paused because the reviewed runbook version changed.", {
+            expectedRunbookVersionHash: schedule.runbookVersionHash,
+            currentRunbookVersionHash: currentVersionHash
+          });
+          continue;
+        }
+
+        if (isHighRiskRunbook(runbook) && schedule.effectiveMode !== "scheduled-plan-only") {
+          pauseSchedule(schedule.id, actor.id, "Scheduled runbook paused because high-risk runbooks cannot auto-dispatch in this slice.", {
+            effectiveMode: schedule.effectiveMode,
+            runbookId: runbook.id
+          });
+          continue;
+        }
+
+        const plan = createRunbookPlan(actor, runbook, session, {
+          trigger: "scheduled",
+          autoDispatch: schedule.effectiveMode === "scheduled-auto",
+          scheduleId: schedule.id
+        });
+
+        database.createAudit({
+          actorId: actor.id,
+          action: "execution.plan.created",
+          targetType: "execution-plan",
+          targetId: plan.id,
+          details: {
+            targetType: plan.targetType,
+            targetId: plan.targetId,
+            sessionId: session.id,
+            riskClass: plan.riskClass,
+            scheduleId: schedule.id,
+            trigger: "scheduled"
+          }
+        });
+
+        let executedAt: string | null = null;
+        if (runbook.requiresApproval) {
+          createPendingApprovalForPlan(
+            plan,
+            actor,
+            `${runbook.name} was generated by a weekly schedule and requires human approval before dispatch.`
+          );
+        } else if (schedule.effectiveMode === "scheduled-auto") {
+          executeRunbookPlan(plan, actor, runbook);
+          executedAt = new Date().toISOString();
+        } else {
+          createReadyPlanRecord(plan, actor, `${runbook.name} was generated by a weekly schedule and is ready for operator review.`);
+        }
+
+        const nextRunAt = computeNextWeeklyRunAt(schedule.weekday, schedule.timeUtc, new Date(new Date(schedule.nextRunAt).getTime() + 1000));
+        const updatedSchedule = database.updateScheduledRunbook(schedule.id, {
+          lastPlannedAt: new Date().toISOString(),
+          lastRunAt: executedAt,
+          nextRunAt
+        });
+
+        database.createAudit({
+          actorId: actor.id,
+          action: "schedule.triggered",
+          targetType: "scheduled-runbook",
+          targetId: updatedSchedule.id,
+          details: {
+            effectiveMode: updatedSchedule.effectiveMode,
+            executedAt,
+            nextRunAt: updatedSchedule.nextRunAt,
+            runbookId: updatedSchedule.runbookId
+          }
+        });
+      } finally {
+        scheduleLocks.delete(schedule.id);
+      }
+    }
   }
 
   function createAgentPlan(actor: UserSummary, agent: AgentManifest, sessionId: string, prompt?: string) {
@@ -513,9 +759,18 @@ export async function createApp(options: AppOptions = {}) {
     database.createUser(user.username, user.password, user.role || "admin");
   }
 
-  const app = Fastify({ logger: false });
+  const app = Fastify({ logger: false }) as FastifyInstance & {
+    processDueScheduledRunbooks?: () => Promise<void>;
+  };
+
+  const schedulerInterval = setInterval(() => {
+    void processDueScheduledRunbooks();
+  }, 30_000);
+
+  app.processDueScheduledRunbooks = processDueScheduledRunbooks;
 
   app.addHook("onClose", async () => {
+    clearInterval(schedulerInterval);
     database.close();
   });
 
@@ -712,6 +967,160 @@ export async function createApp(options: AppOptions = {}) {
     return { runbooks: RUNBOOKS };
   });
 
+  app.get("/api/schedules", async (request, reply) => {
+    const actor = await requireActor(request, reply, database);
+    if (!actor) {
+      return;
+    }
+
+    return { schedules: database.listScheduledRunbooksForActor(actor.id) };
+  });
+
+  app.post("/api/schedules", async (request, reply) => {
+    const actor = await requireActor(request, reply, database);
+    if (!actor) {
+      return;
+    }
+
+    const body = (request.body || {}) as {
+      runbookId?: string;
+      sessionId?: string;
+      weekday?: number;
+      timeUtc?: string;
+      mode?: ScheduledRunbookMode;
+    };
+
+    if (!body.runbookId || !body.sessionId || !validateWeekday(body.weekday) || !validateTimeUtc(body.timeUtc)) {
+      return reply.code(400).send({ message: "runbookId, sessionId, weekday, and timeUtc are required" });
+    }
+
+    const requestedMode = body.mode || "scheduled-plan-only";
+    if (requestedMode !== "scheduled-plan-only" && requestedMode !== "scheduled-auto") {
+      return reply.code(400).send({ message: "mode must be scheduled-plan-only or scheduled-auto" });
+    }
+
+    const runbook = findRunbook(body.runbookId);
+    if (!runbook) {
+      return reply.code(404).send({ message: "runbook not found" });
+    }
+
+    if (requestedMode === "scheduled-auto" && isHighRiskRunbook(runbook)) {
+      return reply.code(400).send({ message: "high-risk runbooks can only use scheduled-plan-only" });
+    }
+
+    const session = database.getSessionByIdForActor(body.sessionId, actor.id);
+    if (!session) {
+      return reply.code(404).send({ message: "session not found" });
+    }
+
+    const schedule = database.createScheduledRunbook({
+      ownerId: actor.id,
+      runbookId: runbook.id,
+      sessionId: session.id,
+      weekday: body.weekday,
+      timeUtc: body.timeUtc,
+      timezone: "UTC",
+      requestedMode,
+      effectiveMode: requestedMode,
+      status: "draft",
+      runbookVersionHash: computeRunbookVersionHash(runbook),
+      nextRunAt: computeNextWeeklyRunAt(body.weekday, body.timeUtc)
+    });
+
+    database.createAudit({
+      actorId: actor.id,
+      action: "schedule.created",
+      targetType: "scheduled-runbook",
+      targetId: schedule.id,
+      details: {
+        runbookId: schedule.runbookId,
+        sessionId: schedule.sessionId,
+        requestedMode: schedule.requestedMode,
+        nextRunAt: schedule.nextRunAt
+      }
+    });
+
+    return reply.code(201).send({ schedule });
+  });
+
+  app.post("/api/schedules/:scheduleId/activate", async (request, reply) => {
+    const actor = await requireActor(request, reply, database);
+    if (!actor) {
+      return;
+    }
+
+    const { scheduleId } = request.params as { scheduleId: string };
+    const schedule = database.getScheduledRunbookForActor(scheduleId, actor.id);
+    if (!schedule) {
+      return reply.code(404).send({ message: "schedule not found" });
+    }
+
+    const runbook = findRunbook(schedule.runbookId);
+    const session = database.getSessionByIdForActor(schedule.sessionId, actor.id);
+    if (!runbook || !session) {
+      return reply.code(409).send({ message: "schedule target no longer resolves" });
+    }
+
+    const runbookVersionHash = computeRunbookVersionHash(runbook);
+    const activated = database.updateScheduledRunbook(schedule.id, {
+      status: "active",
+      runbookVersionHash,
+      nextRunAt: computeNextWeeklyRunAt(schedule.weekday, schedule.timeUtc)
+    });
+
+    database.createAudit({
+      actorId: actor.id,
+      action: "schedule.activated",
+      targetType: "scheduled-runbook",
+      targetId: activated.id,
+      details: {
+        effectiveMode: activated.effectiveMode,
+        nextRunAt: activated.nextRunAt,
+        runbookVersionHash: activated.runbookVersionHash
+      }
+    });
+
+    return { schedule: activated };
+  });
+
+  app.post("/api/schedules/:scheduleId/pause", async (request, reply) => {
+    const actor = await requireActor(request, reply, database);
+    if (!actor) {
+      return;
+    }
+
+    const { scheduleId } = request.params as { scheduleId: string };
+    const schedule = database.getScheduledRunbookForActor(scheduleId, actor.id);
+    if (!schedule) {
+      return reply.code(404).send({ message: "schedule not found" });
+    }
+
+    const paused = database.updateScheduledRunbook(schedule.id, {
+      status: "paused"
+    });
+
+    database.createAudit({
+      actorId: actor.id,
+      action: "schedule.paused",
+      targetType: "scheduled-runbook",
+      targetId: paused.id,
+      details: {
+        effectiveMode: paused.effectiveMode
+      }
+    });
+
+    return { schedule: paused };
+  });
+
+  app.get("/api/scripts", async (request, reply) => {
+    const actor = await requireActor(request, reply, database);
+    if (!actor) {
+      return;
+    }
+
+    return { scripts };
+  });
+
   app.post("/api/runbooks/:runbookId/execute", async (request, reply) => {
     const actor = await requireActor(request, reply, database);
     if (!actor) {
@@ -750,47 +1159,13 @@ export async function createApp(options: AppOptions = {}) {
     });
 
     if (runbook.requiresApproval) {
-      const pendingJob = database.createJob({
-        sessionId: session?.id || null,
-        kind: "execution.plan",
-        subjectId: plan.id,
-        status: "pending_approval",
-        requiresApproval: true,
-        output: planJobOutput(plan, `${runbook.name} is waiting for human approval before dispatch.`)
-      });
-
-        const approval = database.createApproval({
-          jobId: pendingJob.id,
-          requestedBy: actor.id,
-          reason: `${runbook.name} requires explicit approval before dispatching the bounded host helper.`
-        });
-
-      const job = database.updateJob(pendingJob.id, {
-        status: "pending_approval",
-        approvalId: approval.id,
-        output: planJobOutput(plan, `${runbook.name} is waiting for human approval before dispatch.`)
-      });
-      const updatedPlan = database.updateExecutionPlan(plan.id, {
-        approvalId: approval.id,
-        status: "pending_approval"
-      });
-
-      database.createAudit({
-        actorId: actor.id,
-        action: "execution.plan.pending_approval",
-        targetType: "execution-plan",
-        targetId: updatedPlan.id,
-        details: {
-          approvalId: approval.id,
-          requestedBy: actor.username
-        }
-      });
-
-      if (session) {
-        database.recordSessionActivity(session.id);
-      }
-
-      return reply.code(202).send({ plan: updatedPlan, job, approval });
+      return reply.code(202).send(
+        createPendingApprovalForPlan(
+          plan,
+          actor,
+          `${runbook.name} requires explicit approval before dispatching the bounded host helper.`
+        )
+      );
     }
 
     const executed = executeRunbookPlan(plan, actor, runbook);
@@ -1112,6 +1487,8 @@ export async function createApp(options: AppOptions = {}) {
       user: actor,
       sessions: database.listSessionsForActor(actor.id),
       runbooks: RUNBOOKS,
+      schedules: database.listScheduledRunbooksForActor(actor.id),
+      scripts,
       agents,
       approvals: database.listApprovalsForActor(actor.id, "pending"),
       audits: database.listAuditsForActor(actor.id, 20)

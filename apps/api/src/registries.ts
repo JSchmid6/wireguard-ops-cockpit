@@ -1,5 +1,6 @@
+import { createHash } from "node:crypto";
 import path from "node:path";
-import type { AgentManifest, RunbookDefinition } from "@wireguard-ops-cockpit/domain";
+import type { AgentManifest, RunbookDefinition, ScriptDefinition } from "@wireguard-ops-cockpit/domain";
 import type { CommandSpec } from "@wireguard-ops-cockpit/tmux-adapter";
 
 export const INTERNAL_EXECUTION_AGENTS = {
@@ -13,6 +14,36 @@ export const INTERNAL_EXECUTION_AGENTS = {
   }
 } as const;
 
+export const SCRIPTS: ScriptDefinition[] = [
+  {
+    id: "script-disk-health-check",
+    name: "Disk health helper",
+    summary: "Collects disk, filesystem, and backup visibility inside the task tmux session.",
+    integration: "host-tmux",
+    privilegedHelperRequested: false,
+    reviewStatus: "allowlisted",
+    sourcePath: "bin/disk-health-check.sh"
+  },
+  {
+    id: "script-nextcloud-update-plan",
+    name: "Nextcloud planning helper",
+    summary: "Builds a bounded Nextcloud maintenance context before any approved host mutation can continue.",
+    integration: "host-tmux",
+    privilegedHelperRequested: true,
+    reviewStatus: "allowlisted",
+    sourcePath: "bin/nextcloud-update-plan.sh"
+  },
+  {
+    id: "script-service-restart",
+    name: "Web stack restart helper",
+    summary: "Restarts the approved Nextcloud web services through a bounded helper path.",
+    integration: "host-tmux",
+    privilegedHelperRequested: true,
+    reviewStatus: "allowlisted",
+    sourcePath: "bin/restart-nextcloud-web-stack.sh"
+  }
+];
+
 export const RUNBOOKS: RunbookDefinition[] = [
   {
     id: "disk-health-check",
@@ -21,7 +52,9 @@ export const RUNBOOKS: RunbookDefinition[] = [
     requiresSession: true,
     requiresApproval: false,
     integration: "host-tmux",
-    privilegedHelperRequested: false
+    privilegedHelperRequested: false,
+    reviewStatus: "allowlisted",
+    scriptIds: ["script-disk-health-check"]
   },
   {
     id: "nextcloud-update-plan",
@@ -30,7 +63,9 @@ export const RUNBOOKS: RunbookDefinition[] = [
     requiresSession: true,
     requiresApproval: true,
     integration: "host-tmux",
-    privilegedHelperRequested: true
+    privilegedHelperRequested: true,
+    reviewStatus: "allowlisted",
+    scriptIds: ["script-nextcloud-update-plan"]
   },
   {
     id: "service-restart-request",
@@ -39,7 +74,9 @@ export const RUNBOOKS: RunbookDefinition[] = [
     requiresSession: true,
     requiresApproval: true,
     integration: "host-tmux",
-    privilegedHelperRequested: true
+    privilegedHelperRequested: true,
+    reviewStatus: "allowlisted",
+    scriptIds: ["script-service-restart"]
   }
 ];
 
@@ -59,8 +96,31 @@ export function listAgents(): AgentManifest[] {
   return AGENTS;
 }
 
+export function listScripts(): ScriptDefinition[] {
+  return SCRIPTS;
+}
+
+export function computeRunbookVersionHash(runbook: RunbookDefinition): string {
+  const linkedScripts = runbook.scriptIds
+    .map((scriptId) => findScript(scriptId))
+    .filter((script): script is ScriptDefinition => Boolean(script));
+
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        runbook,
+        scripts: linkedScripts
+      })
+    )
+    .digest("hex");
+}
+
 export function findRunbook(runbookId: string): RunbookDefinition | undefined {
   return RUNBOOKS.find((runbook) => runbook.id === runbookId);
+}
+
+export function findScript(scriptId: string): ScriptDefinition | undefined {
+  return SCRIPTS.find((script) => script.id === scriptId);
 }
 
 export function findAgent(agentId: string): AgentManifest | undefined {

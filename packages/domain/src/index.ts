@@ -113,6 +113,41 @@ export interface RunbookDefinition {
   requiresApproval: boolean;
   integration: "placeholder" | "host-tmux";
   privilegedHelperRequested: boolean;
+  reviewStatus: "allowlisted";
+  scriptIds: string[];
+}
+
+export interface ScriptDefinition {
+  id: string;
+  name: string;
+  summary: string;
+  integration: "host-tmux";
+  privilegedHelperRequested: boolean;
+  reviewStatus: "allowlisted";
+  sourcePath: string;
+}
+
+export type ScheduledRunbookMode = "scheduled-plan-only" | "scheduled-auto";
+export type ScheduledRunbookStatus = "draft" | "active" | "paused";
+
+export interface ScheduledRunbook {
+  id: string;
+  ownerId: string;
+  runbookId: string;
+  sessionId: string;
+  scheduleType: "weekly";
+  weekday: number;
+  timeUtc: string;
+  timezone: string;
+  requestedMode: ScheduledRunbookMode;
+  effectiveMode: ScheduledRunbookMode;
+  status: ScheduledRunbookStatus;
+  runbookVersionHash: string;
+  lastPlannedAt: string | null;
+  lastRunAt: string | null;
+  nextRunAt: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface AgentManifest {

@@ -84,13 +84,49 @@ function makeServer(initiallyAuthenticated: boolean) {
   const state = {
     user: initiallyAuthenticated ? { ...defaultUser } : null,
     nextSessionNumber: 3,
+    nextScheduleNumber: 2,
     sessions: initiallyAuthenticated ? [alphaSession, betaSession] : [alphaSession],
+    schedules: [
+      {
+        id: "schedule-1",
+        ownerId: defaultUser.id,
+        runbookId: "disk-health-check",
+        sessionId: alphaSession.id,
+        scheduleType: "weekly",
+        weekday: 5,
+        timeUtc: "18:00",
+        timezone: "UTC",
+        requestedMode: "scheduled-plan-only",
+        effectiveMode: "scheduled-plan-only",
+        status: "draft",
+        runbookVersionHash: "versionhash-1",
+        lastPlannedAt: null,
+        lastRunAt: null,
+        nextRunAt: "2026-04-24T18:00:00.000Z"
+      }
+    ],
     runbooks: [
       {
         id: "disk-health-check",
         name: "Disk health check",
         summary: "Validates disk pressure via the bounded placeholder contract.",
-        requiresApproval: true
+        requiresSession: true,
+        requiresApproval: false,
+        integration: "host-tmux",
+        privilegedHelperRequested: false,
+        reviewStatus: "allowlisted",
+        scriptIds: ["script-disk-health-check"]
+      }
+    ],
+    scripts: [
+      {
+        id: "script-disk-health-check",
+        name: "Disk health helper",
+        summary: "Collects disk, filesystem, and backup visibility inside the task tmux session.",
+        integration: "host-tmux",
+        privilegedHelperRequested: false,
+        reviewStatus: "allowlisted",
+        sourcePath: "bin/disk-health-check.sh"
       }
     ],
     agents: [
@@ -201,8 +237,45 @@ function makeServer(initiallyAuthenticated: boolean) {
       return okResponse({ runbooks: state.runbooks });
     }
 
+    if (url === "/api/schedules") {
+      if (method === "GET") {
+        return okResponse({ schedules: state.schedules });
+      }
+
+      const body = JSON.parse(String(init?.body || "{}")) as {
+        runbookId: string;
+        sessionId: string;
+        weekday: number;
+        timeUtc: string;
+        mode: "scheduled-plan-only" | "scheduled-auto";
+      };
+      const schedule = {
+        id: `schedule-${state.nextScheduleNumber++}`,
+        ownerId: defaultUser.id,
+        runbookId: body.runbookId,
+        sessionId: body.sessionId,
+        scheduleType: "weekly",
+        weekday: body.weekday,
+        timeUtc: body.timeUtc,
+        timezone: "UTC",
+        requestedMode: body.mode,
+        effectiveMode: body.mode,
+        status: "draft",
+        runbookVersionHash: `versionhash-${state.nextScheduleNumber}`,
+        lastPlannedAt: null,
+        lastRunAt: null,
+        nextRunAt: "2026-04-24T18:00:00.000Z"
+      };
+      state.schedules = [schedule, ...state.schedules];
+      return okResponse({ schedule }, 201);
+    }
+
     if (url === "/api/agents") {
       return okResponse({ agents: state.agents });
+    }
+
+    if (url === "/api/scripts") {
+      return okResponse({ scripts: state.scripts });
     }
 
     if (url === "/api/approvals?status=pending") {
@@ -257,6 +330,19 @@ function makeServer(initiallyAuthenticated: boolean) {
       return okResponse({ ok: true });
     }
 
+    if (url.startsWith("/api/schedules/") && method === "POST") {
+      const [, , scheduleId, action] = url.split("/").slice(1);
+      state.schedules = state.schedules.map((schedule) =>
+        schedule.id === scheduleId
+          ? {
+              ...schedule,
+              status: action === "activate" ? "active" : "paused"
+            }
+          : schedule
+      );
+      return okResponse({ schedule: state.schedules.find((schedule) => schedule.id === scheduleId) });
+    }
+
     return errorResponse(`Unhandled request: ${method} ${url}`, 500);
   });
 
@@ -285,7 +371,9 @@ describe("App", () => {
     expect(await screen.findByText("Recent audit trail")).toBeTruthy();
     expect(screen.getByText(/Signed in as/)).toBeTruthy();
     expect(screen.queryByText("authentication required")).toBeNull();
-    expect(screen.getByText("Disk health check")).toBeTruthy();
+    expect(screen.getAllByText("Disk health check").length).toBeGreaterThan(0);
+    expect(screen.getByText("Schedules")).toBeTruthy();
+    expect(screen.getByText("Scripts")).toBeTruthy();
     expect(screen.getByText("Planner agent")).toBeTruthy();
     expect(screen.getByText("Execution plans")).toBeTruthy();
     expect(await screen.findByText("Open terminal bridge")).toBeTruthy();
@@ -319,6 +407,37 @@ describe("App", () => {
     });
     await waitFor(() => {
       expect(document.body.textContent).toContain("cockpit-nightly-maintenance");
+    });
+
+    expect(screen.getByText(/includes 1 script/i)).toBeTruthy();
+    expect(screen.getByText(/source bin\/disk-health-check.sh/i)).toBeTruthy();
+    expect(screen.getByText(/high-risk runbooks stay on scheduled-plan-only/i)).toBeTruthy();
+
+    await user.selectOptions(screen.getByLabelText("Weekday"), "1");
+    await user.clear(screen.getByLabelText("Time UTC"));
+    await user.type(screen.getByLabelText("Time UTC"), "07:30");
+    await user.selectOptions(screen.getByLabelText("Mode"), "scheduled-auto");
+    await user.click(screen.getByRole("button", { name: "Create weekly schedule" }));
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(
+          ([url, init]) =>
+            String(url) === "/api/schedules" &&
+            (init as RequestInit | undefined)?.method === "POST" &&
+            String((init as RequestInit | undefined)?.body).includes("scheduled-auto")
+        )
+      ).toBe(true);
+    });
+
+    await user.click(screen.getAllByRole("button", { name: "Activate" })[0]);
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(
+          ([url, init]) =>
+            String(url).includes("/api/schedules/") && String(url).endsWith("/activate") && (init as RequestInit | undefined)?.method === "POST"
+        )
+      ).toBe(true);
     });
 
     await user.click(screen.getByRole("button", { name: /Plan and queue approval|Plan and execute/ }));
