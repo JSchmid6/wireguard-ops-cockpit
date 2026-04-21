@@ -14,6 +14,9 @@ import type {
   JobStatus,
   PlanStatus,
   PlanTargetType,
+  ScheduledRunbook,
+  ScheduledRunbookMode,
+  ScheduledRunbookStatus,
   TerminalBridge,
   TmuxBackend,
   UserSummary
@@ -90,6 +93,26 @@ interface ExecutionPlanRow {
   pre_execution_hook_json: string;
   runtime_hook_json: string;
   post_execution_hook_json: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface ScheduledRunbookRow {
+  id: string;
+  owner_id: string;
+  runbook_id: string;
+  session_id: string;
+  schedule_type: "weekly";
+  weekday: number;
+  time_utc: string;
+  timezone: string;
+  requested_mode: ScheduledRunbookMode;
+  effective_mode: ScheduledRunbookMode;
+  status: ScheduledRunbookStatus;
+  runbook_version_hash: string;
+  last_planned_at: string | null;
+  last_run_at: string | null;
+  next_run_at: string;
   created_at: string;
   updated_at: string;
 }
@@ -269,6 +292,28 @@ export class CockpitDatabase {
         created_at TEXT NOT NULL,
         FOREIGN KEY (actor_id) REFERENCES users(id)
       );
+
+      CREATE TABLE IF NOT EXISTS scheduled_runbooks (
+        id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL,
+        runbook_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        schedule_type TEXT NOT NULL,
+        weekday INTEGER NOT NULL,
+        time_utc TEXT NOT NULL,
+        timezone TEXT NOT NULL,
+        requested_mode TEXT NOT NULL,
+        effective_mode TEXT NOT NULL,
+        status TEXT NOT NULL,
+        runbook_version_hash TEXT NOT NULL,
+        last_planned_at TEXT,
+        last_run_at TEXT,
+        next_run_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (owner_id) REFERENCES users(id),
+        FOREIGN KEY (session_id) REFERENCES cockpit_sessions(id)
+      );
     `);
 
     const cockpitSessionColumns = this.database
@@ -309,6 +354,14 @@ export class CockpitDatabase {
       .run(id, username, hashPassword(password), role, now());
 
     return { id, username, role };
+  }
+
+  getUserById(userId: string): UserSummary | null {
+    const row = this.database
+      .prepare("SELECT id, username, role FROM users WHERE id = ?")
+      .get(userId) as UserSummary | undefined;
+
+    return row || null;
   }
 
   authenticateUser(username: string, password: string): UserSummary | null {
@@ -615,6 +668,118 @@ export class CockpitDatabase {
     return row ? this.mapExecutionPlan(row) : null;
   }
 
+  createScheduledRunbook(input: {
+    ownerId: string;
+    runbookId: string;
+    sessionId: string;
+    weekday: number;
+    timeUtc: string;
+    timezone: string;
+    requestedMode: ScheduledRunbookMode;
+    effectiveMode: ScheduledRunbookMode;
+    status: ScheduledRunbookStatus;
+    runbookVersionHash: string;
+    nextRunAt: string;
+  }): ScheduledRunbook {
+    const id = randomUUID();
+    const timestamp = now();
+
+    this.database
+      .prepare(
+        `INSERT INTO scheduled_runbooks
+         (id, owner_id, runbook_id, session_id, schedule_type, weekday, time_utc, timezone, requested_mode, effective_mode,
+          status, runbook_version_hash, last_planned_at, last_run_at, next_run_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'weekly', ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)`
+      )
+      .run(
+        id,
+        input.ownerId,
+        input.runbookId,
+        input.sessionId,
+        input.weekday,
+        input.timeUtc,
+        input.timezone,
+        input.requestedMode,
+        input.effectiveMode,
+        input.status,
+        input.runbookVersionHash,
+        input.nextRunAt,
+        timestamp,
+        timestamp
+      );
+
+    return this.getScheduledRunbook(id)!;
+  }
+
+  getScheduledRunbook(id: string): ScheduledRunbook | null {
+    const row = this.database.prepare("SELECT * FROM scheduled_runbooks WHERE id = ?").get(id) as
+      | ScheduledRunbookRow
+      | undefined;
+    return row ? this.mapScheduledRunbook(row) : null;
+  }
+
+  getScheduledRunbookForActor(id: string, actorId: string): ScheduledRunbook | null {
+    const row = this.database
+      .prepare("SELECT * FROM scheduled_runbooks WHERE id = ? AND owner_id = ?")
+      .get(id, actorId) as ScheduledRunbookRow | undefined;
+    return row ? this.mapScheduledRunbook(row) : null;
+  }
+
+  listScheduledRunbooksForActor(actorId: string): ScheduledRunbook[] {
+    const rows = this.database
+      .prepare("SELECT * FROM scheduled_runbooks WHERE owner_id = ? ORDER BY datetime(created_at) DESC")
+      .all(actorId) as ScheduledRunbookRow[];
+    return rows.map((row) => this.mapScheduledRunbook(row));
+  }
+
+  listDueScheduledRunbooks(beforeIso: string, limit = 25): ScheduledRunbook[] {
+    const rows = this.database
+      .prepare(
+        "SELECT * FROM scheduled_runbooks WHERE status = 'active' AND datetime(next_run_at) <= datetime(?) ORDER BY datetime(next_run_at) ASC LIMIT ?"
+      )
+      .all(beforeIso, limit) as ScheduledRunbookRow[];
+    return rows.map((row) => this.mapScheduledRunbook(row));
+  }
+
+  updateScheduledRunbook(
+    scheduleId: string,
+    input: {
+      requestedMode?: ScheduledRunbookMode;
+      effectiveMode?: ScheduledRunbookMode;
+      status?: ScheduledRunbookStatus;
+      runbookVersionHash?: string;
+      lastPlannedAt?: string | null;
+      lastRunAt?: string | null;
+      nextRunAt?: string;
+    }
+  ): ScheduledRunbook {
+    const current = this.getScheduledRunbook(scheduleId);
+    if (!current) {
+      throw new Error("scheduled runbook not found");
+    }
+
+    this.database
+      .prepare(
+        `UPDATE scheduled_runbooks
+         SET requested_mode = ?, effective_mode = ?, status = ?, runbook_version_hash = ?, last_planned_at = ?,
+             last_run_at = ?, next_run_at = ?, updated_at = ?
+         WHERE id = ?`
+      )
+      .run(
+        input.requestedMode ?? current.requestedMode,
+        input.effectiveMode ?? current.effectiveMode,
+        input.status ?? current.status,
+        input.runbookVersionHash ?? current.runbookVersionHash,
+        input.lastPlannedAt !== undefined ? input.lastPlannedAt : current.lastPlannedAt,
+        input.lastRunAt !== undefined ? input.lastRunAt : current.lastRunAt,
+        input.nextRunAt ?? current.nextRunAt,
+        now(),
+        scheduleId
+      );
+
+    return this.getScheduledRunbook(scheduleId)!;
+  }
+
   listExecutionPlansForSession(sessionId: string): ExecutionPlan[] {
     const rows = this.database
       .prepare("SELECT * FROM execution_plans WHERE session_id = ? ORDER BY datetime(created_at) DESC")
@@ -882,6 +1047,28 @@ export class CockpitDatabase {
       preExecutionHook: parseReviewValue(row.pre_execution_hook_json),
       runtimeHook: parseReviewValue(row.runtime_hook_json),
       postExecutionHook: parseReviewValue(row.post_execution_hook_json),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    };
+  }
+
+  private mapScheduledRunbook(row: ScheduledRunbookRow): ScheduledRunbook {
+    return {
+      id: row.id,
+      ownerId: row.owner_id,
+      runbookId: row.runbook_id,
+      sessionId: row.session_id,
+      scheduleType: row.schedule_type,
+      weekday: row.weekday,
+      timeUtc: row.time_utc,
+      timezone: row.timezone,
+      requestedMode: row.requested_mode,
+      effectiveMode: row.effective_mode,
+      status: row.status,
+      runbookVersionHash: row.runbook_version_hash,
+      lastPlannedAt: row.last_planned_at,
+      lastRunAt: row.last_run_at,
+      nextRunAt: row.next_run_at,
       createdAt: row.created_at,
       updatedAt: row.updated_at
     };

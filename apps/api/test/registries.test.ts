@@ -1,12 +1,13 @@
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { buildAgentCommand, findAgent, findRunbook, listAgents } from "../src/registries.js";
+import { buildAgentCommand, findAgent, findRunbook, listAgents, listScripts } from "../src/registries.js";
 
 describe("registries", () => {
   it("finds known runbooks and agents", () => {
     expect(findRunbook("disk-health-check")).toMatchObject({
       id: "disk-health-check",
-      requiresApproval: false
+      requiresApproval: false,
+      scriptIds: ["script-disk-health-check"]
     });
     expect(findRunbook("missing-runbook")).toBeUndefined();
 
@@ -17,6 +18,18 @@ describe("registries", () => {
     expect(findAgent("safety-agent")).toBeUndefined();
     expect(findAgent("squad")).toBeUndefined();
     expect(findAgent("missing-agent")).toBeUndefined();
+  });
+
+  it("lists reviewable script definitions", () => {
+    expect(listScripts()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "script-disk-health-check",
+          reviewStatus: "allowlisted",
+          sourcePath: "bin/disk-health-check.sh"
+        })
+      ])
+    );
   });
 
   it("lists only the public runtime planner agent", () => {

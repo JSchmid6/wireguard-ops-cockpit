@@ -236,10 +236,162 @@ describe("control API", () => {
       user: { username: "admin" },
       sessions: [{ name: "dashboard-session" }],
       runbooks: expect.any(Array),
+      schedules: expect.any(Array),
+      scripts: expect.any(Array),
       agents: expect.any(Array),
       approvals: expect.any(Array),
       audits: expect.any(Array)
     });
+  });
+
+  it("creates and activates weekly schedules for low-risk runbooks", async () => {
+    const app = await createTestApp(openApps);
+    const cookie = await login(app);
+    const session = await createSession(app, cookie, "Scheduled Disk Check");
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/schedules",
+      headers: { cookie },
+      payload: {
+        runbookId: "disk-health-check",
+        sessionId: session.id,
+        weekday: 5,
+        timeUtc: "18:00",
+        mode: "scheduled-auto"
+      }
+    });
+
+    expect(created.statusCode).toBe(201);
+    expect(created.json().schedule).toMatchObject({
+      runbookId: "disk-health-check",
+      sessionId: session.id,
+      requestedMode: "scheduled-auto",
+      effectiveMode: "scheduled-auto",
+      status: "draft"
+    });
+
+    const activated = await app.inject({
+      method: "POST",
+      url: `/api/schedules/${created.json().schedule.id}/activate`,
+      headers: { cookie }
+    });
+
+    expect(activated.statusCode).toBe(200);
+    expect(activated.json().schedule.status).toBe("active");
+  });
+
+  it("blocks scheduled-auto for high-risk runbooks", async () => {
+    const app = await createTestApp(openApps);
+    const cookie = await login(app);
+    const session = await createSession(app, cookie, "Scheduled Upgrade Review");
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/schedules",
+      headers: { cookie },
+      payload: {
+        runbookId: "nextcloud-update-plan",
+        sessionId: session.id,
+        weekday: 5,
+        timeUtc: "18:00",
+        mode: "scheduled-auto"
+      }
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({ message: "high-risk runbooks can only use scheduled-plan-only" });
+  });
+
+  it("processes due low-risk schedules through the bounded executor path", async () => {
+    const dbPath = createTempDbPath(tempDirectories);
+    const app = await createTestApp(openApps, { dbPath });
+    const cookie = await login(app);
+    const session = await createSession(app, cookie, "Automated Disk Check");
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/schedules",
+      headers: { cookie },
+      payload: {
+        runbookId: "disk-health-check",
+        sessionId: session.id,
+        weekday: 5,
+        timeUtc: "18:00",
+        mode: "scheduled-auto"
+      }
+    });
+    const scheduleId = created.json().schedule.id as string;
+
+    await app.inject({
+      method: "POST",
+      url: `/api/schedules/${scheduleId}/activate`,
+      headers: { cookie }
+    });
+
+    const database = new BetterSqlite3(dbPath);
+    database.prepare("UPDATE scheduled_runbooks SET next_run_at = ? WHERE id = ?").run("2026-04-01T00:00:00.000Z", scheduleId);
+    database.close();
+
+    await (app as unknown as { processDueScheduledRunbooks: () => Promise<void> }).processDueScheduledRunbooks();
+
+    const detail = await app.inject({
+      method: "GET",
+      url: `/api/sessions/${session.id}`,
+      headers: { cookie }
+    });
+
+    expect(detail.statusCode).toBe(200);
+    expect(detail.json().plans[0]).toMatchObject({
+      targetType: "runbook",
+      targetId: "disk-health-check",
+      status: "executed"
+    });
+    expect(detail.json().jobs.some((job: { kind: string; subjectId: string }) => job.kind === "runbook" && job.subjectId === "disk-health-check")).toBe(true);
+
+    const schedules = await app.inject({
+      method: "GET",
+      url: "/api/schedules",
+      headers: { cookie }
+    });
+    expect(schedules.statusCode).toBe(200);
+    expect(schedules.json().schedules[0].lastRunAt).not.toBeNull();
+  });
+
+  it("returns reviewable runbook and script definitions", async () => {
+    const app = await createTestApp(openApps);
+    const cookie = await login(app);
+
+    const runbooks = await app.inject({
+      method: "GET",
+      url: "/api/runbooks",
+      headers: { cookie }
+    });
+    const scripts = await app.inject({
+      method: "GET",
+      url: "/api/scripts",
+      headers: { cookie }
+    });
+
+    expect(runbooks.statusCode).toBe(200);
+    expect(runbooks.json().runbooks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "disk-health-check",
+          reviewStatus: "allowlisted",
+          scriptIds: ["script-disk-health-check"]
+        })
+      ])
+    );
+    expect(scripts.statusCode).toBe(200);
+    expect(scripts.json().scripts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "script-disk-health-check",
+          sourcePath: "bin/disk-health-check.sh"
+        })
+      ])
+    );
   });
 
   it("executes safe runbooks immediately when approval is not required", async () => {
