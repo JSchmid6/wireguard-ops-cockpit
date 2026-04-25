@@ -105,6 +105,33 @@ export interface ExecutionPlan {
   updatedAt: string;
 }
 
+export type ExecutionCheckpointKind = "analysis" | "operator-checkpoint" | "runbook" | "verify";
+export type ExecutionCheckpointStatus = "planned" | "awaiting_operator" | "completed";
+
+export interface ExecutionCheckpointDefinition {
+  id: string;
+  label: string;
+  description: string;
+  kind: ExecutionCheckpointKind;
+  runbookId?: string;
+}
+
+export interface ExecutionCheckpointState extends ExecutionCheckpointDefinition {
+  status: ExecutionCheckpointStatus;
+}
+
+export type RunbookWorkflowStepKind = "runbook" | "agent" | "approval" | "verify" | "operator-checkpoint";
+
+export interface RunbookWorkflowStep {
+  id: string;
+  label: string;
+  description: string;
+  kind: RunbookWorkflowStepKind;
+  runbookId?: string;
+  agentId?: string;
+  approvalHint?: string;
+}
+
 export interface RunbookDefinition {
   id: string;
   name: string;
@@ -115,6 +142,7 @@ export interface RunbookDefinition {
   privilegedHelperRequested: boolean;
   reviewStatus: "allowlisted";
   scriptIds: string[];
+  workflowSteps: RunbookWorkflowStep[];
 }
 
 export interface ScriptDefinition {
@@ -129,6 +157,8 @@ export interface ScriptDefinition {
 
 export type ScheduledRunbookMode = "scheduled-plan-only" | "scheduled-auto";
 export type ScheduledRunbookStatus = "draft" | "active" | "paused";
+export type AgentSupervisionMode = "none" | "session-observed";
+export type AgentExecutionAuthority = "advisory-only";
 
 export interface ScheduledRunbook {
   id: string;
@@ -156,7 +186,12 @@ export interface AgentManifest {
   description: string;
   requiresApproval: boolean;
   privilegedHelperRequested: boolean;
-  integration: "demo-local" | "control-plane";
+  integration: "demo-local" | "control-plane" | "copilot-cli";
+  supervisionMode: AgentSupervisionMode;
+  executionAuthority: AgentExecutionAuthority;
+  promptContractId: string;
+  checkpointContractId: string | null;
+  checkpointTemplate: ExecutionCheckpointDefinition[];
 }
 
 export interface SessionDetail {

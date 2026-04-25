@@ -46,11 +46,35 @@ interface ExecutionPlan {
   riskClass: string;
   planHash: string;
   planSummary: string;
+  normalizedInput: Record<string, unknown>;
   plannerReview: ExecutionReview;
   safetyReview: ExecutionReview;
   policyReview: ExecutionReview;
   preExecutionHook: ExecutionReview;
+  runtimeHook: ExecutionReview;
   postExecutionHook: ExecutionReview;
+}
+
+interface ExecutionCheckpointDefinition {
+  id: string;
+  label: string;
+  description: string;
+  kind: string;
+  runbookId?: string;
+}
+
+interface ExecutionCheckpointState extends ExecutionCheckpointDefinition {
+  status: string;
+}
+
+interface RunbookWorkflowStep {
+  id: string;
+  label: string;
+  description: string;
+  kind: string;
+  runbookId?: string;
+  agentId?: string;
+  approvalHint?: string;
 }
 
 interface ApprovalRecord {
@@ -79,6 +103,7 @@ interface RunbookDefinition {
   privilegedHelperRequested: boolean;
   reviewStatus: string;
   scriptIds: string[];
+  workflowSteps: RunbookWorkflowStep[];
 }
 
 interface ScriptDefinition {
@@ -113,12 +138,92 @@ interface AgentManifest {
   id: string;
   name: string;
   description: string;
+  requiresApproval: boolean;
+  supervisionMode: string;
+  executionAuthority: string;
+  promptContractId: string;
+  checkpointContractId: string | null;
+  checkpointTemplate: ExecutionCheckpointDefinition[];
 }
 
 interface SessionDetail {
   session: CockpitSession;
   plans: ExecutionPlan[];
   jobs: JobRecord[];
+}
+
+function parseCheckpointContract(value: unknown): ExecutionCheckpointDefinition[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.flatMap((entry) => {
+    if (!entry || typeof entry !== "object") {
+      return [];
+    }
+
+    const candidate = entry as Record<string, unknown>;
+    if (
+      typeof candidate.id !== "string" ||
+      typeof candidate.label !== "string" ||
+      typeof candidate.description !== "string" ||
+      typeof candidate.kind !== "string"
+    ) {
+      return [];
+    }
+
+    if (candidate.runbookId !== undefined && typeof candidate.runbookId !== "string") {
+      return [];
+    }
+
+    return [
+      {
+        id: candidate.id,
+        label: candidate.label,
+        description: candidate.description,
+        kind: candidate.kind,
+        ...(candidate.runbookId ? { runbookId: candidate.runbookId } : {})
+      }
+    ];
+  });
+}
+
+function parseCheckpointState(value: unknown): ExecutionCheckpointState[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.flatMap((entry) => {
+    if (!entry || typeof entry !== "object") {
+      return [];
+    }
+
+    const candidate = entry as Record<string, unknown>;
+    if (
+      typeof candidate.id !== "string" ||
+      typeof candidate.label !== "string" ||
+      typeof candidate.description !== "string" ||
+      typeof candidate.kind !== "string" ||
+      typeof candidate.status !== "string"
+    ) {
+      return [];
+    }
+
+    if (candidate.runbookId !== undefined && typeof candidate.runbookId !== "string") {
+      return [];
+    }
+
+    return [
+      {
+        id: candidate.id,
+        label: candidate.label,
+        description: candidate.description,
+        kind: candidate.kind,
+        status: candidate.status,
+        ...(candidate.runbookId ? { runbookId: candidate.runbookId } : {})
+      }
+    ];
+  });
 }
 
 export default function App() {
@@ -162,6 +267,11 @@ export default function App() {
     [scripts]
   );
 
+  const agentsById = useMemo(
+    () => Object.fromEntries(agents.map((agent) => [agent.id, agent])),
+    [agents]
+  );
+
   const sessionsById = useMemo(
     () => Object.fromEntries(sessions.map((session) => [session.id, session])),
     [sessions]
@@ -171,6 +281,26 @@ export default function App() {
     () => runbooks.find((runbook) => runbook.id === scheduleDraft.runbookId) || null,
     [runbooks, scheduleDraft.runbookId]
   );
+
+  function renderWorkflowReference(step: RunbookWorkflowStep) {
+    if (step.runbookId) {
+      return `runbook ${runbooks.find((runbook) => runbook.id === step.runbookId)?.name || step.runbookId}`;
+    }
+
+    if (step.agentId) {
+      return `agent ${agentsById[step.agentId]?.name || step.agentId}`;
+    }
+
+    return null;
+  }
+
+  function renderCheckpointReference(checkpoint: ExecutionCheckpointDefinition) {
+    if (!checkpoint.runbookId) {
+      return null;
+    }
+
+    return `runbook ${runbooks.find((runbook) => runbook.id === checkpoint.runbookId)?.name || checkpoint.runbookId}`;
+  }
 
   async function refreshDashboard() {
     try {
@@ -355,6 +485,23 @@ export default function App() {
     }
   }
 
+  async function advanceCheckpoint(jobId: string, checkpointId: string) {
+    setBusy(true);
+    try {
+      await request(`/jobs/${jobId}/checkpoints/${checkpointId}/advance`, {
+        method: "POST"
+      });
+      await refreshDashboard();
+      if (selectedSessionId) {
+        await refreshSession(selectedSessionId);
+      }
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "Unable to advance checkpoint");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function decideApproval(approvalId: string, decision: "approved" | "rejected") {
     setBusy(true);
     try {
@@ -517,31 +664,101 @@ export default function App() {
               ) : null}
               <h3>Execution plans</h3>
               <ul className="list">
-                {sessionDetail.plans.map((plan) => (
-                  <li key={plan.id}>
-                    <strong>
-                      {plan.targetType} · {plan.status} · {plan.riskClass}
-                    </strong>
-                    <p>{plan.planSummary}</p>
-                    <small>hash {plan.planHash.slice(0, 12)}</small>
-                    <p>
-                      Planner {plan.plannerReview.verdict} · Safety {plan.safetyReview.verdict} · Policy {plan.policyReview.verdict}
-                    </p>
-                    <p>
-                      Pre-hook {plan.preExecutionHook.verdict} · Post-hook {plan.postExecutionHook.verdict}
-                    </p>
-                  </li>
-                ))}
+                {sessionDetail.plans.map((plan) => {
+                  const checkpointContract = parseCheckpointContract(plan.normalizedInput.checkpointContract);
+
+                  return (
+                    <li key={plan.id}>
+                      <strong>
+                        {plan.targetType} · {plan.status} · {plan.riskClass}
+                      </strong>
+                      <p>{plan.planSummary}</p>
+                      <small>hash {plan.planHash.slice(0, 12)}</small>
+                      <p>
+                        Planner {plan.plannerReview.verdict} · Safety {plan.safetyReview.verdict} · Policy {plan.policyReview.verdict}
+                      </p>
+                      <p>
+                        Pre-hook {plan.preExecutionHook.verdict} · Runtime {plan.runtimeHook.verdict} · Post-hook {plan.postExecutionHook.verdict}
+                      </p>
+                      <p>
+                        <strong>Safety report</strong> · {plan.safetyReview.summary}
+                      </p>
+                      {plan.targetType === "agent" ? (
+                        <small>
+                          contract {String(plan.normalizedInput.promptContractId || "n/a")} · checkpoints {String(plan.normalizedInput.checkpointContractId || "n/a")} · supervision {String(plan.normalizedInput.supervisionMode || "n/a")} · digest {String(plan.normalizedInput.agentManifestDigest || "n/a").slice(0, 12)}
+                        </small>
+                      ) : null}
+                      {checkpointContract.length > 0 ? (
+                        <div className="workflow-block">
+                          <strong>Checkpoint contract</strong>
+                          <ol className="workflow-list">
+                            {checkpointContract.map((checkpoint) => {
+                              const reference = renderCheckpointReference(checkpoint);
+
+                              return (
+                                <li key={checkpoint.id} className="workflow-step">
+                                  <span className="step-badge checkpoint-status status-planned">planned</span>
+                                  <strong>{checkpoint.label}</strong>
+                                  <p>{checkpoint.description}</p>
+                                  <small>{checkpoint.kind}</small>
+                                  {reference ? <small>{reference}</small> : null}
+                                </li>
+                              );
+                            })}
+                          </ol>
+                        </div>
+                      ) : null}
+                      {Object.keys(plan.safetyReview.details).length > 0 ? <pre>{formatOutput(plan.safetyReview.details)}</pre> : null}
+                    </li>
+                  );
+                })}
                 {sessionDetail.plans.length === 0 ? <li>No execution plans recorded yet.</li> : null}
               </ul>
               <h3>Job timeline</h3>
               <ul className="list">
-                {sessionDetail.jobs.map((job) => (
-                  <li key={job.id}>
-                    <strong>{job.kind}</strong> · {job.status}
-                    <pre>{formatOutput(job.output)}</pre>
-                  </li>
-                ))}
+                {sessionDetail.jobs.map((job) => {
+                  const checkpoints = parseCheckpointState(job.output?.checkpoints);
+                  const activeCheckpointId = typeof job.output?.activeCheckpointId === "string" ? job.output.activeCheckpointId : null;
+
+                  return (
+                    <li key={job.id}>
+                      <strong>{job.kind}</strong> · {job.status}
+                      {checkpoints.length > 0 ? (
+                        <div className="workflow-block">
+                          <strong>Checkpoint state</strong>
+                          <ol className="workflow-list">
+                            {checkpoints.map((checkpoint) => {
+                              const reference = renderCheckpointReference(checkpoint);
+
+                              return (
+                                <li
+                                  key={checkpoint.id}
+                                  className={`workflow-step${activeCheckpointId === checkpoint.id ? " active-step" : ""}`}
+                                >
+                                  <span className={`step-badge checkpoint-status status-${checkpoint.status}`}>
+                                    {checkpoint.status.replace(/_/g, " ")}
+                                  </span>
+                                  <strong>{checkpoint.label}</strong>
+                                  <p>{checkpoint.description}</p>
+                                  <small>{checkpoint.kind}</small>
+                                  {reference ? <small>{reference}</small> : null}
+                                  {activeCheckpointId === checkpoint.id ? (
+                                    <div className="actions">
+                                      <button disabled={busy} onClick={() => advanceCheckpoint(job.id, checkpoint.id)}>
+                                        Mark checkpoint reviewed
+                                      </button>
+                                    </div>
+                                  ) : null}
+                                </li>
+                              );
+                            })}
+                          </ol>
+                        </div>
+                      ) : null}
+                      <pre>{formatOutput(job.output)}</pre>
+                    </li>
+                  );
+                })}
                 {sessionDetail.jobs.length === 0 ? <li>No jobs recorded yet.</li> : null}
               </ul>
             </div>
@@ -676,6 +893,26 @@ export default function App() {
                       .map((scriptId) => scriptsById[scriptId]?.name || scriptId)
                       .join(", ")}
                   </small>
+                  {runbook.workflowSteps.length > 0 ? (
+                    <div className="workflow-block">
+                      <strong>Workflow</strong>
+                      <ol className="workflow-list">
+                        {runbook.workflowSteps.map((step) => {
+                          const reference = renderWorkflowReference(step);
+
+                          return (
+                            <li key={step.id} className="workflow-step">
+                              <span className="step-badge">{step.kind}</span>
+                              <strong>{step.label}</strong>
+                              <p>{step.description}</p>
+                              {reference ? <small>{reference}</small> : null}
+                              {step.approvalHint ? <small>{step.approvalHint}</small> : null}
+                            </li>
+                          );
+                        })}
+                      </ol>
+                    </div>
+                  ) : null}
                   <button disabled={busy || !selectedSession} onClick={() => executeRunbook(runbook.id)}>
                     {runbook.requiresApproval ? "Plan and queue approval" : "Plan and execute"}
                   </button>
@@ -718,8 +955,16 @@ export default function App() {
                 <li key={agent.id}>
                   <strong>{agent.name}</strong>
                   <p>{agent.description}</p>
+                  <small>
+                    approval {agent.requiresApproval ? "required" : "not required"} · supervision {agent.supervisionMode} · authority {agent.executionAuthority}
+                  </small>
+                  <small>
+                    contract {agent.promptContractId} · checkpoint contract {agent.checkpointContractId || "n/a"} · {agent.checkpointTemplate.length} checkpoint{agent.checkpointTemplate.length === 1 ? "" : "s"}
+                  </small>
                   <button disabled={busy || !selectedSession} onClick={() => launchAgent(agent.id)}>
-                    Plan and launch in selected session
+                    {agent.supervisionMode === "session-observed"
+                      ? "Request supervised launch in selected session"
+                      : "Plan and launch in selected session"}
                   </button>
                 </li>
               ))}

@@ -1,34 +1,30 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-NEXTCLOUD_ROOT=/var/www/nextcloud
-PHP_BIN=/usr/bin/php
-LOCK_FILE=/run/wireguard-ops-cockpit/nextcloud-update-plan.lock
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$SCRIPT_DIR/lib/nextcloud-maintenance-common.sh"
 
-mkdir -p /run/wireguard-ops-cockpit
-exec 9>"$LOCK_FILE"
-flock -n 9 || {
-  echo "Another Nextcloud update plan run is already active."
-  exit 1
-}
+lock_nextcloud_maintenance_flow
+ensure_nextcloud_root
 
-echo "== Nextcloud update plan =="
-echo "Timestamp: $(date --iso-8601=seconds)"
-echo "Host: $(hostname -f 2>/dev/null || hostname)"
-echo "Root: $NEXTCLOUD_ROOT"
-echo
+case "$(current_nextcloud_phase)" in
+  idle|verification-complete)
+    ;;
+  *)
+    echo "Cannot start a new Nextcloud preflight while the current maintenance flow is parked at phase $(current_nextcloud_phase)."
+    exit 1
+    ;;
+esac
 
-if [[ ! -d "$NEXTCLOUD_ROOT" ]]; then
-  echo "Nextcloud root not found at $NEXTCLOUD_ROOT"
-  exit 1
-fi
+print_nextcloud_header "Nextcloud update preflight"
+clear_rollback_state
 
 echo "-- Current status --"
-runuser -u www-data -- "$PHP_BIN" "$NEXTCLOUD_ROOT/occ" status
+run_occ status
 echo
 
 echo "-- Maintenance mode --"
-runuser -u www-data -- "$PHP_BIN" "$NEXTCLOUD_ROOT/occ" config:system:get maintenance || true
+run_occ config:system:get maintenance || true
 echo
 
 echo "-- Filesystem capacity --"
@@ -50,8 +46,14 @@ echo
 echo "-- Suggested manual sequence --"
 cat <<'EOF'
 1. Confirm current backups and snapshot state.
-2. Put Nextcloud into maintenance mode before a real update.
-3. Run the updater or deployment-specific file replacement path.
-4. Run occ upgrade as www-data.
-5. Disable maintenance mode and verify status again.
+2. Use the bounded maintenance-mode runbook before a real update.
+3. Run the bounded occ upgrade runbook.
+4. Disable maintenance mode through the reviewed helper.
+5. Run the post-update verification runbook and only restart services through the reviewed helper if needed.
+6. If verification still fails, dispatch the approved rollback restore runbook followed by rollback verification before leaving the maintenance window.
 EOF
+
+set_nextcloud_phase "preflight-complete"
+echo
+echo "-- Stored maintenance phase --"
+echo "preflight-complete"

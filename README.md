@@ -8,8 +8,8 @@ The repository now includes a first working implementation slice:
 - a Node.js/Fastify control API
 - SQLite-backed state for users, sessions, jobs, approvals, and audits
 - explicit `tmux` session management
-- bounded host runbooks for disk checks, Nextcloud planning, and selected service restarts
-- a single public `planner-agent` with internal safety/policy/hook flow
+- bounded host runbooks for disk checks, Nextcloud planning, manifest-bound Nextcloud rollback, and selected service restarts
+- a public `planner-agent` plus a supervised session repair agent, both staying advisory-only behind approvals and bounded runbooks
 - a `ttyd`-backed browser terminal bridge for task-scoped `tmux` sessions
 
 ## Current implementation boundaries
@@ -48,8 +48,9 @@ Read these first:
 
 1. Copy `.env.example` to `.env`
 2. Change `COCKPIT_ADMIN_PASSWORD`
-3. Install dependencies
-4. Start the API and web UI in separate terminals
+3. Make sure GitHub Copilot CLI is installed and authenticated if you want a real `planner-agent` runtime
+4. Install dependencies
+5. Start the API and web UI in separate terminals
 
 ```bash
 cp .env.example .env
@@ -57,6 +58,21 @@ npm install
 npm run dev:api
 npm run dev:web
 ```
+
+Planner runtime notes:
+
+- default planner runtime: `COCKPIT_PLANNER_RUNTIME=copilot-cli`
+- fallback planner runtime: `COCKPIT_PLANNER_RUNTIME=demo-local`
+- default executable: `COCKPIT_COPILOT_EXECUTABLE=copilot`
+- optional model pin: `COCKPIT_COPILOT_MODEL=gpt-5.4`
+- the planner runtime is intentionally bounded to plan-only Copilot CLI usage; host mutation still stays behind approvals and bounded runbooks
+- runbook plans now attach a reviewable safety report in Session detail; high-risk plans stay blocked or pending approval until that review path clears
+- runbook cards now expose reviewed workflow steps so multi-step flows such as Nextcloud maintenance can stay visible in the dashboard
+- the Nextcloud maintenance path is now split into bounded preflight, maintenance-mode, occ-upgrade, maintenance-exit, verification, and optional restart runbooks instead of one larger follow-up step
+- Nextcloud rollback is now a separate reviewed restore plus verify path that only reads an approved manifest under the bounded backup root before maintenance mode is cleared again
+- the supervised repair agent now carries an explicit checkpoint contract in the execution plan and a reviewable checkpoint state in the launched job, so the dashboard can show and advance structured operator checkpoints without turning the agent into the privilege boundary
+- the supervised repair agent runs in the same tmux task context, but it still needs launch approval and cannot authorize or execute host mutation on its own
+- Copilot CLI must already be authenticated; classic `ghp_` PATs are not accepted by Copilot CLI, so use `/login`, `gh auth login`, or a fine-grained token instead
 
 Default endpoints:
 
@@ -132,6 +148,7 @@ Important notes:
 
 - set `COCKPIT_BIND_IP` to the WireGuard IP on the VPS before startup
 - set `COCKPIT_TMUX_MODE=auto` for the host runtime
+- install and authenticate GitHub Copilot CLI on the VPS if the planner runtime should be real instead of `demo-local`
 - set `COCKPIT_TTYD_BASE_URL=/terminal` and a unique `COCKPIT_TERMINAL_SIGNING_SECRET`
 - set `COCKPIT_COOKIE_SECURE=true` only when the stack is behind HTTPS
 - the dashboard stays bound to the WireGuard IP while API and ttyd stay on `127.0.0.1`

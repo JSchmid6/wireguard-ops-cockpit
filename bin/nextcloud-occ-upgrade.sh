@@ -6,22 +6,18 @@ source "$SCRIPT_DIR/lib/nextcloud-maintenance-common.sh"
 
 lock_nextcloud_maintenance_flow
 ensure_nextcloud_root
+require_nextcloud_phase "maintenance-enabled"
 
-print_nextcloud_header "Restart Nextcloud web stack"
+print_nextcloud_header "Run Nextcloud occ upgrade"
 
-echo "-- Bounded restart target --"
-echo "php8.3-fpm apache2"
-echo
-
-systemctl restart php8.3-fpm apache2
-
-echo "-- Service status --"
-systemctl is-active php8.3-fpm apache2
+echo "-- Run occ upgrade --"
+run_occ upgrade
 echo
 
 echo "-- Nextcloud status --"
 run_occ status
 echo
 
+set_nextcloud_phase "upgrade-complete"
 echo "-- Stored maintenance phase --"
-echo "$(current_nextcloud_phase)"
+echo "upgrade-complete"

@@ -3,6 +3,8 @@ import Fastify from "fastify";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type {
   AgentManifest,
+  ExecutionCheckpointDefinition,
+  ExecutionCheckpointState,
   ExecutionPlan,
   ExecutionReview,
   ExecutionRiskClass,
@@ -16,6 +18,7 @@ import { AUTH_COOKIE, clearAuthCookie, parseCookies, serializeAuthCookie } from 
 import { loadConfig, type AppConfig } from "./config.js";
 import { CockpitDatabase } from "./db.js";
 import {
+  computeAgentManifestDigest,
   computeRunbookVersionHash,
   INTERNAL_EXECUTION_AGENTS,
   RUNBOOKS,
@@ -26,10 +29,12 @@ import {
   listAgents,
   findRunbook
 } from "./registries.js";
+import { generateRunbookSafetyReview, type SafetyReviewRunner } from "./safety-review.js";
 
 interface AppOptions {
   config?: AppConfig;
   bootstrapUsers?: Array<{ username: string; password: string; role?: "admin" }>;
+  safetyReviewRunner?: SafetyReviewRunner;
 }
 
 interface LoginAttemptState {
@@ -89,6 +94,166 @@ function review(
   };
 }
 
+function createCheckpointContractDigest(checkpointContract: ExecutionCheckpointDefinition[]): string | null {
+  if (checkpointContract.length === 0) {
+    return null;
+  }
+
+  return createHash("sha256").update(JSON.stringify(checkpointContract)).digest("hex");
+}
+
+function cloneCheckpointContract(checkpointContract: ExecutionCheckpointDefinition[]): ExecutionCheckpointDefinition[] {
+  return checkpointContract.map((checkpoint) => ({ ...checkpoint }));
+}
+
+function parseCheckpointContractValue(value: unknown): ExecutionCheckpointDefinition[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.flatMap((entry) => {
+    if (!entry || typeof entry !== "object") {
+      return [];
+    }
+
+    const candidate = entry as Record<string, unknown>;
+    if (
+      typeof candidate.id !== "string" ||
+      typeof candidate.label !== "string" ||
+      typeof candidate.description !== "string" ||
+      typeof candidate.kind !== "string"
+    ) {
+      return [];
+    }
+
+    if (
+      candidate.kind !== "analysis" &&
+      candidate.kind !== "operator-checkpoint" &&
+      candidate.kind !== "runbook" &&
+      candidate.kind !== "verify"
+    ) {
+      return [];
+    }
+
+    if (candidate.runbookId !== undefined && typeof candidate.runbookId !== "string") {
+      return [];
+    }
+
+    return [
+      {
+        id: candidate.id,
+        label: candidate.label,
+        description: candidate.description,
+        kind: candidate.kind,
+        ...(candidate.runbookId ? { runbookId: candidate.runbookId } : {})
+      } satisfies ExecutionCheckpointDefinition
+    ];
+  });
+}
+
+function createInitialCheckpointState(
+  checkpointContract: ExecutionCheckpointDefinition[]
+): { checkpoints: ExecutionCheckpointState[]; activeCheckpointId: string | null } {
+  const checkpoints = checkpointContract.map((checkpoint, index) => ({
+    ...checkpoint,
+    status: index === 0 ? "awaiting_operator" : "planned"
+  }));
+
+  return {
+    checkpoints,
+    activeCheckpointId: checkpoints[0]?.id || null
+  };
+}
+
+function parseCheckpointStateValue(value: unknown): ExecutionCheckpointState[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.flatMap((entry) => {
+    if (!entry || typeof entry !== "object") {
+      return [];
+    }
+
+    const candidate = entry as Record<string, unknown>;
+    if (
+      typeof candidate.id !== "string" ||
+      typeof candidate.label !== "string" ||
+      typeof candidate.description !== "string" ||
+      typeof candidate.kind !== "string" ||
+      typeof candidate.status !== "string"
+    ) {
+      return [];
+    }
+
+    if (
+      candidate.kind !== "analysis" &&
+      candidate.kind !== "operator-checkpoint" &&
+      candidate.kind !== "runbook" &&
+      candidate.kind !== "verify"
+    ) {
+      return [];
+    }
+
+    if (
+      candidate.status !== "planned" &&
+      candidate.status !== "awaiting_operator" &&
+      candidate.status !== "completed"
+    ) {
+      return [];
+    }
+
+    if (candidate.runbookId !== undefined && typeof candidate.runbookId !== "string") {
+      return [];
+    }
+
+    return [
+      {
+        id: candidate.id,
+        label: candidate.label,
+        description: candidate.description,
+        kind: candidate.kind,
+        status: candidate.status,
+        ...(candidate.runbookId ? { runbookId: candidate.runbookId } : {})
+      } satisfies ExecutionCheckpointState
+    ];
+  });
+}
+
+function advanceCheckpointState(
+  checkpoints: ExecutionCheckpointState[],
+  checkpointId: string
+): { checkpoints: ExecutionCheckpointState[]; activeCheckpointId: string | null; completedCheckpointLabel: string } | null {
+  const currentIndex = checkpoints.findIndex((checkpoint) => checkpoint.id === checkpointId);
+  if (currentIndex < 0 || checkpoints[currentIndex]?.status !== "awaiting_operator") {
+    return null;
+  }
+
+  const updatedCheckpoints = checkpoints.map((checkpoint, index) => {
+    if (index === currentIndex) {
+      return {
+        ...checkpoint,
+        status: "completed" as const
+      };
+    }
+
+    if (index === currentIndex + 1 && checkpoint.status === "planned") {
+      return {
+        ...checkpoint,
+        status: "awaiting_operator" as const
+      };
+    }
+
+    return checkpoint;
+  });
+
+  return {
+    checkpoints: updatedCheckpoints,
+    activeCheckpointId: updatedCheckpoints.find((checkpoint) => checkpoint.status === "awaiting_operator")?.id || null,
+    completedCheckpointLabel: checkpoints[currentIndex].label
+  };
+}
+
 function normalizePrompt(value: string | undefined) {
   const basePrompt = (value || "Inspect the current maintenance context and report back.").trim();
   const withoutControlChars = basePrompt.replace(/[\u0000-\u001f\u007f]+/g, " ");
@@ -132,6 +297,14 @@ function computeNextWeeklyRunAt(weekday: number, timeUtc: string, from = new Dat
 }
 
 function planJobOutput(plan: ExecutionPlan, summary: string) {
+  const runbookVersionHash =
+    typeof plan.normalizedInput.runbookVersionHash === "string" ? plan.normalizedInput.runbookVersionHash : null;
+  const checkpointContractDigest =
+    typeof plan.normalizedInput.checkpointContractDigest === "string"
+      ? plan.normalizedInput.checkpointContractDigest
+      : null;
+  const checkpointCount = parseCheckpointContractValue(plan.normalizedInput.checkpointContract).length;
+
   return {
     summary,
     planId: plan.id,
@@ -139,7 +312,11 @@ function planJobOutput(plan: ExecutionPlan, summary: string) {
     targetType: plan.targetType,
     targetId: plan.targetId,
     riskClass: plan.riskClass,
+    runbookVersionHash,
+    checkpointContractDigest,
+    checkpointCount,
     plannerVerdict: plan.plannerReview.verdict,
+    safetySummary: plan.safetyReview.summary,
     safetyVerdict: plan.safetyReview.verdict,
     policyVerdict: plan.policyReview.verdict
   };
@@ -183,6 +360,41 @@ function agentOutput(agent: AgentManifest, prompt: string, started: boolean, not
   };
 }
 
+function resolveRunbookPlanState(runbook: RunbookDefinition, safetyReview: ExecutionReview) {
+  if (safetyReview.verdict === "blocked") {
+    return {
+      status: "blocked" as const,
+      requiresApproval: false
+    };
+  }
+
+  const requiresApproval = runbook.requiresApproval || safetyReview.verdict === "approval_required";
+  return {
+    status: requiresApproval ? ("pending_approval" as const) : ("ready" as const),
+    requiresApproval
+  };
+}
+
+function createRunbookApprovalReason(plan: ExecutionPlan, runbook: RunbookDefinition) {
+  if (!runbook.requiresApproval && plan.safetyReview.verdict === "approval_required") {
+    return `${runbook.name} was escalated by the safety review and now requires human approval before dispatch.`;
+  }
+
+  return `${runbook.name} requires explicit approval before dispatching the bounded host helper.`;
+}
+
+function createAgentApprovalReason(agent: AgentManifest) {
+  if (agent.supervisionMode === "session-observed") {
+    return `${agent.name} requires operator approval before it can present ${agent.checkpointTemplate.length} staged remediation checkpoints in the session.`;
+  }
+
+  if (agent.privilegedHelperRequested) {
+    return `${agent.name} requires explicit approval before launch because it may request a privileged helper.`;
+  }
+
+  return `${agent.name} requires explicit approval before launch.`;
+}
+
 async function requireActor(
   request: FastifyRequest,
   reply: FastifyReply,
@@ -215,13 +427,14 @@ export async function createApp(options: AppOptions = {}) {
 
   const database = new CockpitDatabase(config.dbPath);
   const tmux = createTmuxAdapter(config.tmuxMode);
-  const agents = listAgents();
+  const agents = listAgents(config.plannerRuntime);
   const scripts = listScripts();
+  const safetyReviewRunner = options.safetyReviewRunner || generateRunbookSafetyReview;
   const terminalSigningSecret = Buffer.from(config.terminalSigningSecret, "utf8");
   const loginAttempts = new Map<string, LoginAttemptState>();
   const scheduleLocks = new Set<string>();
 
-  function createRunbookPlan(
+  async function createRunbookPlan(
     actor: UserSummary,
     runbook: RunbookDefinition,
     session: { id: string; name: string } | null,
@@ -230,9 +443,11 @@ export async function createApp(options: AppOptions = {}) {
       autoDispatch: true
     }
   ) {
+    const runbookVersionHash = computeRunbookVersionHash(runbook);
     const riskClass: ExecutionRiskClass = runbook.requiresApproval || runbook.privilegedHelperRequested ? "high" : "low";
     const normalizedInput = {
       runbookId: runbook.id,
+      runbookVersionHash,
       sessionId: session?.id || null,
       sessionName: session?.name || null,
       trigger: options.trigger,
@@ -246,69 +461,95 @@ export async function createApp(options: AppOptions = {}) {
       {
         integration: runbook.integration,
         privilegedHelperRequested: runbook.privilegedHelperRequested,
-        sessionLinked: Boolean(session)
+        sessionLinked: Boolean(session),
+        runbookVersionHash
       }
     );
-    const safetyReview = review(
-      INTERNAL_EXECUTION_AGENTS.safety.id,
-      runbook.requiresApproval ? "approval_required" : "passed",
-      runbook.requiresApproval
-        ? `${INTERNAL_EXECUTION_AGENTS.safety.name} escalated ${runbook.name} for human approval before any host-facing step can run.`
-        : `${INTERNAL_EXECUTION_AGENTS.safety.name} found the placeholder runbook bounded to a low-risk contract.`,
+    const safetyReview = await safetyReviewRunner(
       {
-        requiresApproval: runbook.requiresApproval,
-        requestedBy: actor.username,
-        riskClass
+        runbook,
+        runbookVersionHash,
+        riskClass,
+        sessionId: session?.id || null,
+        trigger: options.trigger,
+        scheduleId: options.scheduleId || null
+      },
+      {
+        repoRoot: config.repoRoot,
+        plannerRuntime: config.plannerRuntime,
+        copilotExecutable: config.copilotExecutable,
+        copilotModel: config.copilotModel
       }
     );
+    const planState = resolveRunbookPlanState(runbook, safetyReview);
     const policyReview = review(
       null,
       "passed",
       "Deterministic policy gate confirmed the runbook is allowlisted and the request stayed within the manifest contract.",
       {
         runbookId: runbook.id,
-        targetType: "runbook"
+        targetType: "runbook",
+        runbookVersionHash
       }
     );
     const preExecutionHook = review(
       null,
-      "passed",
-      session
-        ? "Pre-exec hook bound the runbook request to the selected cockpit session."
-        : "Pre-exec hook accepted the runbook request without a linked tmux session.",
+      planState.status === "blocked" ? "blocked" : "passed",
+      planState.status === "blocked"
+        ? "Pre-exec hook kept the runbook blocked because the safety review did not approve bounded dispatch."
+        : session
+          ? "Pre-exec hook bound the runbook request to the selected cockpit session."
+          : "Pre-exec hook accepted the runbook request without a linked tmux session.",
       {
-        sessionId: session?.id || null
+        sessionId: session?.id || null,
+        runbookVersionHash
       }
     );
     const runtimeHook = review(
       null,
-      runbook.requiresApproval ? "not_run" : options.autoDispatch ? "pending" : "not_run",
-      runbook.requiresApproval
-        ? "Runtime hook is waiting for approval before dispatch."
-        : options.autoDispatch
-          ? "Runtime hook is armed for bounded placeholder dispatch."
-          : "Runtime hook is waiting for an operator or schedule policy to dispatch the bounded executor.",
+      planState.status === "blocked"
+        ? "not_run"
+        : planState.requiresApproval
+          ? "not_run"
+          : options.autoDispatch
+            ? "pending"
+            : "not_run",
+      planState.status === "blocked"
+        ? "Runtime hook did not arm because the safety review blocked dispatch."
+        : planState.requiresApproval
+          ? "Runtime hook is waiting for approval before dispatch."
+          : options.autoDispatch
+            ? "Runtime hook is armed for bounded placeholder dispatch."
+            : "Runtime hook is waiting for an operator or schedule policy to dispatch the bounded executor.",
       {}
     );
     const postExecutionHook = review(
       null,
-      runbook.requiresApproval ? "not_run" : options.autoDispatch ? "pending" : "not_run",
-      runbook.requiresApproval
-        ? "Post-exec verification will run only after approval and dispatch."
-        : options.autoDispatch
-          ? "Post-exec verification will confirm the placeholder output and audit trail."
-          : "Post-exec verification will start only after a later bounded dispatch occurs.",
+      planState.status === "blocked"
+        ? "not_run"
+        : planState.requiresApproval
+          ? "not_run"
+          : options.autoDispatch
+            ? "pending"
+            : "not_run",
+      planState.status === "blocked"
+        ? "Post-exec verification is skipped because the safety review blocked bounded execution."
+        : planState.requiresApproval
+          ? "Post-exec verification will run only after approval and dispatch."
+          : options.autoDispatch
+            ? "Post-exec verification will confirm the placeholder output and audit trail."
+            : "Post-exec verification will start only after a later bounded dispatch occurs.",
       {}
     );
 
-    return database.createExecutionPlan({
+    const plan = database.createExecutionPlan({
       sessionId: session?.id || null,
       targetType: "runbook",
       targetId: runbook.id,
       requestedBy: actor.id,
-      status: runbook.requiresApproval ? "pending_approval" : "ready",
+      status: planState.status,
       riskClass,
-      requiresApproval: runbook.requiresApproval,
+      requiresApproval: planState.requiresApproval,
       planHash: createPlanHash({
         targetType: "runbook",
         targetId: runbook.id,
@@ -318,9 +559,11 @@ export async function createApp(options: AppOptions = {}) {
         riskClass
       }),
       planSummary:
-        options.trigger === "scheduled"
-          ? `${runbook.name} was generated by a weekly schedule and will still pass planner, safety review, policy validation, and hooks before any bounded execution continues.`
-          : `${runbook.name} will run through planner, safety review, policy validation, and hooks before the bounded executor can continue.`,
+        planState.status === "blocked"
+          ? `${runbook.name} was blocked by the safety review before the bounded executor could continue.`
+          : options.trigger === "scheduled"
+            ? `${runbook.name} was generated by a weekly schedule and will still pass planner, safety review, policy validation, and hooks before any bounded execution continues.`
+            : `${runbook.name} will run through planner, safety review, policy validation, and hooks before the bounded executor can continue.`,
       normalizedInput,
       plannerReview,
       safetyReview,
@@ -329,6 +572,22 @@ export async function createApp(options: AppOptions = {}) {
       runtimeHook,
       postExecutionHook
     });
+
+    database.createAudit({
+      actorId: actor.id,
+      action: "execution.plan.safety_reviewed",
+      targetType: "execution-plan",
+      targetId: plan.id,
+      details: {
+        runbookId: runbook.id,
+        runbookVersionHash,
+        verdict: plan.safetyReview.verdict,
+        source: plan.safetyReview.details.source || null,
+        parseStatus: plan.safetyReview.details.parseStatus || null
+      }
+    });
+
+    return plan;
   }
 
   function createPendingApprovalForPlan(plan: ExecutionPlan, actor: UserSummary, reason: string) {
@@ -402,6 +661,39 @@ export async function createApp(options: AppOptions = {}) {
     return { plan, job };
   }
 
+  function createBlockedPlanRecord(plan: ExecutionPlan, actor: UserSummary, summary: string) {
+    const job = database.createJob({
+      sessionId: plan.sessionId,
+      kind: "execution.plan",
+      subjectId: plan.id,
+      status: "failed",
+      requiresApproval: false,
+      output: {
+        ...planJobOutput(plan, summary),
+        blockedReason: plan.safetyReview.summary
+      },
+      completedAt: new Date().toISOString()
+    });
+
+    database.createAudit({
+      actorId: actor.id,
+      action: "execution.plan.blocked",
+      targetType: "execution-plan",
+      targetId: plan.id,
+      details: {
+        jobId: job.id,
+        safetyVerdict: plan.safetyReview.verdict,
+        requestedBy: actor.username
+      }
+    });
+
+    if (plan.sessionId) {
+      database.recordSessionActivity(plan.sessionId);
+    }
+
+    return { plan, job };
+  }
+
   function pauseSchedule(scheduleId: string, actorId: string | null, summary: string, details: Record<string, unknown>) {
     const schedule = database.updateScheduledRunbook(scheduleId, {
       status: "paused"
@@ -459,7 +751,7 @@ export async function createApp(options: AppOptions = {}) {
           continue;
         }
 
-        const plan = createRunbookPlan(actor, runbook, session, {
+        const plan = await createRunbookPlan(actor, runbook, session, {
           trigger: "scheduled",
           autoDispatch: schedule.effectiveMode === "scheduled-auto",
           scheduleId: schedule.id
@@ -475,23 +767,37 @@ export async function createApp(options: AppOptions = {}) {
             targetId: plan.targetId,
             sessionId: session.id,
             riskClass: plan.riskClass,
+            runbookVersionHash: plan.normalizedInput.runbookVersionHash,
             scheduleId: schedule.id,
             trigger: "scheduled"
           }
         });
 
         let executedAt: string | null = null;
-        if (runbook.requiresApproval) {
+        if (plan.status === "blocked") {
+          createBlockedPlanRecord(plan, actor, `${runbook.name} was generated by a weekly schedule but the safety review blocked dispatch.`);
+          pauseSchedule(schedule.id, actor.id, "Scheduled runbook paused because the safety review blocked the reviewed runbook version.", {
+            runbookId: runbook.id,
+            runbookVersionHash: plan.normalizedInput.runbookVersionHash,
+            safetyVerdict: plan.safetyReview.verdict
+          });
+        } else if (plan.requiresApproval) {
           createPendingApprovalForPlan(
             plan,
             actor,
             `${runbook.name} was generated by a weekly schedule and requires human approval before dispatch.`
           );
-        } else if (schedule.effectiveMode === "scheduled-auto") {
+        } else if (schedule.effectiveMode === "scheduled-auto" && plan.safetyReview.verdict === "passed") {
           executeRunbookPlan(plan, actor, runbook);
           executedAt = new Date().toISOString();
         } else {
-          createReadyPlanRecord(plan, actor, `${runbook.name} was generated by a weekly schedule and is ready for operator review.`);
+          createReadyPlanRecord(
+            plan,
+            actor,
+            plan.safetyReview.verdict === "not_run"
+              ? `${runbook.name} was generated by a weekly schedule, but the safety report is incomplete and needs operator review.`
+              : `${runbook.name} was generated by a weekly schedule and is ready for operator review.`
+          );
         }
 
         const nextRunAt = computeNextWeeklyRunAt(schedule.weekday, schedule.timeUtc, new Date(new Date(schedule.nextRunAt).getTime() + 1000));
@@ -522,10 +828,20 @@ export async function createApp(options: AppOptions = {}) {
   function createAgentPlan(actor: UserSummary, agent: AgentManifest, sessionId: string, prompt?: string) {
     const normalizedPrompt = normalizePrompt(prompt);
     const riskClass: ExecutionRiskClass = agent.requiresApproval || agent.privilegedHelperRequested ? "high" : "moderate";
+    const agentManifestDigest = computeAgentManifestDigest(agent);
+    const checkpointContract = cloneCheckpointContract(agent.checkpointTemplate);
+    const checkpointContractDigest = createCheckpointContractDigest(checkpointContract);
     const normalizedInput = {
       sessionId,
       prompt: normalizedPrompt.prompt,
-      promptLength: normalizedPrompt.prompt.length
+      promptLength: normalizedPrompt.prompt.length,
+      agentManifestDigest,
+      promptContractId: agent.promptContractId,
+      checkpointContractId: agent.checkpointContractId,
+      checkpointContractDigest,
+      checkpointContract,
+      supervisionMode: agent.supervisionMode,
+      executionAuthority: agent.executionAuthority
     };
 
     const plannerReview = review(
@@ -535,19 +851,30 @@ export async function createApp(options: AppOptions = {}) {
       {
         integration: agent.integration,
         promptLength: normalizedPrompt.prompt.length,
-        truncated: normalizedPrompt.truncated
+        truncated: normalizedPrompt.truncated,
+        agentManifestDigest,
+        promptContractId: agent.promptContractId,
+        checkpointContractId: agent.checkpointContractId,
+        checkpointContractDigest,
+        checkpointCount: checkpointContract.length
       }
     );
     const safetyReview = review(
       INTERNAL_EXECUTION_AGENTS.safety.id,
       agent.requiresApproval ? "approval_required" : "passed",
       agent.requiresApproval
-        ? `${INTERNAL_EXECUTION_AGENTS.safety.name} requires explicit approval before ${agent.name} can request any privileged helper.`
+        ? agent.supervisionMode === "session-observed"
+          ? `${INTERNAL_EXECUTION_AGENTS.safety.name} requires explicit operator approval before ${agent.name} can start presenting staged remediation checkpoints in the session.`
+          : `${INTERNAL_EXECUTION_AGENTS.safety.name} requires explicit approval before ${agent.name} can request any privileged helper.`
         : `${INTERNAL_EXECUTION_AGENTS.safety.name} accepted the prompt because the launch path stays inside the bounded local agent launcher contract.`,
       {
         removedControlChars: normalizedPrompt.removedControlChars,
         truncated: normalizedPrompt.truncated,
-        requiresApproval: agent.requiresApproval
+        requiresApproval: agent.requiresApproval,
+        supervisionMode: agent.supervisionMode,
+        executionAuthority: agent.executionAuthority,
+        checkpointContractDigest,
+        checkpointCount: checkpointContract.length
       }
     );
     const policyReview = review(
@@ -556,7 +883,11 @@ export async function createApp(options: AppOptions = {}) {
       "Deterministic policy gate confirmed the agent manifest is allowlisted and no browser-supplied shell command crosses the boundary.",
       {
         agentId: agent.id,
-        targetType: "agent"
+        targetType: "agent",
+        agentManifestDigest,
+        promptContractId: agent.promptContractId,
+        checkpointContractDigest,
+        checkpointCount: checkpointContract.length
       }
     );
     const preExecutionHook = review(
@@ -568,7 +899,9 @@ export async function createApp(options: AppOptions = {}) {
       {
         removedControlChars: normalizedPrompt.removedControlChars,
         truncated: normalizedPrompt.truncated,
-        sessionId
+        sessionId,
+        agentManifestDigest,
+        checkpointContractDigest
       }
     );
     const runtimeHook = review(
@@ -604,7 +937,10 @@ export async function createApp(options: AppOptions = {}) {
         normalizedInput,
         riskClass
       }),
-      planSummary: `${agent.name} will launch only after planner and safety review, deterministic policy validation, and hook checks have passed.`,
+      planSummary:
+        agent.supervisionMode === "session-observed"
+          ? `${agent.name} will launch in the current tmux session only after approval and will stop at ${checkpointContract.length} explicit operator review checkpoints.`
+          : `${agent.name} will launch only after planner and safety review, deterministic policy validation, and hook checks have passed.`,
       normalizedInput,
       plannerReview,
       safetyReview,
@@ -693,7 +1029,13 @@ export async function createApp(options: AppOptions = {}) {
       typeof plan.normalizedInput.prompt === "string"
         ? plan.normalizedInput.prompt
         : "Inspect the current maintenance context and report back.";
-    const command = buildAgentCommand(config.repoRoot, agent, prompt);
+    const command = buildAgentCommand(config.repoRoot, agent, prompt, {
+      plannerRuntime: config.plannerRuntime,
+      copilotExecutable: config.copilotExecutable,
+      copilotModel: config.copilotModel
+    });
+    const checkpointContract = parseCheckpointContractValue(plan.normalizedInput.checkpointContract);
+    const checkpointState = createInitialCheckpointState(checkpointContract);
     const launch = tmux.launchCommand(session.tmuxSessionName, slugify(`agent-${agent.id}`), command);
     const job = database.createJob({
       sessionId: session.id,
@@ -704,7 +1046,18 @@ export async function createApp(options: AppOptions = {}) {
       output: {
         ...agentOutput(agent, prompt, launch.started, launch.note),
         planId: plan.id,
-        planHash: plan.planHash
+        planHash: plan.planHash,
+        agentManifestDigest: typeof plan.normalizedInput.agentManifestDigest === "string" ? plan.normalizedInput.agentManifestDigest : null,
+        promptContractId: typeof plan.normalizedInput.promptContractId === "string" ? plan.normalizedInput.promptContractId : null,
+        checkpointContractId:
+          typeof plan.normalizedInput.checkpointContractId === "string" ? plan.normalizedInput.checkpointContractId : null,
+        checkpointContractDigest:
+          typeof plan.normalizedInput.checkpointContractDigest === "string"
+            ? plan.normalizedInput.checkpointContractDigest
+            : null,
+        checkpoints: checkpointState.checkpoints,
+        activeCheckpointId: checkpointState.activeCheckpointId,
+        supervisionMode: typeof plan.normalizedInput.supervisionMode === "string" ? plan.normalizedInput.supervisionMode : null
       },
       completedAt: new Date().toISOString()
     });
@@ -746,7 +1099,12 @@ export async function createApp(options: AppOptions = {}) {
       details: {
         sessionId: session.id,
         tmuxBackend: launch.backend,
-        planId: plan.id
+        planId: plan.id,
+        checkpointContractDigest:
+          typeof plan.normalizedInput.checkpointContractDigest === "string"
+            ? plan.normalizedInput.checkpointContractDigest
+            : null,
+        activeCheckpointId: checkpointState.activeCheckpointId
       }
     });
 
@@ -1143,7 +1501,7 @@ export async function createApp(options: AppOptions = {}) {
       return reply.code(404).send({ message: "session not found" });
     }
 
-    const plan = createRunbookPlan(actor, runbook, session);
+    const plan = await createRunbookPlan(actor, runbook, session);
 
     database.createAudit({
       actorId: actor.id,
@@ -1154,16 +1512,29 @@ export async function createApp(options: AppOptions = {}) {
         targetType: plan.targetType,
         targetId: plan.targetId,
         sessionId: session?.id || null,
-        riskClass: plan.riskClass
+        riskClass: plan.riskClass,
+        runbookVersionHash: plan.normalizedInput.runbookVersionHash
       }
     });
 
-    if (runbook.requiresApproval) {
+    if (plan.status === "blocked") {
+      const blocked = createBlockedPlanRecord(
+        plan,
+        actor,
+        `${runbook.name} was blocked by the safety review before the bounded host helper could run.`
+      );
+      return reply.code(409).send({
+        message: "safety review blocked runbook dispatch",
+        ...blocked
+      });
+    }
+
+    if (plan.requiresApproval) {
       return reply.code(202).send(
         createPendingApprovalForPlan(
           plan,
           actor,
-          `${runbook.name} requires explicit approval before dispatching the bounded host helper.`
+          createRunbookApprovalReason(plan, runbook)
         )
       );
     }
@@ -1276,6 +1647,43 @@ export async function createApp(options: AppOptions = {}) {
             return reply.code(500).send({ message: "runbook not found for approved plan" });
           }
 
+          const approvedRunbookVersionHash =
+            typeof plan.normalizedInput.runbookVersionHash === "string" ? plan.normalizedInput.runbookVersionHash : null;
+          const currentRunbookVersionHash = computeRunbookVersionHash(runbook);
+          if (!approvedRunbookVersionHash || approvedRunbookVersionHash !== currentRunbookVersionHash) {
+            const blockedPlan = database.updateExecutionPlan(plan.id, {
+              status: "blocked",
+              preExecutionHook: review(
+                null,
+                "blocked",
+                "Pre-exec hook detected a reviewed runbook version mismatch and refused to dispatch the approved action.",
+                {
+                  approvedRunbookVersionHash,
+                  currentRunbookVersionHash
+                }
+              )
+            });
+            const blockedJob = database.updateJob(job.id, {
+              status: "failed",
+              approvalId: updatedApproval.id,
+              completedAt: new Date().toISOString(),
+              output: {
+                ...planJobOutput(blockedPlan, "Execution plan runbook integrity check failed before dispatch."),
+                approvalDecision: "approved",
+                integrityError: "runbook version hash mismatch",
+                approvedRunbookVersionHash,
+                currentRunbookVersionHash
+              }
+            });
+
+            return reply.code(409).send({
+              message: "runbook integrity check failed",
+              approval: updatedApproval,
+              plan: blockedPlan,
+              job: blockedJob
+            });
+          }
+
           const executed = executeRunbookPlan(
             database.updateExecutionPlan(plan.id, {
               approvalId: updatedApproval.id,
@@ -1303,9 +1711,46 @@ export async function createApp(options: AppOptions = {}) {
           return { approval: updatedApproval, plan: executed.plan, job: executed.job, planJob };
         }
 
-        const agent = findAgent(plan.targetId);
+        const agent = findAgent(plan.targetId, config.plannerRuntime);
         if (!agent) {
           return reply.code(500).send({ message: "agent not found for approved plan" });
+        }
+
+        const approvedAgentManifestDigest =
+          typeof plan.normalizedInput.agentManifestDigest === "string" ? plan.normalizedInput.agentManifestDigest : null;
+        const currentAgentManifestDigest = computeAgentManifestDigest(agent);
+        if (!approvedAgentManifestDigest || approvedAgentManifestDigest !== currentAgentManifestDigest) {
+          const blockedPlan = database.updateExecutionPlan(plan.id, {
+            status: "blocked",
+            preExecutionHook: review(
+              null,
+              "blocked",
+              "Pre-exec hook detected an agent manifest mismatch and refused to dispatch the approved launch.",
+              {
+                approvedAgentManifestDigest,
+                currentAgentManifestDigest
+              }
+            )
+          });
+          const blockedJob = database.updateJob(job.id, {
+            status: "failed",
+            approvalId: updatedApproval.id,
+            completedAt: new Date().toISOString(),
+            output: {
+              ...planJobOutput(blockedPlan, "Execution plan agent integrity check failed before dispatch."),
+              approvalDecision: "approved",
+              integrityError: "agent manifest digest mismatch",
+              approvedAgentManifestDigest,
+              currentAgentManifestDigest
+            }
+          });
+
+          return reply.code(409).send({
+            message: "agent integrity check failed",
+            approval: updatedApproval,
+            plan: blockedPlan,
+            job: blockedJob
+          });
         }
 
         const executed = executeAgentPlan(
@@ -1406,7 +1851,7 @@ export async function createApp(options: AppOptions = {}) {
     }
 
     const { agentId } = request.params as { agentId: string };
-    const agent = findAgent(agentId);
+    const agent = findAgent(agentId, config.plannerRuntime);
     if (!agent) {
       return reply.code(404).send({ message: "agent not found" });
     }
@@ -1432,39 +1877,98 @@ export async function createApp(options: AppOptions = {}) {
         targetType: plan.targetType,
         targetId: plan.targetId,
         sessionId: session.id,
-        riskClass: plan.riskClass
+        riskClass: plan.riskClass,
+        checkpointContractDigest:
+          typeof plan.normalizedInput.checkpointContractDigest === "string"
+            ? plan.normalizedInput.checkpointContractDigest
+            : null,
+        checkpointCount: parseCheckpointContractValue(plan.normalizedInput.checkpointContract).length
       }
     });
 
     if (agent.requiresApproval) {
-      const pendingJob = database.createJob({
-        sessionId: session.id,
-        kind: "execution.plan",
-        subjectId: plan.id,
-        status: "pending_approval",
-        requiresApproval: true,
-        output: planJobOutput(plan, `${agent.name} is waiting for human approval before launch.`)
-      });
-      const approval = database.createApproval({
-        jobId: pendingJob.id,
-        requestedBy: actor.id,
-        reason: `${agent.name} requires explicit approval before launch.`
-      });
-      const job = database.updateJob(pendingJob.id, {
-        status: "pending_approval",
-        approvalId: approval.id,
-        output: planJobOutput(plan, `${agent.name} is waiting for human approval before launch.`)
-      });
-      const updatedPlan = database.updateExecutionPlan(plan.id, {
-        approvalId: approval.id,
-        status: "pending_approval"
-      });
-
-      return reply.code(202).send({ plan: updatedPlan, job, approval });
+      return reply.code(202).send(createPendingApprovalForPlan(plan, actor, createAgentApprovalReason(agent)));
     }
 
     const executed = executeAgentPlan(plan, actor, agent);
     return reply.code(201).send(executed);
+  });
+
+  app.post("/api/jobs/:jobId/checkpoints/:checkpointId/advance", async (request, reply) => {
+    const actor = await requireActor(request, reply, database);
+    if (!actor) {
+      return;
+    }
+
+    const { jobId, checkpointId } = request.params as { jobId: string; checkpointId: string };
+    const job = database.getJob(jobId);
+    if (!job || !job.sessionId) {
+      return reply.code(404).send({ message: "job not found" });
+    }
+
+    const session = database.getSessionByIdForActor(job.sessionId, actor.id);
+    if (!session) {
+      return reply.code(404).send({ message: "job not found" });
+    }
+
+    if (job.kind !== "agent") {
+      return reply.code(400).send({ message: "checkpoint advancement is only available for agent jobs" });
+    }
+
+    const checkpoints = parseCheckpointStateValue(job.output?.checkpoints);
+    if (checkpoints.length === 0) {
+      return reply.code(400).send({ message: "job does not expose structured checkpoints" });
+    }
+
+    const activeCheckpointId = typeof job.output?.activeCheckpointId === "string" ? job.output.activeCheckpointId : null;
+    if (activeCheckpointId !== checkpointId) {
+      return reply.code(409).send({ message: "checkpoint is not awaiting operator review" });
+    }
+
+    const advancedCheckpointState = advanceCheckpointState(checkpoints, checkpointId);
+    if (!advancedCheckpointState) {
+      return reply.code(409).send({ message: "checkpoint is not awaiting operator review" });
+    }
+
+    const agentName =
+      (job.subjectId ? findAgent(job.subjectId, config.plannerRuntime)?.name : null) || "Agent";
+    const nextCheckpoint = advancedCheckpointState.checkpoints.find(
+      (checkpoint) => checkpoint.id === advancedCheckpointState.activeCheckpointId
+    );
+
+    const updatedJob = database.updateJob(job.id, {
+      status: job.status,
+      output: {
+        ...(job.output || {}),
+        summary: nextCheckpoint
+          ? `${agentName} is waiting at checkpoint ${nextCheckpoint.label}.`
+          : `${agentName} completed all structured checkpoints and is waiting for a bounded follow-up or session closeout.`,
+        checkpoints: advancedCheckpointState.checkpoints,
+        activeCheckpointId: advancedCheckpointState.activeCheckpointId,
+        lastCompletedCheckpointId: checkpointId,
+        lastCompletedCheckpointLabel: advancedCheckpointState.completedCheckpointLabel
+      },
+      completedAt: job.completedAt
+    });
+
+    database.recordSessionActivity(session.id);
+    database.createAudit({
+      actorId: actor.id,
+      action: "agent.checkpoint.advanced",
+      targetType: "job",
+      targetId: job.id,
+      details: {
+        jobId: job.id,
+        planId: typeof job.output?.planId === "string" ? job.output.planId : null,
+        checkpointId,
+        completedCheckpointLabel: advancedCheckpointState.completedCheckpointLabel,
+        nextCheckpointId: advancedCheckpointState.activeCheckpointId,
+        checkpointContractDigest:
+          typeof job.output?.checkpointContractDigest === "string" ? job.output.checkpointContractDigest : null
+      }
+    });
+
+    return { job: updatedJob };
   });
 
   app.get("/api/audits", async (request, reply) => {
