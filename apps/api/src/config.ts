@@ -13,6 +13,9 @@ export interface AppConfig {
   ttydBaseUrl: string | null;
   terminalSigningSecret: string;
   repoRoot: string;
+  plannerRuntime: "copilot-cli" | "demo-local";
+  copilotExecutable: string;
+  copilotModel: string | null;
   nodeEnv: string;
 }
 
@@ -38,6 +41,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     ttydBaseUrl: env.COCKPIT_TTYD_BASE_URL?.trim() || null,
     terminalSigningSecret: env.COCKPIT_TERMINAL_SIGNING_SECRET || "development-terminal-secret",
     repoRoot,
+    plannerRuntime: env.COCKPIT_PLANNER_RUNTIME === "demo-local" ? "demo-local" : "copilot-cli",
+    copilotExecutable: env.COCKPIT_COPILOT_EXECUTABLE?.trim() || "copilot",
+    copilotModel: env.COCKPIT_COPILOT_MODEL?.trim() || null,
     nodeEnv
   };
 }
