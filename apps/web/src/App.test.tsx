@@ -699,11 +699,11 @@ function makeServer(initiallyAuthenticated: boolean) {
       const [, , jobId, , checkpointId] = url.split("/").slice(1);
       for (const detail of Object.values(state.sessionDetails)) {
         const job = detail.jobs.find((entry) => entry.id === jobId);
-        if (!job || !job.output || !Array.isArray(job.output.checkpoints)) {
+        if (!job || !job.output || !Array.isArray((job.output as Record<string, unknown>).checkpoints)) {
           continue;
         }
 
-        const checkpoints = job.output.checkpoints as Array<Record<string, unknown>>;
+        const checkpoints = (job.output as Record<string, unknown>).checkpoints as Array<Record<string, unknown>>;
         const currentIndex = checkpoints.findIndex((checkpoint) => checkpoint.id === checkpointId);
         const updatedCheckpoints = checkpoints.map((checkpoint, index) => ({
           ...checkpoint,
@@ -717,13 +717,14 @@ function makeServer(initiallyAuthenticated: boolean) {
                   : "planned"
         }));
         const nextCheckpoint = updatedCheckpoints.find((checkpoint) => checkpoint.status === "awaiting_operator") || null;
+        const nextEntry = nextCheckpoint as Record<string, unknown> | null;
         job.output = {
-          ...job.output,
-          summary: nextCheckpoint
-            ? `Supervised repair agent is waiting at checkpoint ${String(nextCheckpoint.label)}.`
+          ...(job.output as Record<string, unknown>),
+          summary: nextEntry
+            ? `Supervised repair agent is waiting at checkpoint ${String(nextEntry.label)}.`
             : "Supervised repair agent completed all structured checkpoints.",
           checkpoints: updatedCheckpoints,
-          activeCheckpointId: nextCheckpoint ? nextCheckpoint.id : null,
+          activeCheckpointId: nextEntry ? nextEntry.id : null,
           lastCompletedCheckpointId: checkpointId,
           lastCompletedCheckpointLabel: String(checkpoints[currentIndex]?.label || "")
         };
