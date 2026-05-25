@@ -123,7 +123,9 @@ describe("registries", () => {
       {
         plannerRuntime: "copilot-cli",
         copilotExecutable: "copilot",
-        copilotModel: "gpt-5.4"
+        copilotModel: "gpt-5.4",
+        opencodeExecutable: "opencode",
+        opencodeModel: null
       }
     );
 
@@ -158,7 +160,9 @@ describe("registries", () => {
       {
         plannerRuntime: "copilot-cli",
         copilotExecutable: "copilot",
-        copilotModel: null
+        copilotModel: null,
+        opencodeExecutable: "opencode",
+        opencodeModel: null
       }
     );
 
@@ -186,7 +190,9 @@ describe("registries", () => {
       {
         plannerRuntime: "demo-local",
         copilotExecutable: "copilot",
-        copilotModel: null
+        copilotModel: null,
+        opencodeExecutable: "opencode",
+        opencodeModel: null
       }
     );
 
@@ -214,5 +220,55 @@ describe("registries", () => {
     expect(rollbackDispatch.windowName).toBe("nextcloud-rollback");
     expect(rollbackDispatch.command.executable).toBe("bash");
     expect(rollbackDispatch.command.args[1]).toContain("nextcloud-rollback-restore.sh");
+  });
+
+  it("builds a bounded OpenCode planner command", () => {
+    const command = buildAgentCommand(
+      "/workspace/repo",
+      {
+        id: "planner-agent",
+        name: "Planner agent",
+        description: "Runs OpenCode inside the task tmux session.",
+        requiresApproval: false,
+        privilegedHelperRequested: false,
+        integration: "opencode",
+        supervisionMode: "none",
+        executionAuthority: "advisory-only",
+        promptContractId: "planner-v1"
+      },
+      "summarize current context",
+      {
+        plannerRuntime: "opencode",
+        copilotExecutable: "copilot",
+        copilotModel: null,
+        opencodeExecutable: "opencode",
+        opencodeModel: "openai/gpt-4o"
+      }
+    );
+
+    expect(command.executable).toBe("bash");
+    expect(command.cwd).toBe("/workspace/repo");
+    expect(command.args[0]).toBe("-lc");
+    expect(command.args[1]).toContain("planner_executable='opencode'");
+    expect(command.args[1]).toContain("run --prompt");
+    expect(command.args[1]).toContain("--model 'openai/gpt-4o'");
+    expect(command.args[1]).toContain("--print-logs");
+    expect(command.args[1]).toContain("Task:");
+    expect(command.args[1]).toContain("summarize current context");
+  });
+
+  it("lists agents with opencode integration when configured", () => {
+    const agents = listAgents("opencode");
+    expect(agents).toHaveLength(2);
+    expect(agents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "planner-agent", integration: "opencode" }),
+        expect.objectContaining({
+          id: "supervised-repair-agent",
+          integration: "opencode",
+          supervisionMode: "session-observed"
+        })
+      ])
+    );
   });
 });

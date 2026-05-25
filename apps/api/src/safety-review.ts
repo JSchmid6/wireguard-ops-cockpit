@@ -8,6 +8,7 @@ type SafetyVerdict = Extract<PlanReviewVerdict, "passed" | "approval_required" |
 const REVIEW_SCHEMA_VERSION = "runbook-safety-review/v1";
 const PARSER_VERSION = "line-schema/v1";
 const COPILOT_TIMEOUT_MS = 30_000;
+const OPENCODE_TIMEOUT_MS = 60_000;
 const SECRET_ENV_VARS = [
   "COCKPIT_ADMIN_PASSWORD",
   "COCKPIT_TERMINAL_SIGNING_SECRET"
@@ -24,7 +25,7 @@ export interface RunbookSafetyReviewInput {
 
 export type SafetyReviewRuntimeConfig = Pick<
   AppConfig,
-  "repoRoot" | "plannerRuntime" | "copilotExecutable" | "copilotModel"
+  "repoRoot" | "plannerRuntime" | "copilotExecutable" | "copilotModel" | "opencodeExecutable" | "opencodeModel"
 >;
 
 export type SafetyReviewRunner = (
@@ -133,9 +134,13 @@ export async function generateRunbookSafetyReview(
 
   const prompt = buildRunbookSafetyPrompt(input);
   const inputHash = hashValue(prompt);
+  const isOpencode = runtime.plannerRuntime === "opencode";
+  const runtimeSource = isOpencode ? "opencode" : "copilot-cli";
 
   try {
-    const runtimeResult = await runCopilotSafetyReview(prompt, runtime);
+    const runtimeResult = isOpencode
+      ? await runOpencodeSafetyReview(prompt, runtime)
+      : await runCopilotSafetyReview(prompt, runtime);
     const parsed = parseRunbookSafetyOutput(runtimeResult.stdout);
     const effectiveVerdict = resolveEffectiveVerdict(parsed.verdict, input.runbook.requiresApproval);
 
@@ -148,7 +153,7 @@ export async function generateRunbookSafetyReview(
           : parsed.summary,
       details: {
         schemaVersion: REVIEW_SCHEMA_VERSION,
-        source: "copilot-cli",
+        source: runtimeSource,
         parserVersion: PARSER_VERSION,
         parseStatus: "ok",
         runbookId: input.runbook.id,
@@ -179,7 +184,7 @@ export async function generateRunbookSafetyReview(
     };
   } catch (error) {
     const reason = error instanceof Error ? error.message : "unknown safety review failure";
-    return createFailedReview(input, inputHash, reason);
+    return createFailedReview(input, inputHash, reason, runtimeSource);
   }
 }
 
@@ -238,7 +243,7 @@ function createSyntheticReview(input: RunbookSafetyReviewInput): ExecutionReview
   };
 }
 
-function createFailedReview(input: RunbookSafetyReviewInput, inputHash: string, reason: string): ExecutionReview {
+function createFailedReview(input: RunbookSafetyReviewInput, inputHash: string, reason: string, source: string = "copilot-cli"): ExecutionReview {
   const highRiskFailure = input.runbook.requiresApproval || input.riskClass === "high";
 
   return {
@@ -249,7 +254,7 @@ function createFailedReview(input: RunbookSafetyReviewInput, inputHash: string, 
       : `${input.runbook.name} did not receive a complete safety report. Review the bounded plan manually before relying on the advisory result.`,
     details: {
       schemaVersion: REVIEW_SCHEMA_VERSION,
-      source: "copilot-cli",
+      source,
       parserVersion: PARSER_VERSION,
       parseStatus: "error",
       runbookId: input.runbook.id,
@@ -353,6 +358,71 @@ async function runCopilotSafetyReview(
         completedAt: new Date().toISOString(),
         durationMs: Date.now() - started,
         model: runtime.copilotModel || null
+      });
+    });
+  });
+}
+
+async function runOpencodeSafetyReview(
+  prompt: string,
+  runtime: SafetyReviewRuntimeConfig
+): Promise<CopilotReviewResult> {
+  const args = [
+    "run",
+    "--prompt",
+    prompt,
+    "--format",
+    "default",
+    "--print-logs",
+    "--dir",
+    runtime.repoRoot
+  ];
+  if (runtime.opencodeModel) {
+    args.push("--model", runtime.opencodeModel);
+  }
+
+  return await new Promise((resolve, reject) => {
+    const startedAt = new Date().toISOString();
+    const started = Date.now();
+    const child = spawn(runtime.opencodeExecutable, args, {
+      cwd: runtime.repoRoot,
+      env: { ...process.env },
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+    const timeout = setTimeout(() => {
+      child.kill();
+      reject(new Error("OpenCode safety review timed out"));
+    }, OPENCODE_TIMEOUT_MS);
+
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    child.on("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    child.on("close", (exitCode) => {
+      clearTimeout(timeout);
+      if (exitCode !== 0) {
+        reject(new Error(stderr.trim() || `OpenCode exited with status ${exitCode ?? "unknown"}`));
+        return;
+      }
+
+      resolve({
+        stdout: stdout.trim(),
+        exitCode: exitCode ?? 0,
+        startedAt,
+        completedAt: new Date().toISOString(),
+        durationMs: Date.now() - started,
+        model: runtime.opencodeModel || null
       });
     });
   });
