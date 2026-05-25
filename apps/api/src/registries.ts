@@ -9,9 +9,11 @@ import type {
 import type { CommandSpec } from "@wireguard-ops-cockpit/tmux-adapter";
 
 export interface AgentRuntimeOptions {
-  plannerRuntime: "copilot-cli" | "demo-local";
+  plannerRuntime: "copilot-cli" | "demo-local" | "opencode";
   copilotExecutable: string;
   copilotModel: string | null;
+  opencodeExecutable: string;
+  opencodeModel: string | null;
 }
 
 export const INTERNAL_EXECUTION_AGENTS = {
@@ -457,12 +459,19 @@ function buildPlannerAgent(plannerRuntime: AgentRuntimeOptions["plannerRuntime"]
     id: "planner-agent",
     name: "Planner agent",
     description:
-      plannerRuntime === "copilot-cli"
-        ? "Runs GitHub Copilot CLI inside the task tmux session to propose a structured repair or maintenance plan before safety review, policy checks, approvals, and bounded execution continue."
-        : "Produces a structured repair or maintenance plan in the task session before safety review, policy checks, approvals, and bounded execution continue.",
+      plannerRuntime === "opencode"
+        ? "Runs OpenCode inside the task tmux session to propose a structured repair or maintenance plan before safety review, policy checks, approvals, and bounded execution continue."
+        : plannerRuntime === "copilot-cli"
+          ? "Runs GitHub Copilot CLI inside the task tmux session to propose a structured repair or maintenance plan before safety review, policy checks, approvals, and bounded execution continue."
+          : "Produces a structured repair or maintenance plan in the task session before safety review, policy checks, approvals, and bounded execution continue.",
     requiresApproval: false,
     privilegedHelperRequested: false,
-    integration: plannerRuntime === "copilot-cli" ? "copilot-cli" : "demo-local",
+    integration:
+      plannerRuntime === "opencode"
+        ? "opencode"
+        : plannerRuntime === "copilot-cli"
+          ? "copilot-cli"
+          : "demo-local",
     supervisionMode: "none",
     executionAuthority: "advisory-only",
     promptContractId: "planner-v1",
@@ -499,12 +508,19 @@ function buildSupervisedRepairAgent(plannerRuntime: AgentRuntimeOptions["planner
     id: "supervised-repair-agent",
     name: "Supervised repair agent",
     description:
-      plannerRuntime === "copilot-cli"
-        ? "Runs GitHub Copilot CLI in the task tmux session as an observed checkpoint actor that proposes staged remediation steps and pauses for operator review."
-        : "Produces staged remediation checkpoints in the task session and pauses for operator review before any bounded follow-up continues.",
+      plannerRuntime === "opencode"
+        ? "Runs OpenCode in the task tmux session as an observed checkpoint actor that proposes staged remediation steps and pauses for operator review."
+        : plannerRuntime === "copilot-cli"
+          ? "Runs GitHub Copilot CLI in the task tmux session as an observed checkpoint actor that proposes staged remediation steps and pauses for operator review."
+          : "Produces staged remediation checkpoints in the task session and pauses for operator review before any bounded follow-up continues.",
     requiresApproval: true,
     privilegedHelperRequested: false,
-    integration: plannerRuntime === "copilot-cli" ? "copilot-cli" : "demo-local",
+    integration:
+      plannerRuntime === "opencode"
+        ? "opencode"
+        : plannerRuntime === "copilot-cli"
+          ? "copilot-cli"
+          : "demo-local",
     supervisionMode: "session-observed",
     executionAuthority: "advisory-only",
     promptContractId: "supervised-repair-v1",
@@ -612,7 +628,9 @@ export function buildAgentCommand(
   runtimeOptions: AgentRuntimeOptions = {
     plannerRuntime: "copilot-cli",
     copilotExecutable: "copilot",
-    copilotModel: null
+    copilotModel: null,
+    opencodeExecutable: "opencode",
+    opencodeModel: null
   }
 ): { executable: string; args: string[]; cwd: string } {
   if (runtimeOptions.plannerRuntime === "demo-local") {
@@ -629,6 +647,32 @@ export function buildAgentCommand(
         "--prompt",
         prompt
       ],
+      cwd: repoRoot
+    };
+  }
+
+  if (runtimeOptions.plannerRuntime === "opencode") {
+    const agentPrompt = buildAgentPrompt(agent, prompt);
+    const modelArgs = runtimeOptions.opencodeModel
+      ? [`--model ${shellQuote(runtimeOptions.opencodeModel)}`]
+      : [];
+    const secretEnvVars = ["COCKPIT_ADMIN_PASSWORD", "COCKPIT_TERMINAL_SIGNING_SECRET"].join(",");
+    const script = [
+      "set -euo pipefail",
+      `planner_executable=${shellQuote(runtimeOptions.opencodeExecutable)}`,
+      'if ! command -v "$planner_executable" >/dev/null 2>&1 && [ ! -x "$planner_executable" ]; then',
+      '  printf "Configured OpenCode runtime %s was not found.\\n" "$planner_executable"',
+      "  exec bash",
+      "fi",
+      `"$planner_executable" run --prompt ${shellQuote(agentPrompt)} ${modelArgs.join(" ")} --dir ${shellQuote(repoRoot)} --print-logs`,
+      'status=$?',
+      'printf "\\nPlanner runtime exited with status %s.\\n" "$status"',
+      "exec bash"
+    ].join("; ");
+
+    return {
+      executable: "bash",
+      args: ["-lc", script],
       cwd: repoRoot
     };
   }

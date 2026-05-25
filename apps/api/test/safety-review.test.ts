@@ -65,13 +65,45 @@ describe("runbook safety review", () => {
         repoRoot: process.cwd(),
         plannerRuntime: "copilot-cli",
         copilotExecutable: "__missing_copilot_binary__",
-        copilotModel: null
+        copilotModel: null,
+        opencodeExecutable: "opencode",
+        opencodeModel: null
       }
     );
 
     expect(review.verdict).toBe("blocked");
     expect(review.summary).toContain("blocked");
     expect(review.details.parseStatus).toBe("error");
+    expect(review.details.runbookVersionHash).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it("fails closed for high-risk runbooks when the OpenCode runtime is unavailable", async () => {
+    const runbook = findRunbook("nextcloud-update-plan");
+    expect(runbook).toBeDefined();
+
+    const review = await generateRunbookSafetyReview(
+      {
+        runbook: runbook!,
+        runbookVersionHash: computeRunbookVersionHash(runbook!),
+        riskClass: "high",
+        sessionId: "session-3",
+        trigger: "manual",
+        scheduleId: null
+      },
+      {
+        repoRoot: process.cwd(),
+        plannerRuntime: "opencode",
+        copilotExecutable: "copilot",
+        copilotModel: null,
+        opencodeExecutable: "__missing_opencode_binary__",
+        opencodeModel: null
+      }
+    );
+
+    expect(review.verdict).toBe("blocked");
+    expect(review.summary).toContain("blocked");
+    expect(review.details.parseStatus).toBe("error");
+    expect(review.details.source).toBe("opencode");
     expect(review.details.runbookVersionHash).toMatch(/^[a-f0-9]{64}$/);
   });
 });
