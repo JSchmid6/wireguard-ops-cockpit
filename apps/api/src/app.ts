@@ -156,7 +156,7 @@ function createInitialCheckpointState(
 ): { checkpoints: ExecutionCheckpointState[]; activeCheckpointId: string | null } {
   const checkpoints = checkpointContract.map((checkpoint, index) => ({
     ...checkpoint,
-    status: index === 0 ? "awaiting_operator" : "planned"
+    status: (index === 0 ? "awaiting_operator" : "planned") as ExecutionCheckpointState["status"],
   }));
 
   return {
@@ -478,7 +478,9 @@ export async function createApp(options: AppOptions = {}) {
         repoRoot: config.repoRoot,
         plannerRuntime: config.plannerRuntime,
         copilotExecutable: config.copilotExecutable,
-        copilotModel: config.copilotModel
+        copilotModel: config.copilotModel,
+        opencodeExecutable: config.opencodeExecutable,
+        opencodeModel: config.opencodeModel
       }
     );
     const planState = resolveRunbookPlanState(runbook, safetyReview);
@@ -1032,7 +1034,9 @@ export async function createApp(options: AppOptions = {}) {
     const command = buildAgentCommand(config.repoRoot, agent, prompt, {
       plannerRuntime: config.plannerRuntime,
       copilotExecutable: config.copilotExecutable,
-      copilotModel: config.copilotModel
+      copilotModel: config.copilotModel,
+      opencodeExecutable: config.opencodeExecutable,
+      opencodeModel: config.opencodeModel
     });
     const checkpointContract = parseCheckpointContractValue(plan.normalizedInput.checkpointContract);
     const checkpointState = createInitialCheckpointState(checkpointContract);
