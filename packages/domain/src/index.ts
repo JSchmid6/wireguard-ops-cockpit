@@ -186,7 +186,7 @@ export interface AgentManifest {
   description: string;
   requiresApproval: boolean;
   privilegedHelperRequested: boolean;
-  integration: "demo-local" | "control-plane" | "copilot-cli";
+  integration: "demo-local" | "control-plane" | "copilot-cli" | "opencode";
   supervisionMode: AgentSupervisionMode;
   executionAuthority: AgentExecutionAuthority;
   promptContractId: string;
