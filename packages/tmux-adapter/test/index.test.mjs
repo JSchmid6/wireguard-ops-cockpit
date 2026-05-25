@@ -36,6 +36,7 @@ test("auto mode falls back to disabled when tmux is unavailable", (t) => {
 
 test("tmux adapter creates sessions, lists them and launches commands", (t) => {
   const calls = [];
+  const seenSessions = new Set();
 
   t.mock.method(__tmuxTestHarness, "spawnSync", (command, args, options) => {
     calls.push({ command, args, options });
@@ -44,8 +45,11 @@ test("tmux adapter creates sessions, lists them and launches commands", (t) => {
       case "-V":
         return { status: 0, stdout: "tmux 3.4", stderr: "" };
       case "has-session":
-        return { status: 1, stdout: "", stderr: "missing session" };
+        return seenSessions.has(args.at(-1))
+          ? { status: 0, stdout: "", stderr: "" }
+          : { status: 1, stdout: "", stderr: "missing session" };
       case "new-session":
+        seenSessions.add(args[args.indexOf("-s") + 1]);
         return { status: 0, stdout: "", stderr: "" };
       case "list-sessions":
         return { status: 0, stdout: "alpha\nbeta\n", stderr: "" };
@@ -94,6 +98,59 @@ test("tmux adapter creates sessions, lists them and launches commands", (t) => {
     ],
     options: { encoding: "utf8" }
   });
+});
+
+test("tmux adapter recreates a missing session before launching a command", (t) => {
+  const calls = [];
+
+  t.mock.method(__tmuxTestHarness, "spawnSync", (command, args, options) => {
+    calls.push({ command, args, options });
+
+    switch (args[0]) {
+      case "-V":
+        return { status: 0, stdout: "tmux 3.4", stderr: "" };
+      case "has-session":
+        return { status: 1, stdout: "", stderr: "missing session" };
+      case "new-session":
+        return { status: 0, stdout: "", stderr: "" };
+      case "new-window":
+        return { status: 0, stdout: "", stderr: "" };
+      default:
+        throw new Error(`Unexpected tmux args: ${args.join(" ")}`);
+    }
+  });
+
+  const adapter = createTmuxAdapter();
+
+  assert.deepEqual(
+    adapter.launchCommand("incident-debug", "agent-demo", {
+      executable: "node",
+      args: ["demo.js"]
+    }),
+    {
+      started: true,
+      backend: "tmux",
+      note: "started node in tmux window agent-demo"
+    }
+  );
+
+  assert.deepEqual(calls.slice(-3), [
+    {
+      command: "tmux",
+      args: ["has-session", "-t", "incident-debug"],
+      options: { encoding: "utf8" }
+    },
+    {
+      command: "tmux",
+      args: ["new-session", "-d", "-s", "incident-debug", "-n", "main"],
+      options: { encoding: "utf8" }
+    },
+    {
+      command: "tmux",
+      args: ["new-window", "-d", "-t", "incident-debug", "-n", "agent-demo", "node", "demo.js"],
+      options: { encoding: "utf8" }
+    }
+  ]);
 });
 
 test("tmux adapter surfaces tmux errors and invalid launch inputs", (t) => {

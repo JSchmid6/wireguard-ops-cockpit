@@ -73,13 +73,16 @@ class DisabledTmuxAdapter implements TmuxAdapter {
 class LocalTmuxAdapter implements TmuxAdapter {
   readonly backend = "tmux" as const;
 
-  ensureSession(name: string): SessionHandle {
-    assertSafeName(name, "session name");
-
+  private ensureSessionExists(name: string): void {
     const existing = __tmuxTestHarness.spawnSync("tmux", ["has-session", "-t", name], { encoding: "utf8" });
     if (existing.status !== 0) {
       runTmux(["new-session", "-d", "-s", name, "-n", "main"]);
     }
+  }
+
+  ensureSession(name: string): SessionHandle {
+    assertSafeName(name, "session name");
+    this.ensureSessionExists(name);
 
     return { name, backend: this.backend };
   }
@@ -106,6 +109,8 @@ class LocalTmuxAdapter implements TmuxAdapter {
     if (command.executable.includes("\u0000")) {
       throw new Error("command executable contains invalid characters");
     }
+
+    this.ensureSessionExists(sessionName);
 
     const args = ["new-window", "-d", "-t", sessionName, "-n", windowName];
     if (command.cwd) {
