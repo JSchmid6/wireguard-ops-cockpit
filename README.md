@@ -48,7 +48,7 @@ Read these first:
 
 1. Copy `.env.example` to `.env`
 2. Change `COCKPIT_ADMIN_PASSWORD`
-3. Make sure GitHub Copilot CLI is installed and authenticated if you want a real `planner-agent` runtime
+3. Make sure GitHub Copilot CLI or OpenCode is installed and authenticated if you want a real `planner-agent` runtime
 4. Install dependencies
 5. Start the API and web UI in separate terminals
 
@@ -62,10 +62,13 @@ npm run dev:web
 Planner runtime notes:
 
 - default planner runtime: `COCKPIT_PLANNER_RUNTIME=copilot-cli`
+- OpenCode runtime: `COCKPIT_PLANNER_RUNTIME=opencode`
 - fallback planner runtime: `COCKPIT_PLANNER_RUNTIME=demo-local`
-- default executable: `COCKPIT_COPILOT_EXECUTABLE=copilot`
-- optional model pin: `COCKPIT_COPILOT_MODEL=gpt-5.4`
-- the planner runtime is intentionally bounded to plan-only Copilot CLI usage; host mutation still stays behind approvals and bounded runbooks
+- default Copilot executable: `COCKPIT_COPILOT_EXECUTABLE=copilot`
+- optional Copilot model pin: `COCKPIT_COPILOT_MODEL=gpt-5.4`
+- default OpenCode executable: `COCKPIT_OPENCODE_EXECUTABLE=opencode`
+- optional OpenCode model pin: `COCKPIT_OPENCODE_MODEL=openai/gpt-4o`
+- the planner runtime is intentionally bounded to plan-only usage; host mutation still stays behind approvals and bounded runbooks
 - runbook plans now attach a reviewable safety report in Session detail; high-risk plans stay blocked or pending approval until that review path clears
 - runbook cards now expose reviewed workflow steps so multi-step flows such as Nextcloud maintenance can stay visible in the dashboard
 - the Nextcloud maintenance path is now split into bounded preflight, maintenance-mode, occ-upgrade, maintenance-exit, verification, and optional restart runbooks instead of one larger follow-up step
@@ -148,7 +151,7 @@ Important notes:
 
 - set `COCKPIT_BIND_IP` to the WireGuard IP on the VPS before startup
 - set `COCKPIT_TMUX_MODE=auto` for the host runtime
-- install and authenticate GitHub Copilot CLI on the VPS if the planner runtime should be real instead of `demo-local`
+- install and authenticate GitHub Copilot CLI or OpenCode on the VPS if the planner runtime should be real instead of `demo-local`
 - set `COCKPIT_TTYD_BASE_URL=/terminal` and a unique `COCKPIT_TERMINAL_SIGNING_SECRET`
 - set `COCKPIT_COOKIE_SECURE=true` only when the stack is behind HTTPS
 - the dashboard stays bound to the WireGuard IP while API and ttyd stay on `127.0.0.1`

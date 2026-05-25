@@ -68,7 +68,11 @@ The detailed control flow lives in `doc/services/execution-control-model.md`.
 
 ## Model guidance
 
-Use the strongest available reasoning model for the `security-champion` role whenever your GitHub Copilot plan and interface allow explicit model choice.
+Use the strongest available reasoning model for the `security-champion` role whenever your runtime and interface allow explicit model choice.
+
+The available model catalog depends on the configured planner runtime:
+
+### Copilot CLI (`COCKPIT_PLANNER_RUNTIME=copilot-cli`)
 
 Recommended priority:
 
@@ -76,7 +80,19 @@ Recommended priority:
 2. **Claude Sonnet 4.6** for good standard-quality review if needed
 3. **GPT-5.4 mini** for cheaper routine work
 
-For architecture and MCP design, a standard model is usually enough. Use GPT-5.4 for the `security-champion` by default unless a stronger security-specialized option becomes available and worth the extra cost.
+### OpenCode (`COCKPIT_PLANNER_RUNTIME=opencode`)
+
+Model selection uses `provider/model` format (e.g. `openai/gpt-4o`, `anthropic/claude-sonnet-4-20250514`). Recommended starting points:
+
+1. **openai/gpt-4o** for general planning and review tasks
+2. **anthropic/claude-sonnet-4-20250514** for safety review and security-critical analysis
+3. **openai/gpt-4.1-mini** for cheaper routine work
+
+Set the model via `COCKPIT_OPENCODE_MODEL=openai/gpt-4o` in `.env`.
+
+### Runtime-agnostic
+
+For architecture and MCP design, a standard model is usually enough. Use the strongest available reasoning model for the `security-champion` by default unless a stronger security-specialized option becomes available and worth the extra cost.
 
 ## Skill strategy
 
