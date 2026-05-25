@@ -18,6 +18,8 @@ describe("loadConfig", () => {
     expect(config.plannerRuntime).toBe("copilot-cli");
     expect(config.copilotExecutable).toBe("copilot");
     expect(config.copilotModel).toBeNull();
+    expect(config.opencodeExecutable).toBe("opencode");
+    expect(config.opencodeModel).toBeNull();
     expect(config.dbPath.endsWith(path.join("data", "cockpit.sqlite"))).toBe(true);
     expect(path.isAbsolute(config.repoRoot)).toBe(true);
   });
@@ -54,5 +56,17 @@ describe("loadConfig", () => {
     expect(config.plannerRuntime).toBe("demo-local");
     expect(config.copilotExecutable).toBe("/usr/local/bin/copilot");
     expect(config.copilotModel).toBe("gpt-5.4");
+  });
+
+  it("resolves the opencode planner runtime", () => {
+    const config = loadConfig({
+      COCKPIT_PLANNER_RUNTIME: "opencode",
+      COCKPIT_OPENCODE_EXECUTABLE: "/usr/local/bin/opencode",
+      COCKPIT_OPENCODE_MODEL: "openai/gpt-4o"
+    });
+
+    expect(config.plannerRuntime).toBe("opencode");
+    expect(config.opencodeExecutable).toBe("/usr/local/bin/opencode");
+    expect(config.opencodeModel).toBe("openai/gpt-4o");
   });
 });
