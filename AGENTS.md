@@ -1,0 +1,82 @@
+# Hermes VPS — Agent Instructions
+
+## System Architecture
+
+Bare-metal Ubuntu VPS (161.97.86.86) running:
+
+| Service | Location | Admin via | DB |
+|---|---|---|---|
+| **Nextcloud 34** | `/var/www/nextcloud`, data `/opt/nextcloud` | occ (as www-data), REST API | MySQL (nextDB) |
+| **GitLab EE 18.8** | `/opt/gitlab` | gitlab-ctl, GitLab API | PostgreSQL (managed) |
+| **WordPress** | `/var/www/html` | wp-cli | MySQL (wordpress) |
+| **Frigate** | Docker, `/opt/frigate` | Frigate UI :5000 | SQLite |
+| **Hermes Agent** | Docker, `hermes-agent` image | docker compose, Hermes CLI | SQLite (state.db) |
+| **Borgmatic** | systemd timer (daily 00:37) | systemctl, borg CLI | n/a |
+| **Apache** | systemd (port 80/443) | systemctl, a2ensite | n/a |
+| **WireGuard** | wg0 (10.0.0.1/24) | wg, wg-quick | n/a |
+| **Cockpit** | Docker (ports 3001,5173) | Cockpit API | SQLite |
+| **Registry** | registry.wejos.de (Apache proxy) | docker login | n/a |
+
+## Network & DNS
+
+- Apache serves all subdomains on 80/443, proxies internally
+- GitLab: Apache → gitlab-workhorse (127.0.0.1:8181)
+- Registry: Apache → GitLab registry (127.0.0.1:5003)
+- Nextcloud Talk HPB: nginx (127.0.0.1:8780)
+- Frigate nginx: 0.0.0.0:5000 (bundled)
+- WireGuard: udp/51820
+
+## Absolute Rules
+
+### Never touch directly
+- `systemctl` on GitLab services → use `gitlab-ctl` ONLY
+- Direct MySQL queries → use `occ` or REST API
+- `iptables` / `ufw` changes without approval
+- `rm -rf` on /opt/nextcloud, /var/www/nextcloud, /opt/gitlab
+
+### Nextcloud
+- occ: `sudo -u www-data php /var/www/nextcloud/occ <cmd>` or `/home/hermes/.hermes/scripts/occ` from Hermes container
+- REST API: `https://nextcloud.wejos.de/remote.php/dav`
+- App passwords only, never admin password
+
+### GitLab
+- Admin: `gitlab-ctl status|restart|tail`
+- API: PAT `glpat-CN...` with api scope
+- Container Registry: `registry.wejos.de`, JWT auth via GitLab
+
+### Hermes Agent
+- Docker container: `hermes` (network_mode: host)
+- Config: `/home/hermes/.hermes/`
+- Compose: `/usr/local/lib/hermes-agent/docker-compose.yml`
+- Restart: `docker compose -f /usr/local/lib/hermes-agent/docker-compose.yml restart gateway`
+
+### Borgmatic Backup
+- Timer: `systemctl list-timers borgmatic.timer`
+- Repo: `ssh://root@10.0.0.5/media/RAID/backup_VServer/borg`
+- Home server: 10.0.0.5 (WireGuard peer)
+
+### Cockpit Runbooks
+- All host operations go through Cockpit Runbooks API
+- Planner (opencode) reviews for safety BEFORE any execution
+- Only allowlisted scripts can run
+- Full audit log at `GET /api/audits`
+
+## Known Pitfalls
+- `nextcloud.wejos.de` → /etc/hosts maps to 127.0.0.1 (Apache serves it)
+- Frigate uses ports 5000-5002 (bundled nginx) — NEVER use these for new services
+- GitLab registry internal port is 5003 (Apache proxies 443→5003)
+- Hermes container can't join Docker bridge networks (network_mode=host)
+- Workhorse switched to Unix socket during reconfigure → Apache must proxy there
+
+---
+## Self-Maintenance Protocol
+
+When you discover new services, changed paths, or undocumented behavior during a runbook review, append your findings above. Format:
+
+```
+## Discovery YYYY-MM-DD
+- <what you found>
+- <action taken or recommended>
+```
+
+This file is the authoritative system context. Keep it current. The next planner run depends on it.

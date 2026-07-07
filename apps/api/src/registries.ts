@@ -689,7 +689,7 @@ export function buildAgentCommand(
     '  printf "Configured Copilot CLI runtime %s was not found.\\n" "$planner_executable"',
     "  exec bash",
     "fi",
-    `"$planner_executable" --mode plan --no-auto-update --disable-builtin-mcps --disallow-temp-dir --no-custom-instructions --deny-tool=shell --deny-tool=write --add-dir ${shellQuote(repoRoot)} --secret-env-vars ${shellQuote(secretEnvVars)} ${modelArgs.join(" ")} -i ${shellQuote(agentPrompt)}`.trim(),
+    `"$planner_executable" --mode plan --no-auto-update --disable-builtin-mcps --disallow-temp-dir --deny-tool=shell --deny-tool=write --add-dir ${shellQuote(repoRoot)} --secret-env-vars ${shellQuote(secretEnvVars)} ${modelArgs.join(" ")} -i ${shellQuote(agentPrompt)}`.trim(),
     'status=$?',
     'printf "\\nPlanner runtime exited with status %s.\\n" "$status"',
     "exec bash"
