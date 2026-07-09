@@ -1338,70 +1338,67 @@ export async function createApp(options: AppOptions = {}) {
     }
 
     const body = (request.body || {}) as {
-      id?: string;
-      name?: string;
-      summary?: string;
-      scriptName?: string;
-      privilegedHelperRequested?: boolean;
-      requiresApproval?: boolean;
+      prompt?: string;
+      sessionId?: string;
     };
 
-    if (!body.id || !body.name || !body.summary || !body.scriptName) {
-      return reply.code(400).send({ message: "id, name, summary, and scriptName are required" });
+    if (!body.prompt || !body.sessionId) {
+      return reply.code(400).send({
+        message: "prompt and sessionId are required. Describe what the runbook should do."
+      });
     }
 
-    // Sanitize id
-    const safeId = body.id.replace(/[^a-z0-9_-]/g, "-").slice(0, 64);
-    const scriptId = body.scriptName.replace(/[^a-z0-9_.-]/g, "-").slice(0, 64);
+    if (body.prompt.length < 10 || body.prompt.length > 2000) {
+      return reply.code(400).send({ message: "prompt must be 10-2000 characters" });
+    }
 
-    const runbook: RunbookDefinition = {
-      id: safeId,
-      name: body.name.slice(0, 120),
-      summary: body.summary.slice(0, 240),
-      requiresSession: true,
-      requiresApproval: body.requiresApproval ?? false,
-      integration: "host-tmux",
-      privilegedHelperRequested: body.privilegedHelperRequested ?? false,
-      reviewStatus: "allowlisted",
-      scriptIds: [scriptId],
-      workflowSteps: [
-        {
-          id: "run-script",
-          label: `Run ${body.scriptName}`,
-          description: body.summary.slice(0, 240),
-          kind: "runbook",
-          integration: "host-tmux",
-          privilegedHelperRequested: body.privilegedHelperRequested ?? false,
-        },
-      ],
-    };
+    const session = database.getSessionByIdForActor(body.sessionId, actor.id);
+    if (!session) {
+      return reply.code(404).send({ message: "session not found" });
+    }
 
-    // Register the runbook dynamically
-    registerDynamicRunbook(runbook);
+    // Launch the planner agent to generate the runbook
+    const plannerAgent = findAgent("planner-agent", "opencode");
+    if (!plannerAgent) {
+      return reply.code(500).send({ message: "planner agent not available" });
+    }
 
-    // Audit the creation
+    const enhancedPrompt = `Create a new Cockpit runbook. ${body.prompt}
+
+Follow these rules:
+1. Write the shell script to /opt/wireguard-ops-cockpit/bin/<slug>.sh
+2. The script must be idempotent and safe to re-run
+3. No destructive operations (rm -rf, dd, etc.) unless explicitly requested
+4. Output the runbook definition as JSON with fields: id, name, summary, requiresApproval, privilegedHelperRequested
+5. Use a descriptive kebab-case id based on the task`;
+
+    const plan = createAgentPlan(actor, plannerAgent, session.id, enhancedPrompt);
+
     database.createAudit({
       actorId: actor.id,
-      action: "runbook.dynamic.created",
-      targetType: "runbook",
-      targetId: safeId,
+      action: "runbook.dynamic.ordered",
+      targetType: "execution-plan",
+      targetId: plan.id,
       details: {
-        name: runbook.name,
-        summary: runbook.summary,
-        requiresApproval: runbook.requiresApproval,
-        privilegedHelperRequested: runbook.privilegedHelperRequested,
-        scriptId,
+        prompt: body.prompt.slice(0, 240),
+        sessionId: session.id,
       },
     });
 
+    if (plannerAgent.requiresApproval) {
+      return reply.code(202).send({
+        message: "runbook order submitted for approval",
+        planId: plan.id,
+        ...createPendingApprovalForPlan(plan, actor, "Planner agent requires approval before generating the runbook script."),
+      });
+    }
+
+    const executed = executeAgentPlan(plan, actor, plannerAgent);
     return reply.code(201).send({
-      message: "runbook registered",
-      runbook: {
-        id: runbook.id,
-        name: runbook.name,
-        summary: runbook.summary,
-        requiresApproval: runbook.requiresApproval,
-      },
+      message: "runbook generation started",
+      planId: executed.plan?.id ?? plan.id,
+      sessionId: session.id,
+      note: "The planner agent is generating the runbook script. Check the audit log for results.",
     });
   });
 
