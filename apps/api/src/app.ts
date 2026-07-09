@@ -27,7 +27,9 @@ import {
   findAgent,
   listScripts,
   listAgents,
-  findRunbook
+  findRunbook,
+  registerDynamicRunbook,
+  listDynamicRunbooks
 } from "./registries.js";
 import { generateRunbookSafetyReview, type SafetyReviewRunner } from "./safety-review.js";
 
@@ -1326,7 +1328,81 @@ export async function createApp(options: AppOptions = {}) {
       return;
     }
 
-    return { runbooks: RUNBOOKS };
+    return { runbooks: [...RUNBOOKS, ...listDynamicRunbooks()] };
+  });
+
+  app.post("/api/runbooks", async (request, reply) => {
+    const actor = await requireActor(request, reply, database);
+    if (!actor) {
+      return;
+    }
+
+    const body = (request.body || {}) as {
+      id?: string;
+      name?: string;
+      summary?: string;
+      scriptName?: string;
+      privilegedHelperRequested?: boolean;
+      requiresApproval?: boolean;
+    };
+
+    if (!body.id || !body.name || !body.summary || !body.scriptName) {
+      return reply.code(400).send({ message: "id, name, summary, and scriptName are required" });
+    }
+
+    // Sanitize id
+    const safeId = body.id.replace(/[^a-z0-9_-]/g, "-").slice(0, 64);
+    const scriptId = body.scriptName.replace(/[^a-z0-9_.-]/g, "-").slice(0, 64);
+
+    const runbook: RunbookDefinition = {
+      id: safeId,
+      name: body.name.slice(0, 120),
+      summary: body.summary.slice(0, 240),
+      requiresSession: true,
+      requiresApproval: body.requiresApproval ?? false,
+      integration: "host-tmux",
+      privilegedHelperRequested: body.privilegedHelperRequested ?? false,
+      reviewStatus: "allowlisted",
+      scriptIds: [scriptId],
+      workflowSteps: [
+        {
+          id: "run-script",
+          label: `Run ${body.scriptName}`,
+          description: body.summary.slice(0, 240),
+          kind: "runbook",
+          integration: "host-tmux",
+          privilegedHelperRequested: body.privilegedHelperRequested ?? false,
+        },
+      ],
+    };
+
+    // Register the runbook dynamically
+    registerDynamicRunbook(runbook);
+
+    // Audit the creation
+    database.createAudit({
+      actorId: actor.id,
+      action: "runbook.dynamic.created",
+      targetType: "runbook",
+      targetId: safeId,
+      details: {
+        name: runbook.name,
+        summary: runbook.summary,
+        requiresApproval: runbook.requiresApproval,
+        privilegedHelperRequested: runbook.privilegedHelperRequested,
+        scriptId,
+      },
+    });
+
+    return reply.code(201).send({
+      message: "runbook registered",
+      runbook: {
+        id: runbook.id,
+        name: runbook.name,
+        summary: runbook.summary,
+        requiresApproval: runbook.requiresApproval,
+      },
+    });
   });
 
   app.get("/api/schedules", async (request, reply) => {

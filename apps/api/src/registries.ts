@@ -556,8 +556,18 @@ export function computeAgentManifestDigest(agent: AgentManifest): string {
   return createHash("sha256").update(JSON.stringify(agent)).digest("hex");
 }
 
+const DYNAMIC_RUNBOOKS = new Map<string, RunbookDefinition>();
+
+export function registerDynamicRunbook(runbook: RunbookDefinition): void {
+  DYNAMIC_RUNBOOKS.set(runbook.id, runbook);
+}
+
+export function listDynamicRunbooks(): RunbookDefinition[] {
+  return Array.from(DYNAMIC_RUNBOOKS.values());
+}
+
 export function findRunbook(runbookId: string): RunbookDefinition | undefined {
-  return RUNBOOKS.find((runbook) => runbook.id === runbookId);
+  return DYNAMIC_RUNBOOKS.get(runbookId) ?? RUNBOOKS.find((runbook) => runbook.id === runbookId);
 }
 
 export function findScript(scriptId: string): ScriptDefinition | undefined {
