@@ -20,7 +20,7 @@ services:
       - web-node-modules:/workspace/node_modules
     env_file:
       - .env
-    command: sh -c "npm install && npm run dev:web -- --host 0.0.0.0"
+    command: sh -c "npm install && npm run dev:web"
     ports:
       - "5173:5173"
     depends_on:

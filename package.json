@@ -12,6 +12,9 @@
     "dev:api": "npm run dev -w @wireguard-ops-cockpit/api",
     "dev:web": "npm run dev -w @wireguard-ops-cockpit/web",
     "check": "npm run build && npm run test"
+  },
+  "dependencies": {
+    "install": "^0.13.0",
+    "npm": "^11.18.0"
   }
 }
-
