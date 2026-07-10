@@ -1436,16 +1436,35 @@ Follow these rules:
     const executed = executeAgentPlan(plan, actor, plannerAgent);
     const orderPrompt = body.prompt!; // Validated non-null above
 
-    // Auto-register: capture planner output, save script, register runbook
+    // Auto-register: read planner output from log file or tmux, save markdown, register
     const autoRegister = async () => {
       try {
         await new Promise(r => setTimeout(r, 45000));
         const { execSync } = await import("node:child_process");
-        const wmName = slugify(`agent-${plannerAgent.id}`);
-        const raw = execSync(
-          `tmux capture-pane -t "${session.tmuxSessionName}:${wmName}" -p -S -300 2>/dev/null || true`,
-          { encoding: "utf-8", timeout: 5000, maxBuffer: 2 * 1024 * 1024 }
-        ).trim();
+
+        // Read from tee'd log file first (more reliable than tmux pane)
+        let raw = "";
+        try {
+          raw = execSync("cat /tmp/opencode-last.log 2>/dev/null || true", { encoding: "utf-8", timeout: 3000, maxBuffer: 2 * 1024 * 1024 }).trim();
+        } catch { /* ignore */ }
+
+        // Fallback to tmux pane if log file is empty
+        if (raw.length < 100) {
+          const wmName = slugify(`agent-${plannerAgent.id}`);
+          raw = execSync(
+            `tmux capture-pane -t "${session.tmuxSessionName}:${wmName}" -p -S -300 2>/dev/null || true`,
+            { encoding: "utf-8", timeout: 5000, maxBuffer: 2 * 1024 * 1024 }
+          ).trim();
+        }
+
+        // Final fallback: capture main window
+        if (!raw || raw.length < 20) {
+          raw = execSync(
+            `tmux capture-pane -t "${session.tmuxSessionName}" -p -S -300 2>/dev/null || true`,
+            { encoding: "utf-8", timeout: 5000, maxBuffer: 2 * 1024 * 1024 }
+          ).trim();
+        }
+
         if (!raw || raw.length < 20) return;
 
         const name = orderPrompt.slice(0, 60).replace(/[^a-zA-Z0-9 ]/g, "").trim() || "Generated Runbook";
