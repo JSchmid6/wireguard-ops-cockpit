@@ -1499,14 +1499,30 @@ Follow these rules:
           details: { name, script: scriptName },
         });
 
-        // Step 2: Launch runner agent to execute the plan from the markdown
+        // Step 2: Safety review the generated markdown before execution
         const runnerAgent = findAgent("supervised-repair-agent", "opencode");
         if (runnerAgent && session.id) {
           const runnerPrompt = `Execute the runbook plan in ${scriptPath}. Read the file, understand the commands, and run them step by step. Report results.`;
           const runnerPlan = createAgentPlan(actor, runnerAgent, session.id, runnerPrompt);
-          if (!runnerPlan.requiresApproval) {
-            executeAgentPlan(runnerPlan, actor, runnerAgent);
+          
+          // Safety-review the generated markdown content
+          const safetyReview = await safetyReviewRunner(
+            { runbook, runbookVersionHash: "", riskClass: "moderate", sessionId: session.id, trigger: "manual" },
+            { repoRoot: config.repoRoot, plannerRuntime: config.plannerRuntime, copilotExecutable: config.copilotExecutable, copilotModel: config.copilotModel, opencodeExecutable: config.opencodeExecutable, opencodeModel: config.opencodeModel }
+          );
+          
+          if (safetyReview.verdict === "blocked") {
+            database.createAudit({ actorId: actor.id, action: "runbook.dynamic.blocked", targetType: "runbook", targetId: rbId, details: { reason: safetyReview.summary } });
+            return;
           }
+          
+          if (safetyReview.verdict === "approval_required" || runnerPlan.requiresApproval) {
+            createPendingApprovalForPlan(runnerPlan, actor, `Runbook "${name}" requires approval. Safety: ${safetyReview.summary}`);
+            database.createAudit({ actorId: actor.id, action: "runbook.dynamic.pending_approval", targetType: "runbook", targetId: rbId, details: { reason: safetyReview.summary } });
+            return;
+          }
+
+          executeAgentPlan(runnerPlan, actor, runnerAgent);
         }
       } catch { /* best effort — planner output capture is async */ }
     };
