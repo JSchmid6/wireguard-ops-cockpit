@@ -1114,8 +1114,18 @@ export async function createApp(options: AppOptions = {}) {
       }
     });
 
-    return { plan: updatedPlan, job };
-  }
+    // Wait for agent, then capture tmux output
+    await new Promise(resolve => setTimeout(resolve, 5000));
+    let output: string | null = null;
+    try {
+      const { execSync } = await import("node:child_process");
+      output = execSync(
+        `tmux capture-pane -t "${session.tmuxSessionName}:${launch.windowName}" -p 2>/dev/null || true`,
+        { encoding: "utf-8", timeout: 5000, maxBuffer: 1024 * 1024 }
+      ).trim() || null;
+    } catch { /* ignore */ }
+
+    return { plan: updatedPlan, job, output };
 
   database.initialize();
   database.seedAdmin(config.adminUsername, config.adminPassword);
