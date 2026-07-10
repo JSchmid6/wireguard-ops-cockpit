@@ -673,7 +673,7 @@ export function buildAgentCommand(
        '  printf "Configured OpenCode runtime %s was not found.\\n" "$planner_executable"',
        "  exec bash",
        "fi",
-      `DEEPSEEK_API_KEY="\${DEEPSEEK_API_KEY:-}" "$planner_executable" run ${modelArgs.join(" ")} --print-logs ${shellQuote(agentPrompt)}`,
+      `DEEPSEEK_API_KEY="\${DEEPSEEK_API_KEY:-}" "$planner_executable" run --auto ${modelArgs.join(" ")} --print-logs ${shellQuote(agentPrompt)}`,
       'status=$?',
       'printf "\\nPlanner runtime exited with status %s.\\n" "$status"',
       "exec bash"
