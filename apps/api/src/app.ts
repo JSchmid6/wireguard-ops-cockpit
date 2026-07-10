@@ -1507,7 +1507,7 @@ Follow these rules:
           
           // Safety-review the generated markdown content
           const safetyReview = await safetyReviewRunner(
-            { runbook, runbookVersionHash: "", riskClass: "moderate", sessionId: session.id, trigger: "manual" },
+            { runbook, runbookVersionHash: "", riskClass: "moderate", sessionId: session.id, trigger: "manual", scheduleId: null },
             { repoRoot: config.repoRoot, plannerRuntime: config.plannerRuntime, copilotExecutable: config.copilotExecutable, copilotModel: config.copilotModel, opencodeExecutable: config.opencodeExecutable, opencodeModel: config.opencodeModel }
           );
           
