@@ -674,7 +674,7 @@ export function buildAgentCommand(
       '  printf "Configured OpenCode runtime %s was not found.\\n" "$planner_executable"',
       "  exec bash",
       "fi",
-      `"$planner_executable" run --prompt ${shellQuote(agentPrompt)} ${modelArgs.join(" ")} --dir ${shellQuote(repoRoot)} --print-logs`,
+      `"$planner_executable" run ${modelArgs.join(" ")} --print-logs ${shellQuote(agentPrompt)}`,
       'status=$?',
       'printf "\\nPlanner runtime exited with status %s.\\n" "$status"',
       "exec bash"
