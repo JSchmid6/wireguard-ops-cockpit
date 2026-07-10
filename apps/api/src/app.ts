@@ -1322,10 +1322,12 @@ export async function createApp(options: AppOptions = {}) {
       return reply.code(404).send({ message: "session not found" });
     }
 
+    const plansList = database.listExecutionPlansForSession(sessionId);
     return {
       session,
-      plans: database.listExecutionPlansForSession(sessionId),
-      jobs: database.listJobsForSession(sessionId)
+      plans: plansList,
+      jobs: database.listJobsForSession(sessionId),
+      agentStatus: session.tmuxSessionName && plansList.length > 0 ? "completed" : "none"
     };
   });
 
