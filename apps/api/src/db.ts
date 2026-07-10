@@ -314,6 +314,17 @@ export class CockpitDatabase {
         FOREIGN KEY (owner_id) REFERENCES users(id),
         FOREIGN KEY (session_id) REFERENCES cockpit_sessions(id)
       );
+      CREATE TABLE IF NOT EXISTS dynamic_runbooks (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        requires_approval INTEGER NOT NULL DEFAULT 0,
+        privileged_helper BOOLEAN NOT NULL DEFAULT 0,
+        script_id TEXT NOT NULL,
+        created_by TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (created_by) REFERENCES users(id)
+      );
     `);
 
     const cockpitSessionColumns = this.database
@@ -1072,5 +1083,40 @@ export class CockpitDatabase {
       createdAt: row.created_at,
       updatedAt: row.updated_at
     };
+  }
+
+  // --- Dynamic runbooks ---
+
+  createDynamicRunbook(input: {
+    id: string;
+    name: string;
+    summary: string;
+    requiresApproval: boolean;
+    privilegedHelper: boolean;
+    scriptId: string;
+    createdBy: string;
+  }): void {
+    this.database
+      .prepare(
+        `INSERT INTO dynamic_runbooks (id, name, summary, requires_approval, privileged_helper, script_id, created_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(input.id, input.name, input.summary, input.requiresApproval ? 1 : 0, input.privilegedHelper ? 1 : 0, input.scriptId, input.createdBy, new Date().toISOString());
+  }
+
+  listDynamicRunbooks(): Array<{ id: string; name: string; summary: string; requiresApproval: boolean; scriptId: string }> {
+    const rows = this.database.prepare("SELECT * FROM dynamic_runbooks ORDER BY created_at DESC").all() as Array<Record<string, unknown>>;
+    return rows.map((r: Record<string, unknown>) => ({
+      id: r.id as string,
+      name: r.name as string,
+      summary: r.summary as string,
+      requiresApproval: !!(r.requires_approval as number),
+      scriptId: r.script_id as string,
+    }));
+  }
+
+  deleteDynamicRunbook(id: string, actorId: string): boolean {
+    const result = this.database.prepare("DELETE FROM dynamic_runbooks WHERE id = ? AND created_by = ?").run(id, actorId);
+    return result.changes > 0;
   }
 }

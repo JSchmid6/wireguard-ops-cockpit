@@ -562,8 +562,36 @@ export function registerDynamicRunbook(runbook: RunbookDefinition): void {
   DYNAMIC_RUNBOOKS.set(runbook.id, runbook);
 }
 
+export function unregisterDynamicRunbook(id: string): boolean {
+  return DYNAMIC_RUNBOOKS.delete(id);
+}
+
 export function listDynamicRunbooks(): RunbookDefinition[] {
   return Array.from(DYNAMIC_RUNBOOKS.values());
+}
+
+export function loadDynamicRunbooks(runbooks: Array<{ id: string; name: string; summary: string; requiresApproval: boolean; scriptId: string }>): void {
+  for (const r of runbooks) {
+    DYNAMIC_RUNBOOKS.set(r.id, {
+      id: r.id,
+      name: r.name,
+      summary: r.summary,
+      requiresSession: true,
+      requiresApproval: r.requiresApproval,
+      integration: "host-tmux",
+      privilegedHelperRequested: false,
+      reviewStatus: "allowlisted",
+      scriptIds: [r.scriptId],
+      workflowSteps: [{
+        id: "run-script",
+        label: `Run ${r.scriptId}`,
+        description: r.summary,
+        kind: "runbook",
+        integration: "host-tmux",
+        privilegedHelperRequested: false,
+      }],
+    });
+  }
 }
 
 export function findRunbook(runbookId: string): RunbookDefinition | undefined {

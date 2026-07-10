@@ -29,6 +29,8 @@ import {
   listAgents,
   findRunbook,
   registerDynamicRunbook,
+  unregisterDynamicRunbook,
+  loadDynamicRunbooks,
   listDynamicRunbooks
 } from "./registries.js";
 import { generateRunbookSafetyReview, type SafetyReviewRunner } from "./safety-review.js";
@@ -1122,6 +1124,8 @@ export async function createApp(options: AppOptions = {}) {
 
   database.initialize();
   database.seedAdmin(config.adminUsername, config.adminPassword);
+  // Load persisted dynamic runbooks
+  loadDynamicRunbooks(database.listDynamicRunbooks());
   for (const user of options.bootstrapUsers || []) {
     database.createUser(user.username, user.password, user.role || "admin");
   }
@@ -1434,6 +1438,32 @@ Follow these rules:
       sessionId: session.id,
       note: "The planner agent is generating the runbook script. Check the audit log for results.",
     });
+  });
+
+  app.delete("/api/runbooks/:runbookId", async (request, reply) => {
+    const actor = await requireActor(request, reply, database);
+    if (!actor) return;
+
+    const { runbookId } = request.params as { runbookId: string };
+    if (RUNBOOKS.some((r) => r.id === runbookId)) {
+      return reply.code(403).send({ message: "built-in runbooks cannot be deleted" });
+    }
+
+    const deleted = database.deleteDynamicRunbook(runbookId, actor.id);
+    if (!deleted) {
+      return reply.code(404).send({ message: "runbook not found or not authorized" });
+    }
+
+    unregisterDynamicRunbook(runbookId);
+    database.createAudit({
+      actorId: actor.id,
+      action: "runbook.dynamic.deleted",
+      targetType: "runbook",
+      targetId: runbookId,
+      details: {},
+    });
+
+    return { message: "deleted" };
   });
 
   app.get("/api/schedules", async (request, reply) => {
