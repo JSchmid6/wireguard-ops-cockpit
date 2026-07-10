@@ -599,6 +599,19 @@ function buildPlannerPrompt(prompt: string): string {
   ].join("\n");
 }
 
+export function buildRunnerPrompt(markdownPath: string): string {
+  return [
+    "You are the runner-agent for wireguard-ops-cockpit.",
+    "Read the runbook plan at " + markdownPath + ".",
+    "Execute the commands found in the plan. Do NOT ask for permission.",
+    "Report what you did and the results. Be concise.",
+    "RULES:",
+    "- Execute step by step. Stop on error unless recovery is safe.",
+    "- Never delete data or change permissions unless explicitly instructed.",
+    "- Use --auto mode: no approval, no waiting.",
+  ].join("\n");
+}
+
 function buildSupervisedRepairPrompt(prompt: string): string {
   return [
     "You are the supervised-repair-agent for wireguard-ops-cockpit.",

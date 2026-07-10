@@ -325,6 +325,17 @@ export class CockpitDatabase {
         created_at TEXT NOT NULL,
         FOREIGN KEY (created_by) REFERENCES users(id)
       );
+      CREATE TABLE IF NOT EXISTS runbook_results (
+        id TEXT PRIMARY KEY,
+        runbook_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        exit_code INTEGER,
+        output_text TEXT,
+        output_path TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (session_id) REFERENCES cockpit_sessions(id)
+      );
     `);
 
     const cockpitSessionColumns = this.database
@@ -1118,5 +1129,36 @@ export class CockpitDatabase {
   deleteDynamicRunbook(id: string, actorId: string): boolean {
     const result = this.database.prepare("DELETE FROM dynamic_runbooks WHERE id = ? AND created_by = ?").run(id, actorId);
     return result.changes > 0;
+  }
+
+  // --- Runbook results ---
+
+  saveRunbookResult(input: {
+    id: string;
+    runbookId: string;
+    sessionId: string;
+    status: string;
+    exitCode: number | null;
+    outputText: string;
+    outputPath: string;
+  }): void {
+    this.database.prepare(
+      "INSERT OR REPLACE INTO runbook_results (id, runbook_id, session_id, status, exit_code, output_text, output_path, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run(input.id, input.runbookId, input.sessionId, input.status, input.exitCode, input.outputText, input.outputPath, new Date().toISOString());
+  }
+
+  getRunbookResults(runbookId: string): Array<Record<string, unknown>> {
+    return this.database.prepare("SELECT * FROM runbook_results WHERE runbook_id = ? ORDER BY created_at DESC LIMIT 10").all(runbookId) as Array<Record<string, unknown>>;
+  }
+
+  getLatestPipelineRuns(): { lastPlanner: string | null; lastRunner: string | null; activeSessions: number } {
+    const lastPlanner = this.database.prepare("SELECT created_at FROM runbook_results WHERE status = 'planned' ORDER BY created_at DESC LIMIT 1").get() as { created_at: string } | undefined;
+    const lastRunner = this.database.prepare("SELECT created_at FROM runbook_results WHERE status = 'executed' ORDER BY created_at DESC LIMIT 1").get() as { created_at: string } | undefined;
+    const active = this.database.prepare("SELECT COUNT(*) as count FROM cockpit_sessions WHERE status = 'active'").get() as { count: number };
+    return {
+      lastPlanner: lastPlanner?.created_at ?? null,
+      lastRunner: lastRunner?.created_at ?? null,
+      activeSessions: active?.count ?? 0,
+    };
   }
 }

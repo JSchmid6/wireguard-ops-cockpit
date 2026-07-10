@@ -28,6 +28,7 @@ import {
   listScripts,
   listAgents,
   findRunbook,
+  buildRunnerPrompt,
   registerDynamicRunbook,
   unregisterDynamicRunbook,
   loadDynamicRunbooks,
@@ -437,6 +438,7 @@ export async function createApp(options: AppOptions = {}) {
   const terminalSigningSecret = Buffer.from(config.terminalSigningSecret, "utf8");
   const loginAttempts = new Map<string, LoginAttemptState>();
   const scheduleLocks = new Set<string>();
+  const activeOrders = new Set<string>(); // Rate limiting: max 1 order per session
 
   async function createRunbookPlan(
     actor: UserSummary,
@@ -1150,6 +1152,22 @@ export async function createApp(options: AppOptions = {}) {
     tmuxBackend: tmux.backend
   }));
 
+  app.get("/api/pipeline/health", async (request, reply) => {
+    const actor = await requireActor(request, reply, database);
+    if (!actor) return;
+
+    const runs = database.getLatestPipelineRuns();
+    return {
+      status: runs.lastRunner ? "healthy" : "initializing",
+      lastPlannerRun: runs.lastPlanner,
+      lastRunnerRun: runs.lastRunner,
+      activeSessions: runs.activeSessions,
+      activeOrders: activeOrders.size,
+      dynamicRunbooks: listDynamicRunbooks().length,
+      builtinRunbooks: RUNBOOKS.length,
+    };
+  });
+
   app.post("/api/auth/login", async (request, reply) => {
     const body = (request.body || {}) as { username?: string; password?: string };
     if (!body.username || !body.password) {
@@ -1398,6 +1416,12 @@ export async function createApp(options: AppOptions = {}) {
     }
 
     // Launch the planner agent to generate the runbook
+    // Rate limiting: max 1 order per session
+    if (activeOrders.has(session.id)) {
+      return reply.code(429).send({ message: "Another runbook order is already in progress for this session. Wait 60s and retry." });
+    }
+    activeOrders.add(session.id);
+
     const plannerAgent = findAgent("planner-agent", "opencode");
     if (!plannerAgent) {
       return reply.code(500).send({ message: "planner agent not available" });
@@ -1436,99 +1460,66 @@ Follow these rules:
     const executed = executeAgentPlan(plan, actor, plannerAgent);
     const orderPrompt = body.prompt!; // Validated non-null above
 
-    // Auto-register: read planner output from log file or tmux, save markdown, register
+    // Auto-register pipeline: plan → save → execute → notify → cleanup
     const autoRegister = async () => {
       try {
+        // Wait for planner to finish producing output
         await new Promise(r => setTimeout(r, 45000));
+        activeOrders.delete(session.id);
         const { execSync } = await import("node:child_process");
 
-        // Read from tee'd log file first (more reliable than tmux pane)
+        // Read planner output (log file first, tmux fallback)
         let raw = "";
-        try {
-          raw = execSync("cat /tmp/opencode-last.log 2>/dev/null || true", { encoding: "utf-8", timeout: 3000, maxBuffer: 2 * 1024 * 1024 }).trim();
-        } catch { /* ignore */ }
-
-        // Fallback to tmux pane if log file is empty
+        try { raw = execSync("cat /tmp/opencode-last.log 2>/dev/null || true", { encoding: "utf-8", timeout: 3000, maxBuffer: 2 * 1024 * 1024 }).trim(); } catch { }
         if (raw.length < 100) {
-          const wmName = slugify(`agent-${plannerAgent.id}`);
-          raw = execSync(
-            `tmux capture-pane -t "${session.tmuxSessionName}:${wmName}" -p -S -300 2>/dev/null || true`,
-            { encoding: "utf-8", timeout: 5000, maxBuffer: 2 * 1024 * 1024 }
-          ).trim();
+          try { raw = execSync(`tmux capture-pane -t "${session.tmuxSessionName}:${slugify(`agent-${plannerAgent.id}`)}" -p -S -300 2>/dev/null || true`, { encoding: "utf-8", timeout: 5000, maxBuffer: 2 * 1024 * 1024 }).trim(); } catch { }
         }
-
-        // Final fallback: capture main window
-        if (!raw || raw.length < 20) {
-          raw = execSync(
-            `tmux capture-pane -t "${session.tmuxSessionName}" -p -S -300 2>/dev/null || true`,
-            { encoding: "utf-8", timeout: 5000, maxBuffer: 2 * 1024 * 1024 }
-          ).trim();
-        }
-
         if (!raw || raw.length < 20) return;
 
+        // Create runbook
         const name = orderPrompt.slice(0, 60).replace(/[^a-zA-Z0-9 ]/g, "").trim() || "Generated Runbook";
         const rbId = "gen-" + name.toLowerCase().replace(/\s+/g, "-").slice(0, 50);
         const scriptName = `${rbId}.md`;
         const scriptPath = `/opt/wireguard-ops-cockpit/bin/${scriptName}`;
-
-        // Save planner output as markdown — opencode executes commands from it
-        const mdContent = [
-          `# ${name}`,
-          `> Generated ${new Date().toISOString()}`,
-          ``,
-          `## Prompt`,
-          orderPrompt,
-          ``,
-          `## Planner Output`,
-          "```",
-          raw.replace(/```/g, "'''"),
-          "```",
-        ].join("\n");
-
+        const mdContent = [`# ${name}`,`> Generated ${new Date().toISOString()}`,"","## Prompt",orderPrompt,"","## Planner Output","```",raw.replace(/```/g, "'''"),"```"].join("\n");
         execSync(`mkdir -p /opt/wireguard-ops-cockpit/bin && cat > ${scriptPath}`, { input: mdContent, encoding: "utf-8" });
 
         const runbook: RunbookDefinition = {
-          id: rbId,
-          name,
-          summary: orderPrompt.slice(0, 200),
-          requiresSession: true,
-          requiresApproval: false,
-          integration: "host-tmux",
-          privilegedHelperRequested: false,
-          reviewStatus: "allowlisted",
-          scriptIds: [scriptName],
-          workflowSteps: [{
-            id: "analyze-and-execute",
-            label: `OpenCode analyzes ${scriptName}`,
-            description: orderPrompt.slice(0, 200),
-            kind: "runbook",
-          }],
+          id: rbId, name, summary: orderPrompt.slice(0, 200), requiresSession: true, requiresApproval: false,
+          integration: "host-tmux", privilegedHelperRequested: false, reviewStatus: "allowlisted",
+          scriptIds: [scriptName], workflowSteps: [{ id: "analyze-and-execute", label: `OpenCode: ${scriptName}`, description: orderPrompt.slice(0, 200), kind: "runbook" }],
         };
-
         registerDynamicRunbook(runbook);
-        database.createDynamicRunbook({
-          id: rbId, name, summary: orderPrompt.slice(0, 200),
-          requiresApproval: false, privilegedHelper: false,
-          scriptId: scriptName, createdBy: actor.id,
-        });
-        database.createAudit({
-          actorId: actor.id, action: "runbook.dynamic.created",
-          targetType: "runbook", targetId: rbId,
-          details: { name, script: scriptName },
-        });
+        database.createDynamicRunbook({ id: rbId, name, summary: orderPrompt.slice(0, 200), requiresApproval: false, privilegedHelper: false, scriptId: scriptName, createdBy: actor.id });
 
-        // Step 2: Launch runner agent (planner with --auto, no approval needed)
+        // Save planner result
+        const resultId = `res-${rbId}`;
+        database.saveRunbookResult({ id: resultId, runbookId: rbId, sessionId: session.id, status: "planned", exitCode: 0, outputText: raw.substring(0, 10000), outputPath: scriptPath });
+        database.createAudit({ actorId: actor.id, action: "runbook.dynamic.created", targetType: "runbook", targetId: rbId, details: { name, script: scriptName } });
+
+        // Launch runner with runner-specific prompt
         const runnerAgent = findAgent("planner-agent", "opencode");
-        if (runnerAgent && session.id) {
-          const runnerPrompt = `Execute the runbook plan in ${scriptPath}. Read the file, understand the commands, and run them. Output results. Do NOT ask for approval — just execute.`;
+        if (runnerAgent) {
+          const runnerPrompt = buildRunnerPrompt(scriptPath);
           const runnerPlan = createAgentPlan(actor, runnerAgent, session.id, runnerPrompt);
           executeAgentPlan(runnerPlan, actor, runnerAgent);
-          database.createAudit({ actorId: actor.id, action: "runbook.runner.launched", targetType: "runbook", targetId: rbId, details: {} });
+
+          // Wait for runner, save results
+          setTimeout(async () => {
+            await new Promise(r => setTimeout(r, 30000));
+            let runnerOutput = "";
+            try { runnerOutput = execSync("cat /tmp/opencode-last.log 2>/dev/null || true", { encoding: "utf-8", timeout: 3000, maxBuffer: 2 * 1024 * 1024 }).trim(); } catch { }
+            database.saveRunbookResult({
+              id: `res-${rbId}-run`, runbookId: rbId, sessionId: session.id,
+              status: "executed", exitCode: 0,
+              outputText: runnerOutput.substring(0, 5000),
+              outputPath: `/tmp/opencode-last.log`,
+            });
+            database.createAudit({ actorId: actor.id, action: "runbook.runner.completed", targetType: "runbook", targetId: rbId, details: { outputLength: runnerOutput.length } });
+          }, 0);
         }
-      } catch { /* best effort — planner output capture is async */ }
+      } catch { /* fire-and-forget — best effort */ }
     };
-    // Don't await — fire and forget
     autoRegister();
 
     return reply.code(201).send({
