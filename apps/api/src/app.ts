@@ -1498,6 +1498,16 @@ Follow these rules:
           targetType: "runbook", targetId: rbId,
           details: { name, script: scriptName },
         });
+
+        // Step 2: Launch runner agent to execute the plan from the markdown
+        const runnerAgent = findAgent("supervised-repair-agent", "opencode");
+        if (runnerAgent && session.id) {
+          const runnerPrompt = `Execute the runbook plan in ${scriptPath}. Read the file, understand the commands, and run them step by step. Report results.`;
+          const runnerPlan = createAgentPlan(actor, runnerAgent, session.id, runnerPrompt);
+          if (!runnerPlan.requiresApproval) {
+            executeAgentPlan(runnerPlan, actor, runnerAgent);
+          }
+        }
       } catch { /* best effort — planner output capture is async */ }
     };
     // Don't await — fire and forget
