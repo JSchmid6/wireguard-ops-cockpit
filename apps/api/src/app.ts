@@ -1042,7 +1042,10 @@ export async function createApp(options: AppOptions = {}) {
     });
     const checkpointContract = parseCheckpointContractValue(plan.normalizedInput.checkpointContract);
     const checkpointState = createInitialCheckpointState(checkpointContract);
-    const launch = tmux.launchCommand(session.tmuxSessionName, slugify(`agent-${agent.id}`), command);
+
+    // Log and launch agent in tmux
+    const windowName = slugify(`agent-${agent.id}`);
+    const launch = tmux.launchCommand(session.tmuxSessionName, windowName, command);
     const job = database.createJob({
       sessionId: session.id,
       kind: "agent",
@@ -1332,13 +1335,24 @@ export async function createApp(options: AppOptions = {}) {
 
     try {
       const { execSync } = await import("node:child_process");
-      const output = execSync(
-        `tmux capture-pane -t "${session.tmuxSessionName}" -p -S -200 2>/dev/null || true`,
-        { encoding: "utf-8", timeout: 5000, maxBuffer: 2 * 1024 * 1024 }
-      );
-      return { output: output.trim() || "(empty)" };
+      // Capture all windows in the session
+      const windowsRaw = execSync(
+        `tmux list-windows -t "${session.tmuxSessionName}" -F '#{window_name}' 2>/dev/null || true`,
+        { encoding: "utf-8", timeout: 3000 }
+      ).trim();
+      const windows = windowsRaw ? windowsRaw.split("\n") : ["main"];
+      
+      const outputs: Record<string, string> = {};
+      for (const w of windows) {
+        const out = execSync(
+          `tmux capture-pane -t "${session.tmuxSessionName}:${w}" -p -S -200 2>/dev/null || true`,
+          { encoding: "utf-8", timeout: 5000, maxBuffer: 2 * 1024 * 1024 }
+        ).trim();
+        if (out) outputs[w] = out;
+      }
+      return { outputs };
     } catch {
-      return { output: "(capture failed)" };
+      return { outputs: { error: "capture failed" } };
     }
   });
 
