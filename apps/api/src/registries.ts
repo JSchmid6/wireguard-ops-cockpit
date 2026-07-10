@@ -666,15 +666,16 @@ export function buildAgentCommand(
     const modelArgs = runtimeOptions.opencodeModel
       ? [`--model ${shellQuote(runtimeOptions.opencodeModel)}`]
       : [];
-    const secretEnvVars = ["COCKPIT_ADMIN_PASSWORD", "COCKPIT_TERMINAL_SIGNING_SECRET"].join(",");
-    const script = [
-      "set -euo pipefail",
-      `planner_executable=${shellQuote(runtimeOptions.opencodeExecutable)}`,
-      'if ! command -v "$planner_executable" >/dev/null 2>&1 && [ ! -x "$planner_executable" ]; then',
-      '  printf "Configured OpenCode runtime %s was not found.\\n" "$planner_executable"',
-      "  exec bash",
-      "fi",
-      `"$planner_executable" run ${modelArgs.join(" ")} --print-logs ${shellQuote(agentPrompt)}`,
+     const secretEnvVars = ["DEEPSEEK_API_KEY", "COCKPIT_ADMIN_PASSWORD", "COCKPIT_TERMINAL_SIGNING_SECRET"].join(",");
+     const script = [
+       "set -euo pipefail",
+      'export DEEPSEEK_API_KEY="${DEEPSEEK_API_KEY:-}"',
+       `planner_executable=${shellQuote(runtimeOptions.opencodeExecutable)}`,
+       'if ! command -v "$planner_executable" >/dev/null 2>&1 && [ ! -x "$planner_executable" ]; then',
+       '  printf "Configured OpenCode runtime %s was not found.\\n" "$planner_executable"',
+       "  exec bash",
+       "fi",
+      `DEEPSEEK_API_KEY="\${DEEPSEEK_API_KEY:-}" "$planner_executable" run ${modelArgs.join(" ")} --print-logs ${shellQuote(agentPrompt)}`,
       'status=$?',
       'printf "\\nPlanner runtime exited with status %s.\\n" "$status"',
       "exec bash"
