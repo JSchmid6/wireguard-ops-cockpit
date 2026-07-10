@@ -1439,7 +1439,7 @@ Follow these rules:
     // Auto-register: capture planner output, save script, register runbook
     const autoRegister = async () => {
       try {
-        await new Promise(r => setTimeout(r, 15000));
+        await new Promise(r => setTimeout(r, 45000));
         const { execSync } = await import("node:child_process");
         const wmName = slugify(`agent-${plannerAgent.id}`);
         const raw = execSync(
