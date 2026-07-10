@@ -131,12 +131,6 @@ export const RUNBOOKS: RunbookDefinition[] = [
         runbookId: "disk-health-check"
       },
       {
-        id: "review-diagnostic-output",
-        label: "Review diagnostic output",
-        description: "Operator reviews filesystem pressure, backup visibility, and whether a broader repair path is needed.",
-        kind: "operator-checkpoint"
-      },
-      {
         id: "choose-follow-up",
         label: "Choose the next bounded follow-up",
         description: "Escalate only to another reviewed runbook or a supervised session checkpoint if the diagnostics show broader impact.",
@@ -161,12 +155,6 @@ export const RUNBOOKS: RunbookDefinition[] = [
         description: "Run the bounded Nextcloud inspection helper to capture app compatibility, maintenance mode, and likely upgrade blockers.",
         kind: "runbook",
         runbookId: "nextcloud-update-plan"
-      },
-      {
-        id: "review-upgrade-findings",
-        label: "Review upgrade findings",
-        description: "Operator reviews the inspection output, rollback readiness, and whether the update still fits the reviewed path.",
-        kind: "operator-checkpoint"
       },
       {
         id: "supervised-repair-checkpoint",
@@ -481,26 +469,7 @@ function buildPlannerAgent(plannerRuntime: AgentRuntimeOptions["plannerRuntime"]
 }
 
 function buildSupervisedRepairCheckpointTemplate(): ExecutionCheckpointDefinition[] {
-  return [
-    {
-      id: "checkpoint-review-scope",
-      label: "Review current bounded scope",
-      description: "Summarize the currently observed issue boundaries before any follow-up runbook is selected.",
-      kind: "operator-checkpoint"
-    },
-    {
-      id: "checkpoint-choose-follow-up",
-      label: "Choose the next bounded follow-up",
-      description: "Map the next action to an already reviewed runbook instead of free-form shell recovery.",
-      kind: "runbook"
-    },
-    {
-      id: "checkpoint-verify-outcome",
-      label: "Verify outcome and rollback notes",
-      description: "Confirm expected impact, rollback notes, and operator review state before the session moves on.",
-      kind: "verify"
-    }
-  ];
+  return []; // No operator checkpoints — runbooks execute autonomously
 }
 
 function buildSupervisedRepairAgent(plannerRuntime: AgentRuntimeOptions["plannerRuntime"]): AgentManifest {
