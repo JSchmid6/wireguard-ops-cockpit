@@ -587,8 +587,6 @@ export function loadDynamicRunbooks(runbooks: Array<{ id: string; name: string; 
         label: `Run ${r.scriptId}`,
         description: r.summary,
         kind: "runbook",
-        integration: "host-tmux",
-        privilegedHelperRequested: false,
       }],
     });
   }
