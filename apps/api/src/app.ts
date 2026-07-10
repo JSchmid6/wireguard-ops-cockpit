@@ -1436,60 +1436,65 @@ Follow these rules:
     const executed = executeAgentPlan(plan, actor, plannerAgent);
     const orderPrompt = body.prompt!; // Validated non-null above
 
-    // Fire-and-forget: capture planner output after it finishes, auto-register runbook
-    setTimeout(async () => {
+    // Auto-register: capture planner output, save script, register runbook
+    const autoRegister = async () => {
       try {
         await new Promise(r => setTimeout(r, 15000));
         const { execSync } = await import("node:child_process");
         const wmName = slugify(`agent-${plannerAgent.id}`);
         const raw = execSync(
-          `tmux capture-pane -t "${session.tmuxSessionName}:${wmName}" -p -S -200 2>/dev/null || true`,
+          `tmux capture-pane -t "${session.tmuxSessionName}:${wmName}" -p -S -300 2>/dev/null || true`,
           { encoding: "utf-8", timeout: 5000, maxBuffer: 2 * 1024 * 1024 }
         ).trim();
+        if (!raw || raw.length < 20) return;
 
-        if (!raw) return;
+        const name = orderPrompt.slice(0, 60).replace(/[^a-zA-Z0-9 ]/g, "").trim() || "Generated Runbook";
+        const rbId = "gen-" + name.toLowerCase().replace(/\s+/g, "-").slice(0, 50);
+        const scriptName = `${rbId}.sh`;
+        const scriptPath = `/opt/wireguard-ops-cockpit/bin/${scriptName}`;
 
-        const jsonMatch = raw.match(/\{[\s\S]*"id"\s*:\s*"[a-z0-9-]+"[\s\S]*"name"\s*:/);
-        if (!jsonMatch) {
-          const name = orderPrompt.slice(0, 60).replace(/[^a-zA-Z0-9 ]/g, "").trim() || "Generated Runbook";
-          const rbId = "gen-" + name.toLowerCase().replace(/\s+/g, "-").slice(0, 40);
-          const runbook: RunbookDefinition = {
-            id: rbId, name, summary: orderPrompt.slice(0, 200),
-            requiresSession: true, requiresApproval: false,
-            integration: "host-tmux", privilegedHelperRequested: false,
-            reviewStatus: "allowlisted", scriptIds: [], workflowSteps: [],
-          };
-          registerDynamicRunbook(runbook);
-          database.createDynamicRunbook({
-            id: rbId, name, summary: orderPrompt.slice(0, 200),
-            requiresApproval: false, privilegedHelper: false,
-            scriptId: "", createdBy: actor.id,
-          });
-          return;
-        }
+        // Extract bash code block or use entire output as script
+        const codeMatch = raw.match(/```(?:bash|sh)?\n([\s\S]*?)```/);
+        const scriptContent = codeMatch
+          ? `#!/usr/bin/env bash\nset -euo pipefail\n${codeMatch[1].trim()}\n`
+          : `#!/usr/bin/env bash\nset -euo pipefail\n# Planner output for: ${name}\n# ${new Date().toISOString()}\n${raw.split('\n').map(l => '# ' + l).join('\n')}\n`;
 
-        const parsed = JSON.parse(jsonMatch[0]);
-        const rbId = (parsed.id || "gen-" + Date.now().toString(36)).replace(/[^a-z0-9_-]/g, "-").slice(0, 64);
+        execSync(`mkdir -p /opt/wireguard-ops-cockpit/bin && cat > ${scriptPath}`, { input: scriptContent, encoding: "utf-8" });
+        execSync(`chmod +x ${scriptPath}`);
+
         const runbook: RunbookDefinition = {
-          id: rbId, name: parsed.name?.slice(0, 120) || "Generated Runbook",
-          summary: parsed.summary?.slice(0, 240) || orderPrompt.slice(0, 200),
-          requiresSession: true, requiresApproval: parsed.requiresApproval ?? false,
-          integration: "host-tmux", privilegedHelperRequested: parsed.privilegedHelperRequested ?? false,
-          reviewStatus: "allowlisted", scriptIds: parsed.scriptIds || [], workflowSteps: [],
+          id: rbId,
+          name,
+          summary: orderPrompt.slice(0, 200),
+          requiresSession: true,
+          requiresApproval: false,
+          integration: "host-tmux",
+          privilegedHelperRequested: false,
+          reviewStatus: "allowlisted",
+          scriptIds: [scriptName],
+          workflowSteps: [{
+            id: "run-script",
+            label: `Execute ${scriptName}`,
+            description: orderPrompt.slice(0, 200),
+            kind: "runbook",
+          }],
         };
+
         registerDynamicRunbook(runbook);
         database.createDynamicRunbook({
-          id: rbId, name: runbook.name, summary: runbook.summary,
-          requiresApproval: runbook.requiresApproval, privilegedHelper: runbook.privilegedHelperRequested,
-          scriptId: runbook.scriptIds[0] || "", createdBy: actor.id,
+          id: rbId, name, summary: orderPrompt.slice(0, 200),
+          requiresApproval: false, privilegedHelper: false,
+          scriptId: scriptName, createdBy: actor.id,
         });
         database.createAudit({
           actorId: actor.id, action: "runbook.dynamic.created",
           targetType: "runbook", targetId: rbId,
-          details: { name: runbook.name, source: "planner-agent" },
+          details: { name, script: scriptName },
         });
-      } catch { /* best effort */ }
-    }, 1000);
+      } catch { /* best effort — planner output capture is async */ }
+    };
+    // Don't await — fire and forget
+    autoRegister();
 
     return reply.code(201).send({
       message: "runbook generation started",
