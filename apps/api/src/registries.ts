@@ -679,7 +679,7 @@ export function buildAgentCommand(
       'status=$?',
       'printf "\\nPlanner runtime exited with status %s.\\n" "$status"',
       "exec bash"
-    ].join("; ");
+    ].join("\n");
 
     return {
       executable: "bash",
@@ -704,7 +704,7 @@ export function buildAgentCommand(
     'status=$?',
     'printf "\\nPlanner runtime exited with status %s.\\n" "$status"',
     "exec bash"
-  ].join("; ");
+  ].join("\n");
 
   return {
     executable: "bash",
