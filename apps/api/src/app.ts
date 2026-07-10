@@ -1322,6 +1322,26 @@ export async function createApp(options: AppOptions = {}) {
     };
   });
 
+  app.get("/api/sessions/:sessionId/output", async (request, reply) => {
+    const actor = await requireActor(request, reply, database);
+    if (!actor) return;
+
+    const { sessionId } = request.params as { sessionId: string };
+    const session = database.getSessionByIdForActor(sessionId, actor.id);
+    if (!session) return reply.code(404).send({ message: "session not found" });
+
+    try {
+      const { execSync } = await import("node:child_process");
+      const output = execSync(
+        `tmux capture-pane -t "${session.tmuxSessionName}" -p -S -200 2>/dev/null || true`,
+        { encoding: "utf-8", timeout: 5000, maxBuffer: 2 * 1024 * 1024 }
+      );
+      return { output: output.trim() || "(empty)" };
+    } catch {
+      return { output: "(capture failed)" };
+    }
+  });
+
   app.get("/api/runbooks", async (request, reply) => {
     const actor = await requireActor(request, reply, database);
     if (!actor) {
