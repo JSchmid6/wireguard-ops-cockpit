@@ -1,5 +1,35 @@
 # Hermes VPS — Agent Instructions
 
+## Cockpit Runbook Pipeline
+
+Three-stage execution pipeline, all in tmux sessions owned by `wgops` user:
+
+```
+POST /api/runbooks {"prompt":"...","sessionId":"..."}
+  │
+  ├── 1. PLANNER (planner-agent)
+  │     opencode run --auto --print-logs "prompt"
+  │     → produces analysis + command plan
+  │     → saved as .md file in /opt/wireguard-ops-cockpit/bin/
+  │
+  ├── 2. SAFETY REVIEW (safety-review.ts)
+  │     opencode in advisory-only mode
+  │     → checks .md for dangerous commands
+  │     → blocked | passed | approval_required
+  │
+  └── 3. RUNNER (supervised-repair-agent)  
+        opencode reads .md, executes step by step
+        → if blocked: stopped + audit log
+        → if approval: goes to approval queue
+        → if safe: auto-executes
+```
+
+**Key files:** `apps/api/src/app.ts` (endpoints), `apps/api/src/registries.ts` (agents, runbooks), `apps/api/src/db.ts` (persistence), `packages/tmux-adapter/src/index.ts` (tmux integration)
+
+**Build:** `./node_modules/.bin/tsc -p apps/api/tsconfig.json`
+**Deploy:** `systemctl restart wireguard-ops-cockpit-api`
+**Test:** `curl http://127.0.0.1:3001/api/health`
+
 ## System Architecture
 
 Bare-metal Ubuntu VPS (161.97.86.86) running:
