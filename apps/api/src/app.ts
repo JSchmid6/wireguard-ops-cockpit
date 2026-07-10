@@ -1450,17 +1450,24 @@ Follow these rules:
 
         const name = orderPrompt.slice(0, 60).replace(/[^a-zA-Z0-9 ]/g, "").trim() || "Generated Runbook";
         const rbId = "gen-" + name.toLowerCase().replace(/\s+/g, "-").slice(0, 50);
-        const scriptName = `${rbId}.sh`;
+        const scriptName = `${rbId}.md`;
         const scriptPath = `/opt/wireguard-ops-cockpit/bin/${scriptName}`;
 
-        // Extract bash code block or use entire output as script
-        const codeMatch = raw.match(/```(?:bash|sh)?\n([\s\S]*?)```/);
-        const scriptContent = codeMatch
-          ? `#!/usr/bin/env bash\nset -euo pipefail\n${codeMatch[1].trim()}\n`
-          : `#!/usr/bin/env bash\nset -euo pipefail\n# Planner output for: ${name}\n# ${new Date().toISOString()}\n${raw.split('\n').map(l => '# ' + l).join('\n')}\n`;
+        // Save planner output as markdown — opencode executes commands from it
+        const mdContent = [
+          `# ${name}`,
+          `> Generated ${new Date().toISOString()}`,
+          ``,
+          `## Prompt`,
+          orderPrompt,
+          ``,
+          `## Planner Output`,
+          "```",
+          raw.replace(/```/g, "'''"),
+          "```",
+        ].join("\n");
 
-        execSync(`mkdir -p /opt/wireguard-ops-cockpit/bin && cat > ${scriptPath}`, { input: scriptContent, encoding: "utf-8" });
-        execSync(`chmod +x ${scriptPath}`);
+        execSync(`mkdir -p /opt/wireguard-ops-cockpit/bin && cat > ${scriptPath}`, { input: mdContent, encoding: "utf-8" });
 
         const runbook: RunbookDefinition = {
           id: rbId,
@@ -1473,8 +1480,8 @@ Follow these rules:
           reviewStatus: "allowlisted",
           scriptIds: [scriptName],
           workflowSteps: [{
-            id: "run-script",
-            label: `Execute ${scriptName}`,
+            id: "analyze-and-execute",
+            label: `OpenCode analyzes ${scriptName}`,
             description: orderPrompt.slice(0, 200),
             kind: "runbook",
           }],
