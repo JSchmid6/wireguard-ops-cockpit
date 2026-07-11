@@ -962,13 +962,31 @@ export async function createApp(options: AppOptions = {}) {
   }
 
   function filterSensitiveContent(text: string): string {
-    // Remove API keys, tokens, passwords from output before returning to agent
+    // Remove API keys, tokens, passwords, and debug noise from output
     return text
       .replace(/sk-[a-zA-Z0-9]{20,}/g, "[REDACTED:API_KEY]")
       .replace(/glpat-[a-zA-Z0-9_.-]{20,}/g, "[REDACTED:TOKEN]")
       .replace(/eyJ[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,}/g, "[REDACTED:JWT]")
       .replace(/password[=:]\s*\S+/gi, "password=[REDACTED]")
-      .replace(/passphrase[=:]\s*\S+/gi, "passphrase=[REDACTED]");
+      .replace(/passphrase[=:]\s*\S+/gi, "passphrase=[REDACTED]")
+      .replace(/timestamp=.*level=.*/g, "")  // Remove debug log lines
+      .replace(/^\s*\n/gm, "");              // Remove blank lines from removed logs
+  }
+
+  function extractAnswer(rawOutput: string): string {
+    // Extract the actual answer from opencode output (after "exiting loop", before "disposing")
+    const lines = rawOutput.split("\n");
+    let answerStart = -1;
+    let answerEnd = -1;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (lines[i].includes("exiting loop")) answerStart = i + 1;
+      if (lines[i].includes("disposing instance") && answerStart > 0) { answerEnd = i; break; }
+    }
+    if (answerStart > 0 && answerEnd > answerStart) {
+      return lines.slice(answerStart, answerEnd).join("\n").trim();
+    }
+    // Fallback: return last 500 chars, filtered
+    return filterSensitiveContent(rawOutput.slice(-500));
   }
 
   function extractRequiredPermissions(runbook: RunbookDefinition): string[] {
@@ -1455,7 +1473,7 @@ export async function createApp(options: AppOptions = {}) {
           `tmux capture-pane -t "${session.tmuxSessionName}:${w}" -p -S -200 2>/dev/null || true`,
           { encoding: "utf-8", timeout: 5000, maxBuffer: 2 * 1024 * 1024 }
         ).trim();
-        if (out) outputs[w] = out;
+        if (out) outputs[w] = w.includes("agent-planner") ? extractAnswer(out) : out;
       }
       return { outputs };
     } catch {
