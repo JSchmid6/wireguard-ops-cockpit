@@ -1232,23 +1232,21 @@ export async function createApp(options: AppOptions = {}) {
     if (!body.prompt || !body.sessionId) {
       return reply.code(400).send({ message: "prompt and sessionId are required" });
     }
-    if (body.prompt.length < 10 || body.prompt.length > 2000) {
-      return reply.code(400).send({ message: "prompt must be 10-2000 characters" });
-    }
 
-    const session = database.getSessionByIdForActor(body.sessionId, actor.id);
+    // Delegate to the agent launch endpoint (same proven code path)
+    const agent = findAgent("planner-agent", "opencode");
+    if (!agent) return reply.code(500).send({ message: "planner not available" });
+
+    const session = database.getSessionRuntimeTargetForActor(body.sessionId, actor.id);
     if (!session) return reply.code(404).send({ message: "session not found" });
 
-    const plannerAgent = findAgent("planner-agent", "opencode");
-    if (!plannerAgent) return reply.code(500).send({ message: "planner not available" });
-
-    const plan = createAgentPlan(actor, plannerAgent, session.id, body.prompt);
-    executeAgentPlan(plan, actor, plannerAgent);
+    const plan = createAgentPlan(actor, agent, session.id, body.prompt);
+    executeAgentPlan(plan, actor, agent);
 
     return reply.code(202).send({
       message: "research started",
       sessionId: session.id,
-      note: "Planner is analyzing. Results available at GET /api/sessions/:id/output in ~30s."
+      note: "Planner is analyzing. Results available at GET /api/sessions/:id/output in ~45s."
     });
   });
 
