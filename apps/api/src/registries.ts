@@ -776,6 +776,18 @@ export function buildRunbookDispatch(
 
   const dispatch = commandByRunbook[runbook.id];
   if (!dispatch) {
+    // Fallback for dynamic runbooks: run opencode to execute the .md plan
+    if (runbook.scriptIds.length > 0 && runbook.scriptIds[0].endsWith(".md")) {
+      const winName = runbook.id.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").substring(0, 32);
+      return {
+        windowName: winName,
+        command: {
+          executable: "bash",
+          args: ["-lc", `DEEPSEEK_API_KEY="\${DEEPSEEK_API_KEY:-}" opencode run --auto --print-logs "Read and execute the runbook plan at ${mdPath}. Do NOT ask for approval — just execute." 2>&1 | tee /tmp/opencode-last.log; exec bash`],
+          cwd: repoRoot,
+        },
+      };
+    }
     throw new Error(`no dispatch command registered for runbook ${runbook.id}`);
   }
 
