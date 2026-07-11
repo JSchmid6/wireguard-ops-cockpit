@@ -1442,7 +1442,7 @@ export async function createApp(options: AppOptions = {}) {
 
     const plansList = database.listExecutionPlansForSession(sessionId);
     const lastPlan = plansList[0];
-    const elapsed = lastPlan ? Math.floor((Date.now() - new Date(lastPlan.created_at).getTime()) / 1000) : 0;
+    const elapsed = lastPlan ? Math.floor((Date.now() - new Date(lastPlan.createdAt).getTime()) / 1000) : 0;
     const isRunning = elapsed > 0 && elapsed < 60; // Planner takes ~45s
 
     return {
