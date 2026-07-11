@@ -1,6 +1,21 @@
 # Hermes VPS — Agent Instructions
 
-## Cockpit Runbook Pipeline
+## Security Model
+
+**Runner has full sudo** (`wgops ALL=(ALL) NOPASSWD: ALL`). Security is NOT enforced
+by sudoers — it's enforced by the Cockpit pipeline:
+
+```
+James orders → Planner generates → Safety Review checks → Approved? → Runner executes
+```
+
+Three outcomes:
+- **blocked**: dangerous commands detected → stopped, logged, James notified
+- **approval_required**: risky but not blocked → Jochen approves/denies via dashboard
+- **passed**: safe → Runner executes immediately with full sudo
+
+The Runner only executes AFTER safety review passes or approval is granted.
+This means James can do ANYTHING on the host, but only through reviewed runbooks.
 
 Three-stage execution pipeline, all in tmux sessions owned by `wgops` user:
 
