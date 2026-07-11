@@ -803,7 +803,7 @@ export function buildRunbookDispatch(
       executable: "bash",
       args: [
         "-lc",
-        `set -euo pipefail; ${dispatch.commandLine}; status=$?; printf '\\nRunbook finished with exit code %s. Staying attached for operator follow-up.\\n' "$status"; exec bash`
+        `set -euo pipefail; ${dispatch.commandLine}; status=$?; sudo rm -f /etc/sudoers.d/runner-* /etc/sudoers.d/agent-* 2>/dev/null || true; printf '\\nRunbook finished with exit code %s. Staying attached for operator follow-up.\\n' "$status"; exec bash`
       ],
       cwd: repoRoot
     }

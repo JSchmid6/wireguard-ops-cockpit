@@ -998,14 +998,6 @@ export async function createApp(options: AppOptions = {}) {
     const dispatch = buildRunbookDispatch(config.repoRoot, runbook);
     const launch = tmux.launchCommand(session.tmuxSessionName, dispatch.windowName, dispatch.command);
 
-    // Cleanup sudoers when the main command completes (before exec bash keeps window alive)
-    if (dispatch.command.executable === "bash" && dispatch.command.args[0] === "-lc") {
-      const cleanupSnippet = `; sudo rm -f /etc/sudoers.d/runner-* /etc/sudoers.d/agent-* 2>/dev/null || true`;
-      if (!dispatch.command.args[1].includes("cleanupSnippet") && !dispatch.command.args[1].includes("sudo rm -f /etc/sudoers.d")) {
-        dispatch.command.args[1] = dispatch.command.args[1].replace(/(; exec bash)$/, cleanupSnippet + '$1');
-      }
-    }
-
     // Schedule sudoers cleanup after runbook completes (5 min timeout)
     setTimeout(() => {
       try {
