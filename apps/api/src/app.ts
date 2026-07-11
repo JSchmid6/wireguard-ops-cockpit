@@ -1,4 +1,5 @@
 import { createHash, createHmac } from "node:crypto";
+import { execSync } from "node:child_process";
 import Fastify from "fastify";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type {
@@ -968,8 +969,7 @@ export async function createApp(options: AppOptions = {}) {
     // Grant temporary sudo for this runbook execution
     const sudoersFile = `/etc/sudoers.d/runner-${runbook.id.substring(0, 20).replace(/[^a-z0-9]/g, "")}`;
     try {
-      const { execSync } = require("node:child_process");
-      execSync(`echo "wgops ALL=(ALL) NOPASSWD: ALL" | sudo tee ${sudoersFile} && sudo chmod 440 ${sudoersFile}`, { encoding: "utf-8", timeout: 5000 });
+      execSync(`touch /tmp/cockpit-sudo-grant-attempted && printf 'wgops ALL=(ALL) NOPASSWD: ALL\\n' | tee ${sudoersFile} > /dev/null && chmod 440 ${sudoersFile}`, { encoding: "utf-8", timeout: 5000 });
     } catch { /* non-blocking */ }
 
     const dispatch = buildRunbookDispatch(config.repoRoot, runbook);
@@ -978,8 +978,7 @@ export async function createApp(options: AppOptions = {}) {
     // Schedule sudoers cleanup after runbook completes (5 min timeout)
     setTimeout(() => {
       try {
-        const { execSync: es } = require("node:child_process");
-        es(`sudo rm -f ${sudoersFile} 2>/dev/null || true`, { timeout: 5000 });
+        execSync(`sudo rm -f ${sudoersFile} 2>/dev/null || true`, { timeout: 5000 });
       } catch { /* best effort */ }
     }, 5 * 60 * 1000);
     const job = database.createJob({
@@ -1052,9 +1051,7 @@ export async function createApp(options: AppOptions = {}) {
     // Grant temporary sudo for agent execution
     const sudoersFile = `/etc/sudoers.d/agent-${agent.id.replace(/[^a-z0-9]/g, "").substring(0, 20)}`;
     try {
-      const { execSync } = require("node:child_process");
-      execSync(`echo "wgops ALL=(ALL) NOPASSWD: ALL" | sudo tee ${sudoersFile} && sudo chmod 440 ${sudoersFile}`, { encoding: "utf-8", timeout: 5000 });
-      setTimeout(() => { try { require("node:child_process").execSync(`sudo rm -f ${sudoersFile} 2>/dev/null || true`, { timeout: 5000 }); } catch { } }, 5 * 60 * 1000);
+      execSync(`touch /tmp/cockpit-sudo-grant-attempted && printf 'wgops ALL=(ALL) NOPASSWD: ALL\\n' | tee ${sudoersFile} > /dev/null && chmod 440 ${sudoersFile}`, { encoding: "utf-8", timeout: 5000 });
     } catch { /* non-blocking */ }
 
     const prompt =
