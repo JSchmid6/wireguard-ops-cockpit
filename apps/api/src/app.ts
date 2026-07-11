@@ -1,5 +1,6 @@
 import { createHash, createHmac } from "node:crypto";
 import { execSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import Fastify from "fastify";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type {
@@ -965,7 +966,7 @@ export async function createApp(options: AppOptions = {}) {
     try {
       const mdPath = `${config.repoRoot}/bin/${runbook.scriptIds[0] || ""}`;
       if (!mdPath.endsWith(".md")) return [];
-      const content = require("node:fs").readFileSync(mdPath, "utf-8");
+      const content = readFileSync(mdPath, "utf-8");
       const permMatch = content.match(/## Required Permissions\n([\s\S]*?)(?:\n\n|\n```|$)/);
       if (!permMatch) return [];
       return permMatch[1].split("\n")

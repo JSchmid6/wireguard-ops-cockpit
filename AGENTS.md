@@ -2,20 +2,21 @@
 
 ## Security Model
 
-**Runner has full sudo** (`wgops ALL=(ALL) NOPASSWD: ALL`). Security is NOT enforced
-by sudoers — it's enforced by the Cockpit pipeline:
+**Runner gets temporary, scoped sudo per execution.**
+
+The sudoers entry is created before dispatch and self-destructs when the command completes.
+No permanent `wgops` sudo — only the binaries listed in the planner's `## Required Permissions`.
 
 ```
-James orders → Planner generates → Safety Review checks → Approved? → Runner executes
+## Required Permissions
+/usr/bin/apt-get
+/usr/bin/systemctl
 ```
 
-Three outcomes:
-- **blocked**: dangerous commands detected → stopped, logged, James notified
-- **approval_required**: risky but not blocked → Jochen approves/denies via dashboard
-- **passed**: safe → Runner executes immediately with full sudo
+These are parsed from the `.md` plan, validated against actual commands, and scoped to exactly those binaries.
+Fallback: `ALL` if planner didn't specify permissions.
 
-The Runner only executes AFTER safety review passes or approval is granted.
-This means James can do ANYTHING on the host, but only through reviewed runbooks.
+Cleanup: `rm -f /etc/sudoers.d/runner-*` runs immediately after the command completes, before `exec bash`.
 
 Three-stage execution pipeline, all in tmux sessions owned by `wgops` user:
 
