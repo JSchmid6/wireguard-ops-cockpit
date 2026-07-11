@@ -1151,6 +1151,10 @@ export class CockpitDatabase {
     return this.database.prepare("SELECT * FROM runbook_results WHERE runbook_id = ? ORDER BY created_at DESC LIMIT 10").all(runbookId) as Array<Record<string, unknown>>;
   }
 
+  getRunbookResultsForSession(sessionId: string): Array<Record<string, unknown>> {
+    return this.database.prepare("SELECT * FROM runbook_results WHERE session_id = ? ORDER BY created_at DESC LIMIT 5").all(sessionId) as Array<Record<string, unknown>>;
+  }
+
   getLatestPipelineRuns(): { lastPlanner: string | null; lastRunner: string | null; activeSessions: number } {
     const lastPlanner = this.database.prepare("SELECT created_at FROM runbook_results WHERE status = 'planned' ORDER BY created_at DESC LIMIT 1").get() as { created_at: string } | undefined;
     const lastRunner = this.database.prepare("SELECT created_at FROM runbook_results WHERE status = 'executed' ORDER BY created_at DESC LIMIT 1").get() as { created_at: string } | undefined;

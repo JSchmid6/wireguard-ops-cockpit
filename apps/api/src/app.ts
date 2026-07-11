@@ -961,6 +961,16 @@ export async function createApp(options: AppOptions = {}) {
     });
   }
 
+  function filterSensitiveContent(text: string): string {
+    // Remove API keys, tokens, passwords from output before returning to agent
+    return text
+      .replace(/sk-[a-zA-Z0-9]{20,}/g, "[REDACTED:API_KEY]")
+      .replace(/glpat-[a-zA-Z0-9_.-]{20,}/g, "[REDACTED:TOKEN]")
+      .replace(/eyJ[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,}/g, "[REDACTED:JWT]")
+      .replace(/password[=:]\s*\S+/gi, "password=[REDACTED]")
+      .replace(/passphrase[=:]\s*\S+/gi, "passphrase=[REDACTED]");
+  }
+
   function extractRequiredPermissions(runbook: RunbookDefinition): string[] {
     // Look for the .md file content to find ## Required Permissions section
     try {
@@ -1196,6 +1206,34 @@ export async function createApp(options: AppOptions = {}) {
     tmuxBackend: tmux.backend
   }));
 
+  app.post("/api/research", async (request, reply) => {
+    const actor = await requireActor(request, reply, database);
+    if (!actor) return;
+
+    const body = (request.body || {}) as { prompt?: string; sessionId?: string };
+    if (!body.prompt || !body.sessionId) {
+      return reply.code(400).send({ message: "prompt and sessionId are required" });
+    }
+    if (body.prompt.length < 10 || body.prompt.length > 2000) {
+      return reply.code(400).send({ message: "prompt must be 10-2000 characters" });
+    }
+
+    const session = database.getSessionByIdForActor(body.sessionId, actor.id);
+    if (!session) return reply.code(404).send({ message: "session not found" });
+
+    const plannerAgent = findAgent("planner-agent", "opencode");
+    if (!plannerAgent) return reply.code(500).send({ message: "planner not available" });
+
+    const plan = createAgentPlan(actor, plannerAgent, session.id, body.prompt);
+    executeAgentPlan(plan, actor, plannerAgent);
+
+    return reply.code(202).send({
+      message: "research started",
+      sessionId: session.id,
+      note: "Planner is analyzing. Results available at GET /api/sessions/:id/output in ~30s."
+    });
+  });
+
   app.get("/api/pipeline/health", async (request, reply) => {
     const actor = await requireActor(request, reply, database);
     if (!actor) return;
@@ -1389,7 +1427,8 @@ export async function createApp(options: AppOptions = {}) {
       session,
       plans: plansList,
       jobs: database.listJobsForSession(sessionId),
-      agentStatus: session.tmuxSessionName && plansList.length > 0 ? "completed" : "none"
+      agentStatus: session.tmuxSessionName && plansList.length > 0 ? "completed" : "none",
+      runnerResults: database.getRunbookResultsForSession(sessionId) || [],
     };
   });
 
