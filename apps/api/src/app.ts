@@ -960,16 +960,38 @@ export async function createApp(options: AppOptions = {}) {
     });
   }
 
+  function extractRequiredPermissions(runbook: RunbookDefinition): string[] {
+    // Look for the .md file content to find ## Required Permissions section
+    try {
+      const mdPath = `${config.repoRoot}/bin/${runbook.scriptIds[0] || ""}`;
+      if (!mdPath.endsWith(".md")) return [];
+      const content = require("node:fs").readFileSync(mdPath, "utf-8");
+      const permMatch = content.match(/## Required Permissions\n([\s\S]*?)(?:\n\n|\n```|$)/);
+      if (!permMatch) return [];
+      return permMatch[1].split("\n")
+        .map(l => l.trim())
+        .filter(l => l.startsWith("/") && !l.includes(" ") && l.length > 2);
+    } catch {
+      return [];
+    }
+  }
+
   function executeRunbookPlan(plan: ExecutionPlan, actor: UserSummary, runbook: RunbookDefinition) {
     const session = plan.sessionId ? database.getSessionByIdForActor(plan.sessionId, plan.requestedBy) : null;
     if (!session) {
       throw new Error("session not found for runbook plan");
     }
 
-    // Grant temporary sudo for this runbook execution
+    // Grant temporary sudo for exactly the commands listed in the plan
     const sudoersFile = `/etc/sudoers.d/runner-${runbook.id.substring(0, 20).replace(/[^a-z0-9]/g, "")}`;
     try {
-      execSync(`touch /tmp/cockpit-sudo-grant-attempted && printf 'wgops ALL=(ALL) NOPASSWD: ALL\\n' | tee ${sudoersFile} > /dev/null && chmod 440 ${sudoersFile}`, { encoding: "utf-8", timeout: 5000 });
+      // Extract required permissions from planner output (## Required Permissions section)
+      const requiredPerms = extractRequiredPermissions(runbook);
+      const permLines = requiredPerms.map(p => `/usr/bin/${p}, /bin/${p}, /usr/sbin/${p}, /sbin/${p}`).join(", ");
+      const sudoRule = requiredPerms.length > 0
+        ? `wgops ALL=(ALL) NOPASSWD: ${requiredPerms.join(", ")}`
+        : "wgops ALL=(ALL) NOPASSWD: ALL"; // Fallback: full sudo if planner didn't specify
+      execSync(`printf '${sudoRule}\\n' | tee ${sudoersFile} > /dev/null && chmod 440 ${sudoersFile}`, { encoding: "utf-8", timeout: 5000 });
     } catch { /* non-blocking */ }
 
     const dispatch = buildRunbookDispatch(config.repoRoot, runbook);
