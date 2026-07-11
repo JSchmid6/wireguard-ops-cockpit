@@ -969,8 +969,8 @@ export async function createApp(options: AppOptions = {}) {
       const permMatch = content.match(/## Required Permissions\n([\s\S]*?)(?:\n\n|\n```|$)/);
       if (!permMatch) return [];
       return permMatch[1].split("\n")
-        .map(l => l.trim())
-        .filter(l => l.startsWith("/") && !l.includes(" ") && l.length > 2);
+        .map((l: string) => l.trim())
+        .filter((l: string) => l.startsWith("/") && !l.includes(" ") && l.length > 2);
     } catch {
       return [];
     }
