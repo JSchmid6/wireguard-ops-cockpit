@@ -1468,13 +1468,7 @@ export async function createApp(options: AppOptions = {}) {
       const { execSync } = await import("node:child_process");
       const outputs: Record<string, string> = {};
 
-      // Primary source: /tmp/opencode-last.log (complete output via tee)
-      try {
-        const log = execSync("cat /tmp/opencode-last.log 2>/dev/null || true", { encoding: "utf-8", timeout: 5000, maxBuffer: 2 * 1024 * 1024 }).trim();
-        if (log) outputs["agent-last-output"] = extractAnswer(log);
-      } catch { /* non-blocking */ }
-
-      // Fallback: capture all windows in the session
+      // Primary: capture all windows in the session (deep scrollback)
       const windowsRaw = execSync(
         `tmux list-windows -t "${session.tmuxSessionName}" -F '#{window_name}' 2>/dev/null || true`,
         { encoding: "utf-8", timeout: 3000 }
@@ -1482,12 +1476,11 @@ export async function createApp(options: AppOptions = {}) {
       const windows = windowsRaw ? windowsRaw.split("\n") : ["main"];
 
       for (const w of windows) {
-        if (outputs[w]) continue;
         const out = execSync(
-          `tmux capture-pane -t "${session.tmuxSessionName}:${w}" -p -S -500 2>/dev/null || true`,
+          `tmux capture-pane -t "${session.tmuxSessionName}:${w}" -p -S -2000 2>/dev/null || true`,
           { encoding: "utf-8", timeout: 5000, maxBuffer: 2 * 1024 * 1024 }
         ).trim();
-        if (out) outputs[w] = w.includes("agent-planner") ? extractAnswer(out) : out;
+        if (out) outputs[w] = out;
       }
       return { outputs };
     } catch {
