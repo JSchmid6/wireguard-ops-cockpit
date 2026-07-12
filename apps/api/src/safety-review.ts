@@ -369,17 +369,12 @@ async function runOpencodeSafetyReview(
 ): Promise<CopilotReviewResult> {
   const args = [
     "run",
-    "--prompt",
-    prompt,
-    "--format",
-    "default",
+    "--auto",
     "--print-logs",
     "--dir",
-    runtime.repoRoot
+    runtime.repoRoot,
+    prompt
   ];
-  if (runtime.opencodeModel) {
-    args.push("--model", runtime.opencodeModel);
-  }
 
   return await new Promise((resolve, reject) => {
     const startedAt = new Date().toISOString();

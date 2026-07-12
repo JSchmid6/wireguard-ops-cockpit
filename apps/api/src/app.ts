@@ -375,6 +375,15 @@ function resolveRunbookPlanState(runbook: RunbookDefinition, safetyReview: Execu
     };
   }
 
+  // If the safety review failed to run (not_run), treat as requiring approval.
+  // Better to block execution than to silently pass un-reviewed commands.
+  if (safetyReview.verdict === "not_run") {
+    return {
+      status: "pending_approval" as const,
+      requiresApproval: true
+    };
+  }
+
   const requiresApproval = runbook.requiresApproval || safetyReview.verdict === "approval_required";
   return {
     status: requiresApproval ? ("pending_approval" as const) : ("ready" as const),
@@ -1804,12 +1813,57 @@ Follow these rules:
         integration: "host-tmux", privilegedHelperRequested: false, reviewStatus: "allowlisted",
         scriptIds: [scriptName], workflowSteps: [{ id: "execute", label: `OpenCode: ${scriptName}`, description: body.prompt.slice(0, 200), kind: "runbook" }],
       };
-      registerDynamicRunbook(runbook);
-      database.createDynamicRunbook({ id: genRbId, name: genName, summary: body.prompt.slice(0, 200), requiresApproval: false, privilegedHelper: false, scriptId: scriptName, createdBy: actor.id });
-      database.saveRunbookResult({ id: `res-${genRbId}`, runbookId: genRbId, sessionId: session.id, status: "planned", exitCode: 0, outputText: cleanedPlanner.substring(0, 10000), outputPath: scriptPath });
-      database.createAudit({ actorId: actor.id, action: "runbook.dynamic.created", targetType: "runbook", targetId: genRbId, details: { name: genName, script: scriptName } });
 
-      // Launch runner agent with different window suffix
+      // Register (idempotent: replace if same prompt was already used)
+      try { database.createDynamicRunbook({ id: genRbId, name: genName, summary: body.prompt.slice(0, 200), requiresApproval: false, privilegedHelper: false, scriptId: scriptName, createdBy: actor.id }); } catch (e: any) {
+        if (e.message && e.message.includes("UNIQUE")) {
+          database.deleteDynamicRunbook(genRbId, actor.id);
+          unregisterDynamicRunbook(genRbId);
+          database.createDynamicRunbook({ id: genRbId, name: genName, summary: body.prompt.slice(0, 200), requiresApproval: false, privilegedHelper: false, scriptId: scriptName, createdBy: actor.id });
+        } else { throw e; }
+      }
+      registerDynamicRunbook(runbook);
+
+      // Safety review before execution — NEVER skip
+      const safetyPlan = await createRunbookPlan(actor, runbook, session);
+      const safetyVerdict = safetyPlan.status;
+
+      // "ready" = allowlisted / pre-reviewed → safe to proceed
+      // "executed" = full safety review passed
+      // "blocked" = dangerous → STOP
+      // "not_run" = safety review failed → STOP (better safe than sorry)
+      // "requiresApproval" → return for manual approval
+      if (safetyVerdict === "blocked") {
+        const blocked = createBlockedPlanRecord(safetyPlan, actor, `${genName} was blocked by the safety review.`);
+        return reply.code(409).send({
+          message: "safety review BLOCKED — runbook not executed",
+          runbookId: genRbId,
+          plannerOutput: filterSensitiveContent(cleanedPlanner).substring(0, 2000),
+          ...blocked,
+          elapsedMs: Date.now() - startTime,
+        });
+      }
+
+      if (safetyPlan.requiresApproval) {
+        return reply.code(202).send({
+          message: "runbook requires human approval before execution",
+          runbookId: genRbId,
+          plannerOutput: filterSensitiveContent(cleanedPlanner).substring(0, 2000),
+          elapsedMs: Date.now() - startTime,
+        });
+      }
+
+      if (safetyVerdict !== "ready" && safetyVerdict !== "executed") {
+        return reply.code(202).send({
+          message: "safety review returned unclear — runbook NOT executed. Order manually.",
+          runbookId: genRbId,
+          safetyVerdict,
+          plannerOutput: filterSensitiveContent(cleanedPlanner).substring(0, 2000),
+          elapsedMs: Date.now() - startTime,
+        });
+      }
+
+      // Launch runner agent (this IS the execution — opencode reads the .md and runs the steps)
       const runnerPrompt = buildRunnerPrompt(scriptPath);
       const runnerPlan = createAgentPlan(actor, plannerAgent, session.id, runnerPrompt);
       executeAgentPlan(runnerPlan, actor, plannerAgent, "-runner");
