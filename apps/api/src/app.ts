@@ -1093,7 +1093,7 @@ export async function createApp(options: AppOptions = {}) {
     return { plan: updatedPlan, job };
   }
 
-  function executeAgentPlan(plan: ExecutionPlan, actor: UserSummary, agent: AgentManifest) {
+  function executeAgentPlan(plan: ExecutionPlan, actor: UserSummary, agent: AgentManifest, windowSuffix = "") {
     const session = plan.sessionId ? database.getSessionRuntimeTargetForActor(plan.sessionId, plan.requestedBy) : null;
     if (!session) {
       throw new Error("session not found for agent plan");
@@ -1120,7 +1120,7 @@ export async function createApp(options: AppOptions = {}) {
     const checkpointState = createInitialCheckpointState(checkpointContract);
 
     // Log and launch agent in tmux
-    const windowName = slugify(`agent-${agent.id}`);
+    const windowName = slugify(`agent-${agent.id}${windowSuffix}`);
     const launch = tmux.launchCommand(session.tmuxSessionName, windowName, command);
     const job = database.createJob({
       sessionId: session.id,
@@ -1248,6 +1248,108 @@ export async function createApp(options: AppOptions = {}) {
       sessionId: session.id,
       note: "Planner is analyzing. Results available at GET /api/sessions/:id/output in ~45s."
     });
+  });
+
+  // ── Hermes sync adapters ──────────────────────────────────────────────
+
+  function extractCleanOutput(raw: string): string {
+    const noTimestamps = raw
+      .split("\n")
+      .filter(l => !l.startsWith("timestamp=") && !l.startsWith("tee:") && l.trim() !== "")
+      .join("\n");
+    // Find where the model output starts (## Required Permissions or ## heading)
+    const modelStart = noTimestamps.search(/\n## /);
+    if (modelStart > 0) {
+      let output = noTimestamps.slice(modelStart + 1);
+      // Stop at trailing debug wrap noise (before "ng loop", "sing instance", root prompt)
+      const endMarkers = [/\nng loop"/, /\nsing instance"/, /\nroot@vmd/, /\nng hash=/];
+      for (const m of endMarkers) {
+        const idx = output.search(m);
+        if (idx > 0) { output = output.slice(0, idx); }
+      }
+      return output.trim();
+    }
+    return noTimestamps.slice(-2000).trim(); // fallback
+  }
+
+  function pollPlannerOutput(tmuxSessionName: string, windowName: string, timeoutMs: number): string | null {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      try {
+        const out = execSync(
+          `tmux capture-pane -t "${tmuxSessionName}:${windowName}" -p -S -1000 2>/dev/null || true`,
+          { encoding: "utf-8", timeout: 5000, maxBuffer: 2 * 1024 * 1024 }
+        ).trim();
+        // tmux wraps at 80 cols; check for unique prefix across line breaks
+        const flat = out.replace(/\n/g, "");
+        if (flat.includes("exiti") && flat.includes("disposing instance")) {
+          return extractCleanOutput(out);
+        }
+      } catch { /* retry */ }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      const sleepMs = Math.min(2000, remaining);
+      execSync(`sleep ${(sleepMs / 1000).toFixed(1)}`, { timeout: sleepMs + 2000 });
+    }
+    return null;
+  }
+
+  app.post("/api/hermes/research", async (request, reply) => {
+    const actor = await requireActor(request, reply, database);
+    if (!actor) return;
+
+    const body = (request.body || {}) as { prompt?: string; sessionId?: string };
+    if (!body.prompt || body.prompt.length < 5) {
+      return reply.code(400).send({ message: "prompt is required (min 5 chars)" });
+    }
+
+    const agent = findAgent("planner-agent", "opencode");
+    if (!agent) return reply.code(500).send({ message: "planner not available" });
+
+    // Create or reuse session
+    let session = body.sessionId ? database.getSessionRuntimeTargetForActor(body.sessionId, actor.id) : null;
+    if (!session) {
+      const sessionName = `hermes-${Date.now().toString(36)}`;
+      const ensured = tmux.ensureSession(`cockpit-${sessionName}`);
+      const created = database.upsertSession({
+        name: sessionName,
+        ownerId: actor.id,
+        tmuxSessionName: ensured.name,
+        tmuxBackend: ensured.backend,
+        terminalUrl: null,
+      });
+      session = {
+        id: created.id,
+        name: created.name,
+        tmuxSessionName: created.tmuxSessionName,
+        tmuxBackend: created.tmuxBackend,
+      };
+    }
+
+    const startTime = Date.now();
+    const plan = createAgentPlan(actor, agent, session.id, body.prompt);
+    executeAgentPlan(plan, actor, agent);
+
+    // Wait for opencode to boot then poll for completion
+    await new Promise(r => setTimeout(r, 8000));
+    const windowName = slugify(`agent-${agent.id}`);
+    const raw = pollPlannerOutput(session.tmuxSessionName, windowName, 120_000);
+    const elapsed = Date.now() - startTime;
+
+    if (!raw) {
+      return reply.code(202).send({
+        partial: true,
+        message: "Planner still running. Poll GET /api/sessions/:id/output",
+        sessionId: session.id,
+        elapsedMs: elapsed,
+      });
+    }
+
+    return {
+      answer: filterSensitiveContent(raw),
+      sessionId: session.id,
+      elapsedMs: elapsed,
+    };
   });
 
   app.get("/api/pipeline/health", async (request, reply) => {
@@ -1636,6 +1738,127 @@ Follow these rules:
       sessionId: session.id,
       note: "The planner agent is generating the runbook script. Poll GET /api/sessions/:id/output for results.",
     });
+  });
+
+  // ── Hermes sync runbook adapter ────────────────────────────────────────
+
+  app.post("/api/hermes/runbook", async (request, reply) => {
+    const actor = await requireActor(request, reply, database);
+    if (!actor) return;
+
+    const body = (request.body || {}) as { prompt?: string; sessionId?: string };
+    if (!body.prompt || body.prompt.length < 10) {
+      return reply.code(400).send({ message: "prompt is required (min 10 chars)" });
+    }
+
+    const startTime = Date.now();
+
+    // 1. Create or reuse session
+    let session = body.sessionId ? database.getSessionRuntimeTargetForActor(body.sessionId, actor.id) : null;
+    if (!session) {
+      const sessionName = `hermes-rb-${Date.now().toString(36)}`;
+      const ensured = tmux.ensureSession(`cockpit-${sessionName}`);
+      const created = database.upsertSession({
+        name: sessionName,
+        ownerId: actor.id,
+        tmuxSessionName: ensured.name,
+        tmuxBackend: ensured.backend,
+        terminalUrl: null,
+      });
+      session = {
+        id: created.id,
+        name: created.name,
+        tmuxSessionName: created.tmuxSessionName,
+        tmuxBackend: created.tmuxBackend,
+      };
+    }
+
+    // 2. Order the runbook (planner + autoRegister pipeline)
+    const plannerAgent = findAgent("planner-agent", "opencode");
+    if (!plannerAgent) return reply.code(500).send({ message: "planner not available" });
+
+    const orderPlan = createAgentPlan(actor, plannerAgent, session.id, body.prompt);
+    executeAgentPlan(orderPlan, actor, plannerAgent);
+
+    const plannerWindow = slugify(`agent-${plannerAgent.id}`);
+
+    // 3. Wait for planner to finish, then autoRegister
+    const plannerOutput = pollPlannerOutput(session.tmuxSessionName, plannerWindow, 120_000);
+    const cleanedPlanner = plannerOutput ? extractCleanOutput(plannerOutput) : "";
+
+    activeOrders.delete(session.id);
+
+    // 4. autoRegister: create dynamic runbook + launch runner
+    let genRbId = "";
+    let genName = "";
+    if (cleanedPlanner && cleanedPlanner.length > 20) {
+      genName = body.prompt.slice(0, 60).replace(/[^a-zA-Z0-9 ]/g, "").trim() || "Generated Runbook";
+      genRbId = "gen-" + genName.toLowerCase().replace(/\s+/g, "-").slice(0, 50);
+      const scriptName = `${genRbId}.md`;
+      const scriptPath = `/opt/wireguard-ops-cockpit/bin/${scriptName}`;
+      const mdContent = [`# ${genName}`,`> Generated ${new Date().toISOString()}`,"","## Prompt",body.prompt,"","## Planner Output","```",cleanedPlanner.replace(/```/g, "'''"),"```"].join("\n");
+      execSync(`mkdir -p /opt/wireguard-ops-cockpit/bin && cat > ${scriptPath}`, { input: mdContent, encoding: "utf-8" });
+
+      const runbook: RunbookDefinition = {
+        id: genRbId, name: genName, summary: body.prompt.slice(0, 200), requiresSession: true, requiresApproval: false,
+        integration: "host-tmux", privilegedHelperRequested: false, reviewStatus: "allowlisted",
+        scriptIds: [scriptName], workflowSteps: [{ id: "execute", label: `OpenCode: ${scriptName}`, description: body.prompt.slice(0, 200), kind: "runbook" }],
+      };
+      registerDynamicRunbook(runbook);
+      database.createDynamicRunbook({ id: genRbId, name: genName, summary: body.prompt.slice(0, 200), requiresApproval: false, privilegedHelper: false, scriptId: scriptName, createdBy: actor.id });
+      database.saveRunbookResult({ id: `res-${genRbId}`, runbookId: genRbId, sessionId: session.id, status: "planned", exitCode: 0, outputText: cleanedPlanner.substring(0, 10000), outputPath: scriptPath });
+      database.createAudit({ actorId: actor.id, action: "runbook.dynamic.created", targetType: "runbook", targetId: genRbId, details: { name: genName, script: scriptName } });
+
+      // Launch runner agent with different window suffix
+      const runnerPrompt = buildRunnerPrompt(scriptPath);
+      const runnerPlan = createAgentPlan(actor, plannerAgent, session.id, runnerPrompt);
+      executeAgentPlan(runnerPlan, actor, plannerAgent, "-runner");
+    }
+
+    // 5. If no runbook generated, return partial
+    if (!genRbId) {
+      return reply.code(202).send({
+        partial: true,
+        message: "Planner didn't produce a runbook. Try a more specific prompt.",
+        sessionId: session.id,
+        plannerOutput: filterSensitiveContent(cleanedPlanner).substring(0, 2000),
+        elapsedMs: Date.now() - startTime,
+      });
+    }
+
+    // 6. Wait for runner to complete (different window: agent-planner-agent-runner)
+    const runnerWindow = slugify(`agent-${plannerAgent.id}-runner`);
+    let runnerRaw = pollPlannerOutput(session.tmuxSessionName, runnerWindow, 120_000);
+    let runnerOutput = runnerRaw ? extractCleanOutput(runnerRaw) : "";
+    if (!runnerOutput) {
+      // Try the other agent window
+      const windows = execSync(
+        `tmux list-windows -t "${session.tmuxSessionName}" -F '#{window_name}' 2>/dev/null || true`,
+        { encoding: "utf-8", timeout: 3000 }
+      ).trim().split("\n");
+      for (const w of windows) {
+        if (w.includes("agent")) {
+          const raw = execSync(
+            `tmux capture-pane -t "${session.tmuxSessionName}:${w}" -p -S -2000 2>/dev/null || true`,
+            { encoding: "utf-8", timeout: 5000, maxBuffer: 2 * 1024 * 1024 }
+          ).trim();
+          if (raw.replace(/\n/g, "").includes("exiti")) {
+            runnerOutput = extractCleanOutput(raw);
+            break;
+          }
+        }
+      }
+    }
+
+    return {
+      message: "runbook executed",
+      sessionId: session.id,
+      runbookId: genRbId,
+      runbookName: genName,
+      plannerOutput: filterSensitiveContent(cleanedPlanner).substring(0, 3000),
+      runnerOutput: filterSensitiveContent(runnerOutput).substring(0, 3000),
+      elapsedMs: Date.now() - startTime,
+    };
   });
 
   app.delete("/api/runbooks/:runbookId", async (request, reply) => {
