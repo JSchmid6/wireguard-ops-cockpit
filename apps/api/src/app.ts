@@ -1259,7 +1259,60 @@ export async function createApp(options: AppOptions = {}) {
     });
   });
 
-  // ── Hermes sync adapters ──────────────────────────────────────────────
+  function extractRunnerHandoff(raw: string): string {
+    const noTimestamps = raw
+      .split("\n")
+      .filter(l => !l.startsWith("timestamp=") && !l.startsWith("tee:") && l.trim() !== "")
+      .join("\n");
+    // Primary: look for ## EXECUTION RESULT handoff section
+    const handoffStart = noTimestamps.search(/\n## EXECUTION RESULT/);
+    if (handoffStart > 0) {
+      let output = noTimestamps.slice(handoffStart + 1);
+      const endMarkers = [/\nng loop"/, /\nsing instance"/, /\nroot@vmd/, /\nexec bash/];
+      for (const m of endMarkers) {
+        const idx = output.search(m);
+        if (idx > 0) { output = output.slice(0, idx); }
+      }
+      return output.trim();
+    }
+    // Fallback: find the model's execution output
+    // Runner outputs after reading the .md: "$ command", then actual stdout, then model summary
+    const execIndex = noTimestamps.search(/\n\$ \/usr\/|\n\$ \w+.*&&/);
+    if (execIndex > 0) {
+      let output = noTimestamps.slice(execIndex + 1);
+      const endMarkers = [/\nng loop"/, /\nsing instance"/, /\nroot@vmd/, /\nexec bash/];
+      for (const m of endMarkers) {
+        const idx = output.search(m);
+        if (idx > 0) { output = output.slice(0, idx); }
+      }
+      return output
+        .split("\n")
+        .filter(l => !l.includes("/root/.local/share/opencode/snapshot/") && l.trim() !== "")
+        .join("\n")
+        .trim();
+    }
+    // Alternative: look for "EXECUTION RESULT" or "Done." or "Executing"
+    const altIndex = noTimestamps.search(/\n(EXECUTION RESULT|Done\.|Executing|STATUS:)/);
+    if (altIndex > 0) {
+      let output = noTimestamps.slice(altIndex + 1);
+      const endMarkers = [/\nng loop"/, /\nsing instance"/, /\nroot@vmd/];
+      for (const m of endMarkers) {
+        const idx = output.search(m);
+        if (idx > 0) { output = output.slice(0, idx); }
+      }
+      return output
+        .split("\n")
+        .filter(l => !l.includes("/root/.local/share/opencode/snapshot/") && l.trim() !== "")
+        .join("\n")
+        .trim();
+    }
+    // Last resort: strip debug, keep anything that looks like content
+    return noTimestamps
+      .split("\n")
+      .filter(l => l.length > 10 && !l.match(/^[a-z]+ \w+=\w+/))
+      .join("\n")
+      .trim();
+  }
 
   function extractCleanOutput(raw: string): string {
     const noTimestamps = raw
@@ -1929,7 +1982,7 @@ Follow these rules:
     const runnerWindow = slugify(`agent-${plannerAgent.id}-runner`);
     let runnerRaw = session.tmuxBackend === "disabled" ? null
       : pollPlannerOutput(session.tmuxSessionName, runnerWindow, Math.max(5000, totalTimeout - (Date.now() - startTime)));
-    let runnerOutput = runnerRaw ? extractCleanOutput(runnerRaw) : "";
+    let runnerOutput = runnerRaw ? extractRunnerHandoff(runnerRaw) : "";
     if (!runnerOutput) {
       // Try the other agent window
       const windows = execSync(
@@ -1943,7 +1996,7 @@ Follow these rules:
             { encoding: "utf-8", timeout: 5000, maxBuffer: 2 * 1024 * 1024 }
           ).trim();
           if (raw.replace(/\n/g, "").includes("exiti")) {
-            runnerOutput = extractCleanOutput(raw);
+            runnerOutput = extractRunnerHandoff(raw);
             break;
           }
         }

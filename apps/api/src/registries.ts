@@ -608,12 +608,22 @@ export function buildRunnerPrompt(markdownPath: string): string {
   return [
     "You are the runner-agent for wireguard-ops-cockpit.",
     "Read the runbook plan at " + markdownPath + ".",
-    "Execute the commands found in the plan. Do NOT ask for permission.",
-    "Report what you did and the results. Be concise.",
+    "Execute EVERY command found in the plan. Do NOT ask for permission — use --auto mode.",
+    "",
+    "After you have executed ALL commands, produce a final handoff section. Use EXACTLY this format:",
+    "",
+    "## EXECUTION RESULT",
+    "STATUS: success|partial|failed",
+    "EXIT_CODE: <number, or 'unknown'>",
+    "WHAT_RAN: <one-line summary of which commands ran>",
+    "OUTPUT: <key command output, trimmed to the most relevant lines>",
+    "NOTES: <any warnings, errors, or follow-up needed>",
+    "",
     "RULES:",
-    "- Execute step by step. Stop on error unless recovery is safe.",
-    "- Never delete data or change permissions unless explicitly instructed.",
-    "- Use --auto mode: no approval, no waiting.",
+    "- Run every command in the plan. Do not skip steps.",
+    "- If a command fails, note it in NOTES but continue to the handoff.",
+    "- Include the actual command output in the OUTPUT field — James needs to see it.",
+    "- Be concise. The handoff is what the operator reads.",
   ].join("\n");
 }
 
@@ -642,6 +652,11 @@ function buildSupervisedRepairPrompt(prompt: string): string {
 function buildAgentPrompt(agent: AgentManifest, prompt: string): string {
   if (agent.promptContractId === "supervised-repair-v1") {
     return buildSupervisedRepairPrompt(prompt);
+  }
+
+  // Runner prompts (containing "## EXECUTION RESULT") skip the planner wrapper
+  if (prompt.includes("## EXECUTION RESULT") || prompt.includes("runner-agent")) {
+    return prompt;
   }
 
   return buildPlannerPrompt(prompt);
