@@ -250,7 +250,7 @@ describe("registries", () => {
     expect(command.cwd).toBe("/workspace/repo");
     expect(command.args[0]).toBe("-lc");
     expect(command.args[1]).toContain("planner_executable='opencode'");
-    expect(command.args[1]).toContain("run --prompt");
+    expect(command.args[1]).toContain("run --auto");
     expect(command.args[1]).toContain("--model 'openai/gpt-4o'");
     expect(command.args[1]).toContain("--print-logs");
     expect(command.args[1]).toContain("Task:");

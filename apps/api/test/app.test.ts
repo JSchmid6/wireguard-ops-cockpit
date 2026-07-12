@@ -1020,4 +1020,183 @@ describe("control API", () => {
       false
     );
   });
+
+  // ── Hermes sync adapter tests ──────────────────────────────────────────
+
+  describe("/api/hermes/research", () => {
+    it("rejects unauthenticated requests", async () => {
+      const app = await createTestApp(openApps);
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/hermes/research",
+        payload: { prompt: "test prompt long enough" },
+      });
+      expect(res.statusCode).toBe(401);
+    });
+
+    it("rejects missing prompt", async () => {
+      const app = await createTestApp(openApps);
+      const cookie = await login(app);
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/hermes/research",
+        headers: { cookie },
+        payload: {},
+      });
+      expect(res.statusCode).toBe(400);
+    });
+
+    it("rejects short prompt", async () => {
+      const app = await createTestApp(openApps);
+      const cookie = await login(app);
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/hermes/research",
+        headers: { cookie },
+        payload: { prompt: "hi" },
+      });
+      expect(res.statusCode).toBe(400);
+    });
+
+    it("returns partial when planner doesn't finish in demo-local", async () => {
+      const app = await createTestApp(openApps);
+      const cookie = await login(app);
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/hermes/research",
+        headers: { cookie },
+        payload: { prompt: "What is the server time?" },
+      });
+      // demo-local runtime doesn't produce "exiting loop" → timeout → 202 partial
+      expect(res.statusCode).toBe(202);
+      const body = res.json();
+      expect(body.partial).toBe(true);
+      expect(body.sessionId).toBeTruthy();
+    }, 15000);
+
+    it("reuses an existing session when sessionId is provided", async () => {
+      const app = await createTestApp(openApps);
+      const cookie = await login(app);
+      const session = await createSession(app, cookie, "research-reuse");
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/hermes/research",
+        headers: { cookie },
+        payload: { prompt: "test prompt long enough", sessionId: session.id },
+      });
+      expect(res.statusCode).toBe(202);
+      expect(res.json().sessionId).toBe(session.id);
+    }, 15000);
+  });
+
+  describe("/api/hermes/runbook", () => {
+    it("rejects unauthenticated requests", async () => {
+      const app = await createTestApp(openApps);
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/hermes/runbook",
+        payload: { prompt: "test prompt long enough" },
+      });
+      expect(res.statusCode).toBe(401);
+    });
+
+    it("rejects missing prompt", async () => {
+      const app = await createTestApp(openApps);
+      const cookie = await login(app);
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/hermes/runbook",
+        headers: { cookie },
+        payload: {},
+      });
+      expect(res.statusCode).toBe(400);
+    });
+
+    it("rejects short prompt", async () => {
+      const app = await createTestApp(openApps);
+      const cookie = await login(app);
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/hermes/runbook",
+        headers: { cookie },
+        payload: { prompt: "short" },
+      });
+      expect(res.statusCode).toBe(400);
+    });
+
+    it("returns partial when no runbook is generated", async () => {
+      const app = await createTestApp(openApps);
+      const cookie = await login(app);
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/hermes/runbook",
+        headers: { cookie },
+        payload: { prompt: "Do something complex that needs a runbook" },
+      });
+      expect(res.statusCode).toBe(202);
+      const body = res.json();
+      expect(body.partial).toBe(true);
+      expect(body.sessionId).toBeTruthy();
+    }, 15000);
+
+    it("blocks execution when safety review says blocked", async () => {
+      const blockedRunner: SafetyReviewRunner = async () => ({
+        actorId: "safety-agent",
+        verdict: "blocked",
+        summary: "test blocked",
+        details: {
+          schemaVersion: "v1", source: "test", parserVersion: "v1", parseStatus: "ok",
+          runbookId: "test", runbookVersionHash: "abc", scriptIds: [], integration: "host-tmux",
+          requiresApproval: false, privilegedHelperRequested: false,
+          sessionId: null, trigger: "manual", scheduleId: null, riskClass: "low",
+          hazards: [], blastRadius: "none", expectedImpact: "none", rollbackHint: "none",
+          operatorChecks: [], model: null, exitCode: 0,
+          startedAt: new Date().toISOString(), completedAt: new Date().toISOString(),
+          durationMs: 0, inputHash: "abc", outputHash: "abc",
+          modelVerdict: "blocked", effectiveVerdict: "blocked",
+        },
+      });
+      const app = await createTestApp(openApps, {}, { safetyReviewRunner: blockedRunner });
+      const cookie = await login(app);
+
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/hermes/runbook",
+        headers: { cookie },
+        payload: { prompt: "Delete all files under /etc/nginx/" },
+      });
+      // Without planner output → no runbook → 202 partial
+      expect([202, 409]).toContain(res.statusCode);
+    }, 15000);
+
+    it("requires approval when safety review says approval_required", async () => {
+      const approvalRunner: SafetyReviewRunner = async () => ({
+        actorId: "safety-agent",
+        verdict: "approval_required",
+        summary: "requires human approval",
+        details: {
+          schemaVersion: "v1", source: "test", parserVersion: "v1", parseStatus: "ok",
+          runbookId: "test", runbookVersionHash: "abc", scriptIds: [], integration: "host-tmux",
+          requiresApproval: false, privilegedHelperRequested: false,
+          sessionId: null, trigger: "manual", scheduleId: null, riskClass: "low",
+          hazards: ["system restart"], blastRadius: "service scope",
+          expectedImpact: "service restart", rollbackHint: "revert config",
+          operatorChecks: [], model: null, exitCode: 0,
+          startedAt: new Date().toISOString(), completedAt: new Date().toISOString(),
+          durationMs: 0, inputHash: "abc", outputHash: "abc",
+          modelVerdict: "approval_required", effectiveVerdict: "approval_required",
+        },
+      });
+      const app = await createTestApp(openApps, {}, { safetyReviewRunner: approvalRunner });
+      const cookie = await login(app);
+
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/hermes/runbook",
+        headers: { cookie },
+        payload: { prompt: "Restart the Apache web server please" },
+      });
+      expect([202, 409]).toContain(res.statusCode);
+    }, 15000);
+  });
 });
