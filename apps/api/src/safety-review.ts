@@ -53,11 +53,36 @@ interface CopilotReviewResult {
 }
 
 export function buildRunbookSafetyPrompt(input: RunbookSafetyReviewInput): string {
+  // Read the actual script content so the safety LLM can see the commands
+  let scriptContent = "(script not available)";
+  try {
+    const fs = require("node:fs");
+    const repoRoot = process.env.COCKPIT_REPO_ROOT || "/opt/wireguard-ops-cockpit";
+    for (const sid of input.runbook.scriptIds) {
+      const p = `${repoRoot}/bin/${sid}`;
+      if (fs.existsSync(p)) { scriptContent = fs.readFileSync(p, "utf-8"); break; }
+    }
+  } catch { /* best-effort */ }
+
   return [
     "You are the safety-agent for wireguard-ops-cockpit.",
-    "Review only the provided allowlisted runbook metadata.",
-    "Do not ask to inspect the repository, files, tmux sessions, terminals, logs, or the host.",
-    "Do not execute commands and do not propose arbitrary shell access.",
+    "Your job is to classify whether a runbook script is safe to execute automatically.",
+    "",
+    "## Verdict rules (use these thresholds):",
+    "- **blocked**: Destructive operations on system-critical paths (/etc, /var, /opt, /boot, /usr, /root).",
+    "  Examples: rm -rf /etc/*, wipefs, mkfs, dd to /dev/sd*, truncate -s 0 /var/log/*, chmod 777 /etc/passwd.",
+    "- **approval_required**: Operations that modify configs, services, or packages but could be rolled back.",
+    "  Examples: systemctl restart a service, apt-get install, editing /etc/* config files, docker restart.",
+    "  Also: anything requiring sudo on production paths, opening ports in iptables, or changing file ownership.",
+    "- **passed**: Read-only, informational, or trivial cleanup of non-critical paths.",
+    "  Examples: date, uptime, ls, cat, head/tail on logs, rm -rf /tmp/cache/*, rm stale .lock files.",
+    "  Also: systemctl status (not restart), apt-get update (not upgrade), git status.",
+    "",
+    "## Context:",
+    "This host runs Nextcloud, GitLab, WordPress, Frigate, and Apache in production.",
+    "The operator is an AI agent ordering maintenance via natural language.",
+    "Assume the operator is authorized but may make mistakes — your verdict is the critical safety gate.",
+    "",
     "Return exactly these seven lines and nothing else:",
     "VERDICT: passed|approval_required|blocked",
     "SUMMARY: <one sentence>",
@@ -66,8 +91,12 @@ export function buildRunbookSafetyPrompt(input: RunbookSafetyReviewInput): strin
     "EXPECTED_IMPACT: <short phrase>",
     "ROLLBACK_HINT: <short phrase>",
     "OPERATOR_CHECKS: <item 1 | item 2 | item 3 or none>",
-    "Runbook metadata:",
-    JSON.stringify(buildPromptPayload(input))
+    "",
+    "## Runbook metadata:",
+    JSON.stringify(buildPromptPayload(input)),
+    "",
+    "## Script content to evaluate:",
+    scriptContent
   ].join("\n");
 }
 
