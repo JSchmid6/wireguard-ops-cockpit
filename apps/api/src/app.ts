@@ -1266,11 +1266,11 @@ export async function createApp(options: AppOptions = {}) {
       .split("\n")
       .filter(l => !l.startsWith("timestamp=") && !l.startsWith("tee:") && l.trim() !== "")
       .join("\n");
-    // Find where the model output starts (## Required Permissions or ## heading)
+    // Planner output: extract from ## Required Permissions to end, cut before trailing debug
     const modelStart = noTimestamps.search(/\n## /);
     if (modelStart > 0) {
       let output = noTimestamps.slice(modelStart + 1);
-      // Stop at trailing debug wrap noise (before "ng loop", "sing instance", root prompt)
+      // Stop at trailing debug wrap noise
       const endMarkers = [/\nng loop"/, /\nsing instance"/, /\nroot@vmd/, /\nng hash=/];
       for (const m of endMarkers) {
         const idx = output.search(m);
@@ -1278,7 +1278,27 @@ export async function createApp(options: AppOptions = {}) {
       }
       return output.trim();
     }
-    return noTimestamps.slice(-2000).trim(); // fallback
+    // Runner output: strip ALL debug fragments, keep only command output
+    return noTimestamps
+      .split("\n")
+      .filter(l => {
+        const t = l.trim();
+        // Keep lines that look like real content
+        if (t.startsWith("#") || t.startsWith("```") || t.startsWith("echo") ||
+            t.startsWith("$ ") || t.startsWith("===") || t.startsWith("> ") ||
+            t.startsWith("/") || t.startsWith("[") ||
+            t.match(/^[A-Z][a-z]/) || t.match(/^\d/) ||
+            t.includes(": ") || t.match(/^[a-z]+ [a-z]+ [a-z]+:/i) ||
+            t.length > 60) return true;
+        // Drop: short fragments, wrapped debug, navigation output
+        if (t.length < 30 && !t.match(/^[A-Z0-9#]/)) return false;
+        if (/^[a-z]+ [a-z]+="[^"]/.test(t)) return false;
+        if (t.startsWith("updated=") || t.startsWith("removed=")) return false;
+        return false;
+      })
+      .join("\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
   }
 
   function pollPlannerOutput(tmuxSessionName: string, windowName: string, timeoutMs: number): string | null {
@@ -1316,8 +1336,10 @@ export async function createApp(options: AppOptions = {}) {
     if (!agent) return reply.code(500).send({ message: "planner not available" });
 
     // Create or reuse session
+    let createdSession = false;
     let session = body.sessionId ? database.getSessionRuntimeTargetForActor(body.sessionId, actor.id) : null;
     if (!session) {
+      createdSession = true;
       const sessionName = `hermes-${Date.now().toString(36)}`;
       const ensured = tmux.ensureSession(`cockpit-${sessionName}`);
       const created = database.upsertSession({
@@ -1335,6 +1357,12 @@ export async function createApp(options: AppOptions = {}) {
       };
     }
 
+    const cleanup = () => {
+      if (createdSession) {
+        try { execSync(`tmux kill-session -t "${session.tmuxSessionName}" 2>/dev/null || true`, { timeout: 5000 }); } catch {}
+      }
+    };
+
     const startTime = Date.now();
     const plan = createAgentPlan(actor, agent, session.id, body.prompt);
     executeAgentPlan(plan, actor, agent);
@@ -1346,6 +1374,7 @@ export async function createApp(options: AppOptions = {}) {
     const elapsed = Date.now() - startTime;
 
     if (!raw) {
+      cleanup();
       return reply.code(202).send({
         partial: true,
         message: "Planner still running. Poll GET /api/sessions/:id/output",
@@ -1354,6 +1383,7 @@ export async function createApp(options: AppOptions = {}) {
       });
     }
 
+    cleanup();
     return {
       answer: filterSensitiveContent(raw),
       sessionId: session.id,
@@ -1763,8 +1793,10 @@ Follow these rules:
     const startTime = Date.now();
 
     // 1. Create or reuse session
+    let createdSession = false;
     let session = body.sessionId ? database.getSessionRuntimeTargetForActor(body.sessionId, actor.id) : null;
     if (!session) {
+      createdSession = true;
       const sessionName = `hermes-rb-${Date.now().toString(36)}`;
       const ensured = tmux.ensureSession(`cockpit-${sessionName}`);
       const created = database.upsertSession({
@@ -1781,6 +1813,12 @@ Follow these rules:
         tmuxBackend: created.tmuxBackend,
       };
     }
+
+    const cleanup = () => {
+      if (createdSession) {
+        try { execSync(`tmux kill-session -t "${session.tmuxSessionName}" 2>/dev/null || true`, { timeout: 5000 }); } catch {}
+      }
+    };
 
     // 2. Order the runbook (planner + autoRegister pipeline)
     const plannerAgent = findAgent("planner-agent", "opencode");
@@ -1814,14 +1852,9 @@ Follow these rules:
         scriptIds: [scriptName], workflowSteps: [{ id: "execute", label: `OpenCode: ${scriptName}`, description: body.prompt.slice(0, 200), kind: "runbook" }],
       };
 
-      // Register (idempotent: replace if same prompt was already used)
-      try { database.createDynamicRunbook({ id: genRbId, name: genName, summary: body.prompt.slice(0, 200), requiresApproval: false, privilegedHelper: false, scriptId: scriptName, createdBy: actor.id }); } catch (e: any) {
-        if (e.message && e.message.includes("UNIQUE")) {
-          database.deleteDynamicRunbook(genRbId, actor.id);
-          unregisterDynamicRunbook(genRbId);
-          database.createDynamicRunbook({ id: genRbId, name: genName, summary: body.prompt.slice(0, 200), requiresApproval: false, privilegedHelper: false, scriptId: scriptName, createdBy: actor.id });
-        } else { throw e; }
-      }
+      // Register (idempotent: delete stale entry then create fresh one)
+      try { database.deleteDynamicRunbook(genRbId, actor.id); } catch { /* not found — ok */ }
+      database.createDynamicRunbook({ id: genRbId, name: genName, summary: body.prompt.slice(0, 200), requiresApproval: false, privilegedHelper: false, scriptId: scriptName, createdBy: actor.id });
       registerDynamicRunbook(runbook);
 
       // Safety review before execution — NEVER skip
@@ -1835,6 +1868,7 @@ Follow these rules:
       // "requiresApproval" → return for manual approval
       if (safetyVerdict === "blocked") {
         const blocked = createBlockedPlanRecord(safetyPlan, actor, `${genName} was blocked by the safety review.`);
+        cleanup();
         return reply.code(409).send({
           message: "safety review BLOCKED — runbook not executed",
           runbookId: genRbId,
@@ -1845,6 +1879,7 @@ Follow these rules:
       }
 
       if (safetyPlan.requiresApproval) {
+        cleanup();
         return reply.code(202).send({
           message: "runbook requires human approval before execution",
           runbookId: genRbId,
@@ -1854,6 +1889,7 @@ Follow these rules:
       }
 
       if (safetyVerdict !== "ready" && safetyVerdict !== "executed") {
+        cleanup();
         return reply.code(202).send({
           message: "safety review returned unclear — runbook NOT executed. Order manually.",
           runbookId: genRbId,
@@ -1871,6 +1907,7 @@ Follow these rules:
 
     // 5. If no runbook generated, return partial
     if (!genRbId) {
+      cleanup();
       return reply.code(202).send({
         partial: true,
         message: "Planner didn't produce a runbook. Try a more specific prompt.",
@@ -1904,6 +1941,7 @@ Follow these rules:
       }
     }
 
+    cleanup();
     return {
       message: "runbook executed",
       sessionId: session.id,
