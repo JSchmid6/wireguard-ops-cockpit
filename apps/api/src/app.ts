@@ -1327,13 +1327,15 @@ export async function createApp(options: AppOptions = {}) {
     const actor = await requireActor(request, reply, database);
     if (!actor) return;
 
-    const body = (request.body || {}) as { prompt?: string; sessionId?: string };
+    const body = (request.body || {}) as { prompt?: string; sessionId?: string; timeoutMs?: number };
     if (!body.prompt || body.prompt.length < 5) {
       return reply.code(400).send({ message: "prompt is required (min 5 chars)" });
     }
 
     const agent = findAgent("planner-agent", "opencode");
     if (!agent) return reply.code(500).send({ message: "planner not available" });
+
+    const pollTimeout = Math.min(body.timeoutMs || 60_000, 300_000); // default 60s, max 5min
 
     // Create or reuse session
     let createdSession = false;
@@ -1372,7 +1374,7 @@ export async function createApp(options: AppOptions = {}) {
     const windowName = slugify(`agent-${agent.id}`);
     const raw = session.tmuxBackend === "disabled"
       ? null
-      : pollPlannerOutput(session.tmuxSessionName, windowName, 120_000);
+      : pollPlannerOutput(session.tmuxSessionName, windowName, pollTimeout);
     const elapsed = Date.now() - startTime;
 
     if (!raw) {
@@ -1787,12 +1789,13 @@ Follow these rules:
     const actor = await requireActor(request, reply, database);
     if (!actor) return;
 
-    const body = (request.body || {}) as { prompt?: string; sessionId?: string };
+    const body = (request.body || {}) as { prompt?: string; sessionId?: string; timeoutMs?: number };
     if (!body.prompt || body.prompt.length < 10) {
       return reply.code(400).send({ message: "prompt is required (min 10 chars)" });
     }
 
     const startTime = Date.now();
+    const pollTimeout = Math.min(body.timeoutMs || 120_000, 600_000); // default 2min, max 10min
 
     // 1. Create or reuse session
     let createdSession = false;
@@ -1834,7 +1837,7 @@ Follow these rules:
     // 3. Wait for planner to finish, then autoRegister
     const plannerOutput = session.tmuxBackend === "disabled"
       ? null
-      : pollPlannerOutput(session.tmuxSessionName, plannerWindow, 120_000);
+      : pollPlannerOutput(session.tmuxSessionName, plannerWindow, pollTimeout);
     const cleanedPlanner = plannerOutput ? extractCleanOutput(plannerOutput) : "";
 
     activeOrders.delete(session.id);
@@ -1923,7 +1926,7 @@ Follow these rules:
 
     // 6. Wait for runner to complete (different window: agent-planner-agent-runner)
     const runnerWindow = slugify(`agent-${plannerAgent.id}-runner`);
-    let runnerRaw = session.tmuxBackend === "disabled" ? null : pollPlannerOutput(session.tmuxSessionName, runnerWindow, 120_000);
+    let runnerRaw = session.tmuxBackend === "disabled" ? null : pollPlannerOutput(session.tmuxSessionName, runnerWindow, pollTimeout);
     let runnerOutput = runnerRaw ? extractCleanOutput(runnerRaw) : "";
     if (!runnerOutput) {
       // Try the other agent window

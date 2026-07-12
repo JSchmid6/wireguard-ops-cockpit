@@ -1,5 +1,5 @@
 # Show the current server uptime
-> Generated 2026-07-12T09:52:12.229Z
+> Generated 2026-07-12T11:17:58.469Z
 
 ## Prompt
 Show the current server uptime
@@ -10,7 +10,6 @@ Show the current server uptime
 /usr/bin/uptime
 '''bash
 #!/usr/bin/env bash
-set -euo pipefail
 /usr/bin/uptime
 '''
 ```
