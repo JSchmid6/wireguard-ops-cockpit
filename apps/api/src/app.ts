@@ -1335,7 +1335,7 @@ export async function createApp(options: AppOptions = {}) {
     const agent = findAgent("planner-agent", "opencode");
     if (!agent) return reply.code(500).send({ message: "planner not available" });
 
-    const pollTimeout = Math.min(body.timeoutMs || 60_000, 300_000); // default 60s, max 5min
+    const totalTimeout = Math.min(body.timeoutMs || 45_000, 300_000); // default 45s, max 5min
 
     // Create or reuse session
     let createdSession = false;
@@ -1372,9 +1372,10 @@ export async function createApp(options: AppOptions = {}) {
     // Wait for opencode to boot then poll for completion
     await new Promise(r => setTimeout(r, 8000));
     const windowName = slugify(`agent-${agent.id}`);
-    const raw = session.tmuxBackend === "disabled"
+    const remaining = totalTimeout - (Date.now() - startTime);
+    const raw = session.tmuxBackend === "disabled" || remaining <= 0
       ? null
-      : pollPlannerOutput(session.tmuxSessionName, windowName, pollTimeout);
+      : pollPlannerOutput(session.tmuxSessionName, windowName, remaining);
     const elapsed = Date.now() - startTime;
 
     if (!raw) {
@@ -1795,7 +1796,7 @@ Follow these rules:
     }
 
     const startTime = Date.now();
-    const pollTimeout = Math.min(body.timeoutMs || 120_000, 600_000); // default 2min, max 10min
+    const totalTimeout = Math.min(body.timeoutMs || 50_000, 600_000); // default 50s, max 10min
 
     // 1. Create or reuse session
     let createdSession = false;
@@ -1837,7 +1838,7 @@ Follow these rules:
     // 3. Wait for planner to finish, then autoRegister
     const plannerOutput = session.tmuxBackend === "disabled"
       ? null
-      : pollPlannerOutput(session.tmuxSessionName, plannerWindow, pollTimeout);
+      : pollPlannerOutput(session.tmuxSessionName, plannerWindow, Math.max(5000, totalTimeout - (Date.now() - startTime)));
     const cleanedPlanner = plannerOutput ? extractCleanOutput(plannerOutput) : "";
 
     activeOrders.delete(session.id);
@@ -1926,7 +1927,8 @@ Follow these rules:
 
     // 6. Wait for runner to complete (different window: agent-planner-agent-runner)
     const runnerWindow = slugify(`agent-${plannerAgent.id}-runner`);
-    let runnerRaw = session.tmuxBackend === "disabled" ? null : pollPlannerOutput(session.tmuxSessionName, runnerWindow, pollTimeout);
+    let runnerRaw = session.tmuxBackend === "disabled" ? null
+      : pollPlannerOutput(session.tmuxSessionName, runnerWindow, Math.max(5000, totalTimeout - (Date.now() - startTime)));
     let runnerOutput = runnerRaw ? extractCleanOutput(runnerRaw) : "";
     if (!runnerOutput) {
       // Try the other agent window
