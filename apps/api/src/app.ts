@@ -1354,6 +1354,24 @@ export async function createApp(options: AppOptions = {}) {
       .trim();
   }
 
+  function stripHashNoise(text: string): string {
+    return text
+      .split("\n")
+      .filter(l => {
+        const t = l.trim();
+        if (!t) return false;
+        if (/^[0-9a-f]{20,}$/.test(t)) return false;
+        if (t.includes("/root/.local/share/opencode/snapshot/")) return false;
+        if (t.includes("73b976bfb76d8f75a5b24372db5108dd1a3d1d91")) return false;
+        if (t.match(/^[a-z]+[.=]ses_/)) return false;
+        if (t.includes("small=false agent=")) return false;
+        return true;
+      })
+      .join("\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  }
+
   function pollPlannerOutput(tmuxSessionName: string, windowName: string, timeoutMs: number): string | null {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
@@ -1843,10 +1861,11 @@ Follow these rules:
     const actor = await requireActor(request, reply, database);
     if (!actor) return;
 
-    const body = (request.body || {}) as { prompt?: string; sessionId?: string; timeoutMs?: number };
+    const body = (request.body || {}) as { prompt?: string; sessionId?: string; timeoutMs?: number; execute?: boolean };
     if (!body.prompt || body.prompt.length < 10) {
       return reply.code(400).send({ message: "prompt is required (min 10 chars)" });
     }
+    const shouldExecute = body.execute !== false;
 
     const startTime = Date.now();
     const totalTimeout = Math.min(body.timeoutMs || 50_000, 600_000); // default 50s, max 10min
@@ -1928,13 +1947,14 @@ Follow these rules:
       // "not_run" = safety review failed → STOP (better safe than sorry)
       // "requiresApproval" → return for manual approval
       if (safetyVerdict === "blocked") {
-        const blocked = createBlockedPlanRecord(safetyPlan, actor, `${genName} was blocked by the safety review.`);
         cleanup();
         return reply.code(409).send({
-          message: "safety review BLOCKED — runbook not executed",
+          message: "blocked",
           runbookId: genRbId,
-          plannerOutput: filterSensitiveContent(cleanedPlanner).substring(0, 2000),
-          ...blocked,
+          runbookName: genName,
+          plan: filterSensitiveContent(stripHashNoise(cleanedPlanner)).substring(0, 5000),
+          safety: "blocked",
+          result: "",
           elapsedMs: Date.now() - startTime,
         });
       }
@@ -1942,9 +1962,12 @@ Follow these rules:
       if (safetyPlan.requiresApproval) {
         cleanup();
         return reply.code(202).send({
-          message: "runbook requires human approval before execution",
+          message: "approval_required",
           runbookId: genRbId,
-          plannerOutput: filterSensitiveContent(cleanedPlanner).substring(0, 2000),
+          runbookName: genName,
+          plan: filterSensitiveContent(stripHashNoise(cleanedPlanner)).substring(0, 5000),
+          safety: "approval_required",
+          result: "",
           elapsedMs: Date.now() - startTime,
         });
       }
@@ -1952,18 +1975,20 @@ Follow these rules:
       if (safetyVerdict !== "ready" && safetyVerdict !== "executed") {
         cleanup();
         return reply.code(202).send({
-          message: "safety review returned unclear — runbook NOT executed. Order manually.",
+          message: "unclear-verdict",
           runbookId: genRbId,
-          safetyVerdict,
-          plannerOutput: filterSensitiveContent(cleanedPlanner).substring(0, 2000),
+          plan: filterSensitiveContent(cleanedPlanner).substring(0, 2000),
+          safety: safetyVerdict,
           elapsedMs: Date.now() - startTime,
         });
       }
 
-      // Launch runner agent (this IS the execution — opencode reads the .md and runs the steps)
-      const runnerPrompt = buildRunnerPrompt(scriptPath);
-      const runnerPlan = createAgentPlan(actor, plannerAgent, session.id, runnerPrompt);
-      executeAgentPlan(runnerPlan, actor, plannerAgent, "-runner");
+      // Launch runner agent (only if execute !== false)
+      if (shouldExecute) {
+        const runnerPrompt = buildRunnerPrompt(scriptPath);
+        const runnerPlan = createAgentPlan(actor, plannerAgent, session.id, runnerPrompt);
+        executeAgentPlan(runnerPlan, actor, plannerAgent, "-runner");
+      }
     }
 
     // 5. If no runbook generated, return partial
@@ -2005,12 +2030,12 @@ Follow these rules:
 
     cleanup();
     return {
-      message: "runbook executed",
+      message: shouldExecute ? "ok" : "plan-only",
       sessionId: session.id,
       runbookId: genRbId,
       runbookName: genName,
-      plannerOutput: filterSensitiveContent(cleanedPlanner).substring(0, 3000),
-      runnerOutput: filterSensitiveContent(runnerOutput).substring(0, 3000),
+      plan: filterSensitiveContent(stripHashNoise(cleanedPlanner)).substring(0, 5000),
+      result: shouldExecute ? filterSensitiveContent(stripHashNoise(runnerOutput)).substring(0, 5000) : "",
       elapsedMs: Date.now() - startTime,
     };
   });
