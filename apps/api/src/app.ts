@@ -1118,12 +1118,14 @@ export async function createApp(options: AppOptions = {}) {
       typeof plan.normalizedInput.prompt === "string"
         ? plan.normalizedInput.prompt
         : "Inspect the current maintenance context and report back.";
+    const logFile = `/tmp/opencode-${session.id.substring(0,8)}-${windowSuffix || agent.id}.log`;
     const command = buildAgentCommand(config.repoRoot, agent, prompt, {
       plannerRuntime: config.plannerRuntime,
       copilotExecutable: config.copilotExecutable,
       copilotModel: config.copilotModel,
       opencodeExecutable: config.opencodeExecutable,
-      opencodeModel: config.opencodeModel
+      opencodeModel: config.opencodeModel,
+      logFile,
     });
     const checkpointContract = parseCheckpointContractValue(plan.normalizedInput.checkpointContract);
     const checkpointState = createInitialCheckpointState(checkpointContract);
@@ -1394,6 +1396,22 @@ export async function createApp(options: AppOptions = {}) {
     return null;
   }
 
+  function pollAgentOutput(logFile: string, timeoutMs: number): string | null {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      try {
+        const out = execSync(`cat ${logFile} 2>/dev/null || true`, {
+          encoding: "utf-8", timeout: 5000, maxBuffer: 2 * 1024 * 1024,
+        }).trim();
+        if (out.includes("disposing instance")) return out;
+      } catch { }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      execSync("sleep 2", { timeout: 4000 });
+    }
+    return null;
+  }
+
   app.post("/api/hermes/research", async (request, reply) => {
     const actor = await requireActor(request, reply, database);
     if (!actor) return;
@@ -1440,13 +1458,13 @@ export async function createApp(options: AppOptions = {}) {
     const plan = createAgentPlan(actor, agent, session.id, body.prompt);
     executeAgentPlan(plan, actor, agent);
 
-    // Wait for opencode to boot then poll for completion
+    // Wait for opencode to boot then poll log file
     await new Promise(r => setTimeout(r, 8000));
-    const windowName = slugify(`agent-${agent.id}`);
+    const planLogFile = `/tmp/opencode-${session.id.substring(0,8)}-${agent.id}.log`;
     const remaining = totalTimeout - (Date.now() - startTime);
     const raw = session.tmuxBackend === "disabled" || remaining <= 0
       ? null
-      : pollPlannerOutput(session.tmuxSessionName, windowName, remaining);
+      : pollAgentOutput(planLogFile, remaining);
     const elapsed = Date.now() - startTime;
 
     if (!raw) {
@@ -1910,7 +1928,7 @@ Follow these rules:
     // 3. Wait for planner to finish, then autoRegister
     const plannerOutput = session.tmuxBackend === "disabled"
       ? null
-      : pollPlannerOutput(session.tmuxSessionName, plannerWindow, Math.max(5000, totalTimeout - (Date.now() - startTime)));
+      : pollAgentOutput(`/tmp/opencode-${session.id.substring(0,8)}-${plannerAgent.id}.log`, Math.max(5000, totalTimeout - (Date.now() - startTime)));
     const cleanedPlanner = plannerOutput ? extractCleanOutput(plannerOutput) : "";
 
     activeOrders.delete(session.id);
@@ -2006,7 +2024,7 @@ Follow these rules:
     // 6. Wait for runner to complete (different window: agent-planner-agent-runner)
     const runnerWindow = slugify(`agent-${plannerAgent.id}-runner`);
     let runnerRaw = session.tmuxBackend === "disabled" ? null
-      : pollPlannerOutput(session.tmuxSessionName, runnerWindow, Math.max(5000, totalTimeout - (Date.now() - startTime)));
+      : pollAgentOutput(`/tmp/opencode-${session.id.substring(0,8)}-${plannerAgent.id}-runner.log`, Math.max(5000, totalTimeout - (Date.now() - startTime)));
     let runnerOutput = runnerRaw ? extractRunnerHandoff(runnerRaw) : "";
     if (!runnerOutput) {
       // Try the other agent window
