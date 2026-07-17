@@ -1,8 +1,8 @@
-# Show current date
-> Generated 2026-07-17T09:23:57.901Z
+# Run the date command to show current time
+> Generated 2026-07-17T09:19:00.966Z
 
 ## Prompt
-Show current date
+Run the date command to show current time
 
 ## Planner Output
 ```

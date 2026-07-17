@@ -1,16 +1,16 @@
-# Show current date
-> Generated 2026-07-17T09:23:57.901Z
+# Show server uptime
+> Generated 2026-07-17T09:16:57.591Z
 
 ## Prompt
-Show current date
+Show server uptime
 
 ## Planner Output
 ```
 ## Required Permissions
-/usr/bin/date
+/usr/bin/uptime
 '''bash
 #!/usr/bin/env bash
 set -euo pipefail
-/usr/bin/date
+/usr/bin/uptime
 '''
 ```

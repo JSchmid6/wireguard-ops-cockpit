@@ -1825,7 +1825,7 @@ Follow these rules:
         const scriptName = `${rbId}.md`;
         const scriptPath = `/opt/wireguard-ops-cockpit/bin/${scriptName}`;
         const mdContent = [`# ${name}`,`> Generated ${new Date().toISOString()}`,"","## Prompt",orderPrompt,"","## Planner Output","```",raw.replace(/```/g, "'''"),"```"].join("\n");
-        execSync(`mkdir -p /opt/wireguard-ops-cockpit/bin && cat > ${scriptPath}`, { input: mdContent, encoding: "utf-8" });
+        execSync(`mkdir -p /opt/wireguard-ops-cockpit/bin && cat > ${scriptPath} && chmod 644 ${scriptPath}`, { input: mdContent, encoding: "utf-8" });
 
         const runbook: RunbookDefinition = {
           id: rbId, name, summary: orderPrompt.slice(0, 200), requiresSession: true, requiresApproval: false,
@@ -1942,7 +1942,7 @@ Follow these rules:
       const scriptName = `${genRbId}.md`;
       const scriptPath = `/opt/wireguard-ops-cockpit/bin/${scriptName}`;
       const mdContent = [`# ${genName}`,`> Generated ${new Date().toISOString()}`,"","## Prompt",body.prompt,"","## Planner Output","```",cleanedPlanner.replace(/```/g, "'''"),"```"].join("\n");
-      execSync(`mkdir -p /opt/wireguard-ops-cockpit/bin && cat > ${scriptPath}`, { input: mdContent, encoding: "utf-8" });
+      execSync(`mkdir -p /opt/wireguard-ops-cockpit/bin && cat > ${scriptPath} && chmod 644 ${scriptPath}`, { input: mdContent, encoding: "utf-8" });
 
       const runbook: RunbookDefinition = {
         id: genRbId, name: genName, summary: body.prompt.slice(0, 200), requiresSession: true, requiresApproval: false,
