@@ -61,7 +61,7 @@ Blocks ~15-50s. Optional `timeoutMs` (default 50s, max 10min). Safety review blo
 ```bash
 COOKIE=$(curl -s -X POST http://127.0.0.1:3001/api/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"$COCKPIT_PASSWORD"}' \
+  -d "{\"username\":\"admin\",\"password\":\"$COCKPIT_PASSWORD\"}" \
   -c - | grep cockpit_session | awk '{print $NF}')
 
 # Research with 30s timeout
