@@ -40,6 +40,16 @@ import {
   listDynamicRunbooks
 } from "./registries.js";
 import { generateRunbookSafetyReview, type SafetyReviewRunner } from "./safety-review.js";
+import {
+  buildAgentTask,
+  classifyCapabilities,
+  createExecutionEnvelope,
+  hashCanonical,
+  normalizeAllowedCapabilities,
+  normalizeEvidence,
+  verifyExecutionEnvelopeSignature,
+  type ExecutionEnvelope,
+} from "./hermes-security.js";
 
 interface AppOptions {
   config?: AppConfig;
@@ -358,11 +368,11 @@ function advanceCheckpointState(
   };
 }
 
-function normalizePrompt(value: string | undefined) {
+function normalizePrompt(value: string | undefined, maxLength = 240) {
   const basePrompt = (value || "Inspect the current maintenance context and report back.").trim();
   const withoutControlChars = basePrompt.replace(/[\u0000-\u001f\u007f]+/g, " ");
   const compact = withoutControlChars.replace(/\s+/g, " ").trim();
-  const normalized = (compact || "Inspect the current maintenance context and report back.").slice(0, 240);
+  const normalized = (compact || "Inspect the current maintenance context and report back.").slice(0, maxLength);
 
   return {
     prompt: normalized,
@@ -537,6 +547,9 @@ export async function createApp(options: AppOptions = {}) {
   if (config.nodeEnv === "production" && config.terminalSigningSecret === "development-terminal-secret") {
     throw new Error("COCKPIT_TERMINAL_SIGNING_SECRET must be changed before running in production");
   }
+  if (config.requireModelDiversity && config.opencodeModel === config.safetyOpencodeModel) {
+    throw new Error("COCKPIT_REQUIRE_MODEL_DIVERSITY requires different planner and safety models");
+  }
 
   const database = new CockpitDatabase(config.dbPath);
   const tmux = createTmuxAdapter(config.tmuxMode);
@@ -594,7 +607,7 @@ export async function createApp(options: AppOptions = {}) {
         copilotExecutable: config.copilotExecutable,
         copilotModel: config.copilotModel,
         opencodeExecutable: config.opencodeExecutable,
-        opencodeModel: config.opencodeModel
+        opencodeModel: config.safetyOpencodeModel
       }
     );
     const planState = resolveRunbookPlanState(runbook, safetyReview);
@@ -941,8 +954,8 @@ export async function createApp(options: AppOptions = {}) {
     }
   }
 
-  function createAgentPlan(actor: UserSummary, agent: AgentManifest, sessionId: string, prompt?: string) {
-    const normalizedPrompt = normalizePrompt(prompt);
+  function createAgentPlan(actor: UserSummary, agent: AgentManifest, sessionId: string, prompt?: string, promptMaxLength = 240) {
+    const normalizedPrompt = normalizePrompt(prompt, promptMaxLength);
     const riskClass: ExecutionRiskClass = agent.requiresApproval || agent.privilegedHelperRequested ? "high" : "moderate";
     const agentManifestDigest = computeAgentManifestDigest(agent);
     const checkpointContract = cloneCheckpointContract(agent.checkpointTemplate);
@@ -1187,7 +1200,13 @@ export async function createApp(options: AppOptions = {}) {
     return { plan: updatedPlan, job };
   }
 
-  function executeAgentPlan(plan: ExecutionPlan, actor: UserSummary, agent: AgentManifest, windowSuffix = "") {
+  function executeAgentPlan(
+    plan: ExecutionPlan,
+    actor: UserSummary,
+    agent: AgentManifest,
+    windowSuffix = "",
+    opencodeModel = config.opencodeModel,
+  ) {
     const session = plan.sessionId ? database.getSessionRuntimeTargetForActor(plan.sessionId, plan.requestedBy) : null;
     if (!session) {
       throw new Error("session not found for agent plan");
@@ -1203,7 +1222,7 @@ export async function createApp(options: AppOptions = {}) {
       copilotExecutable: config.copilotExecutable,
       copilotModel: config.copilotModel,
       opencodeExecutable: config.opencodeExecutable,
-      opencodeModel: config.opencodeModel,
+      opencodeModel,
       logFile,
     });
     const checkpointContract = parseCheckpointContractValue(plan.normalizedInput.checkpointContract);
@@ -1311,7 +1330,13 @@ export async function createApp(options: AppOptions = {}) {
 
   app.get("/api/health", async () => ({
     ok: true,
-    tmuxBackend: tmux.backend
+    tmuxBackend: tmux.backend,
+    security: {
+      modelDiversity: config.opencodeModel !== config.safetyOpencodeModel,
+      warning: config.opencodeModel === config.safetyOpencodeModel
+        ? "Planner and safety reviewer use the same configured model; role isolation remains, but correlated errors are more likely."
+        : null,
+    },
   }));
 
   app.post("/api/research", async (request, reply) => {
@@ -1503,6 +1528,26 @@ export async function createApp(options: AppOptions = {}) {
     return null;
   }
 
+  async function runIndependentVerification(
+    actor: UserSummary,
+    session: { id: string },
+    planner: AgentManifest,
+    intent: string,
+    reviewedPlan: string,
+    runnerResult: string,
+  ): Promise<string> {
+    const verifierPrompt = buildAgentTask(
+      `You are the verifier-agent. Independently verify the requested target state for this intent using read-only commands only. Do not trust the runner's success claim. End with exactly VERIFICATION_STATUS: passed or VERIFICATION_STATUS: failed, followed by EVIDENCE: and REASON:. Intent: ${intent}`,
+      [{ source: "reviewed-plan", content: reviewedPlan }, { source: "runner-handoff", content: runnerResult }],
+    );
+    executeAgentPlan(createAgentPlan(actor, planner, session.id, verifierPrompt, 30_000), actor, planner, "-verifier", config.safetyOpencodeModel);
+    const verifierLog = `/tmp/opencode-${session.id.substring(0,8)}-${planner.id}-verifier.log`;
+    const verifierRaw = await pollAgentLog(verifierLog, 5 * 60_000);
+    return verifierRaw
+      ? filterSensitiveContent(extractCleanOutput(verifierRaw) || extractAnswer(verifierRaw))
+      : "VERIFICATION_STATUS: failed\nREASON: verifier timeout";
+  }
+
   function explanation(input: Partial<HermesExplanation> & Pick<HermesExplanation, "phase" | "intent" | "reason">): HermesExplanation {
     return {
       phase: input.phase,
@@ -1517,11 +1562,18 @@ export async function createApp(options: AppOptions = {}) {
   }
 
   function updateHermesJob(jobId: string, status: JobRecord["status"], detail: HermesExplanation, extra: Record<string, unknown> = {}): JobRecord {
-    return database.updateJob(jobId, {
+    const updated = database.updateJob(jobId, {
       status,
       output: { ...extra, explanation: detail },
       completedAt: ["running", "pending"].includes(status) ? null : new Date().toISOString(),
     });
+    if (
+      (status === "failed_execution" || status === "failed_verification") &&
+      updated.subjectId === "hermes-change"
+    ) {
+      database.createAudit({ actorId: null, action: "hermes.change.failed", targetType: "job", targetId: jobId, details: { status, reason: detail.reason } });
+    }
+    return updated;
   }
 
   async function waitForHermesJob(jobId: string, actorId: string, waitMs: number): Promise<JobRecord | null> {
@@ -1545,9 +1597,10 @@ export async function createApp(options: AppOptions = {}) {
     const actor = await requireActor(request, reply, database);
     if (!actor) return;
 
-    const body = (request.body || {}) as { prompt?: string; sessionId?: string; timeoutMs?: number };
-    if (!body.prompt || body.prompt.length < 5) {
-      return reply.code(400).send({ message: "prompt is required (min 5 chars)" });
+    const body = (request.body || {}) as { prompt?: string; intent?: string; evidence?: unknown; sessionId?: string; timeoutMs?: number };
+    const requestedIntent = (body.intent || body.prompt || "").trim();
+    if (requestedIntent.length < 5) {
+      return reply.code(400).send({ message: "intent or prompt is required (min 5 chars)" });
     }
 
     const agent = findAgent("planner-agent", "opencode");
@@ -1577,7 +1630,9 @@ export async function createApp(options: AppOptions = {}) {
       };
     }
 
-    const intent = body.prompt.trim();
+    const intent = requestedIntent;
+    const untrustedEvidence = normalizeEvidence(body.evidence);
+    const agentTask = buildAgentTask(intent, untrustedEvidence);
     const job = database.createJob({
       sessionId: session.id,
       kind: "agent",
@@ -1598,7 +1653,7 @@ export async function createApp(options: AppOptions = {}) {
           return;
         }
         updateHermesJob(job.id, "running", explanation({ phase: "planning", intent, reason: "Planner is performing read-only research." }));
-        const plan = createAgentPlan(actor, agent, session.id, intent);
+        const plan = createAgentPlan(actor, agent, session.id, agentTask, 30_000);
         executeAgentPlan(plan, actor, agent);
         const logFile = `/tmp/opencode-${session.id.substring(0,8)}-${agent.id}.log`;
         const raw = await pollAgentLog(logFile, 5 * 60_000);
@@ -1611,6 +1666,17 @@ export async function createApp(options: AppOptions = {}) {
           return;
         }
         const answer = filterSensitiveContent(extractCleanOutput(raw) || extractAnswer(raw));
+        if (!answer || answer.length < 20 || /^>\s*build\b/i.test(answer.trim())) {
+          updateHermesJob(job.id, "failed_verification", explanation({
+            phase: "finished", intent,
+            reason: "Planner process exited, but produced no meaningful research result.",
+            completed: ["Planner process", "Sensitive-output filtering"],
+            evidence: [`elapsedMs=${Date.now() - startedAt}`],
+            neededToContinue: ["Inspect planner/provider health; do not treat this job as a successful answer."],
+            recommendedAction: "Retry only after confirming the model provider returns content.",
+          }));
+          return;
+        }
         updateHermesJob(job.id, "completed", explanation({
           phase: "finished", intent, reason: "Research completed successfully.",
           completed: ["Planner research", "Sensitive-output filtering"], evidence: [`elapsedMs=${Date.now() - startedAt}`],
@@ -1659,6 +1725,35 @@ export async function createApp(options: AppOptions = {}) {
     const intent = typeof job.output?.explanation === "object" && job.output.explanation
       ? String((job.output.explanation as Record<string, unknown>).intent || "Approved Hermes change")
       : "Approved Hermes change";
+    if (body.decision === "approved") {
+      const envelope = job.output?.envelope as ExecutionEnvelope | undefined;
+      const plan = job.output?.plan;
+      const safety = job.output?.safety;
+      const policy = job.output?.policy;
+      const capabilities = job.output?.capabilities;
+      const envelopeErrors: string[] = [];
+      if (!envelope || typeof envelope !== "object") {
+        envelopeErrors.push("execution envelope missing");
+      } else {
+        if (!verifyExecutionEnvelopeSignature(envelope, config.executionEnvelopeSecret)) envelopeErrors.push("execution envelope signature mismatch");
+        if (Date.now() > Date.parse(envelope.expiresAt)) envelopeErrors.push("execution envelope expired");
+        if (envelope.jobId !== job.id || envelope.actorId !== actor.id || envelope.sessionId !== job.sessionId) envelopeErrors.push("execution envelope binding mismatch");
+        if (envelope.intentHash !== hashCanonical(intent)) envelopeErrors.push("trusted intent drift");
+        if (envelope.planHash !== hashCanonical(plan)) envelopeErrors.push("reviewed plan drift");
+        if (envelope.safetyHash !== hashCanonical(safety)) envelopeErrors.push("safety review drift");
+        if (envelope.policyHash !== hashCanonical(policy)) envelopeErrors.push("policy decision drift");
+        if (JSON.stringify(envelope.capabilities) !== JSON.stringify(capabilities)) envelopeErrors.push("capability drift");
+      }
+      if (envelopeErrors.length > 0) {
+        const blocked = updateHermesJob(job.id, "blocked_policy", explanation({
+          phase: "finished", intent, reason: "The approved execution envelope is expired or no longer matches the reviewed action.",
+          evidence: envelopeErrors, neededToContinue: ["Create a fresh plan and review; do not reuse this approval."],
+          recommendedAction: "Submit a new change job for the same trusted intent.",
+        }), { ...job.output, envelopeErrors });
+        database.createAudit({ actorId: actor.id, action: "hermes.change.approval_invalid", targetType: "job", targetId: job.id, details: { envelopeErrors } });
+        return reply.code(409).send({ message: "execution envelope validation failed", job: blocked });
+      }
+    }
     database.createAudit({
       actorId: actor.id, action: `hermes.change.${body.decision}`, targetType: "job", targetId: job.id,
       details: { reason: body.reason?.trim() || null },
@@ -1708,15 +1803,20 @@ export async function createApp(options: AppOptions = {}) {
         const raw = await pollAgentLog(runnerLog, 10 * 60_000);
         if (!raw) throw new Error("approved runner did not finish within ten minutes");
         const result = filterSensitiveContent(extractRunnerHandoff(raw));
-        const success = /STATUS:\s*success/i.test(result);
+        const runnerSuccess = /STATUS:\s*success/i.test(result);
+        const reviewedPlan = typeof job.output?.plan === "string" ? job.output.plan : "";
+        const verification = runnerSuccess
+          ? await runIndependentVerification(actor, session, planner, intent, reviewedPlan, result)
+          : "VERIFICATION_STATUS: failed\nREASON: runner did not report success";
+        const success = runnerSuccess && /VERIFICATION_STATUS:\s*passed/i.test(verification);
         updateHermesJob(job.id, success ? "completed" : "failed_verification", explanation({
           phase: "finished", intent,
           reason: success ? "Approved execution and verification completed." : "Approved execution did not report verified success.",
-          completed: ["Planner proposal", "Safety review", "Policy evaluation", "Operator approval", "Runner execution", "Result collection"],
+          completed: ["Planner proposal", "Safety review", "Policy evaluation", "Operator approval", "Runner execution", "Independent verification", "Result collection"],
           neededToContinue: success ? [] : ["Inspect the structured runner result and complete verification or rollback."],
           recommendedAction: success ? "No further action is required." : "Resolve the reported verification issue.",
           rollbackAvailable: Boolean((job.output?.policy as Record<string, unknown> | undefined)?.rollbackAvailable),
-        }), { ...job.output, approval: running.output?.approval, result });
+        }), { ...job.output, approval: running.output?.approval, result, verification });
       } catch (error) {
         updateHermesJob(job.id, "failed_execution", explanation({
           phase: "finished", intent, reason: error instanceof Error ? error.message : "Approved execution failed.",
@@ -2121,9 +2221,10 @@ Follow these rules:
   app.post("/api/hermes/runbook", async (request, reply) => {
     const actor = await requireActor(request, reply, database);
     if (!actor) return;
-    const body = (request.body || {}) as { prompt?: string; sessionId?: string; timeoutMs?: number; execute?: boolean };
-    if (!body.prompt || body.prompt.length < 10) {
-      return reply.code(400).send({ message: "prompt is required (min 10 chars)" });
+    const body = (request.body || {}) as { prompt?: string; intent?: string; evidence?: unknown; allowedCapabilities?: unknown; sessionId?: string; timeoutMs?: number; execute?: boolean };
+    const requestedIntent = (body.intent || body.prompt || "").trim();
+    if (requestedIntent.length < 10) {
+      return reply.code(400).send({ message: "intent or prompt is required (min 10 chars)" });
     }
     const waitMs = Math.min(Math.max(body.timeoutMs ?? 50_000, 0), 55_000);
     const shouldExecute = body.execute !== false;
@@ -2140,7 +2241,10 @@ Follow these rules:
       session = { id: created.id, name: created.name, tmuxSessionName: created.tmuxSessionName, tmuxBackend: created.tmuxBackend };
     }
 
-    const intent = body.prompt.trim();
+    const intent = requestedIntent;
+    const untrustedEvidence = normalizeEvidence(body.evidence);
+    const allowedCapabilities = normalizeAllowedCapabilities(body.allowedCapabilities);
+    const agentTask = buildAgentTask(intent, untrustedEvidence);
     const job = database.createJob({
       sessionId: session.id, kind: "runbook", subjectId: "hermes-change",
       status: "running", requiresApproval: false,
@@ -2150,6 +2254,18 @@ Follow these rules:
     void (async () => {
       const startedAt = Date.now();
       try {
+        const failureWindowStart = new Date(Date.now() - 60 * 60_000).toISOString();
+        const recentFailures = database.countAuditsSince("hermes.change.failed", failureWindowStart);
+        if (recentFailures >= config.maxFailedChangesPerHour) {
+          updateHermesJob(job.id, "blocked_prerequisite", explanation({
+            phase: "finished", intent,
+            reason: `Circuit breaker is open after ${recentFailures} failed change jobs in the last hour.`,
+            evidence: [`failureCount=${recentFailures}`, `windowStart=${failureWindowStart}`],
+            neededToContinue: ["Wait for the failure window to clear or have an operator diagnose the repeated failures."],
+            recommendedAction: "Do not retry automatically; inspect recent failed jobs first.",
+          }));
+          return;
+        }
         if (session.tmuxBackend === "disabled") {
           updateHermesJob(job.id, "blocked_prerequisite", explanation({
             phase: "finished", intent, reason: "tmux is unavailable in this runtime.",
@@ -2160,7 +2276,7 @@ Follow these rules:
         const planner = findAgent("planner-agent", "opencode");
         if (!planner) throw new Error("planner not available");
         updateHermesJob(job.id, "running", explanation({ phase: "planning", intent, reason: "Planner is producing a structured change plan." }));
-        executeAgentPlan(createAgentPlan(actor, planner, session.id, intent), actor, planner);
+        executeAgentPlan(createAgentPlan(actor, planner, session.id, agentTask, 30_000), actor, planner);
         const plannerLog = `/tmp/opencode-${session.id.substring(0,8)}-${planner.id}.log`;
         const plannerRaw = await pollAgentLog(plannerLog, 5 * 60_000);
         if (!plannerRaw) throw new Error("planner did not finish within five minutes");
@@ -2185,8 +2301,43 @@ Follow these rules:
         const review = await safetyReviewRunner({
           runbook: proposal, runbookVersionHash: computeRunbookVersionHash(proposal), riskClass: "moderate",
           sessionId: session.id, trigger: "manual", scheduleId: null,
-        }, config);
-        const policy = evaluatePlanPolicy(planText, review.verdict);
+        }, { ...config, opencodeModel: config.safetyOpencodeModel });
+        let policy = evaluatePlanPolicy(planText, review.verdict);
+        const capabilities = classifyCapabilities(planText);
+        const capabilityEscalation = capabilities.filter((capability) => !allowedCapabilities.includes(capability));
+        if (policy.allowed && capabilityEscalation.length > 0) {
+          policy = {
+            ...policy,
+            zone: "red",
+            allowed: false,
+            status: "blocked_user_approval",
+            reason: "The proposed plan exceeds the capabilities authorized by the trusted request.",
+            evidence: [...policy.evidence, ...capabilityEscalation.map((capability) => `unauthorized capability: ${capability}`)],
+            neededToContinue: ["Authorize the exact capability from trusted operator intent or narrow the plan."],
+          };
+        }
+        if (policy.allowed && capabilities.includes("shell.exception")) {
+          policy = {
+            ...policy,
+            zone: "red",
+            allowed: false,
+            status: "blocked_user_approval",
+            reason: "The plan requires unrestricted shell semantics outside the typed capability contract.",
+            evidence: [...policy.evidence, "capability: shell.exception"],
+            neededToContinue: ["Explicit operator approval or rewrite the plan using typed capabilities."],
+          };
+        }
+        const envelope = createExecutionEnvelope({
+          jobId: job.id, actorId: actor.id, sessionId: session.id, intent,
+          evidence: untrustedEvidence, plan: planText, safety: review, policy, capabilities,
+          ttlMinutes: config.approvalTtlMinutes, signingSecret: config.executionEnvelopeSecret,
+        });
+        const provenance = {
+          trustedIntentHash: hashCanonical(intent),
+          untrustedEvidence: envelope.evidence,
+          allowedCapabilities,
+          injectionBoundary: "trusted-intent/untrusted-evidence-v1",
+        };
         if (!policy.allowed) {
           updateHermesJob(job.id, policy.status === "ready" ? "failed_execution" : policy.status, explanation({
             phase: "finished", intent, reason: policy.reason,
@@ -2194,7 +2345,7 @@ Follow these rules:
             evidence: [review.summary, ...policy.evidence], neededToContinue: policy.neededToContinue,
             recommendedAction: policy.status === "blocked_user_approval" ? "Ask the operator to approve or narrow the plan." : "Revise the plan as indicated.",
             rollbackAvailable: policy.rollbackAvailable,
-          }), { plan: planText, safety: review, policy, proposalPath });
+          }), { plan: planText, safety: review, policy, capabilities, envelope, provenance, proposalPath });
           return;
         }
         if (!shouldExecute) {
@@ -2203,7 +2354,7 @@ Follow these rules:
             completed: ["Planner proposal", "Safety review", "Policy evaluation"],
             evidence: [review.summary, ...policy.evidence], recommendedAction: "Submit an execution request if this plan should run.",
             rollbackAvailable: policy.rollbackAvailable,
-          }), { plan: planText, safety: review, policy, proposalPath, result: "" });
+          }), { plan: planText, safety: review, policy, capabilities, envelope, provenance, proposalPath, result: "" });
           stopEphemeralSession(session.tmuxSessionName, createdSession);
           return;
         }
@@ -2212,7 +2363,7 @@ Follow these rules:
           phase: "executing", intent, reason: policy.reason,
           completed: ["Planner proposal", "Safety review", "Policy evaluation"],
           evidence: [review.summary, ...policy.evidence], rollbackAvailable: policy.rollbackAvailable,
-        }), { plan: planText, safety: review, policy, proposalPath });
+        }), { plan: planText, safety: review, policy, capabilities, envelope, provenance, proposalPath });
         const runnerPrompt = buildRunnerPrompt(proposalPath);
         executeAgentPlan(createAgentPlan(actor, planner, session.id, runnerPrompt), actor, planner, "-runner");
         const runnerLog = `/tmp/opencode-${session.id.substring(0,8)}-${planner.id}-runner.log`;
@@ -2220,16 +2371,28 @@ Follow these rules:
         if (!runnerRaw) throw new Error("runner did not finish within ten minutes");
         const result = filterSensitiveContent(extractRunnerHandoff(runnerRaw));
         if (!result) throw new Error("runner produced no structured execution result");
-        const success = /STATUS:\s*success/i.test(result);
+        const runnerSuccess = /STATUS:\s*success/i.test(result);
+        let verification = "VERIFICATION_STATUS: failed\nREASON: runner did not report success";
+        if (runnerSuccess) {
+          const verifierPrompt = buildAgentTask(
+            `You are the verifier-agent. Independently verify the requested target state for this intent using read-only commands only. Do not trust the runner's success claim. End with exactly VERIFICATION_STATUS: passed or VERIFICATION_STATUS: failed, followed by EVIDENCE: and REASON:. Intent: ${intent}`,
+            [{ source: "reviewed-plan", content: planText }, { source: "runner-handoff", content: result }],
+          );
+          executeAgentPlan(createAgentPlan(actor, planner, session.id, verifierPrompt, 30_000), actor, planner, "-verifier", config.safetyOpencodeModel);
+          const verifierLog = `/tmp/opencode-${session.id.substring(0,8)}-${planner.id}-verifier.log`;
+          const verifierRaw = await pollAgentLog(verifierLog, 5 * 60_000);
+          verification = verifierRaw ? filterSensitiveContent(extractCleanOutput(verifierRaw) || extractAnswer(verifierRaw)) : "VERIFICATION_STATUS: failed\nREASON: verifier timeout";
+        }
+        const success = runnerSuccess && /VERIFICATION_STATUS:\s*passed/i.test(verification);
         updateHermesJob(job.id, success ? "completed" : "failed_verification", explanation({
           phase: "finished", intent,
           reason: success ? "Execution and runner verification completed." : "Execution finished but did not report a verified success.",
-          completed: ["Planner proposal", "Safety review", "Policy evaluation", "Runner execution", "Result collection"],
+          completed: ["Planner proposal", "Safety review", "Policy evaluation", "Runner execution", "Independent verification", "Result collection"],
           evidence: [review.summary, ...policy.evidence, `elapsedMs=${Date.now() - startedAt}`],
           neededToContinue: success ? [] : ["Inspect the structured runner result and complete the failed verification."],
           recommendedAction: success ? "No further action is required." : "Correct the reported issue or perform rollback.",
           rollbackAvailable: policy.rollbackAvailable,
-        }), { plan: planText, safety: review, policy, proposalPath, result, elapsedMs: Date.now() - startedAt });
+        }), { plan: planText, safety: review, policy, capabilities, envelope, provenance, proposalPath, result, verification, elapsedMs: Date.now() - startedAt });
         stopEphemeralSession(session.tmuxSessionName, createdSession);
       } catch (error) {
         updateHermesJob(job.id, "failed_execution", explanation({
@@ -2715,6 +2878,23 @@ Follow these rules:
     const body = (request.body || {}) as { decision?: "approved" | "rejected"; reason?: string };
     if (body.decision !== "approved" && body.decision !== "rejected") {
       return reply.code(400).send({ message: "decision must be approved or rejected" });
+    }
+
+    if (
+      body.decision === "approved" &&
+      Date.now() > Date.parse(approval.createdAt) + config.approvalTtlMinutes * 60_000
+    ) {
+      database.createAudit({
+        actorId: actor.id,
+        action: "approval.expired",
+        targetType: "approval",
+        targetId: approval.id,
+        details: { createdAt: approval.createdAt, ttlMinutes: config.approvalTtlMinutes },
+      });
+      return reply.code(409).send({
+        message: "approval expired; create and review a fresh execution plan",
+        expiresAt: new Date(Date.parse(approval.createdAt) + config.approvalTtlMinutes * 60_000).toISOString(),
+      });
     }
 
     const updatedApproval = database.decideApproval(approvalId, {

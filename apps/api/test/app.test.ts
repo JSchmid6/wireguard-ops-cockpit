@@ -22,10 +22,17 @@ function buildConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     tmuxMode: "disabled",
     ttydBaseUrl: null,
     terminalSigningSecret: "test-terminal-secret",
+    executionEnvelopeSecret: "test-envelope-secret",
     repoRoot: process.cwd(),
     plannerRuntime: "demo-local",
     copilotExecutable: "copilot",
     copilotModel: null,
+    opencodeExecutable: "opencode",
+    opencodeModel: null,
+    safetyOpencodeModel: null,
+    requireModelDiversity: false,
+    approvalTtlMinutes: 30,
+    maxFailedChangesPerHour: 3,
     nodeEnv: "development",
     ...overrides
   };

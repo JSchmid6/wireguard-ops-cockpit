@@ -81,6 +81,14 @@ For Hermes-generated change proposals the implemented zones are:
 
 Approval never grants new operating-system privilege. Even an approved red proposal executes as `wgops` and can use only pre-installed static helpers.
 
+## Prompt-injection and autonomous execution boundary
+
+Hermes requests carry authenticated `intent` separately from `evidence`. Mail, web, log, and document content is serialized as `untrusted-data` with source and digest. Instructions inside evidence do not expand intent or capability authority. Callers explicitly provide `allowedCapabilities`; omission defaults to `read.host`.
+
+Planner output remains untrusted. Cockpit derives capabilities from the executable block and compares them with the trusted request. Capability escalation and unrestricted shell semantics stop for an operator decision. Intent, evidence digests, plan, safety result, policy result, capabilities, actor, session, and expiry are bound into an HMAC-SHA-256 execution envelope. The signing secret is stripped from agent child environments. Approval fails on signature mismatch, drift, or expiry.
+
+Runner success alone cannot close a mutation. A separate verifier receives plan and runner handoff as untrusted evidence, performs read-only checks, and must confirm the target state. Repeated execution or verification failures open a persisted one-hour circuit breaker.
+
 ### Hooks
 
 Hooks are hard guardrails around execution, not optional shell snippets.

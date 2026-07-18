@@ -23,6 +23,8 @@ This first pass keeps the trust boundaries explicit:
 - privileged host behavior runs only through bounded host helpers, approvals, and narrow `sudoers` rules
 - Hermes requests become durable jobs with a structured explanation of intent, phase, completed work, evidence, blockers, and the exact action needed to continue
 - planner output never creates sudo policy or permanently registers a generated runbook; missing privilege fails closed
+- trusted operator intent is separated from untrusted mail/web/log/document evidence and bound with reviews, capabilities, actor, session, and expiry in an execution envelope
+- runner success is independently verified before a mutating Hermes job becomes `completed`
 
 ## Repository structure
 
@@ -70,6 +72,10 @@ Planner runtime notes:
 - optional Copilot model pin: `COCKPIT_COPILOT_MODEL=gpt-5.4`
 - default OpenCode executable: `COCKPIT_OPENCODE_EXECUTABLE=opencode`
 - optional OpenCode model pin: `COCKPIT_OPENCODE_MODEL=openai/gpt-4o`
+- optional safety model pin: `COCKPIT_SAFETY_OPENCODE_MODEL=anthropic/claude-sonnet-4`; health warns when it matches the planner model
+- optional strict diversity: `COCKPIT_REQUIRE_MODEL_DIVERSITY=true`
+- approval TTL and circuit breaker: `COCKPIT_APPROVAL_TTL_MINUTES=30`, `COCKPIT_MAX_FAILED_CHANGES_PER_HOUR=3`
+- set a distinct `COCKPIT_EXECUTION_ENVELOPE_SECRET`; it HMAC-signs reviewed Hermes envelopes and is removed from planner, runner, and verifier environments
 - the planner runtime is intentionally bounded to plan-only usage; host mutation still stays behind approvals and bounded runbooks
 - runbook plans now attach a reviewable safety report in Session detail; high-risk plans stay blocked or pending approval until that review path clears
 - runbook cards now expose reviewed workflow steps so multi-step flows such as Nextcloud maintenance can stay visible in the dashboard

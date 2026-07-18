@@ -688,7 +688,7 @@ function buildAgentPrompt(agent: AgentManifest, prompt: string): string {
   }
 
   // Runner prompts (containing "## EXECUTION RESULT") skip the planner wrapper
-  if (prompt.includes("## EXECUTION RESULT") || prompt.includes("runner-agent")) {
+  if (prompt.includes("## EXECUTION RESULT") || prompt.includes("runner-agent") || prompt.includes("verifier-agent")) {
     return prompt;
   }
 
@@ -734,6 +734,7 @@ export function buildAgentCommand(
       const logFile = runtimeOptions.logFile || "/tmp/opencode-last.log";
       const script = [
         "set -euo pipefail",
+        "unset COCKPIT_ADMIN_PASSWORD COCKPIT_TERMINAL_SIGNING_SECRET COCKPIT_EXECUTION_ENVELOPE_SECRET",
        'export DEEPSEEK_API_KEY="${DEEPSEEK_API_KEY:-}"',
         `planner_executable=${shellQuote(runtimeOptions.opencodeExecutable)}`,
         'if ! command -v "$planner_executable" >/dev/null 2>&1 && [ ! -x "$planner_executable" ]; then',
@@ -756,6 +757,7 @@ export function buildAgentCommand(
   const secretEnvVars = ["COCKPIT_ADMIN_PASSWORD", "COCKPIT_TERMINAL_SIGNING_SECRET"].join(",");
   const script = [
     "set -euo pipefail",
+    "unset COCKPIT_ADMIN_PASSWORD COCKPIT_TERMINAL_SIGNING_SECRET COCKPIT_EXECUTION_ENVELOPE_SECRET",
     'if [ "${GITHUB_TOKEN:-}" != "" ] && [[ "${GITHUB_TOKEN}" == ghp_* ]]; then unset GITHUB_TOKEN; fi',
     'if [ "${GH_TOKEN:-}" != "" ] && [[ "${GH_TOKEN}" == ghp_* ]]; then unset GH_TOKEN; fi',
     `planner_executable=${shellQuote(runtimeOptions.copilotExecutable)}`,

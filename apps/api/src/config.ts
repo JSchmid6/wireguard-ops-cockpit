@@ -12,12 +12,17 @@ export interface AppConfig {
   tmuxMode: "auto" | "disabled";
   ttydBaseUrl: string | null;
   terminalSigningSecret: string;
+  executionEnvelopeSecret: string;
   repoRoot: string;
   plannerRuntime: "copilot-cli" | "demo-local" | "opencode";
   copilotExecutable: string;
   copilotModel: string | null;
   opencodeExecutable: string;
   opencodeModel: string | null;
+  safetyOpencodeModel: string | null;
+  requireModelDiversity: boolean;
+  approvalTtlMinutes: number;
+  maxFailedChangesPerHour: number;
   nodeEnv: string;
 }
 
@@ -31,6 +36,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const cookieSecure =
     env.COCKPIT_COOKIE_SECURE === undefined ? nodeEnv === "production" : env.COCKPIT_COOKIE_SECURE === "true";
 
+  const terminalSigningSecret = env.COCKPIT_TERMINAL_SIGNING_SECRET || "development-terminal-secret";
   return {
     apiHost: env.COCKPIT_API_HOST || "127.0.0.1",
     apiPort: Number(env.COCKPIT_API_PORT || "3001"),
@@ -41,7 +47,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     cookieSecure,
     tmuxMode: env.COCKPIT_TMUX_MODE === "disabled" ? "disabled" : "auto",
     ttydBaseUrl: env.COCKPIT_TTYD_BASE_URL?.trim() || null,
-    terminalSigningSecret: env.COCKPIT_TERMINAL_SIGNING_SECRET || "development-terminal-secret",
+    terminalSigningSecret,
+    executionEnvelopeSecret: env.COCKPIT_EXECUTION_ENVELOPE_SECRET || terminalSigningSecret,
     repoRoot,
     plannerRuntime:
       env.COCKPIT_PLANNER_RUNTIME === "demo-local"
@@ -53,6 +60,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     copilotModel: env.COCKPIT_COPILOT_MODEL?.trim() || null,
     opencodeExecutable: env.COCKPIT_OPENCODE_EXECUTABLE?.trim() || "opencode",
     opencodeModel: env.COCKPIT_OPENCODE_MODEL?.trim() || null,
+    safetyOpencodeModel: env.COCKPIT_SAFETY_OPENCODE_MODEL?.trim() || env.COCKPIT_OPENCODE_MODEL?.trim() || null,
+    requireModelDiversity: env.COCKPIT_REQUIRE_MODEL_DIVERSITY === "true",
+    approvalTtlMinutes: Math.max(1, Number(env.COCKPIT_APPROVAL_TTL_MINUTES || "30")),
+    maxFailedChangesPerHour: Math.max(1, Number(env.COCKPIT_MAX_FAILED_CHANGES_PER_HOUR || "3")),
     nodeEnv
   };
 }

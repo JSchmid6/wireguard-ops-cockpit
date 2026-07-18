@@ -431,6 +431,7 @@ async function runOpencodeSafetyReview(
     "run",
     "--auto",
     "--print-logs",
+    ...(runtime.opencodeModel ? ["--model", runtime.opencodeModel] : []),
     "--dir",
     runtime.repoRoot,
     prompt
@@ -439,9 +440,13 @@ async function runOpencodeSafetyReview(
   return await new Promise((resolve, reject) => {
     const startedAt = new Date().toISOString();
     const started = Date.now();
+    const childEnvironment = { ...process.env };
+    delete childEnvironment.COCKPIT_ADMIN_PASSWORD;
+    delete childEnvironment.COCKPIT_TERMINAL_SIGNING_SECRET;
+    delete childEnvironment.COCKPIT_EXECUTION_ENVELOPE_SECRET;
     const child = spawn(runtime.opencodeExecutable, args, {
       cwd: runtime.repoRoot,
-      env: { ...process.env },
+      env: childEnvironment,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"]
     });

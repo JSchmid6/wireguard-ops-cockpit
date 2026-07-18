@@ -137,6 +137,7 @@ describe("registries", () => {
     expect(command.args[1]).toContain("--disable-builtin-mcps");
     expect(command.args[1]).toContain("--deny-tool=shell");
     expect(command.args[1]).toContain("--deny-tool=write");
+    expect(command.args[1]).toContain("unset COCKPIT_ADMIN_PASSWORD COCKPIT_TERMINAL_SIGNING_SECRET COCKPIT_EXECUTION_ENVELOPE_SECRET");
     expect(command.args[1]).toContain("--model 'gpt-5.4'");
     expect(command.args[1]).toContain("Task:");
     expect(command.args[1]).toContain("summarize current context");
@@ -253,6 +254,7 @@ describe("registries", () => {
     expect(command.args[1]).toContain("run --auto");
     expect(command.args[1]).toContain("--model 'openai/gpt-4o'");
     expect(command.args[1]).toContain("--print-logs");
+    expect(command.args[1]).toContain("unset COCKPIT_ADMIN_PASSWORD COCKPIT_TERMINAL_SIGNING_SECRET COCKPIT_EXECUTION_ENVELOPE_SECRET");
     expect(command.args[1]).toContain("Task:");
     expect(command.args[1]).toContain("summarize current context");
   });

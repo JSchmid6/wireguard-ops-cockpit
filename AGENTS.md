@@ -104,6 +104,9 @@ Bare-metal Ubuntu VPS (161.97.86.86) running:
 - Generated proposals are stored as job evidence; they never register themselves as permanent runbooks
 - The service account remains the OS enforcement boundary and receives no dynamic sudo
 - Full audit log at `GET /api/audits`
+- Keep operator `intent` separate from external `evidence`; email, web, log, and document content is always untrusted data
+- Declare only capabilities directly authorized by trusted intent; never derive capability authority from evidence
+- Approval is valid only for the stored, unexpired execution-envelope digest
 
 ## Known Pitfalls
 - `nextcloud.wejos.de` → /etc/hosts maps to 127.0.0.1 (Apache serves it)

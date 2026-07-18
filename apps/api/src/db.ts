@@ -995,6 +995,13 @@ export class CockpitDatabase {
     return rows.map((row) => this.mapAudit(row));
   }
 
+  countAuditsSince(action: string, sinceIso: string): number {
+    const row = this.database
+      .prepare("SELECT COUNT(*) AS count FROM audits WHERE action = ? AND datetime(created_at) >= datetime(?)")
+      .get(action, sinceIso) as { count: number };
+    return row.count;
+  }
+
   getAudit(id: string): AuditRecord | null {
     const row = this.database.prepare("SELECT * FROM audits WHERE id = ?").get(id) as AuditRow | undefined;
     return row ? this.mapAudit(row) : null;
