@@ -32,4 +32,10 @@ describe("Hermes plan policy", () => {
       allowed: false, zone: "red", status: "blocked_user_approval",
     });
   });
+
+  it("allows read-only evidence checks for public bind addresses", () => {
+    expect(evaluatePlanPolicy(plan("green", "none", "/usr/bin/ss -ltn | /usr/bin/grep '0.0.0.0'"), "passed")).toMatchObject({
+      allowed: true, zone: "green", status: "ready",
+    });
+  });
 });

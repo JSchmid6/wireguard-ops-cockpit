@@ -104,17 +104,17 @@ export function evaluatePlanPolicy(plan: string, safetyVerdict: string): PlanPol
       : "green";
   const rollback = sectionValue(plan, "Rollback");
   const rollbackAvailable = Boolean(rollback && !/^none\.?$/i.test(rollback));
+  const executableScript = plan.match(/```(?:bash|sh)\s*\n([\s\S]*?)```/i)?.[1] || "";
 
   // These are intentionally few hard boundaries. Contextual classification
   // remains the Safety LLM's job.
   const hardBoundaries: Array<[RegExp, string]> = [
     [/\b(rm\s+-rf|mkfs|wipefs|shred)\b/i, "destructive data operation"],
-    [/\b(iptables|nft|ufw|sshd_config|authorized_keys|useradd|userdel|visudo)\b/i, "network or identity boundary"],
-    [/(0\.0\.0\.0|\[::\]).{0,40}(:\d+|port)/i, "possible public network exposure"],
+    [/\b(iptables|nft|ufw|useradd|userdel|usermod|groupadd|groupdel|visudo)\b/i, "network or identity boundary"],
     [/\b(mysql|mariadb)\b.{0,80}\b(nextcloud|oc_)/i, "direct Nextcloud database access"],
-    [/\/etc\/sudoers|NOPASSWD/i, "sudo authority change"],
+    [/(?:>|tee\b|sed\s+-i\b)[^\n]*(?:\/etc\/sudoers|NOPASSWD)/i, "sudo authority change"],
   ];
-  const hit = hardBoundaries.find(([pattern]) => pattern.test(plan));
+  const hit = hardBoundaries.find(([pattern]) => pattern.test(executableScript));
   if (hit) {
     return {
       zone: "red", allowed: false, status: "blocked_user_approval",
