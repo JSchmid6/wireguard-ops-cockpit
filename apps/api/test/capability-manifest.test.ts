@@ -30,4 +30,15 @@ describe("dynamic capability manifest", () => {
   it("rejects root as a delegated step identity", () => {
     expect(() => parseCapabilityManifest(contained.replace('"www-data"', '"root"'))).toThrow(/non-root/);
   });
+
+  it("parses a semantic manifest from an unlabeled fence", () => {
+    const unlabeled = contained.replace("```capability", "```");
+    expect(parseCapabilityManifest(unlabeled)?.name).toBe("adapt tool");
+  });
+
+  it("parses a standalone semantic JSON manifest without accepting surrounding prose", () => {
+    const standalone = contained.replace(/^```capability\n|\n```$/g, "");
+    expect(parseCapabilityManifest(standalone)?.name).toBe("adapt tool");
+    expect(parseCapabilityManifest(`Plan: ${standalone}`)).toBeNull();
+  });
 });

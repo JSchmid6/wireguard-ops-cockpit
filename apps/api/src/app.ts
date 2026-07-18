@@ -569,7 +569,7 @@ export async function createApp(options: AppOptions = {}) {
     plannerModel: config.opencodeModel,
     safetyModel: config.safetyOpencodeModel,
     capabilityContract: "cockpit-capability/v1",
-    brokerRoleContract: "plan-pure-local-v5",
+    brokerRoleContract: "ephemeral-role-workspace-v7",
   });
   if (config.nodeEnv === "production" && config.adminPassword === "change-me-now") {
     throw new Error("COCKPIT_ADMIN_PASSWORD must be changed before running in production");
@@ -1463,7 +1463,7 @@ export async function createApp(options: AppOptions = {}) {
       .join("\n");
     // Planner output: preserve a dynamic capability fence even when it precedes legacy markdown sections.
     const capabilityStart = noTimestamps.search(
-      /(?:^|\n)```(?:capability|json)\s*\n(?=\s*\{[\s\S]{0,1000}?"version"\s*:\s*"cockpit-capability\/v1")/i
+      /(?:^|\n)```(?:capability|json)?\s*\n(?=\s*\{[\s\S]{0,1000}?"version"\s*:\s*"cockpit-capability\/v1")/i
     );
     const modelStart = noTimestamps.search(/(?:^|\n)## /);
     const contentStart = capabilityStart >= 0 ? capabilityStart + (noTimestamps[capabilityStart] === "\n" ? 1 : 0)
@@ -1573,7 +1573,7 @@ export async function createApp(options: AppOptions = {}) {
     actor: UserSummary,
     session: { id: string },
     agent: AgentManifest,
-    role: "planner" | "runner" | "safety" | "verifier",
+    role: "planner" | "research" | "runner" | "safety" | "verifier",
     prompt: string,
     windowSuffix: string,
     timeoutMs: number,
@@ -1765,7 +1765,7 @@ export async function createApp(options: AppOptions = {}) {
           return;
         }
         updateHermesJob(job.id, "running", explanation({ phase: "planning", intent, reason: "Planner is performing read-only research." }));
-        const raw = await runIsolatedAgent(actor, session, agent, "planner", agentTask, "", 5 * 60_000);
+        const raw = await runIsolatedAgent(actor, session, agent, "research", agentTask, "", 2 * 60_000);
         const answer = filterSensitiveContent(extractCleanOutput(raw) || extractAnswer(raw));
         if (!answer || answer.length < 20 || /^>\s*build\b/i.test(answer.trim())) {
           updateHermesJob(job.id, "failed_verification", explanation({
@@ -2510,7 +2510,7 @@ Follow these rules:
         let verification = "VERIFICATION_STATUS: failed\nREASON: runner did not report success";
         if (runnerSuccess) {
           const verifierPrompt = buildAgentTask(
-            `You are the verifier-agent. Independently verify the requested target state for this intent using read-only commands only. Do not trust the runner's success claim. End with exactly VERIFICATION_STATUS: passed or VERIFICATION_STATUS: failed, followed by EVIDENCE: and REASON:. Intent: ${intent}`,
+            `You are the verifier-agent. Independently verify the requested target state for this intent. Do not trust the runner's STATUS claim. First evaluate the supplied signed runner handoff's raw command output; when it directly proves every requested condition, do not call redundant tools. Otherwise use focused read-only commands only. Do not repair anything. Your final response is mandatory and must end with exactly VERIFICATION_STATUS: passed or VERIFICATION_STATUS: failed, followed by EVIDENCE: and REASON:. Never stop after announcing an intended check. Intent: ${intent}`,
             [{ source: "reviewed-plan", content: planText }, { source: "runner-handoff", content: result }],
           );
           const verifierRaw = await runIsolatedAgent(actor, session, planner, "verifier", verifierPrompt, "-verifier", 5 * 60_000, config.safetyOpencodeModel);

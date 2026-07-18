@@ -1,0 +1,77 @@
+#!/bin/sh
+set -eu
+umask 077
+
+action=${1:-}
+service=${2:-}
+shift 2 2>/dev/null || true
+reason=${*:-}
+audit_dir=/var/log/wireguard-ops-cockpit-recovery
+audit_file=$audit_dir/actions.tsv
+
+usage() {
+  echo "usage: cockpit-break-glass status|logs <cockpit-service>" >&2
+  echo "       cockpit-break-glass restart <cockpit-service> <reason>" >&2
+  exit 64
+}
+
+case "$service" in
+  wireguard-ops-cockpit-api.service|wireguard-ops-cockpit-agent.service|wireguard-ops-cockpit-executor.service|wireguard-ops-cockpit-ttyd.service) ;;
+  *) usage ;;
+esac
+
+verify() {
+  attempts=0
+  while [ "$attempts" -lt 20 ]; do
+    if /usr/bin/systemctl is-active --quiet "$service"; then
+      case "$service" in
+        wireguard-ops-cockpit-api.service)
+          /usr/bin/curl --fail --silent --max-time 2 http://127.0.0.1:3001/api/health >/dev/null 2>&1 && return 0
+          ;;
+        wireguard-ops-cockpit-agent.service)
+          test -S /run/cockpit-agent/agent.sock && return 0
+          ;;
+        wireguard-ops-cockpit-executor.service)
+          test -S /run/cockpit-executor/executor.sock && return 0
+          ;;
+        *) return 0 ;;
+      esac
+    fi
+    attempts=$((attempts + 1))
+    /usr/bin/sleep 0.5
+  done
+  return 1
+}
+
+record() {
+  result=$1
+  /usr/bin/install -d -m 0700 -o root -g root "$audit_dir"
+  encoded_reason=$(printf '%s' "$reason" | /usr/bin/base64 -w 0)
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(/usr/bin/date --iso-8601=seconds)" "$(/usr/bin/id -u)" "$action" "$service" "$result" "$encoded_reason" >>"$audit_file"
+  /usr/bin/logger -t cockpit-break-glass -- "$action $service result=$result reason_b64=$encoded_reason"
+}
+
+case "$action" in
+  status)
+    [ -z "$reason" ] || usage
+    /usr/bin/systemctl status --no-pager "$service"
+    ;;
+  logs)
+    [ -z "$reason" ] || usage
+    /usr/bin/journalctl -u "$service" --since "-30 minutes" --no-pager -n 200
+    ;;
+  restart)
+    [ "$(/usr/bin/id -u)" -eq 0 ] || { echo "restart requires root" >&2; exit 77; }
+    [ -n "$reason" ] || { echo "restart requires an audit reason" >&2; exit 64; }
+    if /usr/bin/systemctl restart "$service" && verify; then
+      record success
+      echo "$service restarted and verified"
+    else
+      record failed
+      echo "$service restart or verification failed" >&2
+      exit 1
+    fi
+    ;;
+  *) usage ;;
+esac

@@ -8,9 +8,10 @@ const executable = process.env.COCKPIT_OPENCODE_EXECUTABLE || "opencode";
 const plannerModel = process.env.COCKPIT_OPENCODE_MODEL || "";
 const safetyModel = process.env.COCKPIT_SAFETY_OPENCODE_MODEL || plannerModel;
 const workspaceRoot = process.env.COCKPIT_AGENT_WORKSPACE_ROOT || "/var/lib/wireguard-ops-agent/sessions";
+const opencodeConfig = process.env.COCKPIT_OPENCODE_CONFIG || "/var/lib/wireguard-ops-agent/.config/opencode/opencode.jsonc";
 const contextRoot = new URL("../context/", import.meta.url);
 const staleWorkspaceAgeMs = 24 * 60 * 60 * 1000;
-const allowedRoles = new Set(["planner", "runner", "safety", "verifier"]);
+const allowedRoles = new Set(["planner", "research", "runner", "safety", "verifier"]);
 
 export function validateRequest(value) {
   if (!value || typeof value !== "object") throw new Error("request must be an object");
@@ -52,7 +53,7 @@ export function createSessionWorkspace(request, root = workspaceRoot) {
 
 export function runAgent(request) {
   return new Promise((resolve) => {
-    const model = request.role === "planner" || request.role === "runner" ? plannerModel : safetyModel;
+    const model = request.role === "planner" || request.role === "research" || request.role === "runner" ? plannerModel : safetyModel;
     const opencodeAgent = request.role === "runner" ? "build" : "plan";
     const args = ["run", "--auto", "--pure", "--agent", opencodeAgent, ...(model ? ["--model", model] : []), "--print-logs", request.prompt];
     let workspace;
@@ -68,6 +69,7 @@ export function runAgent(request) {
         HOME: process.env.HOME,
         PATH: process.env.PATH,
         DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY,
+        OPENCODE_CONFIG: opencodeConfig,
         NODE_ENV: "production",
       },
       stdio: ["ignore", "pipe", "pipe"],
@@ -88,7 +90,7 @@ export function runAgent(request) {
     const timer = setTimeout(() => {
       child.kill("SIGTERM");
       forceKillTimer = setTimeout(() => child.kill("SIGKILL"), 5000);
-    }, request.role === "runner" ? 600000 : 300000);
+    }, request.role === "runner" ? 600000 : request.role === "research" ? 120000 : 300000);
     child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => { if (stdout.length < 2_000_000) stdout += chunk; });
     child.stderr.on("data", (chunk) => { if (stderr.length < 200_000) stderr += chunk; });

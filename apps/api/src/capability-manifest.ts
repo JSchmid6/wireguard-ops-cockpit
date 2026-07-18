@@ -34,10 +34,13 @@ function cleanStrings(value: unknown, maximum: number, length = 1000): string[] 
 
 export function parseCapabilityManifest(plan: string): CapabilityManifest | null {
   const match = plan.match(/```(?:json\s+)?capability\s*\n([\s\S]*?)```/i)
-    || plan.match(/```json\s*\n([\s\S]*?"version"\s*:\s*"cockpit-capability\/v1"[\s\S]*?)```/i);
-  if (!match) return null;
+    || plan.match(/```(?:json)?\s*\n([\s\S]*?"version"\s*:\s*"cockpit-capability\/v1"[\s\S]*?)```/i);
+  const standalone = plan.trim();
+  const manifestText = match?.[1] || (standalone.startsWith("{") && standalone.endsWith("}")
+    && standalone.includes('"version":"cockpit-capability/v1"') ? standalone : null);
+  if (!manifestText) return null;
   let raw: unknown;
-  try { raw = JSON.parse(match[1]); } catch { throw new Error("capability manifest is not valid JSON"); }
+  try { raw = JSON.parse(manifestText); } catch { throw new Error("capability manifest is not valid JSON"); }
   if (!raw || typeof raw !== "object") throw new Error("capability manifest must be an object");
   const value = raw as Record<string, unknown>;
   if (value.version !== "cockpit-capability/v1") throw new Error("unsupported capability manifest version");
@@ -90,6 +93,7 @@ export function capabilityNeedsOperatorApproval(manifest: CapabilityManifest): b
 export function capabilityPlannerContract(): string {
   return [
     "For a change, include exactly one fenced `capability` JSON manifest using version cockpit-capability/v1.",
+    "Render the complete manifest JSON on one physical line between the opening and closing fence. Do not pretty-print it: the unattended OpenCode console can omit brace-only and array-only display lines.",
     "Describe tools with direct absolute argv arrays, not shell syntax; discover current tool help/version before relying on unstable flags. Omit cwd unless host-directory visibility is essential.",
     "For a step that must run as a non-root service account, declare runAsUser instead of invoking sudo or runuser.",
     "Declare minimal readablePaths for read-only host visibility and only exact writablePaths that must change. Set network to none, local (host loopback only, no listening), outbound, or host.",

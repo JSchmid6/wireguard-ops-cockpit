@@ -38,15 +38,29 @@ Hermes authenticates as an `automation` identity using a random bearer token sto
 
 Research and change planning use distinct prompt contracts. Research agents perform a bounded number of focused read-only inspections and must return factual evidence rather than a runbook or capability manifest. Access denials are reported instead of being bypassed, and research may not create temporary files or probe unrelated network endpoints. Change planners return a reviewable dynamic capability manifest; only the separately bounded executor may mutate host state.
 
+Research is also a distinct broker role. It maps to OpenCode's non-mutating `plan` agent but receives its own root-controlled role file, a six-tool budget, and a 120-second child-process hard limit. Change planning, safety, and verification retain their separate five-minute limits; runner execution retains ten minutes. A research timeout is a preserved diagnostic failure, never authority to broaden inspection or fall back to shell execution.
+
 Planner and safety model selection is configuration, not policy. The current deployment deliberately uses `opencode/big-pickle` for planning/research and `deepseek/deepseek-v4-pro` for safety review so correlated single-model failures are visible. Operators may replace either model without changing the execution contracts or deterministic effect boundary.
 
 The isolated broker maps non-executing roles (`planner`, research through planner, `safety`, and `verifier`) to OpenCode's `plan` agent. Only the bounded `runner` role uses the `build` agent. Broker invocations use `--pure` so external OpenCode plugins cannot silently expand a role's tools or instructions.
 
 Each broker invocation receives a new mode-`0700` session workspace below `/var/lib/wireguard-ops-agent/sessions`. The broker copies a root-controlled common contract plus the selected role contract into that workspace as `AGENTS.md`, launches OpenCode there, and removes only that exact prefixed directory when the child exits. No Cockpit source checkout is the default agent workspace. On broker startup, prefixed session directories older than 24 hours are treated as crash remnants and removed; unrelated entries are preserved.
 
+The common contract describes the actual execution topology: Nextcloud and its primary database are host services; the agent is a sandboxed systemd identity; and signed mutations use a separate bubblewrap helper. A distinct mount namespace is therefore not evidence that the target runs in Docker. Research must not promote unrelated containers or processes into a root-cause hypothesis without target-specific invocation or cgroup evidence.
+
 Hermes API calls that create their own tmux session also own its lifecycle. A terminal cleanup path kills the exact generated `cockpit-hermes-*` session after completion, rejection, failure, or timeout. A session supplied by the caller is persistent and is never killed by this mechanism. Job output, proposals, safety evidence, envelopes, and audit records are stored outside both ephemeral resources before cleanup.
 
+### Cockpit break-glass recovery
+
+Cockpit cannot be its own only recovery dependency. Normal host administration remains Cockpit-only, but a root operator may use `deploy/recovery/cockpit-break-glass` when Cockpit itself cannot safely dispatch its repair. This is not a second general administration channel.
+
+The recovery tool accepts only `status`, 30-minute `logs`, and a reason-bearing `restart` for `wireguard-ops-cockpit-api.service`, `wireguard-ops-cockpit-agent.service`, `wireguard-ops-cockpit-executor.service`, or `wireguard-ops-cockpit-ttyd.service`. It provides no shell, file, network, database, application-service, or arbitrary-systemd target. A restart must run as root, must pass the service-specific active/socket/API health verification, and appends timestamp, UID, action, target, result, and base64-encoded reason to root-only `/var/log/wireguard-ops-cockpit-recovery/actions.tsv` and the system journal under `cockpit-break-glass`.
+
+Source/configuration repairs remain normal reviewed repository changes; the break-glass tool only restores the known Cockpit runtime after such a repair. After recovery, perform the failed operation through Cockpit and retain its ordinary job evidence.
+
 OpenCode's `plan` profile allows `external_directory` inspection because the broker's systemd service already enforces a read-only host view, blocks privilege gain, protects home directories, and denies writes. Secret-like `.env` reads retain OpenCode's separate restriction. This avoids unattended jobs hanging on redundant interactive read prompts without expanding mutation authority.
+
+The broker passes the root-controlled config through `OPENCODE_CONFIG=/var/lib/wireguard-ops-agent/.config/opencode/opencode.jsonc` instead of relying on implicit global-file discovery. Its `external_directory=allow` is global for the sandbox identity because OpenCode's built-in `plan` agent delegates filesystem discovery to `explore`, which does not inherit a plan-only override. This is required operationally: `--auto` does not resolve repeated external-directory asks in this non-interactive runtime, and either an undiscovered or plan-only override consumes the full broker timeout. The OS view remains read-only and secret reads retain their separate denial.
 
 The repeated-change circuit breaker counts failures per runtime fingerprint (planner model, safety model, capability contract, and broker role contract). A verified runtime repair therefore starts a fresh failure audit without erasing history; repeated failures under the unchanged runtime still stop autonomous retries.
 
@@ -59,6 +73,20 @@ Network scope distinguishes `none`, `local`, `outbound`, and `host`. `local` per
 When the capability helper exits nonzero, the executor broker preserves both stderr and its structured stdout result. Control stores that diagnostic together with the reviewed plan and envelope so a failed sandbox prerequisite is explainable instead of collapsing to a generic executor error.
 
 Planner-output extraction recognizes a capability by its semantic `cockpit-capability/v1` version inside either a `capability` or ordinary `json` fence. It does not depend on optional Markdown headings and must preserve JSON braces verbatim.
+
+An unlabeled Markdown fence containing the same semantic version is also valid. OpenCode models may omit the requested fence label while returning otherwise valid JSON; treating that response as generic prose destroys braces and arrays, falsely classifies the plan as `shell.exception`, and forces unnecessary approval.
+
+The planner contract requires the manifest JSON on one physical line. This is an output-transport constraint, not an application capability schema: OpenCode's formatted unattended console output was observed dropping brace-only and array-only lines from pretty-printed model output. Compact JSON preserves the complete agent-authored contract through that transport.
+
+Control also accepts a standalone JSON object with semantic version `cockpit-capability/v1` when the planner omits the fence entirely. It does not scan arbitrary surrounding prose for loose braces; the unfenced form must be the complete trimmed output.
+
+Independent verification distinguishes a runner claim from raw runner evidence. The verifier never trusts `STATUS: success`, but it may evaluate exact command output carried inside the signed handoff when that output directly proves every requested condition. It launches additional read-only observations only when the evidence is insufficient, and it must always return the terminal `VERIFICATION_STATUS`, `EVIDENCE`, and `REASON` schema.
+
+### Nextcloud CLI inside the capability sandbox
+
+The host Nextcloud 34 CLI initializes its database successfully when the capability binds `/run/mysqld`, uses `network: local` for Redis/Unix connectivity, and invokes PHP with `mysqli.default_socket=/run/mysqld/mysqld.sock` plus `pdo_mysql.default_socket=/run/mysqld/mysqld.sock`. The empty sandbox root does not reproduce the host's `/var/run -> /run` alias.
+
+Normal `occ` commands then call `OC_Util::checkServer()`, which creates, writes, and unlinks a random `data_dir_writability_test_*` file in the configured data directory and may open the Nextcloud log. Consequently, `occ status` is not filesystem-read-only despite its semantic purpose. Do not expose the complete protected data directory as writable merely for health checking. The TLS-verified loopback `https://nextcloud.wejos.de/status.php` capability is the contained health path. Mutating `occ` jobs must declare their real effect and receive only the authority justified by trusted intent.
 
 ## Components
 

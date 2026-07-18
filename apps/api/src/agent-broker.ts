@@ -1,7 +1,7 @@
 import net from "node:net";
 import { randomUUID } from "node:crypto";
 
-export type AgentBrokerRole = "planner" | "runner" | "safety" | "verifier";
+export type AgentBrokerRole = "planner" | "research" | "runner" | "safety" | "verifier";
 
 export async function runBrokerAgent(socketPath: string, role: AgentBrokerRole, prompt: string): Promise<string> {
   return await new Promise((resolve, reject) => {

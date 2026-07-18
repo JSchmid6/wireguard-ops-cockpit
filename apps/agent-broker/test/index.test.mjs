@@ -10,6 +10,7 @@ const { cleanupStaleWorkspaces, createSessionWorkspace, removeSessionWorkspace, 
 test.after(() => fs.rmSync(process.env.COCKPIT_AGENT_WORKSPACE_ROOT, { recursive: true, force: true }));
 test("agent broker accepts only bounded roles and prompts", () => {
   assert.deepEqual(validateRequest({ requestId: "12345678", role: "planner", prompt: "inspect" }), { requestId: "12345678", role: "planner", prompt: "inspect" });
+  assert.deepEqual(validateRequest({ requestId: "12345678", role: "research", prompt: "inspect" }), { requestId: "12345678", role: "research", prompt: "inspect" });
   assert.throws(() => validateRequest({ requestId: "12345678", role: "root", prompt: "inspect" }), /invalid agent role/);
 });
 
