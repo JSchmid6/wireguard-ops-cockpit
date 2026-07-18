@@ -1,1 +1,2 @@
 cockpit-executor ALL=(root) NOPASSWD: /usr/local/sbin/cockpit-service-action *
+cockpit-executor ALL=(root) NOPASSWD: /opt/node-v20.19.1-linux-x64/bin/node /usr/local/lib/wireguard-ops-cockpit/cockpit-capability-action.mjs

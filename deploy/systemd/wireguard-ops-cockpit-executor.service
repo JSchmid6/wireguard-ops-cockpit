@@ -21,7 +21,7 @@ NoNewPrivileges=false
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/run/cockpit-executor
+ReadWritePaths=/run/cockpit-executor /var/lib/wireguard-ops-cockpit/capability-snapshots
 RestrictAddressFamilies=AF_UNIX
 
 [Install]

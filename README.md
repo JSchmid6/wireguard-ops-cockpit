@@ -25,6 +25,7 @@ This first pass keeps the trust boundaries explicit:
 - planner output never creates sudo policy or permanently registers a generated runbook; missing privilege fails closed
 - trusted operator intent is separated from untrusted mail/web/log/document evidence and bound with reviews, capabilities, actor, session, and expiry in an execution envelope
 - runner success is independently verified before a mutating Hermes job becomes `completed`
+- Hermes may author new versioned capability manifests at runtime; tool commands remain agent-owned while a generic OS sandbox enforces signed effect scope, snapshots, network isolation, and risk approval
 
 ## Repository structure
 

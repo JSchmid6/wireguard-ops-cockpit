@@ -42,8 +42,13 @@ import {
 } from "./registries.js";
 import { generateRunbookSafetyReview, type SafetyReviewRunner } from "./safety-review.js";
 import { runBrokerAgent } from "./agent-broker.js";
-import { runExecutorAction } from "./executor-broker.js";
+import { runDynamicCapability, runExecutorAction } from "./executor-broker.js";
 import {
+  capabilityManifestHash, capabilityNeedsOperatorApproval, capabilityPlannerContract,
+  parseCapabilityManifest, type CapabilityManifest,
+} from "./capability-manifest.js";
+import {
+  approveExecutionEnvelope,
   buildAgentTask,
   classifyCapabilities,
   createExecutionEnvelope,
@@ -51,6 +56,7 @@ import {
   normalizeAllowedCapabilities,
   normalizeEvidence,
   verifyExecutionEnvelopeSignature,
+  type CapabilityId,
   type ExecutionEnvelope,
 } from "./hermes-security.js";
 
@@ -1434,10 +1440,13 @@ export async function createApp(options: AppOptions = {}) {
       .split("\n")
       .filter(l => !l.startsWith("timestamp=") && !l.startsWith("tee:") && l.trim() !== "")
       .join("\n");
-    // Planner output: extract from ## Required Permissions to end, cut before trailing debug
-    const modelStart = noTimestamps.search(/\n## /);
-    if (modelStart > 0) {
-      let output = noTimestamps.slice(modelStart + 1);
+    // Planner output: preserve a dynamic capability fence even when it precedes legacy markdown sections.
+    const capabilityStart = noTimestamps.search(/(?:^|\n)```(?:json\s+)?capability\s*\n/i);
+    const modelStart = noTimestamps.search(/(?:^|\n)## /);
+    const contentStart = capabilityStart >= 0 ? capabilityStart + (noTimestamps[capabilityStart] === "\n" ? 1 : 0)
+      : modelStart >= 0 ? modelStart + (noTimestamps[modelStart] === "\n" ? 1 : 0) : -1;
+    if (contentStart >= 0) {
+      let output = noTimestamps.slice(contentStart);
       // Stop at trailing debug wrap noise
       const endMarkers = [/\nng loop"/, /\nsing instance"/, /\nroot@vmd/, /\nng hash=/];
       for (const m of endMarkers) {
@@ -1586,7 +1595,14 @@ export async function createApp(options: AppOptions = {}) {
     ].join("\n");
   }
 
-  async function executeTypedCapabilities(planText: string, envelope: ExecutionEnvelope): Promise<string | null> {
+  async function executeTypedCapabilities(planText: string, envelope: ExecutionEnvelope, manifest?: CapabilityManifest | null): Promise<string | null> {
+    if (manifest) {
+      if (!config.executorBrokerSocket || !config.executorBrokerSecret) throw new Error("sandbox executor broker is not configured");
+      const output = await runDynamicCapability(config.executorBrokerSocket, config.executorBrokerSecret, {
+        action: "capability.execute", manifest, envelope, expiresAt: envelope.expiresAt, envelopeDigest: envelope.digest,
+      });
+      return `## EXECUTION RESULT\nSTATUS: success\nEXIT_CODE: 0\nWHAT_RAN: ${manifest.name}\nOUTPUT: ${filterSensitiveContent(output).slice(-30000)}\nNOTES: executed from a signed, agent-authored capability manifest in the host-effect sandbox`;
+    }
     if (!envelope.capabilities.includes("service.manage")) return null;
     if (!config.executorBrokerSocket || !config.executorBrokerSecret) {
       throw new Error("typed executor broker is not configured");
@@ -1632,6 +1648,16 @@ export async function createApp(options: AppOptions = {}) {
       database.createAudit({ actorId: null, action: "hermes.change.failed", targetType: "job", targetId: jobId, details: { status, reason: detail.reason } });
     }
     return updated;
+  }
+
+  async function retainValidatedCapability(jobId: string, manifest: CapabilityManifest | null | undefined): Promise<string | null> {
+    if (!manifest) return null;
+    const digest = capabilityManifestHash(manifest);
+    const capabilityDir = path.join(path.dirname(config.dbPath), "capabilities");
+    await mkdir(capabilityDir, { recursive: true, mode: 0o700 });
+    const capabilityPath = path.join(capabilityDir, `${digest}.json`);
+    await writeFile(capabilityPath, JSON.stringify({ digest, validatedByJob: jobId, validatedAt: new Date().toISOString(), manifest }, null, 2), { encoding: "utf-8", mode: 0o600 });
+    return capabilityPath;
   }
 
   async function waitForHermesJob(jobId: string, actorId: string, waitMs: number): Promise<JobRecord | null> {
@@ -1778,6 +1804,7 @@ export async function createApp(options: AppOptions = {}) {
       const safety = job.output?.safety;
       const policy = job.output?.policy;
       const capabilities = job.output?.capabilities;
+      const manifest = job.output?.manifest as CapabilityManifest | null | undefined;
       const envelopeErrors: string[] = [];
       if (!envelope || typeof envelope !== "object") {
         envelopeErrors.push("execution envelope missing");
@@ -1790,6 +1817,7 @@ export async function createApp(options: AppOptions = {}) {
         if (envelope.safetyHash !== hashCanonical(safety)) envelopeErrors.push("safety review drift");
         if (envelope.policyHash !== hashCanonical(policy)) envelopeErrors.push("policy decision drift");
         if (JSON.stringify(envelope.capabilities) !== JSON.stringify(capabilities)) envelopeErrors.push("capability drift");
+        if (envelope.manifestHash !== (manifest ? capabilityManifestHash(manifest) : undefined)) envelopeErrors.push("capability manifest drift");
       }
       if (envelopeErrors.length > 0) {
         const blocked = updateHermesJob(job.id, "blocked_policy", explanation({
@@ -1841,13 +1869,18 @@ export async function createApp(options: AppOptions = {}) {
       completed: ["Planner proposal", "Safety review", "Policy evaluation", "Operator approval"],
       recommendedAction: "Poll this job until execution and verification finish.",
       rollbackAvailable: Boolean((job.output?.policy as Record<string, unknown> | undefined)?.rollbackAvailable),
-    }), { ...job.output, approval: { decision: "approved", reason: body.reason?.trim() || null, actorId: actor.id } });
+    }), {
+      ...job.output,
+      envelope: approveExecutionEnvelope(job.output?.envelope as ExecutionEnvelope, config.executionEnvelopeSecret, config.approvalTtlMinutes),
+      approval: { decision: "approved", reason: body.reason?.trim() || null, actorId: actor.id },
+    });
 
     void (async () => {
       try {
         const reviewedPlan = typeof job.output?.plan === "string" ? job.output.plan : "";
-        const envelope = job.output?.envelope as ExecutionEnvelope;
-        const typedResult = await executeTypedCapabilities(reviewedPlan, envelope);
+        const envelope = running.output?.envelope as ExecutionEnvelope;
+        const manifest = running.output?.manifest as CapabilityManifest | null | undefined;
+        const typedResult = await executeTypedCapabilities(reviewedPlan, envelope, manifest);
         const raw = typedResult || await runIsolatedAgent(actor, session, planner, "runner", isolatedRunnerPrompt(proposalPath, reviewedPlan), "-runner", 10 * 60_000);
         const result = typedResult || filterSensitiveContent(extractRunnerHandoff(raw));
         const runnerSuccess = /STATUS:\s*success/i.test(result);
@@ -1855,6 +1888,7 @@ export async function createApp(options: AppOptions = {}) {
           ? await runIndependentVerification(actor, session, planner, intent, reviewedPlan, result)
           : "VERIFICATION_STATUS: failed\nREASON: runner did not report success";
         const success = runnerSuccess && /VERIFICATION_STATUS:\s*passed/i.test(verification);
+        const retainedCapability = success ? await retainValidatedCapability(job.id, manifest) : null;
         updateHermesJob(job.id, success ? "completed" : "failed_verification", explanation({
           phase: "finished", intent,
           reason: success ? "Approved execution and verification completed." : "Approved execution did not report verified success.",
@@ -1862,13 +1896,13 @@ export async function createApp(options: AppOptions = {}) {
           neededToContinue: success ? [] : ["Inspect the structured runner result and complete verification or rollback."],
           recommendedAction: success ? "No further action is required." : "Resolve the reported verification issue.",
           rollbackAvailable: Boolean((job.output?.policy as Record<string, unknown> | undefined)?.rollbackAvailable),
-        }), { ...job.output, approval: running.output?.approval, result, verification });
+        }), { ...running.output, retainedCapability, result, verification });
       } catch (error) {
         updateHermesJob(job.id, "failed_execution", explanation({
           phase: "finished", intent, reason: error instanceof Error ? error.message : "Approved execution failed.",
           neededToContinue: ["Inspect the preserved proposal and execution session."],
           recommendedAction: "Correct the reported prerequisite or perform the documented rollback.",
-        }), { ...job.output, approval: running.output?.approval });
+        }), { ...running.output });
       }
     })();
     return reply.code(202).send({ job: running, message: "Approval recorded; execution started. Poll the job endpoint." });
@@ -2295,7 +2329,7 @@ Follow these rules:
     const intent = requestedIntent;
     const untrustedEvidence = normalizeEvidence(body.evidence);
     const allowedCapabilities = normalizeAllowedCapabilities(body.allowedCapabilities);
-    const agentTask = buildAgentTask(intent, untrustedEvidence);
+    const agentTask = `${buildAgentTask(intent, untrustedEvidence)}\n\nDYNAMIC CAPABILITY CONTRACT:\n${capabilityPlannerContract()}`;
     const job = database.createJob({
       sessionId: session.id, kind: "runbook", subjectId: "hermes-change",
       status: "running", requiresApproval: false,
@@ -2351,9 +2385,11 @@ Follow these rules:
           sessionId: session.id, trigger: "manual", scheduleId: null,
         }, { ...config, opencodeModel: config.safetyOpencodeModel });
         let policy = evaluatePlanPolicy(planText, review.verdict);
-        const capabilities = classifyCapabilities(planText);
+        const manifest = parseCapabilityManifest(planText);
+        const manifestHash = manifest ? capabilityManifestHash(manifest) : undefined;
+        const capabilities: CapabilityId[] = manifest ? [manifest.writablePaths.length > 0 ? "filesystem.write" : "read.host"] : classifyCapabilities(planText);
         const capabilityEscalation = capabilities.filter((capability) => !allowedCapabilities.includes(capability));
-        if (policy.allowed && capabilityEscalation.length > 0) {
+        if (!manifest && policy.allowed && capabilityEscalation.length > 0) {
           policy = {
             ...policy,
             zone: "red",
@@ -2364,7 +2400,7 @@ Follow these rules:
             neededToContinue: ["Authorize the exact capability from trusted operator intent or narrow the plan."],
           };
         }
-        if (policy.allowed && capabilities.includes("shell.exception")) {
+        if (!manifest && policy.allowed && capabilities.includes("shell.exception")) {
           policy = {
             ...policy,
             zone: "red",
@@ -2378,7 +2414,7 @@ Follow these rules:
         const unsupportedAutonomousCapabilities = capabilities.filter((capability) =>
           capability !== "read.host" && capability !== "service.manage" && capability !== "shell.exception"
         );
-        if (policy.allowed && unsupportedAutonomousCapabilities.length > 0) {
+        if (!manifest && policy.allowed && unsupportedAutonomousCapabilities.length > 0) {
           policy = {
             ...policy,
             allowed: false,
@@ -2388,10 +2424,18 @@ Follow these rules:
             neededToContinue: ["Install and review a narrow typed helper; do not fall back to agent shell execution."],
           };
         }
+        if (manifest && policy.allowed && capabilityNeedsOperatorApproval(manifest)) {
+          policy = {
+            ...policy, zone: "red", allowed: false, status: "blocked_user_approval",
+            reason: "The dynamic capability can expose a service, lose existing data, or cross an identity/secret boundary.",
+            evidence: [...policy.evidence, ...manifest.risk.map((risk) => `declared risk: ${risk}`), `network: ${manifest.network}`],
+            neededToContinue: ["Confirm this exact signed capability manifest."],
+          };
+        }
         const envelope = createExecutionEnvelope({
           jobId: job.id, actorId: actor.id, sessionId: session.id, intent,
           evidence: untrustedEvidence, plan: planText, safety: review, policy, capabilities,
-          ttlMinutes: config.approvalTtlMinutes, signingSecret: config.executionEnvelopeSecret,
+          manifestHash, ttlMinutes: config.approvalTtlMinutes, signingSecret: config.executionEnvelopeSecret,
         });
         const provenance = {
           trustedIntentHash: hashCanonical(intent),
@@ -2406,7 +2450,7 @@ Follow these rules:
             evidence: [review.summary, ...policy.evidence], neededToContinue: policy.neededToContinue,
             recommendedAction: policy.status === "blocked_user_approval" ? "Ask the operator to approve or narrow the plan." : "Revise the plan as indicated.",
             rollbackAvailable: policy.rollbackAvailable,
-          }), { plan: planText, safety: review, policy, capabilities, envelope, provenance, proposalPath });
+          }), { plan: planText, safety: review, policy, capabilities, manifest, envelope, provenance, proposalPath });
           return;
         }
         if (!shouldExecute) {
@@ -2415,7 +2459,7 @@ Follow these rules:
             completed: ["Planner proposal", "Safety review", "Policy evaluation"],
             evidence: [review.summary, ...policy.evidence], recommendedAction: "Submit an execution request if this plan should run.",
             rollbackAvailable: policy.rollbackAvailable,
-          }), { plan: planText, safety: review, policy, capabilities, envelope, provenance, proposalPath, result: "" });
+          }), { plan: planText, safety: review, policy, capabilities, manifest, envelope, provenance, proposalPath, result: "" });
           stopEphemeralSession(session.tmuxSessionName, createdSession);
           return;
         }
@@ -2424,8 +2468,8 @@ Follow these rules:
           phase: "executing", intent, reason: policy.reason,
           completed: ["Planner proposal", "Safety review", "Policy evaluation"],
           evidence: [review.summary, ...policy.evidence], rollbackAvailable: policy.rollbackAvailable,
-        }), { plan: planText, safety: review, policy, capabilities, envelope, provenance, proposalPath });
-        const typedResult = await executeTypedCapabilities(planText, envelope);
+        }), { plan: planText, safety: review, policy, capabilities, manifest, envelope, provenance, proposalPath });
+        const typedResult = await executeTypedCapabilities(planText, envelope, manifest);
         const runnerRaw = typedResult || await runIsolatedAgent(actor, session, planner, "runner", isolatedRunnerPrompt(proposalPath, planText), "-runner", 10 * 60_000);
         const result = typedResult || filterSensitiveContent(extractRunnerHandoff(runnerRaw));
         if (!result) throw new Error("runner produced no structured execution result");
@@ -2440,15 +2484,16 @@ Follow these rules:
           verification = filterSensitiveContent(extractCleanOutput(verifierRaw) || extractAnswer(verifierRaw));
         }
         const success = runnerSuccess && /VERIFICATION_STATUS:\s*passed/i.test(verification);
+        const retainedCapability = success ? await retainValidatedCapability(job.id, manifest) : null;
         updateHermesJob(job.id, success ? "completed" : "failed_verification", explanation({
           phase: "finished", intent,
           reason: success ? "Execution and runner verification completed." : "Execution finished but did not report a verified success.",
           completed: ["Planner proposal", "Safety review", "Policy evaluation", "Runner execution", "Independent verification", "Result collection"],
-          evidence: [review.summary, ...policy.evidence, `elapsedMs=${Date.now() - startedAt}`],
+          evidence: [review.summary, ...policy.evidence, ...(retainedCapability ? [`validated capability: ${retainedCapability}`] : []), `elapsedMs=${Date.now() - startedAt}`],
           neededToContinue: success ? [] : ["Inspect the structured runner result and complete the failed verification."],
           recommendedAction: success ? "No further action is required." : "Correct the reported issue or perform rollback.",
           rollbackAvailable: policy.rollbackAvailable,
-        }), { plan: planText, safety: review, policy, capabilities, envelope, provenance, proposalPath, result, verification, elapsedMs: Date.now() - startedAt });
+        }), { plan: planText, safety: review, policy, capabilities, manifest, envelope, provenance, proposalPath, retainedCapability, result, verification, elapsedMs: Date.now() - startedAt });
         stopEphemeralSession(session.tmuxSessionName, createdSession);
       } catch (error) {
         updateHermesJob(job.id, "failed_execution", explanation({

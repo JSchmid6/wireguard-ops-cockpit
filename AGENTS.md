@@ -109,6 +109,9 @@ Bare-metal Ubuntu VPS (161.97.86.86) running:
 - Approval is valid only for the stored, unexpired execution-envelope digest
 - Production agents run only through `/run/cockpit-agent/agent.sock`; never restore local `wgops` agent execution
 - Mutations run only through `/run/cockpit-executor/executor.sock` and a typed helper; never give the Agent socket access to the Executor group
+- Prefer agent-authored `cockpit-capability/v1` manifests over one helper per tool command. Keep tool discovery, flags, sequencing, effects, rollback, and verification agent-owned.
+- Deterministic enforcement validates the signed manifest and actual host-effect scope. Only realistic external exposure, loss of existing data, and identity/credential/secret boundaries require a separate operator decision.
+- Retain a generated capability by digest only after independent post-execution verification.
 
 ## Known Pitfalls
 - `nextcloud.wejos.de` → /etc/hosts maps to 127.0.0.1 (Apache serves it)

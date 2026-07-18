@@ -1,0 +1,106 @@
+#!/usr/bin/node
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync, copyFileSync } from "node:fs";
+import { dirname, normalize, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
+
+function fail(message, code = 64) { process.stderr.write(`${message}\n`); process.exit(code); }
+function canonicalHash(value) { return createHash("sha256").update(JSON.stringify(value)).digest("hex"); }
+function readSecret() {
+  const env = readFileSync("/etc/wireguard-ops-cockpit/api.env", "utf8");
+  const line = env.split(/\r?\n/).find((item) => item.startsWith("COCKPIT_EXECUTION_ENVELOPE_SECRET="));
+  if (!line) fail("execution authority is unavailable", 78);
+  return line.slice(line.indexOf("=") + 1).replace(/^['"]|['"]$/g, "");
+}
+function verifyEnvelope(envelope, manifest) {
+  if (!envelope || envelope.version !== "hermes-execution-envelope/v1" || typeof envelope.digest !== "string") fail("invalid execution envelope");
+  const { digest, ...unsigned } = envelope;
+  const expected = createHmac("sha256", readSecret()).update(JSON.stringify(unsigned)).digest("hex");
+  if (!/^[a-f0-9]{64}$/.test(digest) || !timingSafeEqual(Buffer.from(digest, "hex"), Buffer.from(expected, "hex"))) fail("execution envelope signature mismatch", 77);
+  if (Date.now() > Date.parse(envelope.expiresAt)) fail("execution envelope expired", 77);
+  if (envelope.manifestHash !== canonicalHash(manifest)) fail("capability manifest drift", 77);
+}
+
+let input = "";
+process.stdin.setEncoding("utf8");
+for await (const chunk of process.stdin) { input += chunk; if (input.length > 524288) fail("capability request too large"); }
+let request;
+try { request = JSON.parse(input); } catch { fail("invalid capability request JSON"); }
+const { manifest, envelope } = request || {};
+verifyEnvelope(envelope, manifest);
+if (!/^[a-zA-Z0-9_.-]{1,128}$/.test(envelope.jobId || "")) fail("invalid envelope job id");
+if (!manifest || manifest.version !== "cockpit-capability/v1" || !Array.isArray(manifest.steps) || manifest.steps.length < 1 || manifest.steps.length > 24) fail("invalid capability manifest");
+
+const approved = envelope.operatorApproved === true;
+const risky = new Set(["exposure", "data_loss", "identity_or_secret"]);
+if (!approved && (manifest.network === "host" || (manifest.risk || []).some((item) => risky.has(item)))) fail("operator approval is required for exposure, data-loss, identity, or secret risk", 77);
+
+const forbiddenRoots = new Set(["/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib64", "/opt", "/proc", "/root", "/run", "/sbin", "/sys", "/usr", "/var"]);
+const protectedPath = /(?:^|\/)(?:\.ssh|sudoers(?:\.d)?|shadow|gshadow|passwd|group|ssh|wireguard|secrets?|credentials?|private|keys?)(?:\/|$)|\.(?:key|pem|p12|env|db|sqlite3?)$|^\/(?:opt\/nextcloud|opt\/gitlab|var\/www\/nextcloud\/config|var\/lib\/wireguard-ops-cockpit)(?:\/|$)/i;
+const paths = Array.isArray(manifest.writablePaths) ? manifest.writablePaths : [];
+if (paths.length > 32) fail("too many writable paths");
+const writablePaths = paths.map((item) => {
+  if (typeof item !== "string" || !item.startsWith("/") || item.includes("\0")) fail("invalid writable path");
+  const clean = normalize(item);
+  if (forbiddenRoots.has(clean)) fail(`writable scope is too broad: ${clean}`, 77);
+  const parent = existsSync(clean) ? realpathSync(dirname(clean)) : realpathSync(dirname(clean));
+  const resolved = resolve(parent, clean.split("/").at(-1));
+  if (!resolved.startsWith(`${parent}/`)) fail("writable path escapes its parent");
+  if (!approved && protectedPath.test(resolved)) fail(`protected path requires operator approval: ${resolved}`, 77);
+  if (!existsSync(resolved)) fail(`writable target must already exist so it can be snapshotted: ${resolved}`, 77);
+  const stat = lstatSync(resolved);
+  if (!stat.isFile()) fail(`autonomous writable scope must be an exact regular file: ${resolved}`, 77);
+  if (stat.size > 10 * 1024 * 1024) fail(`writable file is too large for automatic snapshot: ${resolved}`, 77);
+  return resolved;
+});
+
+const dangerousExecutable = /\/(?:rm|shred|dd|mkfs(?:\.[^/]*)?|fdisk|parted|iptables|nft|ufw|ip|wg|wg-quick|useradd|userdel|usermod|groupadd|groupdel|passwd|visudo|docker|podman)$/;
+if (!approved && manifest.steps.some((step) => dangerousExecutable.test(step?.argv?.[0] || ""))) fail("requested executable can cause exposure or irreversible loss and requires operator approval", 77);
+
+const backupRoot = `/var/lib/wireguard-ops-cockpit/capability-snapshots/${envelope.jobId}`;
+mkdirSync(backupRoot, { recursive: true, mode: 0o700 });
+const snapshot = [];
+for (const [index, target] of writablePaths.entries()) {
+  if (existsSync(target)) {
+    const backup = `${backupRoot}/${index}`; copyFileSync(target, backup); snapshot.push({ target, backup, existed: true });
+  } else snapshot.push({ target, backup: null, existed: false });
+}
+writeFileSync(`${backupRoot}/manifest.json`, JSON.stringify({ manifest, snapshot }, null, 2), { mode: 0o600 });
+
+const outputs = [];
+for (const [index, step] of manifest.steps.entries()) {
+  if (!step || !Array.isArray(step.argv) || step.argv.length < 1 || step.argv.length > 64 || step.argv.some((arg) => typeof arg !== "string" || arg.includes("\0"))) fail(`invalid step ${index + 1}`);
+  if (!step.argv[0].startsWith("/") || !existsSync(step.argv[0])) fail(`step ${index + 1} executable is unavailable`);
+  const properties = [
+    "--property=Type=exec", "--property=NoNewPrivileges=yes", "--property=PrivateTmp=yes", "--property=TemporaryFileSystem=/:ro",
+    "--property=ProtectHome=yes", "--property=ProtectKernelTunables=yes", "--property=ProtectKernelModules=yes", "--property=ProtectControlGroups=yes",
+    "--property=RestrictSUIDSGID=yes", "--property=LockPersonality=yes", "--property=RestrictRealtime=yes", "--property=PrivateDevices=yes",
+    "--property=CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER",
+    "--property=RestrictNamespaces=yes", "--property=ProtectProc=invisible", "--property=ProcSubset=pid",
+    "--property=SystemCallFilter=~@mount @swap @reboot @raw-io @privileged",
+    "--property=BindReadOnlyPaths=/usr /bin /lib /lib64 /etc/ld.so.cache /etc/alternatives",
+    ...writablePaths.map((item) => `--property=BindPaths=${item}`),
+  ];
+  if (manifest.network === "none") properties.push("--property=PrivateNetwork=yes", "--property=RestrictAddressFamilies=AF_UNIX");
+  if (manifest.network === "outbound") properties.push(
+    "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6", "--property=SocketBindDeny=any",
+    "--property=BindReadOnlyPaths=/etc/resolv.conf /etc/nsswitch.conf /etc/hosts /etc/ssl/certs /etc/ca-certificates.conf",
+  );
+  if (manifest.network === "host") properties.push("--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6");
+  if (step.cwd) {
+    const cwd = realpathSync(step.cwd);
+    if (!approved && cwd !== "/tmp" && cwd !== "/var/tmp") fail(`host working-directory access requires operator approval; use direct paths for contained execution: ${cwd}`, 77);
+    if (approved) properties.push(`--property=BindReadOnlyPaths=${cwd}`);
+    properties.push(`--working-directory=${cwd}`);
+  }
+  const timeout = Number.isInteger(step.timeoutSeconds) ? Math.min(Math.max(step.timeoutSeconds, 1), 900) : 120;
+  const result = spawnSync("/usr/bin/systemd-run", ["--wait", "--pipe", "--collect", "--quiet", `--property=TimeoutStartSec=${timeout}`, ...properties, "--", ...step.argv], {
+    encoding: "utf8", timeout: (timeout + 10) * 1000, maxBuffer: 1024 * 1024, env: { PATH: "/usr/sbin:/usr/bin:/sbin:/bin", LANG: "C.UTF-8" },
+  });
+  outputs.push({ step: index + 1, argv: step.argv, status: result.status, stdout: (result.stdout || "").slice(-12000), stderr: (result.stderr || "").slice(-4000) });
+  if (result.status !== 0) {
+    for (const item of snapshot) if (item.existed && item.backup) copyFileSync(item.backup, item.target);
+    process.stdout.write(JSON.stringify({ status: "failed_rolled_back", snapshot: backupRoot, outputs })); process.exit(result.status || 1);
+  }
+}
+process.stdout.write(JSON.stringify({ status: "success", snapshot: backupRoot, outputs }));

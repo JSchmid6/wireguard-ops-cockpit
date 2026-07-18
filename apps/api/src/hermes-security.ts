@@ -37,6 +37,8 @@ export interface ExecutionEnvelope {
   safetyHash: string;
   policyHash: string;
   capabilities: CapabilityId[];
+  manifestHash?: string;
+  operatorApproved?: boolean;
   issuedAt: string;
   expiresAt: string;
   digest: string;
@@ -48,6 +50,16 @@ export function hashCanonical(value: unknown): string {
 
 function signEnvelope(unsigned: Omit<ExecutionEnvelope, "digest">, signingSecret: string): string {
   return createHmac("sha256", signingSecret).update(JSON.stringify(unsigned)).digest("hex");
+}
+
+export function approveExecutionEnvelope(envelope: ExecutionEnvelope, signingSecret: string, ttlMinutes: number, now = new Date()): ExecutionEnvelope {
+  if (!verifyExecutionEnvelopeSignature(envelope, signingSecret)) throw new Error("cannot approve an invalid execution envelope");
+  const { digest: _digest, ...current } = envelope;
+  const unsigned = {
+    ...current, operatorApproved: true, issuedAt: now.toISOString(),
+    expiresAt: new Date(now.getTime() + ttlMinutes * 60_000).toISOString(),
+  };
+  return { ...unsigned, digest: signEnvelope(unsigned, signingSecret) };
 }
 
 export function verifyExecutionEnvelopeSignature(envelope: ExecutionEnvelope, signingSecret: string): boolean {
@@ -131,6 +143,8 @@ export function createExecutionEnvelope(input: {
   safety: unknown;
   policy: unknown;
   capabilities: CapabilityId[];
+  manifestHash?: string;
+  operatorApproved?: boolean;
   ttlMinutes: number;
   signingSecret: string;
   now?: Date;
@@ -147,6 +161,8 @@ export function createExecutionEnvelope(input: {
     safetyHash: hashCanonical(input.safety),
     policyHash: hashCanonical(input.policy),
     capabilities: [...input.capabilities].sort(),
+    ...(input.manifestHash ? { manifestHash: input.manifestHash } : {}),
+    ...(input.operatorApproved ? { operatorApproved: true } : {}),
     issuedAt: issued.toISOString(),
     expiresAt: new Date(issued.getTime() + input.ttlMinutes * 60_000).toISOString(),
   };
@@ -163,6 +179,8 @@ export function validateExecutionEnvelope(envelope: ExecutionEnvelope, expected:
   if (envelope.safetyHash !== hashCanonical(expected.safety)) errors.push("safety review drift");
   if (envelope.policyHash !== hashCanonical(expected.policy)) errors.push("policy drift");
   if (JSON.stringify(envelope.capabilities) !== JSON.stringify([...expected.capabilities].sort())) errors.push("capability drift");
+  if (envelope.manifestHash !== expected.manifestHash) errors.push("capability manifest drift");
+  if (Boolean(envelope.operatorApproved) !== Boolean(expected.operatorApproved)) errors.push("operator approval drift");
   const evidence = expected.evidence.map((item) => ({ source: item.source, digest: hashCanonical(item.content), length: item.content.length }));
   if (JSON.stringify(envelope.evidence) !== JSON.stringify(evidence)) errors.push("evidence drift");
   return errors;

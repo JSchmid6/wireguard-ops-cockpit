@@ -16,7 +16,23 @@ Execution authority is split into five layers:
 4. pre/post execution hooks
 5. bounded executor
 
-Only the bounded executor may mutate the host, and only through a registered runbook or helper path.
+Only the bounded executor may mutate the host, through either a narrow legacy helper or a signed agent-authored capability manifest.
+
+## Dynamic agent-centric capabilities
+
+`cockpit-capability/v1` is an execution handoff, not an application-specific policy schema. The planner discovers installed versions and current tool help, then declares direct absolute argv steps, exact writable paths, network need, expected effects, verification, rollback, and effect risk. Tool names, subcommands, flags, and changing application APIs remain agent-owned.
+
+The stable deterministic boundary is deliberately lower. It verifies the HMAC-bound manifest digest, actor/session/intent/review binding and expiry, then constrains real process effects with systemd isolation, exact-file write scopes, pre-change snapshots, network isolation, timeouts, and a small protected-effect boundary. Realistic new external exposure, loss of existing data, and identity/credential/secret access require a separate operator decision. Contained reversible changes do not.
+
+Lifecycle:
+
+1. Planner creates a manifest from trusted intent while treating mail, web, logs, and documents as untrusted evidence.
+2. An independent safety agent reviews intent fit, possible effects, rollback, and injection attempts.
+3. Control signs the exact manifest. Protected effects wait for approval; contained effects proceed autonomously.
+4. The root sandbox helper independently verifies the signature, snapshots writable files, and executes direct argv without shell evaluation.
+5. A separate read-only verifier checks target state. Only a verified manifest is retained by digest under Control state for reuse and audit.
+
+This lifecycle replaces the assumption that every future application command needs a prewritten helper. Kernel privilege, filesystem scope, networking, protected effects, and signatures remain deterministic because an LLM must never be its own privilege boundary.
 
 ## Components
 
@@ -57,7 +73,7 @@ It must not be the only component that can authorize privileged execution.
 
 ### Deterministic policy gate
 
-The policy gate is the authoritative allow or deny layer. It deliberately keeps only hard boundaries deterministic; contextual classification remains with the safety LLM.
+The policy gate is the authoritative allow or deny layer. It keeps only stable hard boundaries deterministic; contextual classification and changing tool interfaces remain with the agents.
 
 It validates:
 
@@ -70,13 +86,13 @@ It validates:
 - concurrency and lock conditions
 - plan hash equality between approved and executed action
 
-If a request cannot be represented as an allowlisted runbook or helper, execution stops.
+Legacy runbooks retain their allowlists. New tasks should be represented as dynamic capability manifests and stop only when the requested real effects cannot be safely contained by an installed sandbox profile.
 
 For Hermes-generated change proposals the implemented zones are:
 
 - green: contextual review passes and execution may continue autonomously
 - yellow: autonomous execution is allowed only with an explicit rollback in the plan
-- red: destructive operations, identity/network changes, public exposure, direct Nextcloud database access, or sudo-policy changes require an operator decision
+- red: realistic public exposure, loss of existing data, or identity/credential/secret access requires an operator decision
 - policy/prerequisite block: the response identifies the failed boundary and what must change before a new attempt
 
 Approval never grants new operating-system privilege. Even an approved red proposal executes as `wgops` and can use only pre-installed static helpers.
@@ -97,7 +113,7 @@ Production separates three kernel-level identities:
 - `cockpit-agent` runs the local Agent Broker and owns only its model configuration and provider key. It cannot read Control state or the Executor socket.
 - `cockpit-executor` runs the typed Executor Broker. It cannot read Control state, provider credentials, or the Agent socket. Its only sudo entry invokes a root-owned validating helper.
 
-The Agent and Executor sockets use distinct Unix groups. When `COCKPIT_AGENT_BROKER_SOCKET` is configured, Control refuses all legacy same-process agent launches. Autonomous mutation is currently implemented only for typed `service.status` and `service.restart` actions targeting the helper allowlist. Unsupported capabilities fail closed; they never fall back to Agent shell execution.
+The Agent and Executor sockets use distinct Unix groups. When `COCKPIT_AGENT_BROKER_SOCKET` is configured, Control refuses all legacy same-process agent launches. Legacy typed service actions remain available; new autonomous work uses signed dynamic manifests and never falls back to unrestricted Agent shell execution.
 
 ### Hooks
 
@@ -162,9 +178,9 @@ For a `website-down` incident, the preferred path is:
 5. The executor restarts only the allowlisted service.
 6. Post-exec hooks confirm the site is healthy again before closing the incident.
 
-## Runbook extension lifecycle
+## Historical runbook extension lifecycle
 
-The system should eventually be extensible through agent-generated runbook proposals, but creation and activation must stay separate from normal repair execution.
+The staged permanent-runbook model below remains relevant for reusable privileged helpers, but is superseded for ordinary contained changes by the dynamic signed-manifest lifecycle above.
 
 Runbook states:
 

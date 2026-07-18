@@ -2,6 +2,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   buildAgentCommand,
+  buildBrokerAgentPrompt,
   computeAgentManifestDigest,
   buildRunbookDispatch,
   findAgent,
@@ -11,6 +12,13 @@ import {
 } from "../src/registries.js";
 
 describe("registries", () => {
+  it("uses the dynamic manifest contract for agent-centric change jobs", () => {
+    const planner = findAgent("planner-agent", "opencode")!;
+    const prompt = buildBrokerAgentPrompt(planner, "TRUSTED_INTENT: probe\nDYNAMIC CAPABILITY CONTRACT:\nversion cockpit-capability/v1");
+    expect(prompt).toContain("exactly one fenced `capability` JSON manifest");
+    expect(prompt).toContain("Do not return a bash/sh code fence");
+    expect(prompt).not.toContain("Produce a structured, reviewable plan and a bash script");
+  });
   it("finds known runbooks and agents", () => {
     expect(findRunbook("disk-health-check")).toMatchObject({
       id: "disk-health-check",
