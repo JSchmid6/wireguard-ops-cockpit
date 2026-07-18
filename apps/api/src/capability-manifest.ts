@@ -5,6 +5,7 @@ export type CapabilityRisk = "contained" | "exposure" | "data_loss" | "identity_
 export interface CapabilityStep {
   argv: string[];
   cwd?: string;
+  runAsUser?: string;
   timeoutSeconds?: number;
 }
 
@@ -13,8 +14,9 @@ export interface CapabilityManifest {
   name: string;
   purpose: string;
   steps: CapabilityStep[];
+  readablePaths: string[];
   writablePaths: string[];
-  network: "none" | "outbound" | "host";
+  network: "none" | "local" | "outbound" | "host";
   expectedEffects: string[];
   verification: string[];
   rollback: string[];
@@ -51,18 +53,25 @@ export function parseCapabilityManifest(plan: string): CapabilityManifest | null
     if (!argv[0].startsWith("/")) throw new Error(`capability step ${index + 1} executable must be absolute`);
     const cwd = typeof step.cwd === "string" ? step.cwd.trim() : undefined;
     if (cwd && !cwd.startsWith("/")) throw new Error(`capability step ${index + 1} cwd must be absolute`);
+    const runAsUser = typeof step.runAsUser === "string" ? step.runAsUser.trim() : undefined;
+    if (runAsUser && (!/^[a-z_][a-z0-9_-]{0,31}$/.test(runAsUser) || runAsUser === "root")) {
+      throw new Error(`capability step ${index + 1} runAsUser must name a non-root local account`);
+    }
     const timeoutSeconds = typeof step.timeoutSeconds === "number" && Number.isInteger(step.timeoutSeconds)
       ? Math.min(Math.max(step.timeoutSeconds, 1), 900) : 120;
-    return { argv, ...(cwd ? { cwd } : {}), timeoutSeconds };
+    return { argv, ...(cwd ? { cwd } : {}), ...(runAsUser ? { runAsUser } : {}), timeoutSeconds };
   });
+  const readablePaths = cleanStrings(value.readablePaths, 32, 1000);
+  if (readablePaths.some((item) => !item.startsWith("/") || item.includes("\0"))) throw new Error("readable paths must be absolute");
   const writablePaths = cleanStrings(value.writablePaths, 32, 1000);
   if (writablePaths.some((item) => !item.startsWith("/") || item.includes("\0"))) throw new Error("writable paths must be absolute");
-  const network = value.network === "outbound" || value.network === "host" ? value.network : "none";
+  const network = value.network === "local" || value.network === "outbound" || value.network === "host" ? value.network : "none";
   const validRisks = new Set<CapabilityRisk>(["contained", "exposure", "data_loss", "identity_or_secret"]);
   const risk = cleanStrings(value.risk, 4, 40).filter((item): item is CapabilityRisk => validRisks.has(item as CapabilityRisk));
   if (risk.length === 0) risk.push("contained");
   const manifest: CapabilityManifest = {
-    version: "cockpit-capability/v1", name, purpose, steps, writablePaths: [...new Set(writablePaths)].sort(), network,
+    version: "cockpit-capability/v1", name, purpose, steps,
+    readablePaths: [...new Set(readablePaths)].sort(), writablePaths: [...new Set(writablePaths)].sort(), network,
     expectedEffects: cleanStrings(value.expectedEffects, 32), verification: cleanStrings(value.verification, 32),
     rollback: cleanStrings(value.rollback, 32), risk: [...new Set(risk)].sort(),
   };
@@ -82,9 +91,10 @@ export function capabilityPlannerContract(): string {
   return [
     "For a change, include exactly one fenced `capability` JSON manifest using version cockpit-capability/v1.",
     "Describe tools with direct absolute argv arrays, not shell syntax; discover current tool help/version before relying on unstable flags. Omit cwd unless host-directory visibility is essential.",
-    "Declare only paths that must change. Set network to none, outbound, or host.",
+    "For a step that must run as a non-root service account, declare runAsUser instead of invoking sudo or runuser.",
+    "Declare minimal readablePaths for read-only host visibility and only exact writablePaths that must change. Set network to none, local (host loopback only, no listening), outbound, or host.",
     "Risk values are contained, exposure, data_loss, identity_or_secret. Never understate risk.",
     "Include observable expectedEffects, independent verification criteria, and a concrete rollback procedure.",
-    "Example shape: {\"version\":\"cockpit-capability/v1\",\"name\":\"...\",\"purpose\":\"...\",\"steps\":[{\"argv\":[\"/usr/bin/tool\",\"arg\"]}],\"writablePaths\":[],\"network\":\"none\",\"expectedEffects\":[],\"verification\":[],\"rollback\":[],\"risk\":[\"contained\"]}",
+    "Example shape: {\"version\":\"cockpit-capability/v1\",\"name\":\"...\",\"purpose\":\"...\",\"steps\":[{\"argv\":[\"/usr/bin/tool\",\"arg\"],\"runAsUser\":\"service-user\"}],\"readablePaths\":[],\"writablePaths\":[],\"network\":\"none\",\"expectedEffects\":[],\"verification\":[],\"rollback\":[],\"risk\":[\"contained\"]}",
   ].join("\n");
 }

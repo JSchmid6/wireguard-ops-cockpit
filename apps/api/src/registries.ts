@@ -651,6 +651,22 @@ function buildCapabilityPlannerPrompt(prompt: string): string {
   ].join("\n");
 }
 
+function buildResearchPrompt(prompt: string): string {
+  return [
+    "You are the read-only research agent for wireguard-ops-cockpit.",
+    "Investigate the trusted intent now with focused read-only tools and return factual findings, not a proposed script.",
+    "The operating-system sandbox is the enforcement boundary: never attempt mutation, privilege escalation, credential access, or permission changes.",
+    "Use at most six focused read-only tool calls, then stop investigating and write the report. Do not create or remove temporary files.",
+    "Prefer narrow commands and installed command help over broad filesystem searches. Do not make network probes unless the trusted intent explicitly asks for them.",
+    "If the sandbox denies an inspection, record that limitation instead of trying alternate paths or escalating access. Do not inspect user content unless the trusted intent explicitly requests it.",
+    "Finish with these sections: Summary, Evidence, Missing prerequisites, Compatibility assessment, Recommended next action.",
+    "Include actual versions, states, and command results needed to support the conclusion. Clearly label anything that could not be verified.",
+    "Do not return bash/sh/capability code fences, a Required Permissions list, or instructions for a future investigator.",
+    "Research task:",
+    prompt,
+  ].join("\n");
+}
+
 export function buildRunnerPrompt(markdownPath: string): string {
   return [
     "You are the runner-agent for wireguard-ops-cockpit.",
@@ -705,6 +721,8 @@ function buildAgentPrompt(agent: AgentManifest, prompt: string): string {
   if (prompt.includes("## EXECUTION RESULT") || prompt.includes("runner-agent") || prompt.includes("verifier-agent")) {
     return prompt;
   }
+
+  if (prompt.includes("READ_ONLY_RESEARCH_CONTRACT:")) return buildResearchPrompt(prompt);
 
   if (prompt.includes("DYNAMIC CAPABILITY CONTRACT:")) return buildCapabilityPlannerPrompt(prompt);
 

@@ -11,6 +11,7 @@ WorkingDirectory=/opt/wireguard-ops-cockpit
 Environment=NODE_ENV=production
 Environment=PATH=/opt/node-v20.19.1-linux-x64/bin:/usr/local/bin:/usr/bin:/bin
 Environment=COCKPIT_AGENT_BROKER_SOCKET=/run/cockpit-agent/agent.sock
+Environment=COCKPIT_AGENT_WORKSPACE_ROOT=/var/lib/wireguard-ops-agent/sessions
 EnvironmentFile=/etc/wireguard-ops-cockpit/agent.env
 RuntimeDirectory=cockpit-agent
 RuntimeDirectoryMode=0770

@@ -36,6 +36,30 @@ This lifecycle replaces the assumption that every future application command nee
 
 Hermes authenticates as an `automation` identity using a random bearer token stored hashed in Control. Its route scopes cover Hermes research/change/job polling and selected bounded discovery/runbook calls only. It cannot use approval or audit endpoints and cannot perform interactive password login. Rotating an administrator password revokes all existing administrator sessions.
 
+Research and change planning use distinct prompt contracts. Research agents perform a bounded number of focused read-only inspections and must return factual evidence rather than a runbook or capability manifest. Access denials are reported instead of being bypassed, and research may not create temporary files or probe unrelated network endpoints. Change planners return a reviewable dynamic capability manifest; only the separately bounded executor may mutate host state.
+
+Planner and safety model selection is configuration, not policy. The current deployment deliberately uses `opencode/big-pickle` for planning/research and `deepseek/deepseek-v4-pro` for safety review so correlated single-model failures are visible. Operators may replace either model without changing the execution contracts or deterministic effect boundary.
+
+The isolated broker maps non-executing roles (`planner`, research through planner, `safety`, and `verifier`) to OpenCode's `plan` agent. Only the bounded `runner` role uses the `build` agent. Broker invocations use `--pure` so external OpenCode plugins cannot silently expand a role's tools or instructions.
+
+Each broker invocation receives a new mode-`0700` session workspace below `/var/lib/wireguard-ops-agent/sessions`. The broker copies a root-controlled common contract plus the selected role contract into that workspace as `AGENTS.md`, launches OpenCode there, and removes only that exact prefixed directory when the child exits. No Cockpit source checkout is the default agent workspace. On broker startup, prefixed session directories older than 24 hours are treated as crash remnants and removed; unrelated entries are preserved.
+
+Hermes API calls that create their own tmux session also own its lifecycle. A terminal cleanup path kills the exact generated `cockpit-hermes-*` session after completion, rejection, failure, or timeout. A session supplied by the caller is persistent and is never killed by this mechanism. Job output, proposals, safety evidence, envelopes, and audit records are stored outside both ephemeral resources before cleanup.
+
+OpenCode's `plan` profile allows `external_directory` inspection because the broker's systemd service already enforces a read-only host view, blocks privilege gain, protects home directories, and denies writes. Secret-like `.env` reads retain OpenCode's separate restriction. This avoids unattended jobs hanging on redundant interactive read prompts without expanding mutation authority.
+
+The repeated-change circuit breaker counts failures per runtime fingerprint (planner model, safety model, capability contract, and broker role contract). A verified runtime repair therefore starts a fresh failure audit without erasing history; repeated failures under the unchanged runtime still stop autonomous retries.
+
+If a later execution or verification stage fails, the terminal job preserves the already reviewed plan, safety result, policy decision, capability manifest, signed envelope, and proposal path. Failure reporting must add its explanation rather than erase the evidence needed to diagnose or safely continue.
+
+Dynamic capabilities may declare minimal `readablePaths` and a non-root `runAsUser` per step. The executor performs the identity drop and read-only bind itself; manifests must not use `sudo`, `su`, or `runuser`. Container CLIs are evaluated by operation: read-only `ps`, `inspect`, `version`, and `info` are contained, while unknown or mutating subcommands require operator approval.
+
+Network scope distinguishes `none`, `local`, `outbound`, and `host`. `local` permits connections only to host loopback/Unix services and denies all socket binding, so internal Redis or database-backed administration does not masquerade as public exposure. `host` remains operator-gated because it can listen or reach arbitrary host networks.
+
+When the capability helper exits nonzero, the executor broker preserves both stderr and its structured stdout result. Control stores that diagnostic together with the reviewed plan and envelope so a failed sandbox prerequisite is explainable instead of collapsing to a generic executor error.
+
+Planner-output extraction recognizes a capability by its semantic `cockpit-capability/v1` version inside either a `capability` or ordinary `json` fence. It does not depend on optional Markdown headings and must preserve JSON braces verbatim.
+
 ## Components
 
 ### `planner-agent`

@@ -33,7 +33,12 @@ export function execute(payload) {
       child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
       child.stdout.on("data", (chunk) => { output += chunk; }); child.stderr.on("data", (chunk) => { error += chunk; });
       child.on("error", (reason) => resolve({ ok: false, error: reason.message }));
-      child.on("close", (code) => resolve({ ok: code === 0, exitCode: code, output: output.slice(-50000), error: code === 0 ? null : error.slice(-10000) }));
+      child.on("close", (code) => resolve({
+        ok: code === 0,
+        exitCode: code,
+        output: output.slice(-50000),
+        error: code === 0 ? null : [error, output].filter(Boolean).join("\n").slice(-50000),
+      }));
       child.stdin.end(JSON.stringify({ manifest: payload.manifest, envelope: payload.envelope }));
       return;
     }

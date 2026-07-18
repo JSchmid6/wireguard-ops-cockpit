@@ -1,5 +1,5 @@
 import { createHash, createHmac } from "node:crypto";
-import { execSync } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -565,6 +565,12 @@ async function requireActor(
 
 export async function createApp(options: AppOptions = {}) {
   const config = options.config || loadConfig();
+  const changeRuntimeFingerprint = hashCanonical({
+    plannerModel: config.opencodeModel,
+    safetyModel: config.safetyOpencodeModel,
+    capabilityContract: "cockpit-capability/v1",
+    brokerRoleContract: "plan-pure-local-v5",
+  });
   if (config.nodeEnv === "production" && config.adminPassword === "change-me-now") {
     throw new Error("COCKPIT_ADMIN_PASSWORD must be changed before running in production");
   }
@@ -1456,7 +1462,9 @@ export async function createApp(options: AppOptions = {}) {
       .filter(l => !l.startsWith("timestamp=") && !l.startsWith("tee:") && l.trim() !== "")
       .join("\n");
     // Planner output: preserve a dynamic capability fence even when it precedes legacy markdown sections.
-    const capabilityStart = noTimestamps.search(/(?:^|\n)```(?:json\s+)?capability\s*\n/i);
+    const capabilityStart = noTimestamps.search(
+      /(?:^|\n)```(?:capability|json)\s*\n(?=\s*\{[\s\S]{0,1000}?"version"\s*:\s*"cockpit-capability\/v1")/i
+    );
     const modelStart = noTimestamps.search(/(?:^|\n)## /);
     const contentStart = capabilityStart >= 0 ? capabilityStart + (noTimestamps[capabilityStart] === "\n" ? 1 : 0)
       : modelStart >= 0 ? modelStart + (noTimestamps[modelStart] === "\n" ? 1 : 0) : -1;
@@ -1660,7 +1668,13 @@ export async function createApp(options: AppOptions = {}) {
       (status === "failed_execution" || status === "failed_verification") &&
       updated.subjectId === "hermes-change"
     ) {
-      database.createAudit({ actorId: null, action: "hermes.change.failed", targetType: "job", targetId: jobId, details: { status, reason: detail.reason } });
+      database.createAudit({
+        actorId: null,
+        action: "hermes.change.failed",
+        targetType: "job",
+        targetId: jobId,
+        details: { status, reason: detail.reason, runtimeFingerprint: changeRuntimeFingerprint },
+      });
     }
     return updated;
   }
@@ -1687,9 +1701,8 @@ export async function createApp(options: AppOptions = {}) {
 
   function stopEphemeralSession(tmuxSessionName: string, createdSession: boolean): void {
     if (!createdSession) return;
-    try {
-      execSync(`tmux kill-session -t "${tmuxSessionName}" 2>/dev/null || true`, { timeout: 5000 });
-    } catch { /* best effort after durable output was stored */ }
+    if (!/^cockpit-hermes-(?:rb-)?[a-z0-9]+$/i.test(tmuxSessionName)) return;
+    spawnSync("tmux", ["kill-session", "-t", tmuxSessionName], { timeout: 5000, encoding: "utf8" });
   }
 
   app.post("/api/hermes/research", async (request, reply) => {
@@ -1731,7 +1744,7 @@ export async function createApp(options: AppOptions = {}) {
 
     const intent = requestedIntent;
     const untrustedEvidence = normalizeEvidence(body.evidence);
-    const agentTask = buildAgentTask(intent, untrustedEvidence);
+    const agentTask = `${buildAgentTask(intent, untrustedEvidence)}\n\nREAD_ONLY_RESEARCH_CONTRACT:\nInvestigate and report the current state. Never return an executable plan.`;
     const job = database.createJob({
       sessionId: session.id,
       kind: "agent",
@@ -1770,12 +1783,13 @@ export async function createApp(options: AppOptions = {}) {
           completed: ["Planner research", "Sensitive-output filtering"], evidence: [`elapsedMs=${Date.now() - startedAt}`],
           recommendedAction: "Use the findings to decide whether a change job is needed.",
         }), { answer, elapsedMs: Date.now() - startedAt });
-        stopEphemeralSession(session.tmuxSessionName, createdSession);
       } catch (error) {
         updateHermesJob(job.id, "failed_execution", explanation({
           phase: "finished", intent, reason: error instanceof Error ? error.message : "Research failed.",
           neededToContinue: ["Inspect the job evidence and planner runtime."], recommendedAction: "Correct the prerequisite and retry.",
         }));
+      } finally {
+        stopEphemeralSession(session.tmuxSessionName, createdSession);
       }
     })();
 
@@ -2360,12 +2374,12 @@ Follow these rules:
       const startedAt = Date.now();
       try {
         const failureWindowStart = new Date(Date.now() - 60 * 60_000).toISOString();
-        const recentFailures = database.countAuditsSince("hermes.change.failed", failureWindowStart);
+        const recentFailures = database.countAuditsSinceForRuntime("hermes.change.failed", failureWindowStart, changeRuntimeFingerprint);
         if (recentFailures >= config.maxFailedChangesPerHour) {
           updateHermesJob(job.id, "blocked_prerequisite", explanation({
             phase: "finished", intent,
             reason: `Circuit breaker is open after ${recentFailures} failed change jobs in the last hour.`,
-            evidence: [`failureCount=${recentFailures}`, `windowStart=${failureWindowStart}`],
+            evidence: [`failureCount=${recentFailures}`, `windowStart=${failureWindowStart}`, `runtimeFingerprint=${changeRuntimeFingerprint}`],
             neededToContinue: ["Wait for the failure window to clear or have an operator diagnose the repeated failures."],
             recommendedAction: "Do not retry automatically; inspect recent failed jobs first.",
           }));
@@ -2480,7 +2494,6 @@ Follow these rules:
             evidence: [review.summary, ...policy.evidence], recommendedAction: "Submit an execution request if this plan should run.",
             rollbackAvailable: policy.rollbackAvailable,
           }), { plan: planText, safety: review, policy, capabilities, manifest, envelope, provenance, proposalPath, result: "" });
-          stopEphemeralSession(session.tmuxSessionName, createdSession);
           return;
         }
 
@@ -2514,13 +2527,15 @@ Follow these rules:
           recommendedAction: success ? "No further action is required." : "Correct the reported issue or perform rollback.",
           rollbackAvailable: policy.rollbackAvailable,
         }), { plan: planText, safety: review, policy, capabilities, manifest, envelope, provenance, proposalPath, retainedCapability, result, verification, elapsedMs: Date.now() - startedAt });
-        stopEphemeralSession(session.tmuxSessionName, createdSession);
       } catch (error) {
+        const preservedOutput = database.getJobForActor(job.id, actor.id)?.output || {};
         updateHermesJob(job.id, "failed_execution", explanation({
           phase: "finished", intent, reason: error instanceof Error ? error.message : "Change job failed.",
           neededToContinue: ["Inspect the preserved proposal, session, and job evidence."],
           recommendedAction: "Resolve the reported prerequisite before retrying.",
-        }));
+        }), preservedOutput);
+      } finally {
+        stopEphemeralSession(session.tmuxSessionName, createdSession);
       }
     })();
 

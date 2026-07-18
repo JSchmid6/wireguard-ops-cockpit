@@ -113,6 +113,18 @@ Bare-metal Ubuntu VPS (161.97.86.86) running:
 - Deterministic enforcement validates the signed manifest and actual host-effect scope. Only realistic external exposure, loss of existing data, and identity/credential/secret boundaries require a separate operator decision.
 - Retain a generated capability by digest only after independent post-execution verification.
 - Hermes authenticates with a dedicated route-scoped `automation` bearer token. Never place an administrator password in agent scripts, prompts, shared cookie jars, or model environments; automation tokens cannot approve their own work.
+- Research uses a dedicated, tool-budgeted read-only prompt contract and returns factual evidence instead of a runbook or capability manifest. It reports sandbox denials rather than bypassing them. Change planning and bounded execution remain separate stages.
+- Planner/research and safety-review models are independently configurable. Production currently uses `opencode/big-pickle` for planning/research and `deepseek/deepseek-v4-pro` for safety review; changing models must not change authority or execution boundaries.
+- The isolated broker runs planner/research/safety/verifier with OpenCode's `plan` agent and only the bounded runner with `build`; all broker calls use `--pure` to exclude external plugins.
+- The OpenCode `plan` profile allows external-directory reads because systemd supplies the real read-only/NoNewPrivileges boundary. Secret-like files retain their separate restriction; the unattended planner must not block on redundant read prompts.
+- Change circuit breaking is scoped to a fingerprint of the planner/safety models and execution contracts. Runtime repairs do not erase audit history, while unchanged runtimes still stop after repeated failures.
+- Terminal execution failures must preserve the reviewed plan, safety result, policy, manifest, signed envelope, provenance, and proposal path so James can explain and recover without guessing.
+- Dynamic manifests use minimal `readablePaths` and per-step non-root `runAsUser`; they never invoke `sudo`, `su`, or `runuser`. Docker/Podman read operations are autonomous only for explicitly read-only subcommands, while unknown or mutating operations require approval.
+- Capability network scopes are `none`, `local`, `outbound`, and `host`. `local` is loopback/Unix connectivity with socket binding denied; only `host` is treated as potential exposure by scope alone.
+- Executor failures preserve helper stderr and structured stdout; never collapse a failed capability to a generic error when bounded diagnostics exist.
+- Capability extraction recognizes `cockpit-capability/v1` in either `capability` or standard `json` fences and preserves the complete JSON independently of optional Markdown headings.
+- Every isolated OpenCode invocation runs in a private, disposable workspace below `/var/lib/wireguard-ops-agent/sessions`, populated with root-controlled common and role-specific `AGENTS.md` instructions. It never starts in the Cockpit source tree. The broker removes the exact workspace on process exit and removes only prefixed workspaces older than 24 hours after a broker restart.
+- API-created Hermes tmux sessions are ephemeral and are killed in a terminal cleanup path after success, policy block, failure, or timeout. User-supplied/persistent sessions are never removed by this cleanup.
 
 ## Known Pitfalls
 - `nextcloud.wejos.de` → /etc/hosts maps to 127.0.0.1 (Apache serves it)

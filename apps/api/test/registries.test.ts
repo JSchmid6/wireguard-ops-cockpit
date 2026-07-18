@@ -12,6 +12,17 @@ import {
 } from "../src/registries.js";
 
 describe("registries", () => {
+  it("uses a factual read-only contract for research jobs", () => {
+    const planner = findAgent("planner-agent", "opencode")!;
+    const prompt = buildBrokerAgentPrompt(planner, "TRUSTED_INTENT: inventory\nREAD_ONLY_RESEARCH_CONTRACT:\nreport facts");
+    expect(prompt).toContain("Investigate the trusted intent now with focused read-only tools");
+    expect(prompt).toContain("return factual findings");
+    expect(prompt).toContain("at most six focused read-only tool calls");
+    expect(prompt).toContain("Do not create or remove temporary files");
+    expect(prompt).toContain("Do not return bash/sh/capability code fences");
+    expect(prompt).not.toContain("Produce a structured, reviewable plan and a bash script");
+  });
+
   it("uses the dynamic manifest contract for agent-centric change jobs", () => {
     const planner = findAgent("planner-agent", "opencode")!;
     const prompt = buildBrokerAgentPrompt(planner, "TRUSTED_INTENT: probe\nDYNAMIC CAPABILITY CONTRACT:\nversion cockpit-capability/v1");

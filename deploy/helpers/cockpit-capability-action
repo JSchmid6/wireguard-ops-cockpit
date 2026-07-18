@@ -38,6 +38,14 @@ if (!approved && (manifest.network === "host" || (manifest.risk || []).some((ite
 const forbiddenRoots = new Set(["/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib64", "/opt", "/proc", "/root", "/run", "/sbin", "/sys", "/usr", "/var"]);
 const protectedPath = /(?:^|\/)(?:\.ssh|sudoers(?:\.d)?|shadow|gshadow|passwd|group|ssh|wireguard|secrets?|credentials?|private|keys?)(?:\/|$)|\.(?:key|pem|p12|env|db|sqlite3?)$|^\/(?:opt\/nextcloud|opt\/gitlab|var\/www\/nextcloud\/config|var\/lib\/wireguard-ops-cockpit)(?:\/|$)/i;
 const paths = Array.isArray(manifest.writablePaths) ? manifest.writablePaths : [];
+const readPaths = Array.isArray(manifest.readablePaths) ? manifest.readablePaths : [];
+if (readPaths.length > 32) fail("too many readable paths");
+const readablePaths = readPaths.map((item) => {
+  if (typeof item !== "string" || !item.startsWith("/") || item.includes("\0")) fail("invalid readable path");
+  const resolved = realpathSync(normalize(item));
+  if (forbiddenRoots.has(resolved)) fail(`readable scope is too broad: ${resolved}`, 77);
+  return resolved;
+});
 if (paths.length > 32) fail("too many writable paths");
 const writablePaths = paths.map((item) => {
   if (typeof item !== "string" || !item.startsWith("/") || item.includes("\0")) fail("invalid writable path");
@@ -54,8 +62,15 @@ const writablePaths = paths.map((item) => {
   return resolved;
 });
 
-const dangerousExecutable = /\/(?:rm|shred|dd|mkfs(?:\.[^/]*)?|fdisk|parted|iptables|nft|ufw|ip|wg|wg-quick|useradd|userdel|usermod|groupadd|groupdel|passwd|visudo|docker|podman)$/;
-if (!approved && manifest.steps.some((step) => dangerousExecutable.test(step?.argv?.[0] || ""))) fail("requested executable can cause exposure or irreversible loss and requires operator approval", 77);
+const dangerousExecutable = /\/(?:rm|shred|dd|mkfs(?:\.[^/]*)?|fdisk|parted|iptables|nft|ufw|ip|wg|wg-quick|useradd|userdel|usermod|groupadd|groupdel|passwd|visudo|sudo|runuser|su)$/;
+const readOnlyContainerCommands = new Set(["ps", "inspect", "version", "info"]);
+function stepNeedsApproval(step) {
+  const executable = step?.argv?.[0] || "";
+  if (dangerousExecutable.test(executable)) return true;
+  if (/\/(?:docker|podman)$/.test(executable)) return !readOnlyContainerCommands.has(step?.argv?.[1] || "");
+  return false;
+}
+if (!approved && manifest.steps.some(stepNeedsApproval)) fail("requested operation can cause exposure or irreversible loss and requires operator approval", 77);
 
 const backupRoot = `/var/lib/wireguard-ops-cockpit/capability-snapshots/${envelope.jobId}`;
 mkdirSync(backupRoot, { recursive: true, mode: 0o700 });
@@ -71,6 +86,8 @@ const outputs = [];
 for (const [index, step] of manifest.steps.entries()) {
   if (!step || !Array.isArray(step.argv) || step.argv.length < 1 || step.argv.length > 64 || step.argv.some((arg) => typeof arg !== "string" || arg.includes("\0"))) fail(`invalid step ${index + 1}`);
   if (!step.argv[0].startsWith("/") || !existsSync(step.argv[0])) fail(`step ${index + 1} executable is unavailable`);
+  const runAsUser = typeof step.runAsUser === "string" ? step.runAsUser : "";
+  if (runAsUser && (!/^[a-z_][a-z0-9_-]{0,31}$/.test(runAsUser) || runAsUser === "root")) fail(`step ${index + 1} has invalid runAsUser`);
   const properties = [
     "--property=Type=exec", "--property=NoNewPrivileges=yes", "--property=PrivateTmp=yes", "--property=TemporaryFileSystem=/:ro",
     "--property=ProtectHome=yes", "--property=ProtectKernelTunables=yes", "--property=ProtectKernelModules=yes", "--property=ProtectControlGroups=yes",
@@ -79,9 +96,16 @@ for (const [index, step] of manifest.steps.entries()) {
     "--property=RestrictNamespaces=yes", "--property=ProtectProc=invisible", "--property=ProcSubset=pid",
     "--property=SystemCallFilter=~@mount @swap @reboot @raw-io @privileged",
     "--property=BindReadOnlyPaths=/usr /bin /lib /lib64 /etc/ld.so.cache /etc/alternatives",
+    ...readablePaths.map((item) => `--property=BindReadOnlyPaths=${item}`),
     ...writablePaths.map((item) => `--property=BindPaths=${item}`),
   ];
+  if (runAsUser) properties.push(`--property=User=${runAsUser}`);
   if (manifest.network === "none") properties.push("--property=PrivateNetwork=yes", "--property=RestrictAddressFamilies=AF_UNIX");
+  if (manifest.network === "local") properties.push(
+    "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6", "--property=SocketBindDeny=any",
+    "--property=IPAddressDeny=any", "--property=IPAddressAllow=localhost",
+    "--property=BindReadOnlyPaths=/etc/nsswitch.conf /etc/hosts",
+  );
   if (manifest.network === "outbound") properties.push(
     "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6", "--property=SocketBindDeny=any",
     "--property=BindReadOnlyPaths=/etc/resolv.conf /etc/nsswitch.conf /etc/hosts /etc/ssl/certs /etc/ca-certificates.conf",

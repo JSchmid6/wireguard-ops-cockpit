@@ -1052,6 +1052,15 @@ export class CockpitDatabase {
     return row.count;
   }
 
+  countAuditsSinceForRuntime(action: string, sinceIso: string, runtimeFingerprint: string): number {
+    const row = this.database
+      .prepare(
+        "SELECT COUNT(*) AS count FROM audits WHERE action = ? AND datetime(created_at) >= datetime(?) AND json_extract(details_json, '$.runtimeFingerprint') = ?"
+      )
+      .get(action, sinceIso, runtimeFingerprint) as { count: number };
+    return row.count;
+  }
+
   getAudit(id: string): AuditRecord | null {
     const row = this.database.prepare("SELECT * FROM audits WHERE id = ?").get(id) as AuditRow | undefined;
     return row ? this.mapAudit(row) : null;
