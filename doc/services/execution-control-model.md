@@ -34,6 +34,8 @@ Lifecycle:
 
 This lifecycle replaces the assumption that every future application command needs a prewritten helper. Kernel privilege, filesystem scope, networking, protected effects, and signatures remain deterministic because an LLM must never be its own privilege boundary.
 
+Hermes authenticates as an `automation` identity using a random bearer token stored hashed in Control. Its route scopes cover Hermes research/change/job polling and selected bounded discovery/runbook calls only. It cannot use approval or audit endpoints and cannot perform interactive password login. Rotating an administrator password revokes all existing administrator sessions.
+
 ## Components
 
 ### `planner-agent`

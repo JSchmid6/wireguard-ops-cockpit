@@ -1,4 +1,4 @@
-export type UserRole = "admin";
+export type UserRole = "admin" | "automation";
 export type TmuxBackend = "tmux" | "disabled";
 export type SessionStatus = "active";
 export type JobKind = "session.ensure" | "execution.plan" | "runbook" | "agent";

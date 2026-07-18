@@ -15,8 +15,12 @@ Never add `cockpit-agent` to `cockpit-executor-client` or grant it access to Con
 - `/etc/wireguard-ops-cockpit/api.env`: envelope and executor-client secrets; no provider key
 - `/etc/wireguard-ops-cockpit/agent.env`: provider key and model selection only
 - `/etc/wireguard-ops-cockpit/executor.env`: executor broker secret only
+- `/home/hermes/.hermes/credentials/cockpit.token`: Hermes-owned route-scoped bearer token; Control stores only its SHA-256 hash
+- `/etc/wireguard-ops-cockpit/admin-recovery.env`: root-only recovery login, never sourced into an agent service
 
 All three files are `root:root` mode `0600`. systemd reads them before dropping identity.
+
+The Hermes token file is `hermes:hermes` mode `0600` because Hermes must present it, but method-and-route scopes grant no approval or audit access. Rotating the administrator password must revoke existing cookie sessions. Rotating the Hermes token replaces the previous hash for the same token label.
 
 ## Installed files
 

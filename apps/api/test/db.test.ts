@@ -27,6 +27,21 @@ describe("CockpitDatabase", () => {
     expect(database.findUserByAuthToken(token)).toBeNull();
   });
 
+  it("rotates scoped API tokens and admin credentials", () => {
+    const automation = database.createUser("hermes", "random-unusable-password", "automation");
+    const first = database.rotateApiToken(automation.id, "hermes", ["POST /api/hermes/runbook"]);
+    expect(database.findUserByApiToken(first)).toEqual({ actor: automation, scopes: ["POST /api/hermes/runbook"] });
+    const second = database.rotateApiToken(automation.id, "hermes", ["GET /api/hermes/jobs/:jobId", "POST /api/hermes/runbook"]);
+    expect(database.findUserByApiToken(first)).toBeNull();
+    expect(database.findUserByApiToken(second)?.scopes).toEqual(["GET /api/hermes/jobs/:jobId", "POST /api/hermes/runbook"]);
+
+    const session = database.issueAuthSession(database.authenticateUser("admin", "test-password")!.id, 1);
+    database.updateUserPassword("admin", "rotated-password");
+    expect(database.authenticateUser("admin", "test-password")).toBeNull();
+    expect(database.authenticateUser("admin", "rotated-password")?.role).toBe("admin");
+    expect(database.findUserByAuthToken(session)).toBeNull();
+  });
+
   it("upserts sessions and updates terminal bridge metadata", () => {
     const created = database.upsertSession({
       name: "incident-debug",

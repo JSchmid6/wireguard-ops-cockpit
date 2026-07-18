@@ -45,7 +45,7 @@ async function createTestApp(
   openApps: TestApp[],
   overrides: Partial<AppConfig> = {},
   options: {
-    bootstrapUsers?: Array<{ username: string; password: string; role?: "admin" }>;
+    bootstrapUsers?: Array<{ username: string; password: string; role?: "admin" | "automation" }>;
     safetyReviewRunner?: SafetyReviewRunner;
   } = {}
 ): Promise<TestApp> {
@@ -112,6 +112,25 @@ function createTempDbPath(tempDirectories: string[]) {
 }
 
 describe("control API", () => {
+  it("scopes automation bearer tokens and forbids interactive automation login", async () => {
+    const dbPath = createTempDbPath(tempDirectories);
+    const app = await createTestApp(openApps, { dbPath }, {
+      bootstrapUsers: [{ username: "hermes-automation", password: "unusable-random-password", role: "automation" }],
+    });
+    const database = new (await import("../src/db.js")).CockpitDatabase(dbPath);
+    database.initialize();
+    const automation = database.authenticateUser("hermes-automation", "unusable-random-password")!;
+    const token = database.rotateApiToken(automation.id, "hermes", ["GET /api/runbooks", "GET /api/hermes/jobs/:jobId"]);
+    database.close();
+
+    const allowed = await app.inject({ method: "GET", url: "/api/runbooks", headers: { authorization: `Bearer ${token}` } });
+    expect(allowed.statusCode).toBe(200);
+    const forbidden = await app.inject({ method: "GET", url: "/api/audits", headers: { authorization: `Bearer ${token}` } });
+    expect(forbidden.statusCode).toBe(403);
+    const loginResponse = await app.inject({ method: "POST", url: "/api/auth/login", payload: { username: "hermes-automation", password: "unusable-random-password" } });
+    expect(loginResponse.statusCode).toBe(403);
+    expect(loginResponse.headers["set-cookie"]).toBeUndefined();
+  });
   const openApps: TestApp[] = [];
   const tempDirectories: string[] = [];
 

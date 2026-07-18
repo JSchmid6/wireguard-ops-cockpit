@@ -121,6 +121,10 @@ interface UserRow extends UserSummary {
   password_hash: string;
 }
 
+interface ApiTokenRow extends UserSummary {
+  scopes_json: string;
+}
+
 interface SessionRuntimeTarget {
   id: string;
   name: string;
@@ -208,6 +212,17 @@ export class CockpitDatabase {
         token_hash TEXT NOT NULL UNIQUE,
         expires_at TEXT NOT NULL,
         created_at TEXT NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+      );
+
+      CREATE TABLE IF NOT EXISTS api_tokens (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        label TEXT NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE,
+        scopes_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        last_used_at TEXT,
         FOREIGN KEY (user_id) REFERENCES users(id)
       );
 
@@ -396,6 +411,41 @@ export class CockpitDatabase {
     }
 
     return { id: row.id, username: row.username, role: row.role };
+  }
+
+  updateUserPassword(username: string, password: string): void {
+    const user = this.database.prepare("SELECT id FROM users WHERE username = ?").get(username) as { id: string } | undefined;
+    if (!user) throw new Error("user not found");
+    this.database.transaction(() => {
+      this.database.prepare("UPDATE users SET password_hash = ? WHERE id = ?").run(hashPassword(password), user.id);
+      this.database.prepare("DELETE FROM auth_sessions WHERE user_id = ?").run(user.id);
+    })();
+  }
+
+  rotateApiToken(userId: string, label: string, scopes: string[]): string {
+    const token = createAuthToken();
+    this.database.transaction(() => {
+      this.database.prepare("DELETE FROM api_tokens WHERE user_id = ? AND label = ?").run(userId, label);
+      this.database.prepare(
+        "INSERT INTO api_tokens (id, user_id, label, token_hash, scopes_json, created_at, last_used_at) VALUES (?, ?, ?, ?, ?, ?, NULL)"
+      ).run(randomUUID(), userId, label, token.hash, JSON.stringify([...new Set(scopes)].sort()), now());
+    })();
+    return `cpt_${token.raw}`;
+  }
+
+  findUserByApiToken(rawToken: string): { actor: UserSummary; scopes: string[] } | null {
+    if (!rawToken.startsWith("cpt_")) return null;
+    const tokenHash = hashAuthToken(rawToken.slice(4));
+    const row = this.database.prepare(
+      `SELECT users.id, users.username, users.role, api_tokens.scopes_json
+       FROM api_tokens JOIN users ON users.id = api_tokens.user_id
+       WHERE api_tokens.token_hash = ?`
+    ).get(tokenHash) as ApiTokenRow | undefined;
+    if (!row) return null;
+    this.database.prepare("UPDATE api_tokens SET last_used_at = ? WHERE token_hash = ?").run(now(), tokenHash);
+    let scopes: string[] = [];
+    try { scopes = JSON.parse(row.scopes_json) as string[]; } catch { return null; }
+    return { actor: { id: row.id, username: row.username, role: row.role }, scopes };
   }
 
   issueAuthSession(userId: string, ttlHours: number): string {

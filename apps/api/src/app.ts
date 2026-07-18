@@ -62,7 +62,7 @@ import {
 
 interface AppOptions {
   config?: AppConfig;
-  bootstrapUsers?: Array<{ username: string; password: string; role?: "admin" }>;
+  bootstrapUsers?: Array<{ username: string; password: string; role?: UserSummary["role"] }>;
   safetyReviewRunner?: SafetyReviewRunner;
 }
 
@@ -532,6 +532,21 @@ async function requireActor(
   reply: FastifyReply,
   database: CockpitDatabase
 ): Promise<UserSummary | null> {
+  const authorization = request.headers.authorization;
+  if (authorization?.startsWith("Bearer ")) {
+    const apiIdentity = database.findUserByApiToken(authorization.slice(7).trim());
+    if (!apiIdentity) {
+      await reply.code(401).send({ message: "authentication required" });
+      return null;
+    }
+    const route = request.routeOptions.url || "";
+    const scope = `${request.method.toUpperCase()} ${route}`;
+    if (apiIdentity.actor.role !== "automation" || !apiIdentity.scopes.includes(scope)) {
+      await reply.code(403).send({ message: "API token is not authorized for this endpoint" });
+      return null;
+    }
+    return apiIdentity.actor;
+  }
   const cookies = parseCookies(request.headers.cookie);
   const token = cookies[AUTH_COOKIE];
   if (!token) {
@@ -1961,6 +1976,11 @@ export async function createApp(options: AppOptions = {}) {
         }
       });
       return reply.code(401).send({ message: "invalid credentials" });
+    }
+
+    if (actor.role !== "admin") {
+      database.createAudit({ actorId: actor.id, action: "auth.login_forbidden", targetType: "user", targetId: actor.id, details: { username: actor.username } });
+      return reply.code(403).send({ message: "interactive login is not available for this account" });
     }
 
     loginAttempts.delete(loginKey);

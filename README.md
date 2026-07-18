@@ -26,6 +26,7 @@ This first pass keeps the trust boundaries explicit:
 - trusted operator intent is separated from untrusted mail/web/log/document evidence and bound with reviews, capabilities, actor, session, and expiry in an execution envelope
 - runner success is independently verified before a mutating Hermes job becomes `completed`
 - Hermes may author new versioned capability manifests at runtime; tool commands remain agent-owned while a generic OS sandbox enforces signed effect scope, snapshots, network isolation, and risk approval
+- Hermes uses a dedicated hashed-at-rest bearer token restricted to its job and bounded discovery routes; interactive administrator credentials are separate and automation cannot approve jobs
 
 ## Repository structure
 

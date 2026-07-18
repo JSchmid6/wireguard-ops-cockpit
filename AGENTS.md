@@ -112,6 +112,7 @@ Bare-metal Ubuntu VPS (161.97.86.86) running:
 - Prefer agent-authored `cockpit-capability/v1` manifests over one helper per tool command. Keep tool discovery, flags, sequencing, effects, rollback, and verification agent-owned.
 - Deterministic enforcement validates the signed manifest and actual host-effect scope. Only realistic external exposure, loss of existing data, and identity/credential/secret boundaries require a separate operator decision.
 - Retain a generated capability by digest only after independent post-execution verification.
+- Hermes authenticates with a dedicated route-scoped `automation` bearer token. Never place an administrator password in agent scripts, prompts, shared cookie jars, or model environments; automation tokens cannot approve their own work.
 
 ## Known Pitfalls
 - `nextcloud.wejos.de` → /etc/hosts maps to 127.0.0.1 (Apache serves it)
