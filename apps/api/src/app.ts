@@ -1,6 +1,8 @@
 import { createHash, createHmac } from "node:crypto";
 import { execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
 import Fastify from "fastify";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type {
@@ -10,6 +12,7 @@ import type {
   ExecutionPlan,
   ExecutionReview,
   ExecutionRiskClass,
+  JobRecord,
   RunbookDefinition,
   ScheduledRunbook,
   ScheduledRunbookMode,
@@ -61,6 +64,100 @@ function slugify(value: string): string {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 24);
+}
+
+type HermesPhase = "queued" | "planning" | "reviewing" | "executing" | "verifying" | "finished";
+
+interface HermesExplanation {
+  phase: HermesPhase;
+  intent: string;
+  completed: string[];
+  reason: string;
+  evidence: string[];
+  neededToContinue: string[];
+  recommendedAction: string;
+  rollbackAvailable: boolean;
+}
+
+interface PlanPolicyResult {
+  zone: "green" | "yellow" | "red";
+  allowed: boolean;
+  status: "ready" | "blocked_policy" | "blocked_user_approval" | "blocked_prerequisite";
+  reason: string;
+  evidence: string[];
+  neededToContinue: string[];
+  rollbackAvailable: boolean;
+}
+
+function sectionValue(plan: string, heading: string): string {
+  const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = plan.match(new RegExp(`## ${escaped}\\s*\\n([\\s\\S]*?)(?=\\n## |$)`, "i"));
+  return match?.[1]?.trim() || "";
+}
+
+export function evaluatePlanPolicy(plan: string, safetyVerdict: string): PlanPolicyResult {
+  const declared = sectionValue(plan, "Risk Zone").toLowerCase();
+  let zone: PlanPolicyResult["zone"] = declared.includes("red")
+    ? "red"
+    : declared.includes("yellow")
+      ? "yellow"
+      : "green";
+  const rollback = sectionValue(plan, "Rollback");
+  const rollbackAvailable = Boolean(rollback && !/^none\.?$/i.test(rollback));
+
+  // These are intentionally few hard boundaries. Contextual classification
+  // remains the Safety LLM's job.
+  const hardBoundaries: Array<[RegExp, string]> = [
+    [/\b(rm\s+-rf|mkfs|wipefs|shred)\b/i, "destructive data operation"],
+    [/\b(iptables|nft|ufw|sshd_config|authorized_keys|useradd|userdel|visudo)\b/i, "network or identity boundary"],
+    [/(0\.0\.0\.0|\[::\]).{0,40}(:\d+|port)/i, "possible public network exposure"],
+    [/\b(mysql|mariadb)\b.{0,80}\b(nextcloud|oc_)/i, "direct Nextcloud database access"],
+    [/\/etc\/sudoers|NOPASSWD/i, "sudo authority change"],
+  ];
+  const hit = hardBoundaries.find(([pattern]) => pattern.test(plan));
+  if (hit) {
+    return {
+      zone: "red", allowed: false, status: "blocked_user_approval",
+      reason: `The plan crosses a protected boundary: ${hit[1]}.`,
+      evidence: [hit[1]],
+      neededToContinue: ["Explicit operator approval or a lower-impact alternative."],
+      rollbackAvailable,
+    };
+  }
+  if (safetyVerdict === "blocked" || safetyVerdict === "not_run") {
+    return {
+      zone: "red", allowed: false, status: "blocked_policy",
+      reason: "The independent safety review did not authorize execution.",
+      evidence: [`safety verdict: ${safetyVerdict}`],
+      neededToContinue: ["Resolve the safety finding and submit a revised plan."],
+      rollbackAvailable,
+    };
+  }
+  if (zone === "red") {
+    return {
+      zone, allowed: false, status: "blocked_user_approval",
+      reason: "The planner classified the operation as red.",
+      evidence: ["planner risk zone: red"],
+      neededToContinue: ["Explicit operator approval."],
+      rollbackAvailable,
+    };
+  }
+  if (zone === "yellow" && !rollbackAvailable) {
+    return {
+      zone, allowed: false, status: "blocked_prerequisite",
+      reason: "Yellow operations require a concrete rollback plan.",
+      evidence: ["rollback section is missing or none"],
+      neededToContinue: ["Add and validate a concrete rollback procedure."],
+      rollbackAvailable: false,
+    };
+  }
+  if (safetyVerdict === "approval_required") zone = "yellow";
+  return {
+    zone, allowed: true, status: "ready",
+    reason: zone === "green" ? "Read-only or low-impact plan passed review." : "Reversible scoped change passed review.",
+    evidence: [`safety verdict: ${safetyVerdict}`, `risk zone: ${zone}`],
+    neededToContinue: [], rollbackAvailable,
+  };
 }
 
 function terminalUrl(baseUrl: string | null, sessionId: string, signingSecret: Buffer): string | null {
@@ -1020,27 +1117,15 @@ export async function createApp(options: AppOptions = {}) {
       throw new Error("session not found for runbook plan");
     }
 
-    // Grant temporary sudo for exactly the commands listed in the plan
-    const sudoersFile = `/etc/sudoers.d/runner-${runbook.id.substring(0, 20).replace(/[^a-z0-9]/g, "")}`;
-    try {
-      // Extract required permissions from planner output (## Required Permissions section)
-      const requiredPerms = extractRequiredPermissions(runbook);
-      const permLines = requiredPerms.map(p => `/usr/bin/${p}, /bin/${p}, /usr/sbin/${p}, /sbin/${p}`).join(", ");
-      const sudoRule = requiredPerms.length > 0
-        ? `wgops ALL=(ALL) NOPASSWD: ${requiredPerms.join(", ")}`
-        : "wgops ALL=(ALL) NOPASSWD: ALL"; // Fallback: full sudo if planner didn't specify
-      execSync(`printf '${sudoRule}\\n' | tee ${sudoersFile} > /dev/null && chmod 440 ${sudoersFile}`, { encoding: "utf-8", timeout: 5000 });
-    } catch { /* non-blocking */ }
+    // Privilege is granted only by the versioned, administrator-installed
+    // sudoers manifest. Runtime plans can request a registered helper, but
+    // they can never manufacture new sudo authority.
+    // If the operating system has no matching static sudoers entry, `sudo -n`
+    // fails closed and the job records a prerequisite failure.
 
     const dispatch = buildRunbookDispatch(config.repoRoot, runbook);
     const launch = tmux.launchCommand(session.tmuxSessionName, dispatch.windowName, dispatch.command);
 
-    // Schedule sudoers cleanup after runbook completes (5 min timeout)
-    setTimeout(() => {
-      try {
-        execSync(`sudo rm -f ${sudoersFile} 2>/dev/null || true`, { timeout: 5000 });
-      } catch { /* best effort */ }
-    }, 5 * 60 * 1000);
     const job = database.createJob({
       sessionId: session.id,
       kind: "runbook",
@@ -1107,12 +1192,6 @@ export async function createApp(options: AppOptions = {}) {
     if (!session) {
       throw new Error("session not found for agent plan");
     }
-
-    // Grant temporary sudo for agent execution
-    const sudoersFile = `/etc/sudoers.d/agent-${agent.id.replace(/[^a-z0-9]/g, "").substring(0, 20)}`;
-    try {
-      execSync(`touch /tmp/cockpit-sudo-grant-attempted && printf 'wgops ALL=(ALL) NOPASSWD: ALL\\n' | tee ${sudoersFile} > /dev/null && chmod 440 ${sudoersFile}`, { encoding: "utf-8", timeout: 5000 });
-    } catch { /* non-blocking */ }
 
     const prompt =
       typeof plan.normalizedInput.prompt === "string"
@@ -1412,6 +1491,56 @@ export async function createApp(options: AppOptions = {}) {
     return null;
   }
 
+  async function pollAgentLog(logFile: string, timeoutMs: number): Promise<string | null> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      try {
+        const output = await readFile(logFile, "utf-8");
+        if (output.includes("disposing instance")) return output;
+      } catch { /* log is created by the agent after startup */ }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    return null;
+  }
+
+  function explanation(input: Partial<HermesExplanation> & Pick<HermesExplanation, "phase" | "intent" | "reason">): HermesExplanation {
+    return {
+      phase: input.phase,
+      intent: input.intent,
+      completed: input.completed || [],
+      reason: input.reason,
+      evidence: input.evidence || [],
+      neededToContinue: input.neededToContinue || [],
+      recommendedAction: input.recommendedAction || "Continue monitoring this job.",
+      rollbackAvailable: input.rollbackAvailable || false,
+    };
+  }
+
+  function updateHermesJob(jobId: string, status: JobRecord["status"], detail: HermesExplanation, extra: Record<string, unknown> = {}): JobRecord {
+    return database.updateJob(jobId, {
+      status,
+      output: { ...extra, explanation: detail },
+      completedAt: ["running", "pending"].includes(status) ? null : new Date().toISOString(),
+    });
+  }
+
+  async function waitForHermesJob(jobId: string, actorId: string, waitMs: number): Promise<JobRecord | null> {
+    const deadline = Date.now() + waitMs;
+    while (Date.now() < deadline) {
+      const job = database.getJobForActor(jobId, actorId);
+      if (!job || !["pending", "running"].includes(job.status)) return job;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    return database.getJobForActor(jobId, actorId);
+  }
+
+  function stopEphemeralSession(tmuxSessionName: string, createdSession: boolean): void {
+    if (!createdSession) return;
+    try {
+      execSync(`tmux kill-session -t "${tmuxSessionName}" 2>/dev/null || true`, { timeout: 5000 });
+    } catch { /* best effort after durable output was stored */ }
+  }
+
   app.post("/api/hermes/research", async (request, reply) => {
     const actor = await requireActor(request, reply, database);
     if (!actor) return;
@@ -1424,7 +1553,7 @@ export async function createApp(options: AppOptions = {}) {
     const agent = findAgent("planner-agent", "opencode");
     if (!agent) return reply.code(500).send({ message: "planner not available" });
 
-    const totalTimeout = Math.min(body.timeoutMs || 45_000, 300_000); // default 45s, max 5min
+    const waitMs = Math.min(Math.max(body.timeoutMs ?? 45_000, 0), 55_000);
 
     // Create or reuse session
     let createdSession = false;
@@ -1448,41 +1577,155 @@ export async function createApp(options: AppOptions = {}) {
       };
     }
 
-    const cleanup = () => {
-      if (createdSession) {
-        try { execSync(`tmux kill-session -t "${session.tmuxSessionName}" 2>/dev/null || true`, { timeout: 5000 }); } catch {}
+    const intent = body.prompt.trim();
+    const job = database.createJob({
+      sessionId: session.id,
+      kind: "agent",
+      subjectId: "hermes-research",
+      status: "running",
+      requiresApproval: false,
+      output: { explanation: explanation({ phase: "queued", intent, reason: "Research job accepted." }) },
+    });
+
+    void (async () => {
+      const startedAt = Date.now();
+      try {
+        if (session.tmuxBackend === "disabled") {
+          updateHermesJob(job.id, "blocked_prerequisite", explanation({
+            phase: "finished", intent, reason: "tmux is unavailable in this runtime.",
+            neededToContinue: ["Enable the tmux backend."], recommendedAction: "Restore the tmux runtime and retry.",
+          }));
+          return;
+        }
+        updateHermesJob(job.id, "running", explanation({ phase: "planning", intent, reason: "Planner is performing read-only research." }));
+        const plan = createAgentPlan(actor, agent, session.id, intent);
+        executeAgentPlan(plan, actor, agent);
+        const logFile = `/tmp/opencode-${session.id.substring(0,8)}-${agent.id}.log`;
+        const raw = await pollAgentLog(logFile, 5 * 60_000);
+        if (!raw) {
+          updateHermesJob(job.id, "failed_execution", explanation({
+            phase: "finished", intent, reason: "Planner did not produce a terminal result within five minutes.",
+            evidence: [logFile], neededToContinue: ["Inspect the preserved session and planner log."],
+            recommendedAction: "Check planner availability before retrying.",
+          }));
+          return;
+        }
+        const answer = filterSensitiveContent(extractCleanOutput(raw) || extractAnswer(raw));
+        updateHermesJob(job.id, "completed", explanation({
+          phase: "finished", intent, reason: "Research completed successfully.",
+          completed: ["Planner research", "Sensitive-output filtering"], evidence: [`elapsedMs=${Date.now() - startedAt}`],
+          recommendedAction: "Use the findings to decide whether a change job is needed.",
+        }), { answer, elapsedMs: Date.now() - startedAt });
+        stopEphemeralSession(session.tmuxSessionName, createdSession);
+      } catch (error) {
+        updateHermesJob(job.id, "failed_execution", explanation({
+          phase: "finished", intent, reason: error instanceof Error ? error.message : "Research failed.",
+          neededToContinue: ["Inspect the job evidence and planner runtime."], recommendedAction: "Correct the prerequisite and retry.",
+        }));
       }
-    };
+    })();
 
-    const startTime = Date.now();
-    const plan = createAgentPlan(actor, agent, session.id, body.prompt);
-    executeAgentPlan(plan, actor, agent);
+    const current = await waitForHermesJob(job.id, actor.id, waitMs);
+    if (current && !["pending", "running"].includes(current.status)) return current;
+    return reply.code(202).send({
+      jobId: job.id, sessionId: session.id, status: current?.status || "running", partial: true,
+      message: "Research continues. Poll GET /api/hermes/jobs/:jobId.",
+      explanation: current?.output?.explanation,
+    });
+  });
 
-    // Wait for opencode to boot then poll log file
-    await new Promise(r => setTimeout(r, 8000));
-    const planLogFile = `/tmp/opencode-${session.id.substring(0,8)}-${agent.id}.log`;
-    const remaining = totalTimeout - (Date.now() - startTime);
-    const raw = session.tmuxBackend === "disabled" || remaining <= 0
-      ? null
-      : pollAgentOutput(planLogFile, remaining);
-    const elapsed = Date.now() - startTime;
+  app.get("/api/hermes/jobs/:jobId", async (request, reply) => {
+    const actor = await requireActor(request, reply, database);
+    if (!actor) return;
+    const { jobId } = request.params as { jobId: string };
+    const job = database.getJobForActor(jobId, actor.id);
+    if (!job) return reply.code(404).send({ message: "job not found" });
+    return { job };
+  });
 
-    if (!raw) {
-      cleanup();
-      return reply.code(202).send({
-        partial: true,
-        message: "Planner still running. Poll GET /api/sessions/:id/output",
-        sessionId: session.id,
-        elapsedMs: elapsed,
-      });
+  app.post("/api/hermes/jobs/:jobId/approval", async (request, reply) => {
+    const actor = await requireActor(request, reply, database);
+    if (!actor) return;
+    const { jobId } = request.params as { jobId: string };
+    const body = (request.body || {}) as { decision?: "approved" | "rejected"; reason?: string };
+    const job = database.getJobForActor(jobId, actor.id);
+    if (!job) return reply.code(404).send({ message: "job not found" });
+    if (job.subjectId !== "hermes-change" || job.status !== "blocked_user_approval") {
+      return reply.code(409).send({ message: "job is not awaiting operator approval" });
+    }
+    if (!body.decision || !["approved", "rejected"].includes(body.decision)) {
+      return reply.code(400).send({ message: "decision must be approved or rejected" });
+    }
+    const intent = typeof job.output?.explanation === "object" && job.output.explanation
+      ? String((job.output.explanation as Record<string, unknown>).intent || "Approved Hermes change")
+      : "Approved Hermes change";
+    database.createAudit({
+      actorId: actor.id, action: `hermes.change.${body.decision}`, targetType: "job", targetId: job.id,
+      details: { reason: body.reason?.trim() || null },
+    });
+    if (body.decision === "rejected") {
+      const rejected = updateHermesJob(job.id, "rejected", explanation({
+        phase: "finished", intent, reason: body.reason?.trim() || "Operator rejected the proposed change.",
+        completed: ["Planner proposal", "Safety review", "Policy evaluation", "Operator decision"],
+        recommendedAction: "Narrow or revise the intent before submitting a new change job.",
+        rollbackAvailable: Boolean((job.output?.policy as Record<string, unknown> | undefined)?.rollbackAvailable),
+      }), { ...job.output, approval: { decision: "rejected", reason: body.reason?.trim() || null, actorId: actor.id } });
+      return { job: rejected };
     }
 
-    cleanup();
-    return {
-      answer: filterSensitiveContent(raw),
-      sessionId: session.id,
-      elapsedMs: elapsed,
-    };
+    const proposalPath = typeof job.output?.proposalPath === "string" ? path.resolve(job.output.proposalPath) : "";
+    const proposalRoot = path.resolve(path.join(path.dirname(config.dbPath), "proposals"));
+    if (!proposalPath.startsWith(`${proposalRoot}${path.sep}`)) {
+      return reply.code(409).send({ message: "stored proposal path is outside the protected proposal directory" });
+    }
+    const session = job.sessionId ? database.getSessionRuntimeTargetForActor(job.sessionId, actor.id) : null;
+    const planner = findAgent("planner-agent", "opencode");
+    if (!session || session.tmuxBackend === "disabled" || !planner) {
+      const blocked = updateHermesJob(job.id, "blocked_prerequisite", explanation({
+        phase: "finished", intent, reason: "Approval was recorded, but the executor runtime is unavailable.",
+        neededToContinue: ["Restore the tmux and planner runtime."],
+        recommendedAction: "Restore the prerequisite and submit a new change job.",
+      }), { ...job.output, approval: { decision: "approved", reason: body.reason?.trim() || null, actorId: actor.id } });
+      return { job: blocked };
+    }
+    try {
+      await readFile(proposalPath, "utf-8");
+    } catch {
+      return reply.code(409).send({ message: "stored proposal is no longer available" });
+    }
+
+    const running = updateHermesJob(job.id, "running", explanation({
+      phase: "executing", intent, reason: "Operator approval recorded; the reviewed proposal is executing with the service account's bounded permissions.",
+      completed: ["Planner proposal", "Safety review", "Policy evaluation", "Operator approval"],
+      recommendedAction: "Poll this job until execution and verification finish.",
+      rollbackAvailable: Boolean((job.output?.policy as Record<string, unknown> | undefined)?.rollbackAvailable),
+    }), { ...job.output, approval: { decision: "approved", reason: body.reason?.trim() || null, actorId: actor.id } });
+
+    void (async () => {
+      try {
+        executeAgentPlan(createAgentPlan(actor, planner, session.id, buildRunnerPrompt(proposalPath)), actor, planner, "-runner");
+        const runnerLog = `/tmp/opencode-${session.id.substring(0,8)}-${planner.id}-runner.log`;
+        const raw = await pollAgentLog(runnerLog, 10 * 60_000);
+        if (!raw) throw new Error("approved runner did not finish within ten minutes");
+        const result = filterSensitiveContent(extractRunnerHandoff(raw));
+        const success = /STATUS:\s*success/i.test(result);
+        updateHermesJob(job.id, success ? "completed" : "failed_verification", explanation({
+          phase: "finished", intent,
+          reason: success ? "Approved execution and verification completed." : "Approved execution did not report verified success.",
+          completed: ["Planner proposal", "Safety review", "Policy evaluation", "Operator approval", "Runner execution", "Result collection"],
+          neededToContinue: success ? [] : ["Inspect the structured runner result and complete verification or rollback."],
+          recommendedAction: success ? "No further action is required." : "Resolve the reported verification issue.",
+          rollbackAvailable: Boolean((job.output?.policy as Record<string, unknown> | undefined)?.rollbackAvailable),
+        }), { ...job.output, approval: running.output?.approval, result });
+      } catch (error) {
+        updateHermesJob(job.id, "failed_execution", explanation({
+          phase: "finished", intent, reason: error instanceof Error ? error.message : "Approved execution failed.",
+          neededToContinue: ["Inspect the preserved proposal and execution session."],
+          recommendedAction: "Correct the reported prerequisite or perform the documented rollback.",
+        }), { ...job.output, approval: running.output?.approval });
+      }
+    })();
+    return reply.code(202).send({ job: running, message: "Approval recorded; execution started. Poll the job endpoint." });
   });
 
   app.get("/api/pipeline/health", async (request, reply) => {
@@ -1873,9 +2116,144 @@ Follow these rules:
     });
   });
 
-  // ── Hermes sync runbook adapter ────────────────────────────────────────
+  // ── Hermes durable runbook adapter ─────────────────────────────────────
 
   app.post("/api/hermes/runbook", async (request, reply) => {
+    const actor = await requireActor(request, reply, database);
+    if (!actor) return;
+    const body = (request.body || {}) as { prompt?: string; sessionId?: string; timeoutMs?: number; execute?: boolean };
+    if (!body.prompt || body.prompt.length < 10) {
+      return reply.code(400).send({ message: "prompt is required (min 10 chars)" });
+    }
+    const waitMs = Math.min(Math.max(body.timeoutMs ?? 50_000, 0), 55_000);
+    const shouldExecute = body.execute !== false;
+    let createdSession = false;
+    let session = body.sessionId ? database.getSessionRuntimeTargetForActor(body.sessionId, actor.id) : null;
+    if (!session) {
+      createdSession = true;
+      const sessionName = `hermes-rb-${Date.now().toString(36)}`;
+      const ensured = tmux.ensureSession(`cockpit-${sessionName}`);
+      const created = database.upsertSession({
+        name: sessionName, ownerId: actor.id, tmuxSessionName: ensured.name,
+        tmuxBackend: ensured.backend, terminalUrl: null,
+      });
+      session = { id: created.id, name: created.name, tmuxSessionName: created.tmuxSessionName, tmuxBackend: created.tmuxBackend };
+    }
+
+    const intent = body.prompt.trim();
+    const job = database.createJob({
+      sessionId: session.id, kind: "runbook", subjectId: "hermes-change",
+      status: "running", requiresApproval: false,
+      output: { explanation: explanation({ phase: "queued", intent, reason: "Change job accepted." }) },
+    });
+
+    void (async () => {
+      const startedAt = Date.now();
+      try {
+        if (session.tmuxBackend === "disabled") {
+          updateHermesJob(job.id, "blocked_prerequisite", explanation({
+            phase: "finished", intent, reason: "tmux is unavailable in this runtime.",
+            neededToContinue: ["Enable the tmux backend."], recommendedAction: "Restore the executor runtime and retry.",
+          }));
+          return;
+        }
+        const planner = findAgent("planner-agent", "opencode");
+        if (!planner) throw new Error("planner not available");
+        updateHermesJob(job.id, "running", explanation({ phase: "planning", intent, reason: "Planner is producing a structured change plan." }));
+        executeAgentPlan(createAgentPlan(actor, planner, session.id, intent), actor, planner);
+        const plannerLog = `/tmp/opencode-${session.id.substring(0,8)}-${planner.id}.log`;
+        const plannerRaw = await pollAgentLog(plannerLog, 5 * 60_000);
+        if (!plannerRaw) throw new Error("planner did not finish within five minutes");
+        const planText = filterSensitiveContent(extractCleanOutput(plannerRaw));
+        if (!planText || planText.length < 20) throw new Error("planner produced no reviewable plan");
+
+        const proposalDir = path.join(path.dirname(config.dbPath), "proposals");
+        await mkdir(proposalDir, { recursive: true, mode: 0o700 });
+        const proposalPath = path.join(proposalDir, `${job.id}.md`);
+        await writeFile(proposalPath, planText, { encoding: "utf-8", mode: 0o600 });
+        const proposal: RunbookDefinition = {
+          id: `proposal-${job.id}`, name: intent.slice(0, 60), summary: intent,
+          requiresSession: true, requiresApproval: false, integration: "host-tmux",
+          privilegedHelperRequested: false, reviewStatus: "allowlisted", scriptIds: [proposalPath],
+          workflowSteps: [{ id: "execute", label: "Execute reviewed proposal", description: intent, kind: "runbook" }],
+        };
+
+        updateHermesJob(job.id, "running", explanation({
+          phase: "reviewing", intent, reason: "Independent safety review and hard-boundary policy are evaluating the proposal.",
+          completed: ["Structured planner proposal"], evidence: [proposalPath],
+        }), { plan: planText, proposalPath });
+        const review = await safetyReviewRunner({
+          runbook: proposal, runbookVersionHash: computeRunbookVersionHash(proposal), riskClass: "moderate",
+          sessionId: session.id, trigger: "manual", scheduleId: null,
+        }, config);
+        const policy = evaluatePlanPolicy(planText, review.verdict);
+        if (!policy.allowed) {
+          updateHermesJob(job.id, policy.status === "ready" ? "failed_execution" : policy.status, explanation({
+            phase: "finished", intent, reason: policy.reason,
+            completed: ["Planner proposal", "Safety review", "Policy evaluation"],
+            evidence: [review.summary, ...policy.evidence], neededToContinue: policy.neededToContinue,
+            recommendedAction: policy.status === "blocked_user_approval" ? "Ask the operator to approve or narrow the plan." : "Revise the plan as indicated.",
+            rollbackAvailable: policy.rollbackAvailable,
+          }), { plan: planText, safety: review, policy, proposalPath });
+          return;
+        }
+        if (!shouldExecute) {
+          updateHermesJob(job.id, "completed", explanation({
+            phase: "finished", intent, reason: "Plan-only request completed without execution.",
+            completed: ["Planner proposal", "Safety review", "Policy evaluation"],
+            evidence: [review.summary, ...policy.evidence], recommendedAction: "Submit an execution request if this plan should run.",
+            rollbackAvailable: policy.rollbackAvailable,
+          }), { plan: planText, safety: review, policy, proposalPath, result: "" });
+          stopEphemeralSession(session.tmuxSessionName, createdSession);
+          return;
+        }
+
+        updateHermesJob(job.id, "running", explanation({
+          phase: "executing", intent, reason: policy.reason,
+          completed: ["Planner proposal", "Safety review", "Policy evaluation"],
+          evidence: [review.summary, ...policy.evidence], rollbackAvailable: policy.rollbackAvailable,
+        }), { plan: planText, safety: review, policy, proposalPath });
+        const runnerPrompt = buildRunnerPrompt(proposalPath);
+        executeAgentPlan(createAgentPlan(actor, planner, session.id, runnerPrompt), actor, planner, "-runner");
+        const runnerLog = `/tmp/opencode-${session.id.substring(0,8)}-${planner.id}-runner.log`;
+        const runnerRaw = await pollAgentLog(runnerLog, 10 * 60_000);
+        if (!runnerRaw) throw new Error("runner did not finish within ten minutes");
+        const result = filterSensitiveContent(extractRunnerHandoff(runnerRaw));
+        if (!result) throw new Error("runner produced no structured execution result");
+        const success = /STATUS:\s*success/i.test(result);
+        updateHermesJob(job.id, success ? "completed" : "failed_verification", explanation({
+          phase: "finished", intent,
+          reason: success ? "Execution and runner verification completed." : "Execution finished but did not report a verified success.",
+          completed: ["Planner proposal", "Safety review", "Policy evaluation", "Runner execution", "Result collection"],
+          evidence: [review.summary, ...policy.evidence, `elapsedMs=${Date.now() - startedAt}`],
+          neededToContinue: success ? [] : ["Inspect the structured runner result and complete the failed verification."],
+          recommendedAction: success ? "No further action is required." : "Correct the reported issue or perform rollback.",
+          rollbackAvailable: policy.rollbackAvailable,
+        }), { plan: planText, safety: review, policy, proposalPath, result, elapsedMs: Date.now() - startedAt });
+        stopEphemeralSession(session.tmuxSessionName, createdSession);
+      } catch (error) {
+        updateHermesJob(job.id, "failed_execution", explanation({
+          phase: "finished", intent, reason: error instanceof Error ? error.message : "Change job failed.",
+          neededToContinue: ["Inspect the preserved proposal, session, and job evidence."],
+          recommendedAction: "Resolve the reported prerequisite before retrying.",
+        }));
+      }
+    })();
+
+    const current = await waitForHermesJob(job.id, actor.id, waitMs);
+    if (current && !["pending", "running"].includes(current.status)) return current;
+    return reply.code(202).send({
+      jobId: job.id, sessionId: session.id, status: current?.status || "running", partial: true,
+      message: "Change job continues. Poll GET /api/hermes/jobs/:jobId.", explanation: current?.output?.explanation,
+    });
+  });
+
+  // Historical adapter kept temporarily for response-shape comparison only.
+  // It is unreachable from the documented Hermes route and never used by the skill.
+
+  app.post("/api/internal/legacy-hermes-runbook", async (request, reply) => {
+    return reply.code(410).send({ message: "legacy Hermes runbook adapter is disabled" });
+    /* Legacy blocking implementation retained temporarily for migration notes.
     const actor = await requireActor(request, reply, database);
     if (!actor) return;
 
@@ -1951,7 +2329,7 @@ Follow these rules:
       };
 
       // Register (idempotent: delete stale entry then create fresh one)
-      try { database.deleteDynamicRunbook(genRbId, actor.id); } catch { /* not found — ok */ }
+      try { database.deleteDynamicRunbook(genRbId, actor.id); } catch { }
       database.createDynamicRunbook({ id: genRbId, name: genName, summary: body.prompt.slice(0, 200), requiresApproval: false, privilegedHelper: false, scriptId: scriptName, createdBy: actor.id });
       registerDynamicRunbook(runbook);
 
@@ -2058,6 +2436,8 @@ Follow these rules:
     };
   });
 
+    */
+  });
   app.delete("/api/runbooks/:runbookId", async (request, reply) => {
     const actor = await requireActor(request, reply, database);
     if (!actor) return;

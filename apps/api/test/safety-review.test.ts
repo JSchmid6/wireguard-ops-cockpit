@@ -20,8 +20,10 @@ describe("runbook safety review", () => {
       scheduleId: null
     });
 
-    expect(prompt).toContain("Return exactly these seven lines and nothing else");
-    expect(prompt).toContain('"runbookId":"disk-health-check"');
+    expect(prompt).toContain("Return EXACTLY these 7 lines");
+    expect(prompt).toContain("Script:");
+    expect(prompt).toContain("df -h /");
+    expect(prompt).not.toContain("(script not available)");
     expect(prompt).not.toContain("sessionName");
     expect(prompt).not.toContain('"sessionId":"session-1"');
   });

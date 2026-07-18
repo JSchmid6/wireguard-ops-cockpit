@@ -1058,7 +1058,7 @@ describe("control API", () => {
       expect(res.statusCode).toBe(400);
     });
 
-    it("returns partial when planner doesn't finish in demo-local", async () => {
+    it("returns an explainable prerequisite block when tmux is disabled", async () => {
       const app = await createTestApp(openApps);
       const cookie = await login(app);
       const res = await app.inject({
@@ -1067,11 +1067,11 @@ describe("control API", () => {
         headers: { cookie },
         payload: { prompt: "What is the server time?" },
       });
-      // demo-local runtime doesn't produce "exiting loop" → timeout → 202 partial
-      expect(res.statusCode).toBe(202);
+      expect(res.statusCode).toBe(200);
       const body = res.json();
-      expect(body.partial).toBe(true);
+      expect(body.status).toBe("blocked_prerequisite");
       expect(body.sessionId).toBeTruthy();
+      expect(body.output.explanation.neededToContinue).toContain("Enable the tmux backend.");
     }, 15000);
 
     it("reuses an existing session when sessionId is provided", async () => {
@@ -1084,7 +1084,7 @@ describe("control API", () => {
         headers: { cookie },
         payload: { prompt: "test prompt long enough", sessionId: session.id },
       });
-      expect(res.statusCode).toBe(202);
+      expect(res.statusCode).toBe(200);
       expect(res.json().sessionId).toBe(session.id);
     }, 15000);
   });
@@ -1124,7 +1124,7 @@ describe("control API", () => {
       expect(res.statusCode).toBe(400);
     });
 
-    it("returns partial when no runbook is generated", async () => {
+    it("returns an explainable prerequisite block when execution is unavailable", async () => {
       const app = await createTestApp(openApps);
       const cookie = await login(app);
       const res = await app.inject({
@@ -1133,9 +1133,9 @@ describe("control API", () => {
         headers: { cookie },
         payload: { prompt: "Do something complex that needs a runbook" },
       });
-      expect(res.statusCode).toBe(202);
+      expect(res.statusCode).toBe(200);
       const body = res.json();
-      expect(body.partial).toBe(true);
+      expect(body.status).toBe("blocked_prerequisite");
       expect(body.sessionId).toBeTruthy();
     }, 15000);
 
@@ -1165,8 +1165,8 @@ describe("control API", () => {
         headers: { cookie },
         payload: { prompt: "Delete all files under /etc/nginx/" },
       });
-      // Without planner output → no runbook → 202 partial
-      expect([202, 409]).toContain(res.statusCode);
+      expect(res.statusCode).toBe(200);
+      expect(res.json().status).toBe("blocked_prerequisite");
     }, 15000);
 
     it("requires approval when safety review says approval_required", async () => {
@@ -1196,7 +1196,47 @@ describe("control API", () => {
         headers: { cookie },
         payload: { prompt: "Restart the Apache web server please" },
       });
-      expect([202, 409]).toContain(res.statusCode);
+      expect(res.statusCode).toBe(200);
+      expect(res.json().status).toBe("blocked_prerequisite");
     }, 15000);
+
+    it("records and explains an operator rejection for a red Hermes job", async () => {
+      const dbPath = createTempDbPath(tempDirectories);
+      const app = await createTestApp(openApps, { dbPath });
+      const cookie = await login(app);
+      const created = await app.inject({
+        method: "POST",
+        url: "/api/hermes/runbook",
+        headers: { cookie },
+        payload: { prompt: "Prepare a reviewed network exposure change with rollback" },
+      });
+      const jobId = created.json().id as string;
+      const sqlite = new BetterSqlite3(dbPath);
+      sqlite.prepare("UPDATE jobs SET status = ?, output_json = ? WHERE id = ?").run(
+        "blocked_user_approval",
+        JSON.stringify({
+          explanation: { intent: "Expose a new service", phase: "finished" },
+          policy: { rollbackAvailable: true },
+          proposalPath: path.join(path.dirname(dbPath), "proposals", `${jobId}.md`),
+        }),
+        jobId,
+      );
+      sqlite.close();
+
+      const rejected = await app.inject({
+        method: "POST",
+        url: `/api/hermes/jobs/${jobId}/approval`,
+        headers: { cookie },
+        payload: { decision: "rejected", reason: "Do not expose this service" },
+      });
+
+      expect(rejected.statusCode).toBe(200);
+      expect(rejected.json().job.status).toBe("rejected");
+      expect(rejected.json().job.output.explanation).toMatchObject({
+        intent: "Expose a new service",
+        reason: "Do not expose this service",
+        rollbackAvailable: true,
+      });
+    });
   });
 });

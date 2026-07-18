@@ -1,7 +1,10 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
 import type { ExecutionReview, ExecutionRiskClass, PlanReviewVerdict, RunbookDefinition } from "@wireguard-ops-cockpit/domain";
 import type { AppConfig } from "./config.js";
+import { SCRIPTS } from "./registries.js";
 
 type SafetyVerdict = Extract<PlanReviewVerdict, "passed" | "approval_required" | "blocked">;
 
@@ -52,15 +55,20 @@ interface CopilotReviewResult {
   model: string | null;
 }
 
+function resolveScriptPath(scriptIdOrPath: string, repoRoot: string): string {
+  if (path.isAbsolute(scriptIdOrPath)) return scriptIdOrPath;
+  const definition = SCRIPTS.find((script) => script.id === scriptIdOrPath);
+  return path.join(repoRoot, definition?.sourcePath || path.join("bin", scriptIdOrPath));
+}
+
 export function buildRunbookSafetyPrompt(input: RunbookSafetyReviewInput): string {
   // Read the actual script content so the safety LLM can see the commands
   let scriptContent = "(script not available)";
   try {
-    const fs = require("node:fs");
     const repoRoot = process.env.COCKPIT_REPO_ROOT || "/opt/wireguard-ops-cockpit";
     for (const sid of input.runbook.scriptIds) {
-      const p = `${repoRoot}/bin/${sid}`;
-      if (fs.existsSync(p)) { scriptContent = fs.readFileSync(p, "utf-8"); break; }
+      const p = resolveScriptPath(sid, repoRoot);
+      if (existsSync(p)) { scriptContent = readFileSync(p, "utf-8"); break; }
     }
   } catch { /* best-effort */ }
   // Replace ``` code fences with [code] blocks so they don't confuse the LLM
@@ -157,12 +165,11 @@ export async function generateRunbookSafetyReview(
   // Hardcoded pre-check: read-only commands are always safe
   const SAFE_BINARIES = /^\/(usr\/bin|bin|usr\/sbin|sbin)\/(date|uptime|ls|cat|df|echo|whoami|hostname|uname|pwd|env|printenv|id|groups|getent|wc|head|tail|sort|uniq|grep|awk|sed|tr|cut|basename|dirname|realpath|readlink|stat|file|which|type)$/;
   try {
-    const fs = require("node:fs");
     const repoRoot = process.env.COCKPIT_REPO_ROOT || "/opt/wireguard-ops-cockpit";
     for (const sid of input.runbook.scriptIds) {
-      const p = `${repoRoot}/bin/${sid}`;
-      if (!fs.existsSync(p)) continue;
-      const content = fs.readFileSync(p, "utf-8");
+      const p = resolveScriptPath(sid, repoRoot);
+      if (!existsSync(p)) continue;
+      const content = readFileSync(p, "utf-8");
       const permSection = content.match(/## Required Permissions\n([\s\S]*?)(?:\n\n|\n```|\n'''|$)/);
       if (!permSection) break;
       const binaries = permSection[1].split("\n").map((l: string) => l.trim()).filter((l: string) => l.startsWith("/"));

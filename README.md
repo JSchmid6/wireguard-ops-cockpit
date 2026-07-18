@@ -21,6 +21,8 @@ This first pass keeps the trust boundaries explicit:
 - `tmux` sessions are first-class
 - browser terminal attachment is represented through an external ttyd-compatible URL, not hidden shell access
 - privileged host behavior runs only through bounded host helpers, approvals, and narrow `sudoers` rules
+- Hermes requests become durable jobs with a structured explanation of intent, phase, completed work, evidence, blockers, and the exact action needed to continue
+- planner output never creates sudo policy or permanently registers a generated runbook; missing privilege fails closed
 
 ## Repository structure
 
@@ -110,6 +112,7 @@ npm run check
 
 `npm run test` covers the shared tmux adapter plus the API and web workspaces. `npm run check` is the same build-and-test gate used by CI.
 `npm run coverage` enforces workspace-specific coverage thresholds for the tmux adapter, API, and web UI and is also run in CI.
+Production and local verification must use the same Node.js 20.19.1 runtime because `better-sqlite3` is a native module.
 
 ## Docker Compose development
 

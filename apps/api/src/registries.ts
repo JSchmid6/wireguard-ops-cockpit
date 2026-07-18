@@ -470,7 +470,26 @@ function buildPlannerAgent(plannerRuntime: AgentRuntimeOptions["plannerRuntime"]
 }
 
 function buildSupervisedRepairCheckpointTemplate(): ExecutionCheckpointDefinition[] {
-  return []; // No operator checkpoints — runbooks execute autonomously
+  return [
+    {
+      id: "checkpoint-review-scope",
+      label: "Review current bounded scope",
+      description: "Present the observed state, intended outcome, and policy boundary before a follow-up is selected.",
+      kind: "analysis"
+    },
+    {
+      id: "checkpoint-choose-follow-up",
+      label: "Choose bounded follow-up",
+      description: "Select an allowlisted runbook or keep the work advisory when no safe execution path exists.",
+      kind: "operator-checkpoint"
+    },
+    {
+      id: "checkpoint-verify-outcome",
+      label: "Verify outcome",
+      description: "Compare the resulting state with the stated intent and explain any remaining work or blocker.",
+      kind: "verify"
+    }
+  ];
 }
 
 function buildSupervisedRepairAgent(plannerRuntime: AgentRuntimeOptions["plannerRuntime"]): AgentManifest {
@@ -580,8 +599,8 @@ export function findAgent(
 function buildPlannerPrompt(prompt: string): string {
   return [
     "You are the planner-agent for wireguard-ops-cockpit.",
-    "Produce a bash script that completes the assigned task.",
-    "Output ONLY the script inside a bash code block. No explanation. No markdown outside the block.",
+    "Produce a structured, reviewable plan and a bash script that completes the assigned task.",
+    "Explain prerequisites, impact, rollback, and verification in the named sections.",
     "Format:",
     "## Required Permissions",
     "/full/path/to/binary1",
@@ -592,11 +611,24 @@ function buildPlannerPrompt(prompt: string): string {
     "set -euo pipefail",
     "# ... script logic ...",
     "```",
+    "## Intent",
+    "one sentence",
+    "## Targets",
+    "one target per line",
+    "## Risk Zone",
+    "green|yellow|red",
+    "## Prerequisites",
+    "one prerequisite per line or none",
+    "## Rollback",
+    "concrete rollback steps or none",
+    "## Verification",
+    "concrete checks proving the requested outcome",
     "RULES:",
     "- List EVERY binary the script uses under ## Required Permissions (full paths).",
     "- Script must be idempotent and safe to re-run.",
     "- No human checkpoints, no 'read -p', no waiting for input.",
     "- Attempt self-recovery for non-destructive errors.",
+    "- Never claim a prerequisite exists without checking it in the script.",
     "- Stop on data loss or security issues.",
     "- Use full paths for all binaries (e.g. /usr/bin/apt-get).",
     "The safety review agent checks before execution.",
@@ -796,20 +828,7 @@ export function buildRunbookDispatch(
 
   const dispatch = commandByRunbook[runbook.id];
   if (!dispatch) {
-    // Fallback for dynamic runbooks: run opencode to execute the .md plan
-    if (runbook.scriptIds.length > 0 && runbook.scriptIds[0].endsWith(".md")) {
-      const mdPath = `${path.resolve(repoRoot, "bin")}/${runbook.scriptIds[0]}`;
-      const winName = runbook.id.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").substring(0, 32);
-      return {
-        windowName: winName,
-        command: {
-          executable: "bash",
-          args: ["-lc", `DEEPSEEK_API_KEY="\${DEEPSEEK_API_KEY:-}" opencode run --auto --print-logs "Read and execute ${mdPath}. Do NOT ask for approval." 2>&1 | tee /tmp/opencode-last.log; exec bash`],
-          cwd: repoRoot,
-        },
-      };
-    }
-    throw new Error(`no dispatch command registered for runbook ${runbook.id}`);
+    throw new Error(`runbook ${runbook.id} has no registered bounded dispatch helper`);
   }
 
   return {

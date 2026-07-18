@@ -618,6 +618,17 @@ export class CockpitDatabase {
     return row ? this.mapJob(row) : null;
   }
 
+  getJobForActor(id: string, actorId: string): JobRecord | null {
+    const row = this.database
+      .prepare(
+        `SELECT jobs.* FROM jobs
+         JOIN cockpit_sessions ON cockpit_sessions.id = jobs.session_id
+         WHERE jobs.id = ? AND cockpit_sessions.owner_id = ?`
+      )
+      .get(id, actorId) as JobRow | undefined;
+    return row ? this.mapJob(row) : null;
+  }
+
   listJobsForSession(sessionId: string): JobRecord[] {
     const rows = this.database
       .prepare("SELECT * FROM jobs WHERE session_id = ? ORDER BY datetime(created_at) DESC")

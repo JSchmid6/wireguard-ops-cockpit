@@ -7,6 +7,12 @@ export type JobStatus =
   | "pending_approval"
   | "running"
   | "completed"
+  | "blocked_user_approval"
+  | "blocked_policy"
+  | "blocked_prerequisite"
+  | "failed_execution"
+  | "failed_verification"
+  | "rollback_completed"
   | "rejected"
   | "failed";
 export type ApprovalStatus = "pending" | "approved" | "rejected";

@@ -57,7 +57,7 @@ It must not be the only component that can authorize privileged execution.
 
 ### Deterministic policy gate
 
-The policy gate is the authoritative allow or deny layer.
+The policy gate is the authoritative allow or deny layer. It deliberately keeps only hard boundaries deterministic; contextual classification remains with the safety LLM.
 
 It validates:
 
@@ -71,6 +71,15 @@ It validates:
 - plan hash equality between approved and executed action
 
 If a request cannot be represented as an allowlisted runbook or helper, execution stops.
+
+For Hermes-generated change proposals the implemented zones are:
+
+- green: contextual review passes and execution may continue autonomously
+- yellow: autonomous execution is allowed only with an explicit rollback in the plan
+- red: destructive operations, identity/network changes, public exposure, direct Nextcloud database access, or sudo-policy changes require an operator decision
+- policy/prerequisite block: the response identifies the failed boundary and what must change before a new attempt
+
+Approval never grants new operating-system privilege. Even an approved red proposal executes as `wgops` and can use only pre-installed static helpers.
 
 ### Hooks
 
@@ -121,6 +130,8 @@ Long-running or high-risk actions should execute in the same `tmux` session or a
 8. The bounded executor runs the registered helper or runbook.
 9. Runtime and post-exec hooks verify the outcome and keep the audit trail complete.
 10. The operator can inspect or take over through the same `tmux` session.
+
+Every Hermes request is persisted before planner work begins. `GET /api/hermes/jobs/:jobId` is the stable status interface; a short POST wait may return `202`, but that never cancels the planner or destroys its session. Terminal jobs expose a structured explanation containing the original intent, phase, completed stages, evidence, reason, prerequisites to continue, recommended action, and rollback availability. Red proposals use `POST /api/hermes/jobs/:jobId/approval`; approval and rejection are audited.
 
 ## Website recovery example
 

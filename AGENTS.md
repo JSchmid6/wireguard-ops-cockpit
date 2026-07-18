@@ -2,10 +2,9 @@
 
 ## Security Model
 
-**Runner gets temporary, scoped sudo per execution.**
+**The runner never creates sudo policy.**
 
-The sudoers entry is created before dispatch and self-destructs when the command completes.
-No permanent `wgops` sudo — only the binaries listed in the planner's `## Required Permissions`.
+`wgops` has no generic or planner-derived sudo. Privileged operations are possible only through static, version-controlled, narrowly scoped helpers already installed by an administrator. A planner declaration such as `## Required Permissions` is documentation for review, never authorization.
 
 ```
 ## Required Permissions
@@ -13,10 +12,7 @@ No permanent `wgops` sudo — only the binaries listed in the planner's `## Requ
 /usr/bin/systemctl
 ```
 
-These are parsed from the `.md` plan, validated against actual commands, and scoped to exactly those binaries.
-Fallback: `ALL` if planner didn't specify permissions.
-
-Cleanup: `rm -f /etc/sudoers.d/runner-*` runs immediately after the command completes, before `exec bash`.
+If a required helper is not allowlisted, execution fails closed and the job explains which prerequisite or operator action is missing. There is no `ALL` fallback and no runtime sudoers mutation.
 
 Three-stage execution pipeline, all in tmux sessions owned by `wgops` user:
 
@@ -33,11 +29,12 @@ POST /api/runbooks {"prompt":"...","sessionId":"..."}
   │     → checks .md for dangerous commands
   │     → blocked | passed | approval_required
   │
-  └── 3. RUNNER (supervised-repair-agent)  
+  └── 3. RUNNER (planner runtime, bounded OS identity)
         opencode reads .md, executes step by step
         → if blocked: stopped + audit log
         → if approval: goes to approval queue
-        → if safe: auto-executes
+        → green/yellow: auto-executes when rollback and prerequisites exist
+        → red/hard boundary: blocks for an explicit operator decision
 ```
 
 **Key files:** `apps/api/src/app.ts` (endpoints), `apps/api/src/registries.ts` (agents, runbooks), `apps/api/src/db.ts` (persistence), `packages/tmux-adapter/src/index.ts` (tmux integration)
@@ -104,7 +101,8 @@ Bare-metal Ubuntu VPS (161.97.86.86) running:
 ### Cockpit Runbooks
 - All host operations go through Cockpit Runbooks API
 - Planner (opencode) reviews for safety BEFORE any execution
-- Only allowlisted scripts can run
+- Generated proposals are stored as job evidence; they never register themselves as permanent runbooks
+- The service account remains the OS enforcement boundary and receives no dynamic sudo
 - Full audit log at `GET /api/audits`
 
 ## Known Pitfalls
