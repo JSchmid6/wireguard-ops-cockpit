@@ -83,6 +83,8 @@ or use `"rejected"`. Approval is audited but never creates privilege: execution 
 - `allowedCapabilities` must be derived only from trusted operator intent. Omission means `read.host`.
 - Cockpit HMAC-signs intent, evidence digests, plan, reviews, capabilities, actor, session, and expiry in the approval envelope; expired, unsigned, or drifting approvals must be replanned.
 - Mutation is successful only after independent verification; a runner success claim alone is insufficient.
+- Agents cannot access Control state or the typed Executor socket. Never request a local-shell fallback when a typed capability is unavailable.
+- Autonomous mutation currently supports only the typed service helper allowlist; `blocked_prerequisite` means a reviewed helper must be added first.
 - `## Required Permissions` documents needs; it never creates sudoers rules.
 - There is no fallback to full sudo and no runtime sudoers mutation.
 - Generated proposals are job evidence, not permanently registered runbooks.

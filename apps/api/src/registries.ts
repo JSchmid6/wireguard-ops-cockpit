@@ -695,6 +695,10 @@ function buildAgentPrompt(agent: AgentManifest, prompt: string): string {
   return buildPlannerPrompt(prompt);
 }
 
+export function buildBrokerAgentPrompt(agent: AgentManifest, prompt: string): string {
+  return buildAgentPrompt(agent, prompt);
+}
+
 export function buildAgentCommand(
   repoRoot: string,
   agent: AgentManifest,

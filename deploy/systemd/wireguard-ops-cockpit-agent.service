@@ -1,0 +1,29 @@
+[Unit]
+Description=WireGuard Ops Cockpit isolated agent broker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cockpit-agent
+Group=cockpit-agent-client
+WorkingDirectory=/opt/wireguard-ops-cockpit
+Environment=NODE_ENV=production
+Environment=PATH=/opt/node-v20.19.1-linux-x64/bin:/usr/local/bin:/usr/bin:/bin
+Environment=COCKPIT_AGENT_BROKER_SOCKET=/run/cockpit-agent/agent.sock
+EnvironmentFile=/etc/wireguard-ops-cockpit/agent.env
+RuntimeDirectory=cockpit-agent
+RuntimeDirectoryMode=0770
+ExecStart=/opt/node-v20.19.1-linux-x64/bin/node /opt/wireguard-ops-cockpit/apps/agent-broker/src/index.mjs
+Restart=always
+RestartSec=5
+UMask=0007
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/wireguard-ops-agent /run/cockpit-agent
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

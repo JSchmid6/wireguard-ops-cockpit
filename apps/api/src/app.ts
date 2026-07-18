@@ -1,6 +1,6 @@
 import { createHash, createHmac } from "node:crypto";
 import { execSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import Fastify from "fastify";
@@ -34,12 +34,15 @@ import {
   listAgents,
   findRunbook,
   buildRunnerPrompt,
+  buildBrokerAgentPrompt,
   registerDynamicRunbook,
   unregisterDynamicRunbook,
   loadDynamicRunbooks,
   listDynamicRunbooks
 } from "./registries.js";
 import { generateRunbookSafetyReview, type SafetyReviewRunner } from "./safety-review.js";
+import { runBrokerAgent } from "./agent-broker.js";
+import { runExecutorAction } from "./executor-broker.js";
 import {
   buildAgentTask,
   classifyCapabilities,
@@ -607,7 +610,8 @@ export async function createApp(options: AppOptions = {}) {
         copilotExecutable: config.copilotExecutable,
         copilotModel: config.copilotModel,
         opencodeExecutable: config.opencodeExecutable,
-        opencodeModel: config.safetyOpencodeModel
+        opencodeModel: config.safetyOpencodeModel,
+        agentBrokerSocket: config.agentBrokerSocket,
       }
     );
     const planState = resolveRunbookPlanState(runbook, safetyReview);
@@ -1207,6 +1211,9 @@ export async function createApp(options: AppOptions = {}) {
     windowSuffix = "",
     opencodeModel = config.opencodeModel,
   ) {
+    if (config.agentBrokerSocket) {
+      throw new Error("local agent execution is disabled while the isolated agent broker is configured");
+    }
     const session = plan.sessionId ? database.getSessionRuntimeTargetForActor(plan.sessionId, plan.requestedBy) : null;
     if (!session) {
       throw new Error("session not found for agent plan");
@@ -1216,7 +1223,7 @@ export async function createApp(options: AppOptions = {}) {
       typeof plan.normalizedInput.prompt === "string"
         ? plan.normalizedInput.prompt
         : "Inspect the current maintenance context and report back.";
-    const logFile = `/tmp/opencode-${session.id.substring(0,8)}-${windowSuffix || agent.id}.log`;
+    const logFile = `/tmp/opencode-${session.id.substring(0,8)}-${agent.id}${windowSuffix}.log`;
     const command = buildAgentCommand(config.repoRoot, agent, prompt, {
       plannerRuntime: config.plannerRuntime,
       copilotExecutable: config.copilotExecutable,
@@ -1333,6 +1340,8 @@ export async function createApp(options: AppOptions = {}) {
     tmuxBackend: tmux.backend,
     security: {
       modelDiversity: config.opencodeModel !== config.safetyOpencodeModel,
+      agentIsolation: Boolean(config.agentBrokerSocket && existsSync(config.agentBrokerSocket)),
+      typedExecutor: Boolean(config.executorBrokerSocket && existsSync(config.executorBrokerSocket)),
       warning: config.opencodeModel === config.safetyOpencodeModel
         ? "Planner and safety reviewer use the same configured model; role isolation remains, but correlated errors are more likely."
         : null,
@@ -1528,6 +1537,26 @@ export async function createApp(options: AppOptions = {}) {
     return null;
   }
 
+  async function runIsolatedAgent(
+    actor: UserSummary,
+    session: { id: string },
+    agent: AgentManifest,
+    role: "planner" | "runner" | "safety" | "verifier",
+    prompt: string,
+    windowSuffix: string,
+    timeoutMs: number,
+    model = config.opencodeModel,
+  ): Promise<string> {
+    if (config.agentBrokerSocket) {
+      return await runBrokerAgent(config.agentBrokerSocket, role, buildBrokerAgentPrompt(agent, prompt));
+    }
+    executeAgentPlan(createAgentPlan(actor, agent, session.id, prompt, 30_000), actor, agent, windowSuffix, model);
+    const logFile = `/tmp/opencode-${session.id.substring(0,8)}-${agent.id}${windowSuffix}.log`;
+    const output = await pollAgentLog(logFile, timeoutMs);
+    if (!output) throw new Error(`${role} did not finish within the execution timeout`);
+    return output;
+  }
+
   async function runIndependentVerification(
     actor: UserSummary,
     session: { id: string },
@@ -1540,12 +1569,41 @@ export async function createApp(options: AppOptions = {}) {
       `You are the verifier-agent. Independently verify the requested target state for this intent using read-only commands only. Do not trust the runner's success claim. End with exactly VERIFICATION_STATUS: passed or VERIFICATION_STATUS: failed, followed by EVIDENCE: and REASON:. Intent: ${intent}`,
       [{ source: "reviewed-plan", content: reviewedPlan }, { source: "runner-handoff", content: runnerResult }],
     );
-    executeAgentPlan(createAgentPlan(actor, planner, session.id, verifierPrompt, 30_000), actor, planner, "-verifier", config.safetyOpencodeModel);
-    const verifierLog = `/tmp/opencode-${session.id.substring(0,8)}-${planner.id}-verifier.log`;
-    const verifierRaw = await pollAgentLog(verifierLog, 5 * 60_000);
+    const verifierRaw = await runIsolatedAgent(actor, session, planner, "verifier", verifierPrompt, "-verifier", 5 * 60_000, config.safetyOpencodeModel);
     return verifierRaw
       ? filterSensitiveContent(extractCleanOutput(verifierRaw) || extractAnswer(verifierRaw))
       : "VERIFICATION_STATUS: failed\nREASON: verifier timeout";
+  }
+
+  function isolatedRunnerPrompt(proposalPath: string, planText: string): string {
+    return [
+      buildRunnerPrompt(proposalPath),
+      "",
+      "The control plane supplied the exact HMAC-bound reviewed plan below because the isolated agent cannot access control-plane storage.",
+      "Execute only this content; do not read a replacement plan from another location.",
+      "## REVIEWED PLAN CONTENT",
+      planText,
+    ].join("\n");
+  }
+
+  async function executeTypedCapabilities(planText: string, envelope: ExecutionEnvelope): Promise<string | null> {
+    if (!envelope.capabilities.includes("service.manage")) return null;
+    if (!config.executorBrokerSocket || !config.executorBrokerSecret) {
+      throw new Error("typed executor broker is not configured");
+    }
+    const script = planText.match(/```(?:bash|sh)\s*\n([\s\S]*?)```/i)?.[1] || "";
+    const actions = script.split("\n").flatMap((line) => {
+      const match = line.trim().match(/^(?:sudo\s+)?(?:\/usr\/bin\/)?systemctl\s+(restart|status)\s+([a-zA-Z0-9@_.-]+)$/);
+      return match ? [{ action: `service.${match[1]}` as "service.restart" | "service.status", target: match[2] }] : [];
+    });
+    if (actions.length === 0) throw new Error("service.manage plan contains no typed service action");
+    const outputs: string[] = [];
+    for (const action of actions) {
+      outputs.push(await runExecutorAction(config.executorBrokerSocket, config.executorBrokerSecret, {
+        ...action, expiresAt: envelope.expiresAt, envelopeDigest: envelope.digest,
+      }));
+    }
+    return `## EXECUTION RESULT\nSTATUS: success\nEXIT_CODE: 0\nWHAT_RAN: typed executor service actions\nOUTPUT: ${outputs.join("\n").slice(-10000)}\nNOTES: executed by isolated capability broker`;
   }
 
   function explanation(input: Partial<HermesExplanation> & Pick<HermesExplanation, "phase" | "intent" | "reason">): HermesExplanation {
@@ -1653,18 +1711,7 @@ export async function createApp(options: AppOptions = {}) {
           return;
         }
         updateHermesJob(job.id, "running", explanation({ phase: "planning", intent, reason: "Planner is performing read-only research." }));
-        const plan = createAgentPlan(actor, agent, session.id, agentTask, 30_000);
-        executeAgentPlan(plan, actor, agent);
-        const logFile = `/tmp/opencode-${session.id.substring(0,8)}-${agent.id}.log`;
-        const raw = await pollAgentLog(logFile, 5 * 60_000);
-        if (!raw) {
-          updateHermesJob(job.id, "failed_execution", explanation({
-            phase: "finished", intent, reason: "Planner did not produce a terminal result within five minutes.",
-            evidence: [logFile], neededToContinue: ["Inspect the preserved session and planner log."],
-            recommendedAction: "Check planner availability before retrying.",
-          }));
-          return;
-        }
+        const raw = await runIsolatedAgent(actor, session, agent, "planner", agentTask, "", 5 * 60_000);
         const answer = filterSensitiveContent(extractCleanOutput(raw) || extractAnswer(raw));
         if (!answer || answer.length < 20 || /^>\s*build\b/i.test(answer.trim())) {
           updateHermesJob(job.id, "failed_verification", explanation({
@@ -1798,13 +1845,12 @@ export async function createApp(options: AppOptions = {}) {
 
     void (async () => {
       try {
-        executeAgentPlan(createAgentPlan(actor, planner, session.id, buildRunnerPrompt(proposalPath)), actor, planner, "-runner");
-        const runnerLog = `/tmp/opencode-${session.id.substring(0,8)}-${planner.id}-runner.log`;
-        const raw = await pollAgentLog(runnerLog, 10 * 60_000);
-        if (!raw) throw new Error("approved runner did not finish within ten minutes");
-        const result = filterSensitiveContent(extractRunnerHandoff(raw));
-        const runnerSuccess = /STATUS:\s*success/i.test(result);
         const reviewedPlan = typeof job.output?.plan === "string" ? job.output.plan : "";
+        const envelope = job.output?.envelope as ExecutionEnvelope;
+        const typedResult = await executeTypedCapabilities(reviewedPlan, envelope);
+        const raw = typedResult || await runIsolatedAgent(actor, session, planner, "runner", isolatedRunnerPrompt(proposalPath, reviewedPlan), "-runner", 10 * 60_000);
+        const result = typedResult || filterSensitiveContent(extractRunnerHandoff(raw));
+        const runnerSuccess = /STATUS:\s*success/i.test(result);
         const verification = runnerSuccess
           ? await runIndependentVerification(actor, session, planner, intent, reviewedPlan, result)
           : "VERIFICATION_STATUS: failed\nREASON: runner did not report success";
@@ -2080,6 +2126,11 @@ export async function createApp(options: AppOptions = {}) {
     if (!actor) {
       return;
     }
+    if (config.agentBrokerSocket) {
+      return reply.code(410).send({
+        message: "legacy dynamic runbook generation is disabled under identity isolation; use /api/hermes/runbook",
+      });
+    }
 
     const body = (request.body || {}) as {
       prompt?: string;
@@ -2276,10 +2327,7 @@ Follow these rules:
         const planner = findAgent("planner-agent", "opencode");
         if (!planner) throw new Error("planner not available");
         updateHermesJob(job.id, "running", explanation({ phase: "planning", intent, reason: "Planner is producing a structured change plan." }));
-        executeAgentPlan(createAgentPlan(actor, planner, session.id, agentTask, 30_000), actor, planner);
-        const plannerLog = `/tmp/opencode-${session.id.substring(0,8)}-${planner.id}.log`;
-        const plannerRaw = await pollAgentLog(plannerLog, 5 * 60_000);
-        if (!plannerRaw) throw new Error("planner did not finish within five minutes");
+        const plannerRaw = await runIsolatedAgent(actor, session, planner, "planner", agentTask, "", 5 * 60_000);
         const planText = filterSensitiveContent(extractCleanOutput(plannerRaw));
         if (!planText || planText.length < 20) throw new Error("planner produced no reviewable plan");
 
@@ -2327,6 +2375,19 @@ Follow these rules:
             neededToContinue: ["Explicit operator approval or rewrite the plan using typed capabilities."],
           };
         }
+        const unsupportedAutonomousCapabilities = capabilities.filter((capability) =>
+          capability !== "read.host" && capability !== "service.manage" && capability !== "shell.exception"
+        );
+        if (policy.allowed && unsupportedAutonomousCapabilities.length > 0) {
+          policy = {
+            ...policy,
+            allowed: false,
+            status: "blocked_prerequisite",
+            reason: "The requested capability does not yet have a typed executor helper.",
+            evidence: unsupportedAutonomousCapabilities.map((capability) => `missing typed helper: ${capability}`),
+            neededToContinue: ["Install and review a narrow typed helper; do not fall back to agent shell execution."],
+          };
+        }
         const envelope = createExecutionEnvelope({
           jobId: job.id, actorId: actor.id, sessionId: session.id, intent,
           evidence: untrustedEvidence, plan: planText, safety: review, policy, capabilities,
@@ -2364,12 +2425,9 @@ Follow these rules:
           completed: ["Planner proposal", "Safety review", "Policy evaluation"],
           evidence: [review.summary, ...policy.evidence], rollbackAvailable: policy.rollbackAvailable,
         }), { plan: planText, safety: review, policy, capabilities, envelope, provenance, proposalPath });
-        const runnerPrompt = buildRunnerPrompt(proposalPath);
-        executeAgentPlan(createAgentPlan(actor, planner, session.id, runnerPrompt), actor, planner, "-runner");
-        const runnerLog = `/tmp/opencode-${session.id.substring(0,8)}-${planner.id}-runner.log`;
-        const runnerRaw = await pollAgentLog(runnerLog, 10 * 60_000);
-        if (!runnerRaw) throw new Error("runner did not finish within ten minutes");
-        const result = filterSensitiveContent(extractRunnerHandoff(runnerRaw));
+        const typedResult = await executeTypedCapabilities(planText, envelope);
+        const runnerRaw = typedResult || await runIsolatedAgent(actor, session, planner, "runner", isolatedRunnerPrompt(proposalPath, planText), "-runner", 10 * 60_000);
+        const result = typedResult || filterSensitiveContent(extractRunnerHandoff(runnerRaw));
         if (!result) throw new Error("runner produced no structured execution result");
         const runnerSuccess = /STATUS:\s*success/i.test(result);
         let verification = "VERIFICATION_STATUS: failed\nREASON: runner did not report success";
@@ -2378,10 +2436,8 @@ Follow these rules:
             `You are the verifier-agent. Independently verify the requested target state for this intent using read-only commands only. Do not trust the runner's success claim. End with exactly VERIFICATION_STATUS: passed or VERIFICATION_STATUS: failed, followed by EVIDENCE: and REASON:. Intent: ${intent}`,
             [{ source: "reviewed-plan", content: planText }, { source: "runner-handoff", content: result }],
           );
-          executeAgentPlan(createAgentPlan(actor, planner, session.id, verifierPrompt, 30_000), actor, planner, "-verifier", config.safetyOpencodeModel);
-          const verifierLog = `/tmp/opencode-${session.id.substring(0,8)}-${planner.id}-verifier.log`;
-          const verifierRaw = await pollAgentLog(verifierLog, 5 * 60_000);
-          verification = verifierRaw ? filterSensitiveContent(extractCleanOutput(verifierRaw) || extractAnswer(verifierRaw)) : "VERIFICATION_STATUS: failed\nREASON: verifier timeout";
+          const verifierRaw = await runIsolatedAgent(actor, session, planner, "verifier", verifierPrompt, "-verifier", 5 * 60_000, config.safetyOpencodeModel);
+          verification = filterSensitiveContent(extractCleanOutput(verifierRaw) || extractAnswer(verifierRaw));
         }
         const success = runnerSuccess && /VERIFICATION_STATUS:\s*passed/i.test(verification);
         updateHermesJob(job.id, success ? "completed" : "failed_verification", explanation({
@@ -3167,6 +3223,11 @@ Follow these rules:
     const actor = await requireActor(request, reply, database);
     if (!actor) {
       return;
+    }
+    if (config.agentBrokerSocket) {
+      return reply.code(410).send({
+        message: "legacy local agent launch is disabled under identity isolation; use the durable Hermes endpoints",
+      });
     }
 
     const { agentId } = request.params as { agentId: string };

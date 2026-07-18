@@ -779,7 +779,7 @@ describe("App", () => {
     expect(screen.getByText("Scripts")).toBeTruthy();
     expect(screen.getByText("Planner agent")).toBeTruthy();
     expect(screen.getByText("Supervised repair agent")).toBeTruthy();
-    expect(screen.getByText("Execution plans")).toBeTruthy();
+    expect(await screen.findByText("Execution plans")).toBeTruthy();
     expect(await screen.findByText("Open terminal bridge")).toBeTruthy();
     expect(screen.getByText(/Safety report/)).toBeTruthy();
     expect(screen.getByText(/Filesystem pressure may affect backups/)).toBeTruthy();

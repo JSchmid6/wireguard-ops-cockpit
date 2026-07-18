@@ -24,6 +24,8 @@ describe("loadConfig", () => {
     expect(config.safetyOpencodeModel).toBeNull();
     expect(config.requireModelDiversity).toBe(false);
     expect(config.approvalTtlMinutes).toBe(30);
+    expect(config.agentBrokerSocket).toBeNull();
+    expect(config.executorBrokerSocket).toBeNull();
     expect(config.dbPath.endsWith(path.join("data", "cockpit.sqlite"))).toBe(true);
     expect(path.isAbsolute(config.repoRoot)).toBe(true);
   });
@@ -72,6 +74,9 @@ describe("loadConfig", () => {
       COCKPIT_SAFETY_OPENCODE_MODEL: "anthropic/claude-sonnet-4",
       COCKPIT_REQUIRE_MODEL_DIVERSITY: "true",
       COCKPIT_APPROVAL_TTL_MINUTES: "15"
+      ,COCKPIT_AGENT_BROKER_SOCKET: "/run/cockpit/agent.sock",
+      COCKPIT_EXECUTOR_BROKER_SOCKET: "/run/cockpit/executor.sock",
+      COCKPIT_EXECUTOR_BROKER_SECRET: "executor-secret"
     });
 
     expect(config.plannerRuntime).toBe("opencode");
@@ -80,5 +85,8 @@ describe("loadConfig", () => {
     expect(config.safetyOpencodeModel).toBe("anthropic/claude-sonnet-4");
     expect(config.requireModelDiversity).toBe(true);
     expect(config.approvalTtlMinutes).toBe(15);
+    expect(config.agentBrokerSocket).toBe("/run/cockpit/agent.sock");
+    expect(config.executorBrokerSocket).toBe("/run/cockpit/executor.sock");
+    expect(config.executorBrokerSecret).toBe("executor-secret");
   });
 });

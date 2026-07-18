@@ -5,6 +5,7 @@ import path from "node:path";
 import type { ExecutionReview, ExecutionRiskClass, PlanReviewVerdict, RunbookDefinition } from "@wireguard-ops-cockpit/domain";
 import type { AppConfig } from "./config.js";
 import { SCRIPTS } from "./registries.js";
+import { runBrokerAgent } from "./agent-broker.js";
 
 type SafetyVerdict = Extract<PlanReviewVerdict, "passed" | "approval_required" | "blocked">;
 
@@ -29,7 +30,7 @@ export interface RunbookSafetyReviewInput {
 export type SafetyReviewRuntimeConfig = Pick<
   AppConfig,
   "repoRoot" | "plannerRuntime" | "copilotExecutable" | "copilotModel" | "opencodeExecutable" | "opencodeModel"
->;
+> & { agentBrokerSocket?: string | null };
 
 export type SafetyReviewRunner = (
   input: RunbookSafetyReviewInput,
@@ -199,7 +200,9 @@ export async function generateRunbookSafetyReview(
 
   try {
     const runtimeResult = isOpencode
-      ? await runOpencodeSafetyReview(prompt, runtime)
+      ? runtime.agentBrokerSocket
+        ? await runBrokerSafetyReview(prompt, runtime)
+        : await runOpencodeSafetyReview(prompt, runtime)
       : await runCopilotSafetyReview(prompt, runtime);
     const parsed = parseRunbookSafetyOutput(runtimeResult.stdout);
     const effectiveVerdict = resolveEffectiveVerdict(parsed.verdict, input.runbook.requiresApproval);
@@ -246,6 +249,13 @@ export async function generateRunbookSafetyReview(
     const reason = error instanceof Error ? error.message : "unknown safety review failure";
     return createFailedReview(input, inputHash, reason, runtimeSource);
   }
+}
+
+async function runBrokerSafetyReview(prompt: string, runtime: SafetyReviewRuntimeConfig): Promise<CopilotReviewResult> {
+  const startedAt = new Date().toISOString();
+  const started = Date.now();
+  const stdout = await runBrokerAgent(runtime.agentBrokerSocket!, "safety", prompt);
+  return { stdout, exitCode: 0, startedAt, completedAt: new Date().toISOString(), durationMs: Date.now() - started, model: runtime.opencodeModel };
 }
 
 function buildPromptPayload(input: RunbookSafetyReviewInput) {

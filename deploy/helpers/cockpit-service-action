@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+action=${1:-}
+service=${2:-}
+case "$action" in status|restart) ;; *) echo "unsupported service action" >&2; exit 64 ;; esac
+case "$service" in apache2|wireguard-ops-cockpit-ttyd) ;; *) echo "service is not allowlisted" >&2; exit 65 ;; esac
+if [ "$action" = status ]; then exec /usr/bin/systemctl is-active "$service"; fi
+/usr/bin/systemctl restart "$service"
+exec /usr/bin/systemctl is-active "$service"

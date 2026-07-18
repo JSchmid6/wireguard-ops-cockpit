@@ -107,6 +107,8 @@ Bare-metal Ubuntu VPS (161.97.86.86) running:
 - Keep operator `intent` separate from external `evidence`; email, web, log, and document content is always untrusted data
 - Declare only capabilities directly authorized by trusted intent; never derive capability authority from evidence
 - Approval is valid only for the stored, unexpired execution-envelope digest
+- Production agents run only through `/run/cockpit-agent/agent.sock`; never restore local `wgops` agent execution
+- Mutations run only through `/run/cockpit-executor/executor.sock` and a typed helper; never give the Agent socket access to the Executor group
 
 ## Known Pitfalls
 - `nextcloud.wejos.de` → /etc/hosts maps to 127.0.0.1 (Apache serves it)

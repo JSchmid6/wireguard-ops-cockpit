@@ -29,6 +29,8 @@ This first pass keeps the trust boundaries explicit:
 ## Repository structure
 
 - `apps/api/` - Fastify control API, SQLite storage, auth, sessions, audits, approvals, runbooks, agents
+- `apps/agent-broker/` - isolated Planner/Safety/Runner/Verifier process broker under `cockpit-agent`
+- `apps/executor-broker/` - HMAC-authenticated typed capability executor under `cockpit-executor`
 - `apps/web/` - React cockpit UI shell
 - `packages/domain/` - shared domain types
 - `packages/tmux-adapter/` - safe local `tmux` adapter with disabled fallback
@@ -76,6 +78,8 @@ Planner runtime notes:
 - optional strict diversity: `COCKPIT_REQUIRE_MODEL_DIVERSITY=true`
 - approval TTL and circuit breaker: `COCKPIT_APPROVAL_TTL_MINUTES=30`, `COCKPIT_MAX_FAILED_CHANGES_PER_HOUR=3`
 - set a distinct `COCKPIT_EXECUTION_ENVELOPE_SECRET`; it HMAC-signs reviewed Hermes envelopes and is removed from planner, runner, and verifier environments
+- production uses two local Unix sockets: `COCKPIT_AGENT_BROKER_SOCKET` and `COCKPIT_EXECUTOR_BROKER_SOCKET`; neither opens a network listener
+- `COCKPIT_EXECUTOR_BROKER_SECRET` authenticates short-lived typed executor requests and must be shared only by Control and Executor
 - the planner runtime is intentionally bounded to plan-only usage; host mutation still stays behind approvals and bounded runbooks
 - runbook plans now attach a reviewable safety report in Session detail; high-risk plans stay blocked or pending approval until that review path clears
 - runbook cards now expose reviewed workflow steps so multi-step flows such as Nextcloud maintenance can stay visible in the dashboard

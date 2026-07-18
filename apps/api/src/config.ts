@@ -23,6 +23,9 @@ export interface AppConfig {
   requireModelDiversity: boolean;
   approvalTtlMinutes: number;
   maxFailedChangesPerHour: number;
+  agentBrokerSocket: string | null;
+  executorBrokerSocket: string | null;
+  executorBrokerSecret: string | null;
   nodeEnv: string;
 }
 
@@ -64,6 +67,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     requireModelDiversity: env.COCKPIT_REQUIRE_MODEL_DIVERSITY === "true",
     approvalTtlMinutes: Math.max(1, Number(env.COCKPIT_APPROVAL_TTL_MINUTES || "30")),
     maxFailedChangesPerHour: Math.max(1, Number(env.COCKPIT_MAX_FAILED_CHANGES_PER_HOUR || "3")),
+    agentBrokerSocket: env.COCKPIT_AGENT_BROKER_SOCKET?.trim() || null,
+    executorBrokerSocket: env.COCKPIT_EXECUTOR_BROKER_SOCKET?.trim() || null,
+    executorBrokerSecret: env.COCKPIT_EXECUTOR_BROKER_SECRET?.trim() || null,
     nodeEnv
   };
 }

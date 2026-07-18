@@ -89,6 +89,16 @@ Planner output remains untrusted. Cockpit derives capabilities from the executab
 
 Runner success alone cannot close a mutation. A separate verifier receives plan and runner handoff as untrusted evidence, performs read-only checks, and must confirm the target state. Repeated execution or verification failures open a persisted one-hour circuit breaker.
 
+## Unix identity separation
+
+Production separates three kernel-level identities:
+
+- `wgops` runs Control and owns SQLite, audits, approval state, and envelope secrets. It has no sudo and no provider key.
+- `cockpit-agent` runs the local Agent Broker and owns only its model configuration and provider key. It cannot read Control state or the Executor socket.
+- `cockpit-executor` runs the typed Executor Broker. It cannot read Control state, provider credentials, or the Agent socket. Its only sudo entry invokes a root-owned validating helper.
+
+The Agent and Executor sockets use distinct Unix groups. When `COCKPIT_AGENT_BROKER_SOCKET` is configured, Control refuses all legacy same-process agent launches. Autonomous mutation is currently implemented only for typed `service.status` and `service.restart` actions targeting the helper allowlist. Unsupported capabilities fail closed; they never fall back to Agent shell execution.
+
 ### Hooks
 
 Hooks are hard guardrails around execution, not optional shell snippets.

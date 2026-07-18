@@ -1,0 +1,1 @@
+cockpit-executor ALL=(root) NOPASSWD: /usr/local/sbin/cockpit-service-action *

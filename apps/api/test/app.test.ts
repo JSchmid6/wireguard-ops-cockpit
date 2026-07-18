@@ -33,6 +33,9 @@ function buildConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     requireModelDiversity: false,
     approvalTtlMinutes: 30,
     maxFailedChangesPerHour: 3,
+    agentBrokerSocket: null,
+    executorBrokerSocket: null,
+    executorBrokerSecret: null,
     nodeEnv: "development",
     ...overrides
   };

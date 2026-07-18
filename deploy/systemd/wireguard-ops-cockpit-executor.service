@@ -1,0 +1,28 @@
+[Unit]
+Description=WireGuard Ops Cockpit typed executor broker
+After=network-online.target
+
+[Service]
+Type=simple
+User=cockpit-executor
+Group=cockpit-executor-client
+WorkingDirectory=/opt/wireguard-ops-cockpit
+Environment=NODE_ENV=production
+Environment=PATH=/opt/node-v20.19.1-linux-x64/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=COCKPIT_EXECUTOR_BROKER_SOCKET=/run/cockpit-executor/executor.sock
+EnvironmentFile=/etc/wireguard-ops-cockpit/executor.env
+RuntimeDirectory=cockpit-executor
+RuntimeDirectoryMode=0770
+ExecStart=/opt/node-v20.19.1-linux-x64/bin/node /opt/wireguard-ops-cockpit/apps/executor-broker/src/index.mjs
+Restart=always
+RestartSec=5
+UMask=0007
+NoNewPrivileges=false
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/cockpit-executor
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
