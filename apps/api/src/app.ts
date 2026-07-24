@@ -568,8 +568,9 @@ export async function createApp(options: AppOptions = {}) {
   const changeRuntimeFingerprint = hashCanonical({
     plannerModel: config.opencodeModel,
     safetyModel: config.safetyOpencodeModel,
-    capabilityContract: "cockpit-capability/v1",
+    capabilityContract: hashCanonical(capabilityPlannerContract()),
     brokerRoleContract: "ephemeral-role-workspace-v7",
+    executorBoundaryContract: "dynamic-capability-v2-nextcloud-semantic",
   });
   if (config.nodeEnv === "production" && config.adminPassword === "change-me-now") {
     throw new Error("COCKPIT_ADMIN_PASSWORD must be changed before running in production");
@@ -2421,7 +2422,9 @@ Follow these rules:
         let policy = evaluatePlanPolicy(planText, review.verdict);
         const manifest = parseCapabilityManifest(planText);
         const manifestHash = manifest ? capabilityManifestHash(manifest) : undefined;
-        const capabilities: CapabilityId[] = manifest ? [manifest.writablePaths.length > 0 ? "filesystem.write" : "read.host"] : classifyCapabilities(planText);
+        const nextcloudMutationModes = new Set(["php-install", "php-enable", "exapp-catalog-refresh", "exapp-register"]);
+        const semanticMutation = manifest?.steps.some((step) => step.argv[0] === "/usr/local/sbin/cockpit-nextcloud-app-action" && nextcloudMutationModes.has(step.argv[1] || "")) ?? false;
+        const capabilities: CapabilityId[] = manifest ? [manifest.writablePaths.length > 0 || semanticMutation ? "filesystem.write" : "read.host"] : classifyCapabilities(planText);
         const capabilityEscalation = capabilities.filter((capability) => !allowedCapabilities.includes(capability));
         if (!manifest && policy.allowed && capabilityEscalation.length > 0) {
           policy = {

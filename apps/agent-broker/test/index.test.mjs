@@ -20,6 +20,7 @@ test("agent broker creates a private role-scoped workspace and removes only that
   const instructions = fs.readFileSync(path.join(workspace, "AGENTS.md"), "utf8");
   assert.match(instructions, /disposable session workspace/);
   assert.match(instructions, /Planner role/);
+  assert.match(instructions, /configured HaRP/);
   assert.equal(fs.statSync(workspace).mode & 0o777, 0o700);
   removeSessionWorkspace(workspace, root);
   assert.equal(fs.existsSync(workspace), false);

@@ -46,8 +46,9 @@ export function createSessionWorkspace(request, root = workspaceRoot) {
   const workspace = fs.mkdtempSync(path.join(root, `agent-${request.requestId}-${request.role}-`));
   fs.chmodSync(workspace, 0o700);
   const common = fs.readFileSync(new URL("AGENTS.md", contextRoot), "utf8");
+  const architecture = fs.readFileSync(new URL("system-architecture.md", contextRoot), "utf8");
   const role = fs.readFileSync(new URL(`${request.role}.md`, contextRoot), "utf8");
-  fs.writeFileSync(path.join(workspace, "AGENTS.md"), `${common.trim()}\n\n${role.trim()}\n`, { mode: 0o600 });
+  fs.writeFileSync(path.join(workspace, "AGENTS.md"), `${common.trim()}\n\n${architecture.trim()}\n\n${role.trim()}\n`, { mode: 0o600 });
   return workspace;
 }
 

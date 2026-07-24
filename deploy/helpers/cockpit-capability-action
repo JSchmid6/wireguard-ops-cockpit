@@ -63,6 +63,7 @@ const writablePaths = paths.map((item) => {
 });
 
 const dangerousExecutable = /\/(?:rm|shred|dd|mkfs(?:\.[^/]*)?|fdisk|parted|iptables|nft|ufw|ip|wg|wg-quick|useradd|userdel|usermod|groupadd|groupdel|passwd|visudo|sudo|runuser|su)$/;
+const nextcloudAppHelper = "/usr/local/sbin/cockpit-nextcloud-app-action";
 const readOnlyContainerCommands = new Set(["ps", "inspect", "version", "info"]);
 function stepNeedsApproval(step) {
   const executable = step?.argv?.[0] || "";
@@ -99,6 +100,18 @@ for (const [index, step] of manifest.steps.entries()) {
     ...readablePaths.map((item) => `--property=BindReadOnlyPaths=${item}`),
     ...writablePaths.map((item) => `--property=BindPaths=${item}`),
   ];
+  if (step.argv[0] === nextcloudAppHelper) {
+    if (runAsUser !== "www-data") fail(`step ${index + 1} Nextcloud app action must run as www-data`, 77);
+    if (manifest.network !== "outbound") fail(`step ${index + 1} Nextcloud app action requires outbound-only network scope`, 77);
+    properties.push(
+      "--property=BindReadOnlyPaths=/run/mysqld",
+      "--property=BindReadOnlyPaths=/etc/php",
+      "--property=BindReadOnlyPaths=/var/www/nextcloud",
+      "--property=BindPaths=/var/www/nextcloud/apps",
+      "--property=BindPaths=/var/www/nextcloud/config",
+      "--property=BindPaths=/opt/nextcloud",
+    );
+  }
   if (runAsUser) properties.push(`--property=User=${runAsUser}`);
   if (manifest.network === "none") properties.push("--property=PrivateNetwork=yes", "--property=RestrictAddressFamilies=AF_UNIX");
   if (manifest.network === "local") properties.push(
@@ -117,7 +130,10 @@ for (const [index, step] of manifest.steps.entries()) {
     if (approved) properties.push(`--property=BindReadOnlyPaths=${cwd}`);
     properties.push(`--working-directory=${cwd}`);
   }
-  const timeout = Number.isInteger(step.timeoutSeconds) ? Math.min(Math.max(step.timeoutSeconds, 1), 900) : 120;
+  const requestedTimeout = Number.isInteger(step.timeoutSeconds) ? Math.min(Math.max(step.timeoutSeconds, 1), 900) : 120;
+  const timeout = step.argv[0] === nextcloudAppHelper && step.argv[1] === "exapp-register"
+    ? 3000
+    : step.argv[0] === nextcloudAppHelper ? Math.max(requestedTimeout, 900) : requestedTimeout;
   const result = spawnSync("/usr/bin/systemd-run", ["--wait", "--pipe", "--collect", "--quiet", `--property=TimeoutStartSec=${timeout}`, ...properties, "--", ...step.argv], {
     encoding: "utf8", timeout: (timeout + 10) * 1000, maxBuffer: 1024 * 1024, env: { PATH: "/usr/sbin:/usr/bin:/sbin:/bin", LANG: "C.UTF-8" },
   });

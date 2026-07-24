@@ -1,0 +1,45 @@
+#!/bin/bash
+set -euo pipefail
+
+readonly OCC=/var/www/nextcloud/occ
+readonly PHP=/usr/bin/php
+
+usage() {
+  echo "usage: cockpit-nextcloud-app-action php-install|php-enable|php-status|exapp-catalog-refresh|exapp-register|exapp-status <app-id>" >&2
+  exit 64
+}
+
+[[ $# -eq 2 ]] || usage
+action=$1
+app_id=$2
+[[ $app_id =~ ^[a-z][a-z0-9_]{1,63}$ ]] || { echo "invalid Nextcloud app id" >&2; exit 64; }
+[[ -f $OCC ]] || { echo "Nextcloud occ is unavailable" >&2; exit 69; }
+
+php_args=(
+  -d mysqli.default_socket=/run/mysqld/mysqld.sock
+  -d pdo_mysql.default_socket=/run/mysqld/mysqld.sock
+  "$OCC"
+)
+
+case "$action" in
+  php-install)
+    exec "$PHP" "${php_args[@]}" app:install "$app_id" --no-interaction
+    ;;
+  php-enable)
+    exec "$PHP" "${php_args[@]}" app:enable "$app_id" --no-interaction
+    ;;
+  php-status)
+    exec "$PHP" "${php_args[@]}" app:list --enabled --output=json --no-interaction
+    ;;
+  exapp-register)
+    exec "$PHP" "${php_args[@]}" app_api:app:register "$app_id" --wait-finish --no-interaction
+    ;;
+  exapp-catalog-refresh)
+    exec "$PHP" -d mysqli.default_socket=/run/mysqld/mysqld.sock -d pdo_mysql.default_socket=/run/mysqld/mysqld.sock \
+      /usr/local/lib/wireguard-ops-cockpit/nextcloud-exapp-catalog-refresh.php "$app_id"
+    ;;
+  exapp-status)
+    exec "$PHP" "${php_args[@]}" app_api:app:list --no-interaction
+    ;;
+  *) usage ;;
+esac
