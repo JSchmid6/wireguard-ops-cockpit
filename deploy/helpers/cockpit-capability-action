@@ -66,6 +66,7 @@ const dangerousExecutable = /\/(?:rm|shred|dd|mkfs(?:\.[^/]*)?|fdisk|parted|ipta
 const nextcloudAppHelper = "/usr/local/sbin/cockpit-nextcloud-app-action";
 const nextcloudContextHelper = "/usr/local/sbin/cockpit-nextcloud-context-action";
 const exactFileReplaceHelper = "/usr/local/sbin/cockpit-exact-file-replace";
+const hermesSkillHelper = "/usr/local/lib/wireguard-ops-cockpit/cockpit-hermes-skill-action";
 const readOnlyContainerCommands = new Set(["ps", "inspect", "version", "info"]);
 function stepNeedsApproval(step) {
   const executable = step?.argv?.[0] || "";
@@ -116,6 +117,15 @@ for (const [index, step] of manifest.steps.entries()) {
       "--property=BindPaths=/var/www/nextcloud/apps",
       "--property=BindPaths=/var/www/nextcloud/config",
       "--property=BindPaths=/opt/nextcloud",
+    );
+  }
+  if (step.argv[0] === "/bin/sh" && step.argv[1] === hermesSkillHelper) {
+    if (step.argv.length !== 4 || step.argv[2] !== "install" || step.argv[3] !== "present-work-view" || runAsUser) {
+      fail(`step ${index + 1} has an invalid Hermes skill action`, 77);
+    }
+    properties.push(
+      "--property=BindReadOnlyPaths=/home/hermes/.hermes/interface-app-4-ai-agents/tools/hermes-skills/present-work-view",
+      "--property=BindPaths=/home/hermes/.hermes/skills",
     );
   }
   if (runAsUser) properties.push(`--property=User=${runAsUser}`);

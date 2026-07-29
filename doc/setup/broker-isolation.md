@@ -43,6 +43,12 @@ unit still starts with an empty read-only root and binds only paths authorized
 by the signed manifest. With `ProtectHome=true`, resolution fails before the
 inner sandbox can apply that narrower authority.
 
+The capability launcher recognizes only the exact
+`/bin/sh .../cockpit-hermes-skill-action install present-work-view` signature.
+For that signature it binds the fixed reviewed source read-only and the Hermes
+skills parent writable inside the transient unit. The helper refuses an
+existing target and has no update or delete action.
+
 Pre-change snapshots live under `/var/lib/wireguard-ops-cockpit/capability-snapshots`, a root-only path made writable only inside the Executor service mount namespace. Control retains independently verified manifests separately under `capabilities/`.
 
 ## Verification
