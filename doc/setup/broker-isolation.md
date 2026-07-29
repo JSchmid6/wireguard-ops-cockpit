@@ -32,6 +32,7 @@ The Hermes token file is `hermes:hermes` mode `0600` because Hermes must present
 - `deploy/helpers/cockpit-exact-file-replace` (generic exact-content replacement constrained to the signed manifest's matching writable file)
 - `deploy/helpers/cockpit-nextcloud-context-action` and `deploy/helpers/nextcloud-context-test-file.php` (fixed, non-overwriting Context Chat E2E operations)
 - `deploy/helpers/cockpit-hermes-skill-action` (fixed, non-overwriting installation of the reviewed FullDialog Hermes skill)
+- `deploy/helpers/cockpit-email-archive-deploy` (fixed, approval-gated build/push of the reviewed clean Email Archive commit to the existing private registry)
 - `deploy/helpers/nextcloud-exapp-reinitialize.php` (bounded AppAPI initialization/enable recovery without container or volume recreation)
 - `deploy/sudoers/cockpit-executor`
 
@@ -54,6 +55,12 @@ This semantic boundary is fingerprinted as
 Hermes uid and therefore needs no chown syscall or broader privilege filter.
 The new fingerprint starts a fresh circuit-breaker window without removing the
 failed-job audit history.
+
+The current boundary is
+`dynamic-capability-v10-email-archive-deploy`. Its Email Archive helper accepts
+only `build-push 63f39b2`, verifies a clean exact checkout, writes only Docker
+image/tag state and the existing private registry, and is always
+operator-approval gated. AppAPI lifecycle remains a separate semantic helper.
 
 Pre-change snapshots live under `/var/lib/wireguard-ops-cockpit/capability-snapshots`, a root-only path made writable only inside the Executor service mount namespace. Control retains independently verified manifests separately under `capabilities/`.
 

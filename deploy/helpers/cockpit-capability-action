@@ -67,9 +67,11 @@ const nextcloudAppHelper = "/usr/local/sbin/cockpit-nextcloud-app-action";
 const nextcloudContextHelper = "/usr/local/sbin/cockpit-nextcloud-context-action";
 const exactFileReplaceHelper = "/usr/local/sbin/cockpit-exact-file-replace";
 const hermesSkillHelper = "/usr/local/lib/wireguard-ops-cockpit/cockpit-hermes-skill-action";
+const emailArchiveDeployHelper = "/usr/local/lib/wireguard-ops-cockpit/cockpit-email-archive-deploy";
 const readOnlyContainerCommands = new Set(["ps", "inspect", "version", "info"]);
 function stepNeedsApproval(step) {
   const executable = step?.argv?.[0] || "";
+  if (executable === "/bin/sh" && step?.argv?.[1] === emailArchiveDeployHelper) return true;
   if (dangerousExecutable.test(executable)) return true;
   if (/\/(?:docker|podman)$/.test(executable)) return !readOnlyContainerCommands.has(step?.argv?.[1] || "");
   return false;
@@ -96,6 +98,7 @@ for (const [index, step] of manifest.steps.entries()) {
   const runAsUser = typeof step.runAsUser === "string" ? step.runAsUser : "";
   if (runAsUser && (!/^[a-z_][a-z0-9_-]{0,31}$/.test(runAsUser) || runAsUser === "root")) fail(`step ${index + 1} has invalid runAsUser`);
   const isHermesSkillStep = step.argv[0] === "/bin/sh" && step.argv[1] === hermesSkillHelper;
+  const isEmailArchiveDeployStep = step.argv[0] === "/bin/sh" && step.argv[1] === emailArchiveDeployHelper;
   const properties = [
     "--property=Type=exec", "--property=NoNewPrivileges=yes", "--property=PrivateTmp=yes", "--property=TemporaryFileSystem=/:ro",
     `--property=ProtectHome=${isHermesSkillStep ? "read-only" : "yes"}`, "--property=ProtectKernelTunables=yes", "--property=ProtectKernelModules=yes", "--property=ProtectControlGroups=yes",
@@ -129,6 +132,17 @@ for (const [index, step] of manifest.steps.entries()) {
       "--property=Group=1007",
       "--property=BindReadOnlyPaths=/home/hermes/.hermes/interface-app-4-ai-agents/tools/hermes-skills/present-work-view",
       "--property=BindPaths=/home/hermes/.hermes/skills",
+    );
+  }
+  if (isEmailArchiveDeployStep) {
+    if (step.argv.length !== 4 || step.argv[2] !== "build-push" || step.argv[3] !== "63f39b2" || runAsUser) {
+      fail(`step ${index + 1} has an invalid Email Archive deployment action`, 77);
+    }
+    if (manifest.network !== "outbound") fail(`step ${index + 1} Email Archive deployment requires outbound-only network`, 77);
+    properties.push(
+      "--property=ProtectHome=read-only",
+      "--property=BindReadOnlyPaths=/home/hermes/.hermes/email-archive",
+      "--property=BindPaths=/var/run/docker.sock",
     );
   }
   if (runAsUser) properties.push(`--property=User=${runAsUser}`);
