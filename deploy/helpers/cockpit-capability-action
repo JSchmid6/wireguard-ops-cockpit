@@ -95,9 +95,10 @@ for (const [index, step] of manifest.steps.entries()) {
   }
   const runAsUser = typeof step.runAsUser === "string" ? step.runAsUser : "";
   if (runAsUser && (!/^[a-z_][a-z0-9_-]{0,31}$/.test(runAsUser) || runAsUser === "root")) fail(`step ${index + 1} has invalid runAsUser`);
+  const isHermesSkillStep = step.argv[0] === "/bin/sh" && step.argv[1] === hermesSkillHelper;
   const properties = [
     "--property=Type=exec", "--property=NoNewPrivileges=yes", "--property=PrivateTmp=yes", "--property=TemporaryFileSystem=/:ro",
-    "--property=ProtectHome=yes", "--property=ProtectKernelTunables=yes", "--property=ProtectKernelModules=yes", "--property=ProtectControlGroups=yes",
+    `--property=ProtectHome=${isHermesSkillStep ? "read-only" : "yes"}`, "--property=ProtectKernelTunables=yes", "--property=ProtectKernelModules=yes", "--property=ProtectControlGroups=yes",
     "--property=RestrictSUIDSGID=yes", "--property=LockPersonality=yes", "--property=RestrictRealtime=yes", "--property=PrivateDevices=yes",
     "--property=CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER",
     "--property=RestrictNamespaces=yes", "--property=ProtectProc=invisible", "--property=ProcSubset=pid",
@@ -119,7 +120,7 @@ for (const [index, step] of manifest.steps.entries()) {
       "--property=BindPaths=/opt/nextcloud",
     );
   }
-  if (step.argv[0] === "/bin/sh" && step.argv[1] === hermesSkillHelper) {
+  if (isHermesSkillStep) {
     if (step.argv.length !== 4 || step.argv[2] !== "install" || step.argv[3] !== "present-work-view" || runAsUser) {
       fail(`step ${index + 1} has an invalid Hermes skill action`, 77);
     }
