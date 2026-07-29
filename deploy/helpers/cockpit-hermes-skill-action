@@ -21,10 +21,10 @@ target_dir=$target_root/$skill_name
 [ -f "$source_dir/references/protocol.md" ] || { echo "source protocol reference is missing" >&2; exit 66; }
 [ ! -e "$target_dir" ] || { echo "target skill already exists" >&2; exit 73; }
 
-install -d -o 1007 -g 1007 -m 0750 "$target_dir/agents" "$target_dir/references"
-install -o 1007 -g 1007 -m 0640 "$source_dir/SKILL.md" "$target_dir/SKILL.md"
-install -o 1007 -g 1007 -m 0640 "$source_dir/agents/openai.yaml" "$target_dir/agents/openai.yaml"
-install -o 1007 -g 1007 -m 0640 "$source_dir/references/protocol.md" "$target_dir/references/protocol.md"
+install -d -m 0750 "$target_dir/agents" "$target_dir/references"
+install -m 0640 "$source_dir/SKILL.md" "$target_dir/SKILL.md"
+install -m 0640 "$source_dir/agents/openai.yaml" "$target_dir/agents/openai.yaml"
+install -m 0640 "$source_dir/references/protocol.md" "$target_dir/references/protocol.md"
 
 test "$(find "$target_dir" -type f | wc -l)" -eq 3
 cmp -s "$source_dir/SKILL.md" "$target_dir/SKILL.md"

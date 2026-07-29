@@ -570,7 +570,7 @@ export async function createApp(options: AppOptions = {}) {
     safetyModel: config.safetyOpencodeModel,
     capabilityContract: hashCanonical(capabilityPlannerContract()),
     brokerRoleContract: "ephemeral-role-workspace-v7",
-    executorBoundaryContract: "dynamic-capability-v8-hermes-skill-sandbox",
+    executorBoundaryContract: "dynamic-capability-v9-hermes-skill-unprivileged",
   });
   if (config.nodeEnv === "production" && config.adminPassword === "change-me-now") {
     throw new Error("COCKPIT_ADMIN_PASSWORD must be changed before running in production");
