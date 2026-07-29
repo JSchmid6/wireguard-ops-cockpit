@@ -57,7 +57,7 @@ The new fingerprint starts a fresh circuit-breaker window without removing the
 failed-job audit history.
 
 The current boundary is
-`dynamic-capability-v10-email-archive-deploy`. Its Email Archive helper accepts
+`dynamic-capability-v11-email-archive-safe-directory`. Its Email Archive helper accepts
 only `build-push 63f39b2`, verifies a clean exact checkout, writes only Docker
 image/tag state and the existing private registry, and is always
 operator-approval gated. AppAPI lifecycle remains a separate semantic helper.

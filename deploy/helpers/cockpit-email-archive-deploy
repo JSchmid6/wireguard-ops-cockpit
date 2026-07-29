@@ -11,12 +11,12 @@ image=172.30.0.4:5000/jochen/email-archive
   exit 64
 }
 [ "$commit" = 63f39b2 ] || { echo "unreviewed commit" >&2; exit 77; }
-[ "$(git -C "$source_dir" rev-parse --short=7 HEAD)" = "$commit" ] || {
+[ "$(git -c safe.directory="$source_dir" -C "$source_dir" rev-parse --short=7 HEAD)" = "$commit" ] || {
   echo "source commit mismatch" >&2
   exit 65
 }
-git -C "$source_dir" diff --quiet
-git -C "$source_dir" diff --cached --quiet
+git -c safe.directory="$source_dir" -C "$source_dir" diff --quiet
+git -c safe.directory="$source_dir" -C "$source_dir" diff --cached --quiet
 
 docker build -t "$image:$commit" -t "$image:latest" "$source_dir"
 docker push "$image:$commit"
