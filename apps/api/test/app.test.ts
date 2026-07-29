@@ -1267,5 +1267,52 @@ describe("control API", () => {
         rollbackAvailable: true,
       });
     });
+
+    it("allows an admin to inspect and reject an automation-owned Hermes approval", async () => {
+      const dbPath = createTempDbPath(tempDirectories);
+      const app = await createTestApp(openApps, { dbPath }, {
+        bootstrapUsers: [{ username: "hermes-automation", password: "unusable-random-password", role: "automation" }],
+      });
+      const adminCookie = await login(app);
+      const database = new (await import("../src/db.js")).CockpitDatabase(dbPath);
+      database.initialize();
+      const automation = database.authenticateUser("hermes-automation", "unusable-random-password")!;
+      const session = database.upsertSession({
+        name: "hermes-owned-approval",
+        ownerId: automation.id,
+        tmuxSessionName: "cockpit-hermes-owned-approval",
+        tmuxBackend: "tmux",
+        terminalUrl: null,
+      });
+      const job = database.createJob({
+        sessionId: session.id,
+        kind: "runbook",
+        subjectId: "hermes-change",
+        status: "blocked_user_approval",
+        requiresApproval: false,
+        output: {
+          explanation: { intent: "Deploy reviewed Email Archive image", phase: "finished" },
+          policy: { rollbackAvailable: true },
+        },
+      });
+      database.close();
+
+      const inspected = await app.inject({
+        method: "GET",
+        url: `/api/hermes/jobs/${job.id}`,
+        headers: { cookie: adminCookie },
+      });
+      expect(inspected.statusCode).toBe(200);
+      expect(inspected.json().job.id).toBe(job.id);
+
+      const rejected = await app.inject({
+        method: "POST",
+        url: `/api/hermes/jobs/${job.id}/approval`,
+        headers: { cookie: adminCookie },
+        payload: { decision: "rejected", reason: "Test operator rejection" },
+      });
+      expect(rejected.statusCode).toBe(200);
+      expect(rejected.json().job.status).toBe("rejected");
+    });
   });
 });

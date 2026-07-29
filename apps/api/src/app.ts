@@ -1807,7 +1807,9 @@ export async function createApp(options: AppOptions = {}) {
     const actor = await requireActor(request, reply, database);
     if (!actor) return;
     const { jobId } = request.params as { jobId: string };
-    const job = database.getJobForActor(jobId, actor.id);
+    const job = actor.role === "admin"
+      ? database.getJob(jobId)
+      : database.getJobForActor(jobId, actor.id);
     if (!job) return reply.code(404).send({ message: "job not found" });
     return { job };
   });
@@ -1817,8 +1819,12 @@ export async function createApp(options: AppOptions = {}) {
     if (!actor) return;
     const { jobId } = request.params as { jobId: string };
     const body = (request.body || {}) as { decision?: "approved" | "rejected"; reason?: string };
-    const job = database.getJobForActor(jobId, actor.id);
+    const job = actor.role === "admin"
+      ? database.getJob(jobId)
+      : database.getJobForActor(jobId, actor.id);
     if (!job) return reply.code(404).send({ message: "job not found" });
+    const jobOwnerId = database.getJobOwnerId(jobId);
+    if (!jobOwnerId) return reply.code(409).send({ message: "job owner is unavailable" });
     if (job.subjectId !== "hermes-change" || job.status !== "blocked_user_approval") {
       return reply.code(409).send({ message: "job is not awaiting operator approval" });
     }
@@ -1841,7 +1847,7 @@ export async function createApp(options: AppOptions = {}) {
       } else {
         if (!verifyExecutionEnvelopeSignature(envelope, config.executionEnvelopeSecret)) envelopeErrors.push("execution envelope signature mismatch");
         if (Date.now() > Date.parse(envelope.expiresAt)) envelopeErrors.push("execution envelope expired");
-        if (envelope.jobId !== job.id || envelope.actorId !== actor.id || envelope.sessionId !== job.sessionId) envelopeErrors.push("execution envelope binding mismatch");
+        if (envelope.jobId !== job.id || envelope.actorId !== jobOwnerId || envelope.sessionId !== job.sessionId) envelopeErrors.push("execution envelope binding mismatch");
         if (envelope.intentHash !== hashCanonical(intent)) envelopeErrors.push("trusted intent drift");
         if (envelope.planHash !== hashCanonical(plan)) envelopeErrors.push("reviewed plan drift");
         if (envelope.safetyHash !== hashCanonical(safety)) envelopeErrors.push("safety review drift");

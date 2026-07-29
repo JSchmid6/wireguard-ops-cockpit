@@ -679,6 +679,17 @@ export class CockpitDatabase {
     return row ? this.mapJob(row) : null;
   }
 
+  getJobOwnerId(id: string): string | null {
+    const row = this.database
+      .prepare(
+        `SELECT cockpit_sessions.owner_id AS owner_id FROM jobs
+         JOIN cockpit_sessions ON cockpit_sessions.id = jobs.session_id
+         WHERE jobs.id = ?`
+      )
+      .get(id) as { owner_id: string | null } | undefined;
+    return row?.owner_id || null;
+  }
+
   listJobsForSession(sessionId: string): JobRecord[] {
     const rows = this.database
       .prepare("SELECT * FROM jobs WHERE session_id = ? ORDER BY datetime(created_at) DESC")
