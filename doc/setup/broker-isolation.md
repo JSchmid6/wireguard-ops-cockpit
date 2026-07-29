@@ -49,6 +49,10 @@ For that signature it binds the fixed reviewed source read-only and the Hermes
 skills parent writable inside the transient unit. The helper refuses an
 existing target and has no update or delete action.
 
+This semantic boundary is fingerprinted as
+`dynamic-capability-v8-hermes-skill-sandbox`; the new fingerprint starts a
+fresh circuit-breaker window without removing the failed-job audit history.
+
 Pre-change snapshots live under `/var/lib/wireguard-ops-cockpit/capability-snapshots`, a root-only path made writable only inside the Executor service mount namespace. Control retains independently verified manifests separately under `capabilities/`.
 
 ## Verification
