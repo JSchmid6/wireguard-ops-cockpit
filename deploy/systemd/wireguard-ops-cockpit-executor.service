@@ -23,7 +23,9 @@ PrivateTmp=true
 # envelope-authorized exact paths. `strict` here would make those host paths
 # irreversibly read-only before the inner sandbox can narrow them.
 ProtectSystem=true
-ProtectHome=true
+# The outer executor must resolve envelope-authorized paths below /home before
+# the inner transient unit hides everything and binds only those exact paths.
+ProtectHome=read-only
 ReadWritePaths=/run/cockpit-executor /var/lib/wireguard-ops-cockpit/capability-snapshots
 RestrictAddressFamilies=AF_UNIX
 

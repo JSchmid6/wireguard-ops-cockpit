@@ -31,10 +31,17 @@ The Hermes token file is `hermes:hermes` mode `0600` because Hermes must present
 - `deploy/helpers/cockpit-capability-action` (installed root-owned as `/usr/local/lib/wireguard-ops-cockpit/cockpit-capability-action.mjs` and pinned to the production Node 20 runtime)
 - `deploy/helpers/cockpit-exact-file-replace` (generic exact-content replacement constrained to the signed manifest's matching writable file)
 - `deploy/helpers/cockpit-nextcloud-context-action` and `deploy/helpers/nextcloud-context-test-file.php` (fixed, non-overwriting Context Chat E2E operations)
+- `deploy/helpers/cockpit-hermes-skill-action` (fixed, non-overwriting installation of the reviewed FullDialog Hermes skill)
 - `deploy/helpers/nextcloud-exapp-reinitialize.php` (bounded AppAPI initialization/enable recovery without container or volume recreation)
 - `deploy/sudoers/cockpit-executor`
 
 Helpers must be root-owned and not writable by service identities; the sudoers file must be root-owned and mode `0440`. Run `visudo -cf /etc/sudoers` before restarting the Executor. The dynamic helper independently verifies Control's execution-envelope HMAC, so compromise of the Executor identity alone cannot mint authority.
+
+The outer Executor uses `ProtectHome=read-only`, not `ProtectHome=true`. This
+allows it to resolve signed exact paths below `/home`; each inner transient
+unit still starts with an empty read-only root and binds only paths authorized
+by the signed manifest. With `ProtectHome=true`, resolution fails before the
+inner sandbox can apply that narrower authority.
 
 Pre-change snapshots live under `/var/lib/wireguard-ops-cockpit/capability-snapshots`, a root-only path made writable only inside the Executor service mount namespace. Control retains independently verified manifests separately under `capabilities/`.
 
