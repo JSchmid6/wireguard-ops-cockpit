@@ -5,7 +5,7 @@ readonly OCC=/var/www/nextcloud/occ
 readonly PHP=/usr/bin/php
 
 usage() {
-  echo "usage: cockpit-nextcloud-app-action php-install|php-enable|php-status|exapp-catalog-refresh|exapp-register|exapp-status <app-id>" >&2
+  echo "usage: cockpit-nextcloud-app-action php-install|php-enable|php-status|exapp-catalog-refresh|exapp-register|exapp-reinitialize|exapp-restart-reinitialize|exapp-status <app-id>" >&2
   exit 64
 }
 
@@ -33,6 +33,14 @@ case "$action" in
     ;;
   exapp-register)
     exec "$PHP" "${php_args[@]}" app_api:app:register "$app_id" --wait-finish --no-interaction
+    ;;
+  exapp-reinitialize)
+    exec "$PHP" -d mysqli.default_socket=/run/mysqld/mysqld.sock -d pdo_mysql.default_socket=/run/mysqld/mysqld.sock \
+      /usr/local/lib/wireguard-ops-cockpit/nextcloud-exapp-reinitialize.php "$app_id"
+    ;;
+  exapp-restart-reinitialize)
+    exec "$PHP" -d mysqli.default_socket=/run/mysqld/mysqld.sock -d pdo_mysql.default_socket=/run/mysqld/mysqld.sock \
+      /usr/local/lib/wireguard-ops-cockpit/nextcloud-exapp-reinitialize.php "$app_id" --restart
     ;;
   exapp-catalog-refresh)
     exec "$PHP" -d mysqli.default_socket=/run/mysqld/mysqld.sock -d pdo_mysql.default_socket=/run/mysqld/mysqld.sock \

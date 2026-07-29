@@ -19,7 +19,10 @@ RestartSec=5
 UMask=0007
 NoNewPrivileges=false
 PrivateTmp=true
-ProtectSystem=strict
+# The signed inner capability sandbox remounts / read-only and bind-mounts only
+# envelope-authorized exact paths. `strict` here would make those host paths
+# irreversibly read-only before the inner sandbox can narrow them.
+ProtectSystem=true
 ProtectHome=true
 ReadWritePaths=/run/cockpit-executor /var/lib/wireguard-ops-cockpit/capability-snapshots
 RestrictAddressFamilies=AF_UNIX

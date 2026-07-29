@@ -64,6 +64,8 @@ const writablePaths = paths.map((item) => {
 
 const dangerousExecutable = /\/(?:rm|shred|dd|mkfs(?:\.[^/]*)?|fdisk|parted|iptables|nft|ufw|ip|wg|wg-quick|useradd|userdel|usermod|groupadd|groupdel|passwd|visudo|sudo|runuser|su)$/;
 const nextcloudAppHelper = "/usr/local/sbin/cockpit-nextcloud-app-action";
+const nextcloudContextHelper = "/usr/local/sbin/cockpit-nextcloud-context-action";
+const exactFileReplaceHelper = "/usr/local/sbin/cockpit-exact-file-replace";
 const readOnlyContainerCommands = new Set(["ps", "inspect", "version", "info"]);
 function stepNeedsApproval(step) {
   const executable = step?.argv?.[0] || "";
@@ -87,6 +89,9 @@ const outputs = [];
 for (const [index, step] of manifest.steps.entries()) {
   if (!step || !Array.isArray(step.argv) || step.argv.length < 1 || step.argv.length > 64 || step.argv.some((arg) => typeof arg !== "string" || arg.includes("\0"))) fail(`invalid step ${index + 1}`);
   if (!step.argv[0].startsWith("/") || !existsSync(step.argv[0])) fail(`step ${index + 1} executable is unavailable`);
+  if (step.argv[0] === exactFileReplaceHelper && (step.argv.length !== 4 || !writablePaths.includes(resolve(step.argv[1])))) {
+    fail(`step ${index + 1} exact-file replacement target must be an authorized writable file`, 77);
+  }
   const runAsUser = typeof step.runAsUser === "string" ? step.runAsUser : "";
   if (runAsUser && (!/^[a-z_][a-z0-9_-]{0,31}$/.test(runAsUser) || runAsUser === "root")) fail(`step ${index + 1} has invalid runAsUser`);
   const properties = [
@@ -97,14 +102,15 @@ for (const [index, step] of manifest.steps.entries()) {
     "--property=RestrictNamespaces=yes", "--property=ProtectProc=invisible", "--property=ProcSubset=pid",
     "--property=SystemCallFilter=~@mount @swap @reboot @raw-io @privileged",
     "--property=BindReadOnlyPaths=/usr /bin /lib /lib64 /etc/ld.so.cache /etc/alternatives",
-    ...readablePaths.map((item) => `--property=BindReadOnlyPaths=${item}`),
+    ...readablePaths.filter((item) => !writablePaths.includes(item)).map((item) => `--property=BindReadOnlyPaths=${item}`),
     ...writablePaths.map((item) => `--property=BindPaths=${item}`),
   ];
-  if (step.argv[0] === nextcloudAppHelper) {
-    if (runAsUser !== "www-data") fail(`step ${index + 1} Nextcloud app action must run as www-data`, 77);
-    if (manifest.network !== "outbound") fail(`step ${index + 1} Nextcloud app action requires outbound-only network scope`, 77);
+  if (step.argv[0] === nextcloudAppHelper || step.argv[0] === nextcloudContextHelper) {
+    if (runAsUser !== "www-data") fail(`step ${index + 1} Nextcloud action must run as www-data`, 77);
+    if (manifest.network !== "outbound") fail(`step ${index + 1} Nextcloud action requires outbound-only network scope`, 77);
     properties.push(
       "--property=BindReadOnlyPaths=/run/mysqld",
+      "--property=BindReadOnlyPaths=/run/clamav:/var/run/clamav",
       "--property=BindReadOnlyPaths=/etc/php",
       "--property=BindReadOnlyPaths=/var/www/nextcloud",
       "--property=BindPaths=/var/www/nextcloud/apps",
@@ -117,11 +123,13 @@ for (const [index, step] of manifest.steps.entries()) {
   if (manifest.network === "local") properties.push(
     "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6", "--property=SocketBindDeny=any",
     "--property=IPAddressDeny=any", "--property=IPAddressAllow=localhost",
-    "--property=BindReadOnlyPaths=/etc/nsswitch.conf /etc/hosts",
+    ...["/etc/nsswitch.conf", "/etc/hosts"].filter((item) => !writablePaths.includes(item)).map((item) => `--property=BindReadOnlyPaths=${item}`),
   );
   if (manifest.network === "outbound") properties.push(
     "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6", "--property=SocketBindDeny=any",
-    "--property=BindReadOnlyPaths=/etc/resolv.conf /etc/nsswitch.conf /etc/hosts /etc/ssl/certs /etc/ca-certificates.conf",
+    ...["/etc/resolv.conf", "/etc/nsswitch.conf", "/etc/hosts", "/etc/ssl/certs", "/etc/ca-certificates.conf"]
+      .filter((item) => !writablePaths.includes(item))
+      .map((item) => `--property=BindReadOnlyPaths=${item}`),
   );
   if (manifest.network === "host") properties.push("--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6");
   if (step.cwd) {
@@ -133,14 +141,24 @@ for (const [index, step] of manifest.steps.entries()) {
   const requestedTimeout = Number.isInteger(step.timeoutSeconds) ? Math.min(Math.max(step.timeoutSeconds, 1), 900) : 120;
   const timeout = step.argv[0] === nextcloudAppHelper && step.argv[1] === "exapp-register"
     ? 3000
-    : step.argv[0] === nextcloudAppHelper ? Math.max(requestedTimeout, 900) : requestedTimeout;
+    : step.argv[0] === nextcloudAppHelper || step.argv[0] === nextcloudContextHelper ? Math.max(requestedTimeout, 900) : requestedTimeout;
   const result = spawnSync("/usr/bin/systemd-run", ["--wait", "--pipe", "--collect", "--quiet", `--property=TimeoutStartSec=${timeout}`, ...properties, "--", ...step.argv], {
     encoding: "utf8", timeout: (timeout + 10) * 1000, maxBuffer: 1024 * 1024, env: { PATH: "/usr/sbin:/usr/bin:/sbin:/bin", LANG: "C.UTF-8" },
   });
   outputs.push({ step: index + 1, argv: step.argv, status: result.status, stdout: (result.stdout || "").slice(-12000), stderr: (result.stderr || "").slice(-4000) });
   if (result.status !== 0) {
-    for (const item of snapshot) if (item.existed && item.backup) copyFileSync(item.backup, item.target);
-    process.stdout.write(JSON.stringify({ status: "failed_rolled_back", snapshot: backupRoot, outputs })); process.exit(result.status || 1);
+    const rollbackErrors = [];
+    for (const item of snapshot) {
+      if (item.existed && item.backup) {
+        try { copyFileSync(item.backup, item.target); }
+        catch (error) { rollbackErrors.push({ target: item.target, error: error instanceof Error ? error.message : String(error) }); }
+      }
+    }
+    process.stdout.write(JSON.stringify({
+      status: rollbackErrors.length === 0 ? "failed_rolled_back" : "failed_rollback_incomplete",
+      snapshot: backupRoot, outputs, rollbackErrors,
+    }));
+    process.exit(result.status || 1);
   }
 }
 process.stdout.write(JSON.stringify({ status: "success", snapshot: backupRoot, outputs }));

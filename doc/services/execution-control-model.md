@@ -18,9 +18,19 @@ Execution authority is split into five layers:
 
 Only the bounded executor may mutate the host, through either a narrow legacy helper or a signed agent-authored capability manifest.
 
+The Executor's outer service uses `ProtectSystem=true` to keep system binaries read-only while allowing the signed inner sandbox to bind only the envelope-authorized exact host files writable. Using `ProtectSystem=strict` outside that sandbox makes the authorized bind source irreversibly read-only and defeats both execution and rollback. The unprivileged broker still reaches root only through the fixed HMAC-verifying capability launcher.
+
 ## Dynamic agent-centric capabilities
 
 `cockpit-capability/v1` is an execution handoff, not an application-specific policy schema. The planner discovers installed versions and current tool help, then declares direct absolute argv steps, exact writable paths, network need, expected effects, verification, rollback, and effect risk. Tool names, subcommands, flags, and changing application APIs remain agent-owned.
+
+Exact-file bind mounts cannot be replaced by rename-based editors such as `sed -i`. `cockpit-exact-file-replace` is the generic agent-facing primitive for this case: it is invoked directly with no `runAsUser`, interpreter wrapper, or temporary copy; the target must be identical to an authorized writable path; the expected old text must occur exactly once; and the helper truncates and rewrites the already-bound inode. A pre-execution snapshot remains the rollback source. Rollback errors are preserved in structured executor output instead of being replaced by an uncaught exception.
+
+The exact-file helper uses the sandbox-visible `/usr/bin/node` runtime and CommonJS syntax. Runtime repairs that change the semantic executor boundary increment the boundary fingerprint so the repeated-failure circuit breaker audits the repaired boundary independently without erasing earlier job evidence.
+
+Exact writable authority implies read access to the same file. If a planner redundantly includes one canonical path in both `readablePaths` and `writablePaths`, the Executor omits the duplicate read-only bind and keeps the reviewed writable bind. Without this normalization, systemd resolves the overlap as read-only and a valid contained mutation cannot run.
+
+Network profiles add resolver and trust-store files read-only by default. Those automatic binds use the same overlap normalization, so a specifically reviewed exact write such as `/etc/hosts` is not accidentally made read-only again by the `local` or `outbound` profile.
 
 The stable deterministic boundary is deliberately lower. It verifies the HMAC-bound manifest digest, actor/session/intent/review binding and expiry, then constrains real process effects with systemd isolation, exact-file write scopes, pre-change snapshots, network isolation, timeouts, and a small protected-effect boundary. Realistic new external exposure, loss of existing data, and identity/credential/secret access require a separate operator decision. Contained reversible changes do not.
 
@@ -90,6 +100,8 @@ The host Nextcloud 34 CLI initializes its database successfully when the capabil
 
 Normal `occ` commands then call `OC_Util::checkServer()`, which creates, writes, and unlinks a random `data_dir_writability_test_*` file in the configured data directory and may open the Nextcloud log. Consequently, `occ status` is not filesystem-read-only despite its semantic purpose. Do not expose the complete protected data directory as writable merely for health checking. The TLS-verified loopback `https://nextcloud.wejos.de/status.php` capability is the contained health path. Mutating `occ` jobs must declare their real effect and receive only the authority justified by trusted intent.
 
+Nextcloud Files API writes pass through the installed antivirus integration. Semantic Nextcloud helpers bind host `/run/clamav` read-only at sandbox `/var/run/clamav` so the configured `clamd.ctl` path works despite the empty sandbox root lacking the host's `/var/run -> /run` alias. A missing socket is a failed prerequisite, not a reason to bypass or disable scanning.
+
 App installation crosses several mutable implementation paths (application files, configuration, database state, and the data-directory writability probe), so those paths are never granted generically to an agent-authored command. A dynamic manifest instead invokes `cockpit-nextcloud-app-action` as `www-data` with empty manifest read/write paths; the helper supplies fixed internal scopes. This semantic boundary accepts a validated app id and only install, enable, or AppAPI registration; it has no disable, uninstall, or arbitrary `occ` mode. Nextcloud CLI changes can be absorbed behind this stable intent-level tool without expanding agent authority.
 
 The same helper provides read-oriented PHP-app and ExApp status modes so independent verification never needs direct database access. Reading credentials from Nextcloud configuration or querying MariaDB/MySQL directly is forbidden for every agent role; an unavailable application-level check must remain an explicit evidence gap.
@@ -97,6 +109,16 @@ The same helper provides read-oriented PHP-app and ExApp status modes so indepen
 AppAPI can retain an app-store cache node whose physical `appapi_apps.json` is missing; its fetcher then raises `GenericFileException` before it can refresh. The helper's `exapp-catalog-refresh` mode removes only that regenerable cache through Nextcloud's AppData API, immediately refetches through the official `ExAppFetcher`, and proves the requested app exists in the refreshed catalog. It never touches user files or writes the cache path directly.
 
 AppAPI ExApp registration uses a fixed 3000-second executor ceiling because the official backend may spend substantially longer than an ordinary command pulling and initializing models. Status modes remain non-mutating capability evidence; only install, enable, catalog refresh, and registration are classified as semantic filesystem writes.
+
+An already registered ExApp whose initial callback failed can be recovered with the semantic `exapp-reinitialize` mode. It repeats AppAPI's supported initialization and enable handshake and waits for the reported initialization result. It does not unregister the app, recreate the container, remove its volume, or expose arbitrary `occ` execution.
+
+If the ExApp's internal supervisor exhausted child-process retries before the prerequisite was repaired, `exapp-restart-reinitialize` performs a supported AppAPI stop/start and then the same initialization handshake. It preserves registration, image, container definition, and persistent volume; it is not a standalone disable or arbitrary container-control capability.
+
+Context Chat 5.4 indexes continuously: the former `context_chat:scan` command was removed when indexing direction changed so the ExApp now pulls queued documents from the PHP app. End-to-end checks therefore use the semantic `cockpit-nextcloud-context-action` boundary. It creates only a fresh marker document below a fixed `Cockpit E2E Tests` folder through the public Nextcloud Files API, refuses overwrite, can inspect that exact marker's path/id/size without mutation, and exposes fixed statistics, search, and prompt operations. File evidence is duplicated to stderr because Nextcloud bootstrap buffering can consume stdout. It cannot choose arbitrary paths or content, delete files, or invoke arbitrary `occ` commands. Test documents remain visible to the user instead of being silently removed.
+
+Initial Context Chat documents are pulled in ascending queue-id order. A new E2E marker created while a large historical queue is draining is therefore not immediately searchable. This is an observable pending state, not a reason to manipulate internal queue ids or query Nextcloud's database. Statistics must show a reachable backend and advancing vector count; exact-marker retrieval is verified after the ordinary queue reaches the marker.
+
+If a first AppAPI initialization loses Nextcloud callback connectivity during model download, the upstream model fetcher can consume the configured `save_path` from its in-memory dictionary before failing. A later initialization may then download the GGUF into the container working directory instead of persistent `model_files`, even while reporting init progress. Recovery preserves both copies, places the already downloaded regenerable model at the configured persistent path without overwrite, and uses `exapp-restart-reinitialize` so exhausted supervisor child retries restart through AppAPI without recreating the volume.
 
 ## Components
 

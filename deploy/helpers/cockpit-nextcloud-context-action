@@ -1,0 +1,49 @@
+#!/bin/bash
+set -euo pipefail
+
+readonly OCC=/var/www/nextcloud/occ
+readonly PHP=/usr/bin/php
+readonly CREATE_SCRIPT=/usr/local/lib/wireguard-ops-cockpit/nextcloud-context-test-file.php
+
+usage() {
+  echo "usage: cockpit-nextcloud-context-action create-test|inspect-test|stats|search-test|prompt-test <user-id> <marker>" >&2
+  exit 64
+}
+
+[[ $# -eq 3 ]] || usage
+action=$1
+user_id=$2
+marker=$3
+[[ $user_id =~ ^[A-Za-z0-9_.@-]{1,64}$ ]] || { echo "invalid Nextcloud user id" >&2; exit 64; }
+[[ $marker =~ ^[a-z0-9][a-z0-9-]{7,63}$ ]] || { echo "invalid verification marker" >&2; exit 64; }
+[[ -f $OCC ]] || { echo "Nextcloud occ is unavailable" >&2; exit 69; }
+
+php_args=(
+  -d mysqli.default_socket=/run/mysqld/mysqld.sock
+  -d pdo_mysql.default_socket=/run/mysqld/mysqld.sock
+)
+
+case "$action" in
+  create-test)
+    [[ -f $CREATE_SCRIPT ]] || { echo "Context Chat test-file helper is unavailable" >&2; exit 69; }
+    exec "$PHP" "${php_args[@]}" "$CREATE_SCRIPT" "$user_id" "$marker"
+    ;;
+  inspect-test)
+    [[ -f $CREATE_SCRIPT ]] || { echo "Context Chat test-file helper is unavailable" >&2; exit 69; }
+    exec "$PHP" "${php_args[@]}" "$CREATE_SCRIPT" "$user_id" "$marker" --inspect
+    ;;
+  stats)
+    exec "$PHP" "${php_args[@]}" "$OCC" context_chat:stats --json --no-interaction
+    ;;
+  search-test)
+    exec "$PHP" "${php_args[@]}" "$OCC" context_chat:search "$user_id" \
+      "Find the document whose exact verification marker is $marker and return that marker." \
+      --limit=5 --no-interaction
+    ;;
+  prompt-test)
+    exec "$PHP" "${php_args[@]}" "$OCC" context_chat:prompt "$user_id" \
+      "Using the indexed documents, return the exact verification marker $marker and identify its purpose." \
+      --no-interaction
+    ;;
+  *) usage ;;
+esac

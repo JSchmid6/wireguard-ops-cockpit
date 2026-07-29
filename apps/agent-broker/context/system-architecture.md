@@ -4,6 +4,10 @@ This is a bare-metal Ubuntu VPS. Nextcloud 34 is installed at `/var/www/nextclou
 
 Nextcloud AppAPI `app_api` has a configured HaRP `docker-install` deploy daemon named `appapi_harp`. Its bundled Docker-socket FRP proxy uses port `24000` on the private AppAPI network; historical port `24001`, manual-install, Socat, and direct-proxy workarounds are incorrect. AppAPI-managed ExApps use direct private networking and must not publish unnecessary host ports.
 
+The bare-metal Nextcloud TLS hostname `nextcloud.wejos.de` resolves locally to the private `nextcloud-appapi_default` bridge gateway `172.22.0.1`, not loopback. ExApps in direct HaRP mode must reach the host Apache virtual host through that private gateway; resolving the hostname to `127.0.0.1` makes every ExApp call its own container loopback. The bridge is an internal route and does not publish an additional host port.
+
+Context Chat 5.4 uses pull-based continuous indexing; `context_chat:scan` no longer exists. Its initial queue is processed by ascending queue id, so a newly created E2E marker is not immediately searchable while a large historical queue is draining. Do not manipulate queue ids or query the Nextcloud database to make a test appear complete. Use `context_chat:stats`, preserve the marker for human inspection, and verify retrieval after normal indexing reaches it.
+
 The Email Archive ExApp is AppAPI-managed as `nc_app_email_archive` with no published host port. This proves that the HaRP/AppAPI lifecycle is operational; do not infer otherwise from PHP app directories or `config.php`. The archive source of record is `/home/hermes/.hermes/email-archive`.
 
 ExApps are AppAPI-managed containers and need not appear below a local `apps-external` directory. An empty or absent directory is not evidence that no ExApps are installed or operational.

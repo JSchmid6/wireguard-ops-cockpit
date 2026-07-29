@@ -1,0 +1,34 @@
+#!/usr/bin/node
+const { closeSync, fstatSync, ftruncateSync, openSync, readFileSync, writeSync } = require("node:fs");
+
+function fail(message, code = 64) {
+  process.stderr.write(`${message}\n`);
+  process.exit(code);
+}
+
+if (process.argv.length !== 5) fail("usage: cockpit-exact-file-replace <absolute-file> <exact-old-text> <exact-new-text>");
+const [, , target, oldText, newText] = process.argv;
+if (!target.startsWith("/") || target.includes("\0") || oldText.length < 1 || oldText.includes("\0") || newText.includes("\0")) {
+  fail("invalid exact-file replacement arguments");
+}
+
+const original = readFileSync(target);
+if (original.length > 10 * 1024 * 1024) fail("target is too large", 77);
+const source = original.toString("utf8");
+const first = source.indexOf(oldText);
+if (first === -1 || source.indexOf(oldText, first + oldText.length) !== -1) {
+  fail("exact old text must occur exactly once", 73);
+}
+const updated = Buffer.from(source.slice(0, first) + newText + source.slice(first + oldText.length), "utf8");
+
+const fd = openSync(target, "r+");
+try {
+  if (!fstatSync(fd).isFile()) fail("target is not a regular file", 77);
+  ftruncateSync(fd, 0);
+  let offset = 0;
+  while (offset < updated.length) offset += writeSync(fd, updated, offset);
+  ftruncateSync(fd, updated.length);
+} finally {
+  closeSync(fd);
+}
+process.stdout.write(JSON.stringify({ target, replacements: 1, bytesBefore: original.length, bytesAfter: updated.length }) + "\n");

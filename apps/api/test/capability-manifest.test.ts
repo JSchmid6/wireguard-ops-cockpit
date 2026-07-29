@@ -17,6 +17,8 @@ describe("dynamic capability manifest", () => {
 
   it("documents the semantic Nextcloud helper without granting arbitrary occ", () => {
     expect(capabilityPlannerContract()).toContain("cockpit-nextcloud-app-action");
+    expect(capabilityPlannerContract()).toContain("cockpit-nextcloud-context-action");
+    expect(capabilityPlannerContract()).toContain("cockpit-exact-file-replace");
     expect(capabilityPlannerContract()).toContain("no disable, uninstall, or arbitrary occ");
   });
 

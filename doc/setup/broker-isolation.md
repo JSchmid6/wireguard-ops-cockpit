@@ -29,6 +29,9 @@ The Hermes token file is `hermes:hermes` mode `0600` because Hermes must present
 - `deploy/systemd/wireguard-ops-cockpit-api-brokers.conf`
 - `deploy/helpers/cockpit-service-action`
 - `deploy/helpers/cockpit-capability-action` (installed root-owned as `/usr/local/lib/wireguard-ops-cockpit/cockpit-capability-action.mjs` and pinned to the production Node 20 runtime)
+- `deploy/helpers/cockpit-exact-file-replace` (generic exact-content replacement constrained to the signed manifest's matching writable file)
+- `deploy/helpers/cockpit-nextcloud-context-action` and `deploy/helpers/nextcloud-context-test-file.php` (fixed, non-overwriting Context Chat E2E operations)
+- `deploy/helpers/nextcloud-exapp-reinitialize.php` (bounded AppAPI initialization/enable recovery without container or volume recreation)
 - `deploy/sudoers/cockpit-executor`
 
 Helpers must be root-owned and not writable by service identities; the sudoers file must be root-owned and mode `0440`. Run `visudo -cf /etc/sudoers` before restarting the Executor. The dynamic helper independently verifies Control's execution-envelope HMAC, so compromise of the Executor identity alone cannot mint authority.
