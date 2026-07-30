@@ -46,13 +46,13 @@ inner sandbox can apply that narrower authority.
 
 The capability launcher recognizes only the exact
 `/bin/sh .../cockpit-hermes-skill-action install present-work-view` and
-operator-approved `recover-install present-work-view` signatures. For those
+operator-approved `remove-empty-target present-work-view` signatures. For those
 signatures it binds the fixed reviewed source read-only and the Hermes skills
 parent writable inside the transient unit. Normal installation refuses an
 existing target. Recovery rejects symlinks, non-empty directories, and
-unexpected entries; it removes only the exact empty `agents` and parent
-directories with `rmdir`, then installs the same three reviewed files as
-Hermes.
+unexpected entries and removes only the exact empty `agents` and parent
+directories with `rmdir`. The same signed manifest must then invoke normal
+installation as the Hermes uid, avoiding privileged ownership syscalls.
 
 This semantic boundary is fingerprinted as
 `dynamic-capability-v9-hermes-skill-unprivileged`; the helper runs as the
@@ -61,7 +61,7 @@ The new fingerprint starts a fresh circuit-breaker window without removing the
 failed-job audit history.
 
 The current boundary is
-`dynamic-capability-v13-exact-skill-recovery`. Its Email Archive helper accepts
+`dynamic-capability-v14-split-skill-recovery`. Its Email Archive helper accepts
 only `build-push 63f39b2`, verifies a clean exact checkout, writes only Docker
 image/tag state and the existing private registry, and is always
 operator-approval gated. AppAPI lifecycle remains a separate semantic helper.
