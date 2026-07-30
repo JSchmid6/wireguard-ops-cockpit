@@ -15,8 +15,9 @@ def fail(message: str, code: int = 64) -> None:
     raise SystemExit(code)
 
 
-if sys.argv[1:] != ["enable"]:
-    fail("usage: cockpit-gitlab-runner-rootless-dind enable")
+if sys.argv[1:] not in (["enable"], ["disable"]):
+    fail("usage: cockpit-gitlab-runner-rootless-dind enable|disable")
+action = sys.argv[1]
 
 with open(CONFIG, encoding="utf-8") as handle:
     lines = handle.readlines()
@@ -41,6 +42,29 @@ if len(privileged) != 1 or privileged[0].strip() != "privileged = false":
 
 expected_service = "services_privileged = true"
 expected_allowed = ALLOWED.strip()
+if action == "disable":
+    if not service_privileged and not allowed:
+        print("restricted_rootless_dind=already_disabled jobs_privileged=false")
+        raise SystemExit(0)
+    if not (
+        len(service_privileged) == 1
+        and service_privileged[0].strip() == expected_service
+        and len(allowed) == 1
+        and allowed[0].strip() == expected_allowed
+    ):
+        fail("existing privileged-service policy is not the reviewed exact policy", 77)
+    remove_indices = {
+        start + 1 + section.index(service_privileged[0]),
+        start + 1 + section.index(allowed[0]),
+    }
+    lines = [line for index, line in enumerate(lines) if index not in remove_indices]
+    with open(CONFIG, "w", encoding="utf-8") as handle:
+        handle.writelines(lines)
+        handle.flush()
+        os.fsync(handle.fileno())
+    print("restricted_rootless_dind=disabled jobs_privileged=false removed_settings=2")
+    raise SystemExit(0)
+
 if service_privileged or allowed:
     if (
         len(service_privileged) == 1
