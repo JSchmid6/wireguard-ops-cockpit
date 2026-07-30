@@ -1,0 +1,18 @@
+[Unit]
+Description=Deploy promoted Email Archive image through Nextcloud AppAPI
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/wireguard-ops-cockpit/email-archive-registry.env
+ExecStart=/usr/local/sbin/cockpit-email-archive-auto-deploy
+RuntimeDirectory=email-archive-auto-deploy
+StateDirectory=email-archive-auto-deploy
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/run/email-archive-auto-deploy /var/lib/email-archive-auto-deploy
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

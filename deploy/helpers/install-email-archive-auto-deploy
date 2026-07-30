@@ -1,0 +1,63 @@
+#!/bin/bash
+set -euo pipefail
+umask 077
+
+source_root=/opt/wireguard-ops-cockpit
+credential_dir=/etc/wireguard-ops-cockpit
+credential_file=$credential_dir/email-archive-registry.env
+program_target=/usr/local/sbin/cockpit-email-archive-auto-deploy
+service_target=/etc/systemd/system/email-archive-auto-deploy.service
+timer_target=/etc/systemd/system/email-archive-auto-deploy.timer
+
+[[ $EUID -eq 0 ]] || { echo "installer must run as root" >&2; exit 77; }
+for target in "$credential_file" "$program_target" "$service_target" "$timer_target"; do
+  [[ ! -e $target ]] || { echo "refusing to overwrite existing target: $target" >&2; exit 73; }
+done
+python3 -m py_compile "$source_root/deploy/helpers/cockpit-email-archive-auto-deploy"
+verify_output=$(systemd-analyze verify \
+  "$source_root/deploy/systemd/email-archive-auto-deploy.service" \
+  "$source_root/deploy/systemd/email-archive-auto-deploy.timer" 2>&1 || true)
+unexpected_verify_output=$(printf '%s\n' "$verify_output" |
+  grep -v 'Command /usr/local/sbin/cockpit-email-archive-auto-deploy is not executable: No such file or directory' || true)
+[[ -z $unexpected_verify_output ]] || {
+  printf '%s\n' "$unexpected_verify_output" >&2
+  exit 65
+}
+
+token_json=$(
+  gitlab-rails runner '
+    project = Project.find_by_full_path("Jochen/email-archive")
+    abort("project not found") unless project&.id == 27
+    abort("deploy token already exists") if project.deploy_tokens.active.where(name: "email-archive-auto-deploy").exists?
+    creator = User.find_by_username("root")
+    abort("GitLab root user not found") unless creator
+    token = project.deploy_tokens.create!(
+      name: "email-archive-auto-deploy",
+      username: "email-archive-auto-deploy",
+      project_id: project.id,
+      deploy_token_type: :project_type,
+      read_registry: true,
+      creator_id: creator.id
+    )
+    puts({username: token.username, token: token.token}.to_json)
+  ' 2>/dev/null | tail -n 1
+)
+registry_user=$(printf '%s' "$token_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["username"])')
+registry_password=$(printf '%s' "$token_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+[[ $registry_user =~ ^[A-Za-z0-9._+-]{1,255}$ ]] || { echo "invalid deploy-token username" >&2; exit 65; }
+[[ $registry_password =~ ^gldt-[A-Za-z0-9_-]{20,}$ ]] || { echo "invalid deploy token" >&2; exit 65; }
+
+install -d -m 0700 "$credential_dir"
+{
+  printf 'SOURCE_REGISTRY_USER=%s\n' "$registry_user"
+  printf 'SOURCE_REGISTRY_PASSWORD=%s\n' "$registry_password"
+} > "$credential_file"
+chmod 0600 "$credential_file"
+
+install -m 0755 "$source_root/deploy/helpers/cockpit-email-archive-auto-deploy" "$program_target"
+install -m 0644 "$source_root/deploy/systemd/email-archive-auto-deploy.service" "$service_target"
+install -m 0644 "$source_root/deploy/systemd/email-archive-auto-deploy.timer" "$timer_target"
+systemctl daemon-reload
+systemctl enable --now email-archive-auto-deploy.timer
+
+echo "email_archive_auto_deploy=installed token_scope=read_registry timer=enabled"

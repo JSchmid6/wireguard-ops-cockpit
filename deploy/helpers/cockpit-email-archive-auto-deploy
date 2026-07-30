@@ -1,0 +1,285 @@
+#!/usr/bin/python3
+"""Promote a verified Email Archive image through Nextcloud AppAPI."""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+APP_ID = "email_archive"
+SOURCE_REGISTRY = "registry.wejos.de"
+SOURCE_IMAGE = "registry.wejos.de/jochen/email-archive"
+SOURCE_REPOSITORY = "jochen/email-archive"
+TARGET_IMAGE = "172.30.0.4:5000/jochen/email-archive"
+STATE_PATH = Path("/var/lib/email-archive-auto-deploy/state.json")
+LOCK_PATH = Path("/run/email-archive-auto-deploy/deploy.lock")
+OCC = "/var/www/nextcloud/occ"
+PHP = "/usr/bin/php"
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+IMAGE_ID_RE = re.compile(r"^sha256:([0-9a-f]{64})$")
+TAG_RE = re.compile(r"^(?:[0-9a-f]{40}|rollback-[0-9a-f]{64})$")
+
+
+def fail(message: str) -> None:
+    raise RuntimeError(message)
+
+
+def run(argv: list[str], *, input_text: str | None = None, timeout: int = 900) -> str:
+    completed = subprocess.run(
+        argv,
+        input=input_text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=timeout,
+        check=False,
+        env={
+            "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+            "LANG": "C.UTF-8",
+            "DOCKER_CONFIG": "/run/email-archive-auto-deploy/docker",
+        },
+    )
+    if completed.returncode:
+        fail(f"{argv[0]} failed with exit {completed.returncode}: {completed.stdout[-4000:]}")
+    return completed.stdout
+
+
+class Registry:
+    def __init__(self, username: str, password: str) -> None:
+        self.username = username
+        self.password = password
+        self.token: str | None = None
+
+    def _request(self, path: str, accept: str | None = None) -> urllib.response.addinfourl:
+        headers = {}
+        if accept:
+            headers["Accept"] = accept
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        request = urllib.request.Request(f"https://{SOURCE_REGISTRY}{path}", headers=headers)
+        try:
+            return urllib.request.urlopen(request, timeout=30)
+        except urllib.error.HTTPError as error:
+            if error.code != 401 or self.token:
+                raise
+            challenge = error.headers.get("WWW-Authenticate", "")
+            fields = dict(re.findall(r'([a-z]+)="([^"]+)"', challenge))
+            if not {"realm", "service", "scope"} <= fields.keys():
+                fail("registry returned an invalid bearer challenge")
+            query = urllib.parse.urlencode({"service": fields["service"], "scope": fields["scope"]})
+            auth = base64.b64encode(f"{self.username}:{self.password}".encode()).decode()
+            token_request = urllib.request.Request(
+                f"{fields['realm']}?{query}",
+                headers={"Authorization": f"Basic {auth}"},
+            )
+            with urllib.request.urlopen(token_request, timeout=30) as response:
+                token_payload = json.load(response)
+            self.token = token_payload.get("token") or token_payload.get("access_token")
+            if not self.token:
+                fail("registry token response contained no token")
+            return self._request(path, accept)
+
+    def image(self, reference: str) -> dict[str, str]:
+        accept = "application/vnd.docker.distribution.manifest.v2+json"
+        with self._request(f"/v2/{SOURCE_REPOSITORY}/manifests/{reference}", accept) as response:
+            manifest = json.load(response)
+            digest = response.headers.get("Docker-Content-Digest", "")
+        if not DIGEST_RE.fullmatch(digest):
+            fail("registry returned an invalid manifest digest")
+        config_digest = manifest.get("config", {}).get("digest", "")
+        if not DIGEST_RE.fullmatch(config_digest):
+            fail("image manifest contained an invalid config digest")
+        with self._request(f"/v2/{SOURCE_REPOSITORY}/blobs/{config_digest}") as response:
+            config = json.load(response)
+        labels = config.get("config", {}).get("Labels") or {}
+        revision = labels.get("org.opencontainers.image.revision", "")
+        info_b64 = labels.get("de.wejos.nextcloud.info-xml", "")
+        if not SHA_RE.fullmatch(revision):
+            fail("image has no valid immutable Git revision label")
+        if not isinstance(info_b64, str) or len(info_b64) > 64_000:
+            fail("image has no bounded Nextcloud metadata label")
+        return {"digest": digest, "revision": revision, "info_b64": info_b64}
+
+
+def load_state() -> dict[str, str]:
+    if not STATE_PATH.exists():
+        return {}
+    value = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    return value if isinstance(value, dict) else {}
+
+
+def save_state(value: dict[str, str]) -> None:
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = STATE_PATH.with_suffix(".tmp")
+    temporary.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, STATE_PATH)
+
+
+def internal_digest(tag: str) -> str:
+    if not TAG_RE.fullmatch(tag):
+        fail("invalid private rollback tag")
+    request = urllib.request.Request(
+        f"http://172.30.0.4:5000/v2/jochen/email-archive/manifests/{tag}",
+        headers={"Accept": "application/vnd.docker.distribution.manifest.v2+json"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        digest = response.headers.get("Docker-Content-Digest", "")
+    if not DIGEST_RE.fullmatch(digest):
+        fail("private registry returned an invalid digest")
+    return digest
+
+
+def bootstrap_state(info_b64: str) -> dict[str, str]:
+    image_id = run([
+        "/usr/bin/docker", "inspect", "nc_app_email_archive",
+        "--format", "{{.Image}}",
+    ]).strip()
+    match = IMAGE_ID_RE.fullmatch(image_id)
+    if not match:
+        fail("running Email Archive container has no valid immutable image id")
+    tag = f"rollback-{match.group(1)}"
+    run(["/usr/bin/docker", "tag", image_id, f"{TARGET_IMAGE}:{tag}"])
+    run(["/usr/bin/docker", "push", f"{TARGET_IMAGE}:{tag}"])
+    state = {
+        "tag": tag,
+        "revision": "pre-auto-deploy",
+        "digest": internal_digest(tag),
+        "info_b64": info_b64,
+    }
+    save_state(state)
+    print(f"rollback_snapshot=created tag={tag} digest={state['digest']}")
+    return state
+
+
+def render_info(info_b64: str, revision: str, serial: int) -> bytes:
+    try:
+        source = base64.b64decode(info_b64, validate=True)
+    except (ValueError, binascii.Error) as error:
+        raise RuntimeError("invalid base64 Nextcloud metadata") from error
+    if len(source) > 48_000:
+        fail("Nextcloud metadata exceeds the size limit")
+    root = ET.fromstring(source)
+    if root.findtext("id") != APP_ID:
+        fail("Nextcloud metadata app id mismatch")
+    version = root.find("version")
+    image_tag = root.find("./external-app/docker-install/image-tag")
+    registry = root.findtext("./external-app/docker-install/registry")
+    image = root.findtext("./external-app/docker-install/image")
+    if version is None or image_tag is None:
+        fail("Nextcloud metadata lacks version or image tag")
+    if registry != "172.30.0.4:5000" or image != "jochen/email-archive":
+        fail("Nextcloud metadata targets an unexpected registry image")
+    version.text = f"0.2.{serial}"
+    image_tag.text = revision
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def mirror(username: str, password: str, revision: str, expected_digest: str) -> None:
+    Path("/run/email-archive-auto-deploy/docker").mkdir(parents=True, exist_ok=True)
+    run(["/usr/bin/docker", "login", SOURCE_REGISTRY, "--username", username, "--password-stdin"], input_text=password + "\n")
+    run(["/usr/bin/docker", "pull", f"{SOURCE_IMAGE}@{expected_digest}"])
+    run(["/usr/bin/docker", "tag", f"{SOURCE_IMAGE}@{expected_digest}", f"{TARGET_IMAGE}:{revision}"])
+    run(["/usr/bin/docker", "push", f"{TARGET_IMAGE}:{revision}"])
+    output = run(["/usr/bin/docker", "image", "inspect", f"{TARGET_IMAGE}:{revision}", "--format", "{{json .RepoDigests}}"])
+    if expected_digest not in output:
+        fail("mirrored image digest does not match the promoted source digest")
+
+
+def appapi_update(info: bytes, serial: int) -> None:
+    with tempfile.NamedTemporaryFile(
+        prefix=f"{APP_ID}-{serial}-", suffix=".xml", dir="/run/email-archive-auto-deploy", delete=False
+    ) as handle:
+        handle.write(info)
+        path = handle.name
+    try:
+        os.chmod(path, 0o644)
+        run([
+            "/usr/bin/setpriv", "--reuid=www-data", "--regid=www-data", "--init-groups",
+            PHP,
+            "-d", "mysqli.default_socket=/run/mysqld/mysqld.sock",
+            "-d", "pdo_mysql.default_socket=/run/mysqld/mysqld.sock",
+            OCC, "app_api:app:update", APP_ID,
+            "--info-xml", path, "--wait-finish", "--no-interaction",
+        ], timeout=900)
+        status = run([
+            "/usr/bin/setpriv", "--reuid=www-data", "--regid=www-data", "--init-groups",
+            PHP,
+            "-d", "mysqli.default_socket=/run/mysqld/mysqld.sock",
+            "-d", "pdo_mysql.default_socket=/run/mysqld/mysqld.sock",
+            OCC, "app_api:app:list", "--no-interaction",
+        ])
+        if APP_ID not in status:
+            fail("AppAPI status no longer lists email_archive")
+    finally:
+        Path(path).unlink(missing_ok=True)
+
+
+def deploy() -> None:
+    username = os.environ.get("SOURCE_REGISTRY_USER", "")
+    password = os.environ.get("SOURCE_REGISTRY_PASSWORD", "")
+    if not username or not password:
+        fail("read-only source registry credentials are unavailable")
+    registry = Registry(username, password)
+    desired = registry.image("latest")
+    immutable = registry.image(desired["revision"])
+    if immutable["digest"] != desired["digest"] or immutable["revision"] != desired["revision"]:
+        fail("latest does not match its immutable Git revision tag")
+    state = load_state()
+    if state.get("digest") == desired["digest"]:
+        print(f"deployment=unchanged revision={desired['revision']} digest={desired['digest']}")
+        return
+    if not state:
+        state = bootstrap_state(desired["info_b64"])
+
+    serial = int(time.time())
+    mirror(username, password, desired["revision"], desired["digest"])
+    try:
+        appapi_update(render_info(desired["info_b64"], desired["revision"], serial), serial)
+        if registry.image("latest")["digest"] != desired["digest"]:
+            fail("latest changed while deployment was in progress")
+    except Exception:
+        previous_tag = state.get("tag") or state.get("revision", "")
+        previous_digest = state.get("digest", "")
+        previous_info = state.get("info_b64", "")
+        if TAG_RE.fullmatch(previous_tag) and DIGEST_RE.fullmatch(previous_digest) and previous_info:
+            if internal_digest(previous_tag) != previous_digest:
+                fail("stored rollback tag no longer matches its recorded digest")
+            appapi_update(render_info(previous_info, previous_tag, serial + 1), serial + 1)
+            print(f"rollback=completed tag={previous_tag} digest={previous_digest}", file=sys.stderr)
+        raise
+    save_state({**desired, "tag": desired["revision"]})
+    print(f"deployment=completed revision={desired['revision']} digest={desired['digest']}")
+
+
+def main() -> int:
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("w", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        deploy()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except BlockingIOError:
+        print("deployment=skipped reason=already-running")
+        raise SystemExit(0)
+    except Exception as error:
+        print(f"deployment=failed reason={error}", file=sys.stderr)
+        raise SystemExit(1)

@@ -142,6 +142,20 @@ Bare-metal Ubuntu VPS (161.97.86.86) running:
 - `exapp-catalog-refresh` repairs only AppAPI's regenerable `appapi_apps.json` cache through Nextcloud AppData and refetches it through the official fetcher; it never manipulates the cache path or user data directly.
 - `exapp-reinitialize` repeats AppAPI's initialization and enable handshake for an already registered ExApp without unregistering it or recreating its container or persistent volume. Use it after a contained connectivity repair instead of destructive reinstallation.
 - `exapp-restart-reinitialize` adds a supported AppAPI stop/start before that handshake when an ExApp supervisor has exhausted child-process retries. It preserves the registered app, image, container definition, and persistent volume and is not a general disable operation.
+- Email Archive production deployment is driven by
+  `email-archive-auto-deploy.timer`. The source pipeline promotes `latest` only
+  after tests and both immutable image builds succeed. The fixed deployer
+  authenticates to the GitLab registry with a read-only project deploy token,
+  verifies that `latest`, its OCI Git revision label, and the full immutable
+  revision tag share one manifest digest, mirrors that digest to the private
+  AppAPI registry, and invokes `app_api:app:update`. It stores only the last
+  successful revision, digest, and public app metadata for rollback. Registry
+  credentials are never passed to AppAPI, Docker argv, model prompts, or job
+  output. AppAPI may replace the runtime container during an update, but the
+  ExApp registration and named persistent volume remain intact. Before the
+  first managed deployment, the deployer pushes the exact currently running
+  image under a content-derived private rollback tag; it does not remove the
+  running container or any image.
 - Context Chat end-to-end checks use `cockpit-nextcloud-context-action`. It can create only a new, non-overwriting marker document below `Cockpit E2E Tests` through the Nextcloud Files API, inspect that exact marker's path/id/size, and invoke only fixed statistics, marker-search, and marker-prompt operations. File evidence is also written to stderr because Nextcloud bootstrap buffering can consume stdout. It has no arbitrary path, content, deletion, or `occ` mode.
 - Exact regular-file mutations invoke `cockpit-exact-file-replace` directly without `runAsUser`, an interpreter wrapper, or a temporary copy: the target must equal an envelope-authorized `writablePaths` entry, the old text must occur exactly once, and the helper writes the existing inode rather than attempting a rename across the sandbox bind mount.
 - The Executor service uses `ProtectSystem=true`; the signed inner capability sandbox is the exact-path enforcement boundary. `ProtectSystem=strict` on the outer service would make the host path read-only before the inner sandbox can bind the authorized writable file and would also prevent snapshot restoration.
