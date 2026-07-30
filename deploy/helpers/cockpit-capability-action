@@ -72,6 +72,7 @@ const readOnlyContainerCommands = new Set(["ps", "inspect", "version", "info"]);
 function stepNeedsApproval(step) {
   const executable = step?.argv?.[0] || "";
   if (executable === "/bin/sh" && step?.argv?.[1] === emailArchiveDeployHelper) return true;
+  if (executable === "/bin/sh" && step?.argv?.[1] === hermesSkillHelper && step?.argv?.[2] === "recover-install") return true;
   if (dangerousExecutable.test(executable)) return true;
   if (/\/(?:docker|podman)$/.test(executable)) return !readOnlyContainerCommands.has(step?.argv?.[1] || "");
   return false;
@@ -124,15 +125,15 @@ for (const [index, step] of manifest.steps.entries()) {
     );
   }
   if (isHermesSkillStep) {
-    if (step.argv.length !== 4 || step.argv[2] !== "install" || step.argv[3] !== "present-work-view" || runAsUser) {
+    const skillAction = step.argv[2];
+    if (step.argv.length !== 4 || !["install", "recover-install"].includes(skillAction) || step.argv[3] !== "present-work-view" || runAsUser) {
       fail(`step ${index + 1} has an invalid Hermes skill action`, 77);
     }
     properties.push(
-      "--property=User=1007",
-      "--property=Group=1007",
       "--property=BindReadOnlyPaths=/home/hermes/.hermes/interface-app-4-ai-agents/tools/hermes-skills/present-work-view",
       "--property=BindPaths=/home/hermes/.hermes/skills",
     );
+    if (skillAction === "install") properties.push("--property=User=1007", "--property=Group=1007");
   }
   if (isEmailArchiveDeployStep) {
     if (step.argv.length !== 4 || step.argv[2] !== "build-push" || step.argv[3] !== "63f39b2" || runAsUser) {

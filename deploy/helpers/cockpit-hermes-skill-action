@@ -6,10 +6,10 @@ skill_name=${2:-}
 source_root=/home/hermes/.hermes/interface-app-4-ai-agents/tools/hermes-skills
 target_root=/home/hermes/.hermes/skills
 
-[ "$action" = install ] || {
-  echo "usage: cockpit-hermes-skill-action install <skill-name>" >&2
-  exit 64
-}
+case "$action" in
+  install|recover-install) ;;
+  *) echo "usage: cockpit-hermes-skill-action install|recover-install <skill-name>" >&2; exit 64 ;;
+esac
 case "$skill_name" in
   ''|*[!a-z0-9-]*) echo "invalid skill name" >&2; exit 64 ;;
 esac
@@ -19,12 +19,28 @@ target_dir=$target_root/$skill_name
 [ -f "$source_dir/SKILL.md" ] || { echo "source SKILL.md is missing" >&2; exit 66; }
 [ -f "$source_dir/agents/openai.yaml" ] || { echo "source agent metadata is missing" >&2; exit 66; }
 [ -f "$source_dir/references/protocol.md" ] || { echo "source protocol reference is missing" >&2; exit 66; }
+
+owner_args=
+if [ "$action" = recover-install ]; then
+  [ "$skill_name" = present-work-view ] || { echo "recovery is restricted to present-work-view" >&2; exit 77; }
+  [ -d "$target_dir" ] && [ ! -L "$target_dir" ] || { echo "expected target directory is missing or unsafe" >&2; exit 73; }
+  [ -d "$target_dir/agents" ] && [ ! -L "$target_dir/agents" ] || { echo "expected agents directory is missing or unsafe" >&2; exit 73; }
+  [ "$(find "$target_dir" -mindepth 1 -maxdepth 1 -printf '%f')" = agents ] || { echo "target contains unexpected entries" >&2; exit 73; }
+  [ -z "$(find "$target_dir/agents" -mindepth 1 -print -quit)" ] || { echo "agents directory is not empty" >&2; exit 73; }
+  rmdir "$target_dir/agents"
+  rmdir "$target_dir"
+  owner_args="-o 1007 -g 1007"
+fi
 [ ! -e "$target_dir" ] || { echo "target skill already exists" >&2; exit 73; }
 
-install -d -m 0750 "$target_dir/agents" "$target_dir/references"
-install -m 0640 "$source_dir/SKILL.md" "$target_dir/SKILL.md"
-install -m 0640 "$source_dir/agents/openai.yaml" "$target_dir/agents/openai.yaml"
-install -m 0640 "$source_dir/references/protocol.md" "$target_dir/references/protocol.md"
+# shellcheck disable=SC2086
+install $owner_args -d -m 0750 "$target_dir/agents" "$target_dir/references"
+# shellcheck disable=SC2086
+install $owner_args -m 0640 "$source_dir/SKILL.md" "$target_dir/SKILL.md"
+# shellcheck disable=SC2086
+install $owner_args -m 0640 "$source_dir/agents/openai.yaml" "$target_dir/agents/openai.yaml"
+# shellcheck disable=SC2086
+install $owner_args -m 0640 "$source_dir/references/protocol.md" "$target_dir/references/protocol.md"
 
 test "$(find "$target_dir" -type f | wc -l)" -eq 3
 cmp -s "$source_dir/SKILL.md" "$target_dir/SKILL.md"
