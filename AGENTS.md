@@ -156,6 +156,10 @@ Bare-metal Ubuntu VPS (161.97.86.86) running:
   first managed deployment, the deployer pushes the exact currently running
   image under a content-derived private rollback tag; it does not remove the
   running container or any image.
+- The source registry may return OCI indexes/manifests or Docker schema-2
+  lists/manifests. The deployer advertises all four media types; accepting only
+  Docker's single-image media type makes GitLab return a misleading
+  `MANIFEST_UNKNOWN`/404 even when the read-only deploy token is valid.
 - Context Chat end-to-end checks use `cockpit-nextcloud-context-action`. It can create only a new, non-overwriting marker document below `Cockpit E2E Tests` through the Nextcloud Files API, inspect that exact marker's path/id/size, and invoke only fixed statistics, marker-search, and marker-prompt operations. File evidence is also written to stderr because Nextcloud bootstrap buffering can consume stdout. It has no arbitrary path, content, deletion, or `occ` mode.
 - Exact regular-file mutations invoke `cockpit-exact-file-replace` directly without `runAsUser`, an interpreter wrapper, or a temporary copy: the target must equal an envelope-authorized `writablePaths` entry, the old text must occur exactly once, and the helper writes the existing inode rather than attempting a rename across the sandbox bind mount.
 - The Executor service uses `ProtectSystem=true`; the signed inner capability sandbox is the exact-path enforcement boundary. `ProtectSystem=strict` on the outer service would make the host path read-only before the inner sandbox can bind the authorized writable file and would also prevent snapshot restoration.
