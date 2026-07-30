@@ -1,0 +1,70 @@
+#!/usr/bin/python3
+import os
+import sys
+
+CONFIG = "/etc/gitlab-runner/config.toml"
+ALLOWED = (
+    '    allowed_privileged_services = ["docker.io/library/docker:*-dind-rootless", '
+    '"docker.io/library/docker:dind-rootless", "docker:*-dind-rootless", '
+    '"docker:dind-rootless"]\n'
+)
+
+
+def fail(message: str, code: int = 64) -> None:
+    print(message, file=sys.stderr)
+    raise SystemExit(code)
+
+
+if sys.argv[1:] != ["enable"]:
+    fail("usage: cockpit-gitlab-runner-rootless-dind enable")
+
+with open(CONFIG, encoding="utf-8") as handle:
+    lines = handle.readlines()
+
+if sum(line.strip() == "[[runners]]" for line in lines) != 1:
+    fail("expected exactly one configured runner", 65)
+if sum(line.strip() == "[runners.docker]" for line in lines) != 1:
+    fail("expected exactly one runners.docker section", 65)
+
+start = next(index for index, line in enumerate(lines) if line.strip() == "[runners.docker]")
+end = next(
+    (index for index in range(start + 1, len(lines)) if lines[index].lstrip().startswith("[")),
+    len(lines),
+)
+section = lines[start + 1 : end]
+privileged = [line for line in section if line.strip().startswith("privileged =")]
+service_privileged = [line for line in section if line.strip().startswith("services_privileged =")]
+allowed = [line for line in section if line.strip().startswith("allowed_privileged_services =")]
+
+if len(privileged) != 1 or privileged[0].strip() != "privileged = false":
+    fail("runner jobs must remain privileged = false", 77)
+
+expected_service = "services_privileged = true"
+expected_allowed = ALLOWED.strip()
+if service_privileged or allowed:
+    if (
+        len(service_privileged) == 1
+        and service_privileged[0].strip() == expected_service
+        and len(allowed) == 1
+        and allowed[0].strip() == expected_allowed
+    ):
+        print("restricted_rootless_dind=already_enabled jobs_privileged=false")
+        raise SystemExit(0)
+    fail("existing privileged-service policy is not the reviewed exact policy", 77)
+
+privileged_index = next(
+    index
+    for index in range(start + 1, end)
+    if lines[index].strip() == "privileged = false"
+)
+lines[privileged_index + 1 : privileged_index + 1] = [
+    "    services_privileged = true\n",
+    ALLOWED,
+]
+
+with open(CONFIG, "w", encoding="utf-8") as handle:
+    handle.writelines(lines)
+    handle.flush()
+    os.fsync(handle.fileno())
+
+print("restricted_rootless_dind=enabled jobs_privileged=false allowed_services=4")

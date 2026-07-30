@@ -33,6 +33,7 @@ The Hermes token file is `hermes:hermes` mode `0600` because Hermes must present
 - `deploy/helpers/cockpit-nextcloud-context-action` and `deploy/helpers/nextcloud-context-test-file.php` (fixed, non-overwriting Context Chat E2E operations)
 - `deploy/helpers/cockpit-hermes-skill-action` (fixed, non-overwriting installation of the reviewed FullDialog Hermes skill)
 - `deploy/helpers/cockpit-email-archive-deploy` (fixed, approval-gated build/push of the reviewed clean Email Archive commit to the existing private registry)
+- `deploy/helpers/cockpit-gitlab-runner-rootless-dind` (fixed, approval-gated enablement of only GitLab's allowlisted rootless DinD services while jobs remain unprivileged)
 - `deploy/helpers/nextcloud-exapp-reinitialize.php` (bounded AppAPI initialization/enable recovery without container or volume recreation)
 - `deploy/sudoers/cockpit-executor`
 
@@ -61,7 +62,7 @@ The new fingerprint starts a fresh circuit-breaker window without removing the
 failed-job audit history.
 
 The current boundary is
-`dynamic-capability-v14-split-skill-recovery`. Its Email Archive helper accepts
+`dynamic-capability-v15-restricted-rootless-dind`. Its Email Archive helper accepts
 only `build-push 63f39b2`, verifies a clean exact checkout, writes only Docker
 image/tag state and the existing private registry, and is always
 operator-approval gated. AppAPI lifecycle remains a separate semantic helper.
