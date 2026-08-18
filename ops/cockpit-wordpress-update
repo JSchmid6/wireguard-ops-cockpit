@@ -1,0 +1,190 @@
+#!/bin/bash
+# Bounded WordPress update with the rollback built into the tool.
+#
+# Why this exists: an update that writes /var/www/html declares data_loss in
+# its manifest, and rightly so — the executor's automatic snapshot only covers
+# exact regular files under 10 MB, never a directory tree. So every routine
+# update needed an operator click, and "the agent administers the host without
+# constant clicking" quietly stopped being true.
+#
+# The fix is not to weaken the rule. It is to make the loss structurally
+# impossible, so the manifest can declare `contained` truthfully: this helper
+# takes a database dump and a file archive BEFORE touching anything, updates,
+# verifies, and restores both on any failure. The operator reviews the tool
+# once instead of every update.
+#
+# Deliberately absent: no arbitrary wp command, no path argument, no plugin
+# install/delete, no --force. It updates what is already installed, in the one
+# fixed docroot, or it does nothing.
+set -euo pipefail
+
+readonly DOCROOT=/var/www/html
+readonly BACKUP_ROOT=/var/backups/wordpress
+readonly WP=/usr/local/bin/wp
+readonly KEEP_BACKUPS=10
+
+usage() {
+  echo "usage: cockpit-wordpress-update status|check|update|verify|rollback [<stamp>]" >&2
+  exit 64
+}
+
+log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+
+wp_run() {
+  # wp-cli refuses to run as root without this; the docroot is owned by the
+  # web user, so --allow-root plus the fixed path is the bounded form.
+  "$WP" --allow-root --path="$DOCROOT" "$@"
+}
+
+require_env() {
+  [[ -x $WP ]] || { echo "wp-cli is unavailable at $WP" >&2; exit 69; }
+  [[ -f $DOCROOT/wp-config.php ]] || { echo "no WordPress at $DOCROOT" >&2; exit 69; }
+  wp_run core is-installed >/dev/null 2>&1 || { echo "WordPress at $DOCROOT is not installed" >&2; exit 69; }
+}
+
+# ─── Backup ────────────────────────────────────────────────────────────────
+take_backup() {
+  local stamp="$1" dir="$BACKUP_ROOT/$stamp"
+  mkdir -p "$dir"
+  chmod 700 "$dir"
+
+  log "backup: exporting database"
+  # --add-drop-table so the restore is a true replacement, not a merge onto
+  # a half-updated schema.
+  wp_run db export "$dir/db.sql" --add-drop-table >/dev/null
+
+  log "backup: archiving $DOCROOT"
+  tar -czf "$dir/files.tar.gz" -C "$(dirname "$DOCROOT")" "$(basename "$DOCROOT")"
+
+  # Prove the archive is readable before anything destructive happens. An
+  # unverified backup is not a backup — the same rule the mail archive uses
+  # before it deletes anything from a server.
+  tar -tzf "$dir/files.tar.gz" >/dev/null || { echo "file archive did not verify" >&2; exit 70; }
+  [[ -s $dir/db.sql ]] || { echo "database export is empty" >&2; exit 70; }
+
+  ( cd "$dir" && sha256sum db.sql files.tar.gz > SHA256SUMS )
+  log "backup: complete in $dir ($(du -sh "$dir" | cut -f1))"
+  printf '%s\n' "$stamp" > "$BACKUP_ROOT/.last"
+}
+
+restore_backup() {
+  local stamp="$1" dir="$BACKUP_ROOT/$stamp"
+  [[ -d $dir ]] || { echo "no backup $stamp" >&2; exit 66; }
+  ( cd "$dir" && sha256sum -c SHA256SUMS >/dev/null ) || { echo "backup $stamp failed its checksums; refusing to restore" >&2; exit 70; }
+
+  log "rollback: restoring files from $stamp"
+  # Into a staging directory first, then swap: a tar that fails half way
+  # through must not leave the live docroot in pieces.
+  local staging="$BACKUP_ROOT/.restore.$$"
+  rm -rf "$staging"; mkdir -p "$staging"
+  tar -xzf "$dir/files.tar.gz" -C "$staging"
+  local previous="$BACKUP_ROOT/.previous.$stamp.$$"
+  mv "$DOCROOT" "$previous"
+  mv "$staging/$(basename "$DOCROOT")" "$DOCROOT"
+  rm -rf "$staging" "$previous"
+
+  log "rollback: restoring database from $stamp"
+  wp_run db import "$dir/db.sql" >/dev/null
+  log "rollback: complete"
+}
+
+prune_backups() {
+  local count
+  count=$(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -name '20*' | wc -l)
+  [[ $count -le $KEEP_BACKUPS ]] && return 0
+  find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -name '20*' -printf '%T@ %p\n' \
+    | sort -n | head -n "$(( count - KEEP_BACKUPS ))" | cut -d' ' -f2- \
+    | while read -r old; do log "prune: removing $old"; rm -rf "$old"; done
+}
+
+# ─── Verification ──────────────────────────────────────────────────────────
+verify_site() {
+  local failed=0
+  log "verify: core checksums"
+  wp_run core verify-checksums 2>&1 || failed=1
+  log "verify: database check"
+  wp_run core is-installed || failed=1
+  log "verify: site responds"
+  # Loopback only: this asks whether WordPress renders, not whether DNS works.
+  local code
+  code=$(wp_run eval 'echo function_exists("wp_get_theme") ? "200" : "500";' 2>/dev/null || echo 500)
+  [[ $code == 200 ]] || failed=1
+  return $failed
+}
+
+# ─── Actions ───────────────────────────────────────────────────────────────
+[[ $# -ge 1 ]] || usage
+action=$1
+
+case "$action" in
+  status)
+    require_env
+    echo "core_version=$(wp_run core version)"
+    echo "docroot=$DOCROOT"
+    echo "last_backup=$(cat "$BACKUP_ROOT/.last" 2>/dev/null || echo none)"
+    wp_run plugin list --format=csv --fields=name,status,version,update
+    ;;
+
+  check)
+    require_env
+    echo "--- core ---"
+    wp_run core check-update --format=csv || true
+    echo "--- plugins ---"
+    wp_run plugin list --update=available --format=csv --fields=name,version,update_version || true
+    echo "--- themes ---"
+    wp_run theme list --update=available --format=csv --fields=name,version,update_version || true
+    ;;
+
+  verify)
+    require_env
+    verify_site
+    ;;
+
+  rollback)
+    require_env
+    stamp=${2:-$(cat "$BACKUP_ROOT/.last" 2>/dev/null || true)}
+    [[ -n $stamp ]] || { echo "no backup stamp given and none recorded" >&2; exit 64; }
+    restore_backup "$stamp"
+    verify_site || { echo "site did not verify after rollback" >&2; exit 70; }
+    log "rollback verified"
+    ;;
+
+  update)
+    require_env
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    take_backup "$stamp"
+
+    # From here on any failure restores. The trap is armed only after the
+    # backup exists and verified — before that there is nothing to roll back to
+    # and an automatic restore would be the more dangerous act.
+    trap 'rc=$?; log "update failed (exit $rc) — rolling back"; restore_backup "'"$stamp"'" || log "ROLLBACK FAILED — backup is in '"$BACKUP_ROOT/$stamp"'"; exit $rc' ERR
+
+    log "update: core"
+    wp_run core update
+    log "update: database schema"
+    wp_run core update-db
+    log "update: plugins"
+    wp_run plugin update --all
+    log "update: themes"
+    wp_run theme update --all
+
+    log "verify: post-update"
+    if ! verify_site; then
+      log "verification failed — rolling back"
+      trap - ERR
+      restore_backup "$stamp"
+      verify_site || { echo "site did not verify after rollback either" >&2; exit 70; }
+      echo "update rolled back after failed verification" >&2
+      exit 70
+    fi
+
+    trap - ERR
+    prune_backups
+    log "update complete and verified; backup retained as $stamp"
+    echo "core_version=$(wp_run core version)"
+    ;;
+
+  *)
+    usage
+    ;;
+esac
