@@ -8,7 +8,9 @@ export async function runBrokerAgent(socketPath: string, role: AgentBrokerRole, 
     const connection = net.createConnection(socketPath);
     let response = "";
     connection.setEncoding("utf8");
-    connection.setTimeout(role === "runner" ? 610000 : 310000);
+    // Must stay above the broker's own kill budget (runner 30 min, default 15),
+        // or the socket gives up on a run the broker still considers alive.
+        connection.setTimeout(role === "runner" ? 1810000 : 910000);
     connection.on("connect", () => connection.write(`${JSON.stringify({ requestId: randomUUID(), role, prompt })}\n`));
     connection.on("data", (chunk) => { response += chunk; if (response.length > 2_200_000) connection.destroy(new Error("agent broker response too large")); });
     connection.on("timeout", () => connection.destroy(new Error("agent broker timed out")));

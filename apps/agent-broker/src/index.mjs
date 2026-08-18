@@ -91,7 +91,13 @@ export function runAgent(request) {
     const timer = setTimeout(() => {
       child.kill("SIGTERM");
       forceKillTimer = setTimeout(() => child.kill("SIGKILL"), 5000);
-    }, request.role === "runner" ? 600000 : request.role === "research" ? 120000 : 300000);
+    // Measured 2026-08-18: a 10-step read-only exploration with deepseek-v4-pro
+      // takes almost exactly five minutes, so the old 300s default killed every
+      // planning phase at the moment it finished exploring — the WordPress
+      // update died mid-handoff with "completed: []". The runner budget rises
+      // with it: a core+plugins update plus its backup can exceed ten minutes
+      // without anything being wrong.
+      }, request.role === "runner" ? 1800000 : request.role === "research" ? 120000 : 900000);
     child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => { if (stdout.length < 2_000_000) stdout += chunk; });
     child.stderr.on("data", (chunk) => { if (stderr.length < 200_000) stderr += chunk; });
