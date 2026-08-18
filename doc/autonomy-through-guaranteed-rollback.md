@@ -153,6 +153,103 @@ Job. Vorschlag: die letzten N je Capability-Namen, dazu eine Altersgrenze,
 aufgeräumt im selben Lauf. Ohne das füllt der Mechanismus, der Sicherheit
 schaffen soll, die Platte — was auf diesem Host schon einmal passiert ist.
 
+## Der Snapshot unter dem Dateisystem: Contabo
+
+Die Wurzel liegt auf blankem ext4 (`/dev/sda2`), ohne LVM, btrfs oder ZFS —
+lokal gibt es keine Schicht, die einen Systemzustand einfrieren könnte. Das war
+der Grund, Paketverwaltung als nicht autonomisierbar einzustufen.
+
+Der Hoster liefert sie aber:
+
+```
+POST   /v1/compute/instances/{id}/snapshots               anlegen
+GET    /v1/compute/instances/{id}/snapshots               auflisten
+POST   /v1/compute/instances/{id}/snapshots/{sid}/revert  zurückrollen
+DELETE /v1/compute/instances/{id}/snapshots/{sid}         löschen
+```
+
+OAuth-2-Bearer, Zugangsdaten aus dem Kundenpanel. Der Snapshot liegt auf
+Blockebene, also **unterhalb** von ext4 — er erfasst damit genau das, was ein
+Dateikopier-Rückbau prinzipiell nicht erfassen kann: `postinst`-Skripte,
+Dienstmigrationen, Schemaänderungen. Als Anbieter `vps:contabo` wären
+Systemupdates damit ehrlich autonomisierbar.
+
+Er ist aber von anderer Art als die übrigen, und das muss der Entwurf abbilden:
+
+| | Reichweite | Rückbau | Kollateral |
+|---|---|---|---|
+| `file`/`tree`/`mysql` | deklarierte Pfade | Sekunden, im laufenden System | keiner |
+| `vps:contabo` | **die ganze Maschine** | Neustart, Minuten | **alles seit dem Snapshot** |
+
+Ein Revert um 14:00 auf den Stand von 13:00 nimmt auch die Mails mit, die das
+Archiv inzwischen geholt hat, GitLab-Commits, Nextcloud-Uploads. Chirurgisch
+ist das nicht; es ist eine Zeitmaschine für den Host.
+
+**Deshalb asymmetrisch:**
+
+* **Snapshot anlegen** darf der Executor autonom. Der Wert liegt darin, dass vor
+  einem Systemupdate ein garantierter Rückweg *existiert*.
+* **Revert nur mit Operator-Freigabe.** Ein Rückbau mit Kollateralschaden ist
+  eine Abwägung, keine Rechnung.
+
+Zwei Randbedingungen aus Contabos Dokumentation: Snapshots werden nach 30 Tagen
+gelöscht, und ein Revert entfernt automatisch alle neueren Snapshots. Ein
+Automatismus, der häufig Snapshots anlegt, baut die Historie also ständig um —
+Aufbewahrung gehört hier genauso geplant wie bei den lokalen Anbietern.
+
+**Und der API-Token ist ein Generalschlüssel.** Wer ihn hat, kann die Maschine
+zurückrollen. Für einen Agenten auf einem externen Modell wäre das die
+mächtigste Fähigkeit im System. Er gehört behandelt wie `~/.hermes/credentials`:
+harte Grenze in `evaluatePlanPolicy`, nie in einem Manifest, nie im
+Agentenkontext. Der Executor liest ihn aus seiner eigenen Umgebung.
+
+## MCP: Schema statt Prosa — aber nicht als Gesprächsmuster
+
+`capabilityPlannerContract()` ist heute ein Prosablock von ~1700 Token, mit
+einer Einzelzeile von 1132 Zeichen. Er beschreibt für jeden Helfer die exakten
+Argumente, `runAsUser`, Netzwerkmodus, erlaubte Pfade. Der Executor prüft
+dieselben Regeln noch einmal, an 33 `fail()`-Stellen — die Mehrzahl davon
+Formfehler, nicht Sachfehler.
+
+Das sind **zwei getrennte Wahrheiten über dieselbe Sache**. Driften sie
+auseinander, merkt es niemand, und der Planer erfährt seinen Formfehler erst
+nach Planung und Freigabe, ganz am Ende.
+
+MCP behebt genau das: Aus dem Absatz wird ein Schema, ein falsch geformtes
+Argument existiert gar nicht erst. Was es **nicht** behebt — und was man nicht
+verwechseln darf:
+
+| Schicht | heute | mit MCP |
+|---|---|---|
+| Beschreibung | Prosa | Tool-Schema, maschinenlesbar |
+| Formprüfung | 33 × `fail()` im Executor | Protokoll lehnt vorab ab |
+| Ausführungsgrenze | `TemporaryFileSystem=/:ro` | unverändert |
+| Rückbau | Executor-Snapshot | unverändert |
+| Erlaubnis | Policy + Safety-Urteil | unverändert |
+
+MCP ersetzt die Beschreibungsschicht, nicht die Sicherheitsschicht.
+
+**Der Fallstrick:** MCP ist von Haus aus ein Gesprächsmuster — Werkzeug rufen,
+Ergebnis sehen, nächstes Werkzeug. Das würde die stärkste Eigenschaft des
+Cockpits zerstören: dass ein *vollständiger* Plan geprüft, freigegeben und dann
+als Ganzes ausgeführt wird. Zieht der Agent während des Laufs frei Werkzeuge,
+gibt es nichts mehr, das ein Richter vorab lesen könnte.
+
+**Zuschnitt:**
+
+* **MCP für Entdeckung und Form.** Der Planer fragt, welche Fähigkeiten es gibt
+  und wie ihre Parameter aussehen — Schema statt Absatz.
+* **Das Manifest bleibt die Festlegung.** Ergebnis ist weiterhin ein
+  vollständiges, prüfbares Dokument, kein Strom von Einzelaufrufen.
+* **Nur lesende Werkzeuge direkt aufrufbar** (`status`, `check`, `list`). Alles
+  Verändernde geht durch Plan → Prüfung → Freigabe oder abgeleitete Autonomie →
+  Executor.
+* **Eine Quelle für beides.** Das Schema erzeugt den Contract-Text *und* die
+  Executor-Prüfung, statt sie getrennt zu pflegen.
+
+Hermes' Läufe gehen über `opencode`, das MCP unterstützt — der Weg ist gangbar,
+ohne die Agentenschicht auszutauschen.
+
 ## Was zuerst zu klären ist
 
 1. **`tree` bei großen Bäumen.** 766 MB WordPress dauern ~90 s. Ein
@@ -165,7 +262,14 @@ schaffen soll, die Platte — was auf diesem Host schon einmal passiert ist.
 4. **Migration.** `cockpit-capability/v1` bleibt gültig; v2 ergänzt `scopes`.
    Ein v1-Manifest mit `writablePaths` wird auf `file`-Scopes abgebildet,
    verhält sich also exakt wie heute.
-5. **`cockpit-wordpress-update` danach.** Er wird überflüssig — oder bleibt
+5. **Contabo-Snapshot: Dauer und Wirkung.** Wie lange dauert `POST snapshots`
+   auf einer 1,2-TB-Instanz, und ist die Instanz dabei benutzbar? Ein Anbieter,
+   der den Host für Minuten anhält, ist für Routineläufe untauglich — das muss
+   gemessen werden, bevor er eingeplant wird.
+6. **Wechselwirkung mit borgmatic.** Ein VPS-Snapshot ist kein Ersatz für die
+   Sicherung: 30 Tage Aufbewahrung, beim selben Hoster, und ein Revert löscht
+   neuere Snapshots. Beides nebeneinander, mit klarer Rollenverteilung.
+7. **`cockpit-wordpress-update` danach.** Er wird überflüssig — oder bleibt
    als Beleg, dass der Mechanismus dasselbe leistet. Erst ersetzen, wenn v2
    dieselbe Aufgabe nachweislich erfüllt, nicht vorher.
 
