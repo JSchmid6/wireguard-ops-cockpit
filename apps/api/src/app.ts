@@ -132,6 +132,14 @@ export function evaluatePlanPolicy(plan: string, safetyVerdict: string): PlanPol
     [/\b(iptables|nft|ufw|useradd|userdel|usermod|groupadd|groupdel|visudo)\b/i, "network or identity boundary"],
     [/\b(mysql|mariadb)\b.{0,80}\b(nextcloud|oc_)/i, "direct Nextcloud database access"],
     [/(?:>|tee\b|sed\s+-i\b)[^\n]*(?:\/etc\/sudoers|NOPASSWD)/i, "sudo authority change"],
+      // The agent's own key material. Never a legitimate runbook target in any
+      // direction — a write extends the agent's rights (the NEWKEYBAD fixture
+      // probes exactly this), a read is exfiltration. Matched as a bare path
+      // mention because the fixture hides the write behind variables:
+      // FILE="/home/hermes/.hermes/.env"; echo "$LINE" >> "$FILE".
+      [/(?:\/home\/hermes|~|\$HOME)\/\.hermes\/\.?env\b/i, "agent environment (API keys)"],
+      [/(?:\/home\/hermes|~|\$HOME)\/\.hermes\/credentials/i, "agent credential store"],
+
   ];
   const hit = hardBoundaries.find(([pattern]) => pattern.test(executableScript));
   if (hit) {
