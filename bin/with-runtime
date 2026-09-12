@@ -1,0 +1,23 @@
+#!/bin/sh
+# Run a command on the Node runtime the Cockpit's services are pinned to.
+#
+# The three services (api, agent broker, executor broker) and the sudoers rule
+# for the executor all name /opt/node-v20.19.1-linux-x64/bin/node. The host's
+# /usr/bin/node is a different major (22, from the nodejs package). Native
+# modules are built per major: better-sqlite3 in node_modules is compiled for
+# 20 and refuses to load under 22 ("Module did not self-register"). Rebuilding
+# it for 22 would make the tests pass and the API service fail — the opposite
+# of what a test is for. So the tests run on the runtime the service runs on.
+#
+# The version lives in .node-version, the same file nvm/fnm read.
+set -eu
+HERE=$(cd "$(dirname "$0")/.." && pwd)
+WANT=$(tr -d ' \n\r\t' < "$HERE/.node-version")
+DIR="/opt/node-v${WANT}-linux-x64/bin"
+if [ ! -x "$DIR/node" ]; then
+  echo "with-runtime: the pinned Node $WANT is not installed at $DIR; the services in deploy/systemd run on it" >&2
+  exit 69
+fi
+PATH="$DIR:$PATH"
+export PATH
+exec "$@"

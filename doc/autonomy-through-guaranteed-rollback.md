@@ -208,7 +208,12 @@ Agentenkontext. Der Executor liest ihn aus seiner eigenen Umgebung.
 ```
 ops/cockpit-vps-snapshot            der Helfer (Python, root-eigen), installiert nach
                                     /usr/local/lib/wireguard-ops-cockpit/
-/etc/wireguard-ops-cockpit/contabo.env   Zugang, root 600, per ops/contabo-zugang-hinterlegen.sh
+/etc/wireguard-ops-cockpit/contabo.env   Zugang, root 600 — entweder von Hand per
+                                    ops/contabo-zugang-hinterlegen.sh (read -s) oder aus dem
+                                    Nextcloud-Passwortspeicher per ops/contabo-zugang-aus-nextcloud.py
+                                    (liest den Eintrag „contabo" mit Jochens Vollmacht; Felder
+                                    client_id / client_secret als benutzerdefinierte Felder,
+                                    Benutzername = API-Nutzer, Passwort = API-Passwort)
 ```
 
 | Aktion | Wer | Was |

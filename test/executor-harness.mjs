@@ -7,6 +7,10 @@ import { spawnSync } from "node:child_process";
 
 const EXECUTOR = process.argv[2];
 if (!EXECUTOR) { console.error("usage: harness <executor.mjs>"); process.exit(64); }
+// Derselbe Node wie in der sudoers-Regel des Brokers, nicht der der Shell:
+// /usr/bin/node ist eine andere Hauptversion (22) als die der Dienste (20).
+const PINNED = "/opt/node-v20.19.1-linux-x64/bin/node";
+const NODE = existsSync(PINNED) ? PINNED : "/usr/bin/node";
 
 const secret = readFileSync("/etc/wireguard-ops-cockpit/api.env", "utf8")
   .split(/\r?\n/).find((l) => l.startsWith("COCKPIT_EXECUTION_ENVELOPE_SECRET="))
@@ -24,7 +28,7 @@ function run(manifest, { approved = false } = {}) {
     operatorApproved: approved,
   };
   const digest = createHmac("sha256", secret).update(JSON.stringify(unsigned)).digest("hex");
-  const res = spawnSync("/usr/bin/node", [EXECUTOR], {
+  const res = spawnSync(NODE, [EXECUTOR], {
     input: JSON.stringify({ manifest, envelope: { ...unsigned, digest } }),
     encoding: "utf8", timeout: 600000, maxBuffer: 8 * 1024 * 1024,
   });

@@ -41,7 +41,7 @@ POST /api/runbooks {"prompt":"...","sessionId":"..."}
 
 **Build:** `./node_modules/.bin/tsc -p apps/api/tsconfig.json`
 **Deploy:** `systemctl restart wireguard-ops-cockpit-api`
-**Test:** `curl http://127.0.0.1:3001/api/health`
+**Test:** `npm test` (runs on the services' pinned Node via `bin/with-runtime`; `/usr/bin/node` is a different major and cannot load the native better-sqlite3 build), executor: `node test/executor-harness.mjs ops/cockpit-capability-action.mjs`, health: `curl http://127.0.0.1:3001/api/health`
 
 ## System Architecture
 

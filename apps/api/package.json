@@ -8,8 +8,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx watch src/index.ts",
-    "test": "vitest run",
-    "coverage": "vitest run --coverage"
+    "test": "../../bin/with-runtime vitest run",
+    "coverage": "../../bin/with-runtime vitest run --coverage"
   },
   "dependencies": {
     "@wireguard-ops-cockpit/domain": "*",
