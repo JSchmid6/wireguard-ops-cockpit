@@ -225,5 +225,24 @@ if (vpsCredentials) {
   check("vps scope: only one is allowed", d.status === 77, `status=${d.status}`);
 }
 
+// ── 13: der vps-Helfer lädt als Modul, und sein Taktgeber hält sauber an ──
+//        (12.09.2026: ein Feld namens _stop verdeckte Thread._stop; die erste
+//        echte Messung starb erst beim Anhalten — kein Test hatte create je
+//        ausgeführt. Dieser hier braucht keinen Zugang.)
+{
+  const probe = [
+    "import importlib.machinery, importlib.util, sys",
+    `loader = importlib.machinery.SourceFileLoader('vps', ${JSON.stringify(vpsHelper)})`,
+    "spec = importlib.util.spec_from_loader('vps', loader); m = importlib.util.module_from_spec(spec); loader.exec_module(m)",
+    "t = m.Ticker(interval=0.05); t.start(); import time; time.sleep(0.3); gap = t.stop()",
+    "assert t.ticks >= 3 and 0 < gap < 1, (t.ticks, gap)",
+    "assert m.looks_like_limit(400, {'message': 'Snapshot limit exceeded'}) and not m.looks_like_limit(400, {'message': 'bad name'})",
+    "print('ok')",
+  ].join("\n");
+  const r = spawnSync("/usr/bin/python3", ["-c", probe], { encoding: "utf8", timeout: 20000 });
+  check("vps helper: imports, ticker stops cleanly, limit heuristic holds", r.status === 0 && r.stdout.trim() === "ok",
+    `status=${r.status} ${(r.stderr || "").trim().slice(-200)}`);
+}
+
 console.log(failed === 0 ? "\nAlle Prüfungen bestanden." : `\n${failed} Prüfung(en) FEHLGESCHLAGEN.`);
 process.exit(failed === 0 ? 0 : 1);

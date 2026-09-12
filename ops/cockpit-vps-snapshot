@@ -63,7 +63,7 @@ def die(message: str, code: int = 70) -> "NoReturn":  # noqa: F821
 
 
 def usage() -> "NoReturn":  # noqa: F821
-    die("usage: cockpit-vps-snapshot status|list|create <name> [--wait <seconds>]|delete <snapshotId>|revert <snapshotId>", 64)
+    die("usage: cockpit-vps-snapshot status|list|create <name> [--wait <seconds>] [--observe <seconds>]|delete <snapshotId>|revert <snapshotId>", 64)
 
 
 # ─── Credentials ───────────────────────────────────────────────────────────
@@ -207,11 +207,13 @@ class Ticker(threading.Thread):
         self.interval = interval
         self.max_gap = 0.0
         self.ticks = 0
-        self._stop = threading.Event()
+        # Nicht `_stop`: den Namen benutzt threading.Thread selbst (join()
+        # ruft self._stop()). Der Schatten hat die erste Messung gekostet.
+        self._halt = threading.Event()
 
     def run(self) -> None:
         last = time.monotonic()
-        while not self._stop.is_set():
+        while not self._halt.is_set():
             time.sleep(self.interval)
             now = time.monotonic()
             self.max_gap = max(self.max_gap, now - last)
@@ -219,7 +221,7 @@ class Ticker(threading.Thread):
             last = now
 
     def stop(self) -> float:
-        self._stop.set()
+        self._halt.set()
         self.join(timeout=2)
         return round(self.max_gap, 3)
 
@@ -241,7 +243,7 @@ def looks_like_limit(status: int, data: dict) -> bool:
     return status in (400, 402, 403, 409, 422) and any(word in text for word in ("limit", "maximum", "exceed", "too many", "quota", "no more"))
 
 
-def act_create(api: Api, name: str, wait: int) -> dict:
+def act_create(api: Api, name: str, wait: int, observe: int = 20) -> dict:
     if not NAME_RE.match(name):
         die("snapshot name: letters, digits, dot, underscore, dash; at most 60 characters", 64)
     if not name.startswith(PREFIX):
@@ -280,16 +282,21 @@ def act_create(api: Api, name: str, wait: int) -> dict:
     # Wait until the hoster no longer reports the snapshot as in progress and
     # the instance is back to running. What "in progress" is called is not
     # documented; the pending set is a guess, so the final state is reported
-    # verbatim and the wait is capped.
+    # verbatim and the wait is capped. Measured 12.09.2026: the API answers
+    # the POST within a second and returns `status: null` — completion is not
+    # observable through it. So the guest is watched for at least `observe`
+    # seconds after the call: a pause by the hypervisor would show up there.
     final = created
+    api_seconds = round(time.monotonic() - started, 2)
     deadline = time.monotonic() + max(wait, 5)
+    observe_until = time.monotonic() + observe
     while time.monotonic() < deadline:
         current = snapshot_by_id(api, instance_id, snapshot_id)
         if current is not None:
             final = current
             inst_status, inst_data = api.call("GET", f"/compute/instances/{instance_id}")
             running = ((inst_data.get("data") or [{}])[0].get("status") == "running") if inst_status == 200 else True
-            if str(final.get("status", "")).lower() not in PENDING and running:
+            if str(final.get("status", "")).lower() not in PENDING and running and time.monotonic() >= observe_until:
                 break
         time.sleep(2)
     seconds = round(time.monotonic() - started, 1)
@@ -297,7 +304,9 @@ def act_create(api: Api, name: str, wait: int) -> dict:
     return {
         "instanceId": instance_id,
         "snapshot": {k: final.get(k) for k in ("snapshotId", "name", "createdDate", "autoDeleteDate", "status")},
+        "apiSeconds": api_seconds,
         "seconds": seconds,
+        "observedSeconds": observe,
         "maxGapSeconds": max_gap,
         "instanceStayedResponsive": max_gap < 3.0,
         "rotated": rotated,
@@ -335,23 +344,28 @@ def main(argv: list[str]) -> None:
     if not argv:
         usage()
     action, rest = argv[0], argv[1:]
-    wait = 600
-    if "--wait" in rest:
-        index = rest.index("--wait")
-        try:
-            wait = int(rest[index + 1])
-        except (IndexError, ValueError):
-            usage()
-        if not 5 <= wait <= 3600:
-            die("--wait: 5 to 3600 seconds", 64)
-        rest = rest[:index] + rest[index + 2:]
+    wait, observe = 600, 20
+    for flag, low, high in (("--wait", 5, 3600), ("--observe", 0, 600)):
+        if flag in rest:
+            index = rest.index(flag)
+            try:
+                value = int(rest[index + 1])
+            except (IndexError, ValueError):
+                usage()
+            if not low <= value <= high:
+                die(f"{flag}: {low} to {high} seconds", 64)
+            if flag == "--wait":
+                wait = value
+            else:
+                observe = value
+            rest = rest[:index] + rest[index + 2:]
     api = Api(load_env())
     if action == "status" and not rest:
         result = act_status(api)
     elif action == "list" and not rest:
         result = act_list(api)
     elif action == "create" and len(rest) == 1:
-        result = act_create(api, rest[0], wait)
+        result = act_create(api, rest[0], wait, observe)
     elif action == "delete" and len(rest) == 1:
         result = act_delete(api, rest[0])
     elif action == "revert" and len(rest) == 1:

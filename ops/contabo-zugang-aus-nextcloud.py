@@ -116,9 +116,20 @@ def passwoerter(konto: str, passwort: str) -> list[dict]:
     die(f"Passwortspeicher lehnt das Konto {konto} ab ({letzter}).", 69)
 
 
+def ist_client_eintrag(eintrag: dict) -> bool:
+    """Ein Eintrag, dessen Bezeichnung „client" enthaelt, traegt Client ID
+    und Secret als Benutzername und Passwort — so hat Jochen ihn angelegt
+    („API-contabo-clientID: Nutzer ist clientID und PW das Secret")."""
+    return bool(re.search(r"client", str(eintrag.get("label") or ""), re.I))
+
+
 def felder_von(eintrag: dict) -> dict[str, str]:
     """Die Zielvariablen, die dieser Eintrag liefert. Werte werden nur
-    weitergereicht, nie ausgegeben."""
+    weitergereicht, nie ausgegeben.
+
+    Benutzerdefinierte Felder zuerst; was dann noch fehlt, kommt aus
+    Benutzername und Passwort — bei einem Client-Eintrag als ID und Secret,
+    sonst als API-Nutzer und API-Passwort."""
     roh = eintrag.get("customFields") or "[]"
     try:
         eigene = json.loads(roh) if isinstance(roh, str) else roh
@@ -131,8 +142,14 @@ def felder_von(eintrag: dict) -> dict[str, str]:
             if nach_name.get(name):
                 werte[ziel] = str(nach_name[name]).strip()
                 break
-    werte.setdefault("CONTABO_API_USER", (eintrag.get("username") or "").strip())
-    werte.setdefault("CONTABO_API_PASSWORD", (eintrag.get("password") or "").strip())
+    nutzer = (eintrag.get("username") or "").strip()
+    passwort = (eintrag.get("password") or "").strip()
+    if ist_client_eintrag(eintrag):
+        werte.setdefault("CONTABO_CLIENT_ID", nutzer)
+        werte.setdefault("CONTABO_CLIENT_SECRET", passwort)
+    else:
+        werte.setdefault("CONTABO_API_USER", nutzer)
+        werte.setdefault("CONTABO_API_PASSWORD", passwort)
     return {k: v for k, v in werte.items() if v}
 
 
@@ -189,19 +206,28 @@ def main() -> None:
         die(f"Im Passwortspeicher von {args.konto} gibt es keinen Eintrag mit „contabo\" in Bezeichnung oder URL "
             f"({len(eintraege)} Eintraege gesehen). Anlegen: Bezeichnung „Contabo API\", Benutzername = Konto-E-Mail, "
             "Passwort = API-Passwort (Account -> API), Felder client_id und client_secret.", 66)
-    # Meiste Felder zuerst; bei Gleichstand der Eintrag, der nach API klingt
-    # („auth.contabo", „Contabo API") vor dem Panel-Login („my.contabo.com").
-    def rang(e: dict) -> tuple[int, int]:
-        return (len(felder_von(e)), int(bool(re.search(r"auth|api", str(e.get("label") or ""), re.I))))
+    # Die vier Werte duerfen ueber mehrere Eintraege verteilt sein: einer fuer
+    # den API-Login („auth.contabo"), einer fuer die Client-Zugangsdaten
+    # („API-contabo-clientID"). Zusammengefuehrt wird in Rangfolge — wer
+    # zuerst kommt, behaelt sein Feld: Eintraege, die nach API oder auth
+    # klingen, vor Client-Eintraegen, vor dem blossen Panel-Login
+    # („my.contabo.com"), dessen Passwort NICHT das API-Passwort ist.
+    def rang(e: dict) -> tuple[int, int, int]:
+        label = str(e.get("label") or "")
+        return (int(bool(re.search(r"auth|api", label, re.I)) and not ist_client_eintrag(e)),
+                int(ist_client_eintrag(e)), len(felder_von(e)))
     treffer.sort(key=rang, reverse=True)
-    if len(treffer) > 1 and rang(treffer[0]) == rang(treffer[1]):
-        sys.stderr.write("Mehrere Eintraege passen gleich gut — bitte --eintrag <Kennung>:\n")
-        for e in treffer:
-            sys.stderr.write(f"  {beschreibe(e)}\n")
-        sys.exit(65)
-    eintrag = treffer[0]
-    werte = felder_von(eintrag)
-    print(f"Eintrag: {beschreibe(eintrag)}")
+    werte: dict[str, str] = {}
+    benutzt: list[dict] = []
+    for e in treffer:
+        neu = {k: v for k, v in felder_von(e).items() if k not in werte}
+        if neu:
+            werte.update(neu)
+            benutzt.append(e)
+        if all(k in werte for k in PFLICHT):
+            break
+    for e in benutzt:
+        print(f"Eintrag: {beschreibe(e)}")
     fehlend = [k for k in PFLICHT if k not in werte]
     if fehlend:
         hinweise = {

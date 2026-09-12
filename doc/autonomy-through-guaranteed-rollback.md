@@ -254,8 +254,28 @@ Dokumentation nicht — die erste Antwort der API wird es zeigen.
 `evaluatePlanPolicy` neben `~/.hermes/credentials`: Ein Plan, der die Datei
 liest oder schreibt, wird blockiert, gleich was die Sicherheitsprüfung sagt.
 
-**Noch offen:** die Messung (Frage 5 unten). Das Werkzeug dafür ist eingebaut;
-es fehlt der hinterlegte Zugang.
+**Gemessen (12.09.2026, Instanz 100061162 / vmd61162, Tarif „V3", 1,2 TB):**
+
+```
+POST snapshots      1,08 s bis zur Antwort
+Beobachtung danach  30 s, Takt 0,25 s, größte Lücke 0,288 s  → kein Aussetzer
+status im Ergebnis  null — die API zeigt keinen Fortschritt, Fertigstellung
+                    ist über sie nicht beobachtbar
+createdDate         zwei Stunden hinter UTC (15:49Z bei tatsächlich 17:49Z);
+                    autoDeleteDate stimmt. Hoster-Eigenheit, unsere Uhr ist
+                    NTP-synchron und gegen HTTP-Date geprüft.
+Limit               3 Snapshots je Instanz in diesem Tarif. Der vierte
+                    `create` lief in die Grenze, die Rotation griff (ältester
+                    cockpit-Snapshot weg, neuer angelegt, 2,6 s), Ergebnis
+                    trägt `rotated`. Die Messschnappschüsse wurden danach
+                    gelöscht; das Konto steht wieder auf null.
+```
+
+Damit ist Jochens Erwartung bestätigt: Copy-on-Write, Anlegen ist eine
+Buchhaltungsoperation, die Instanz läuft durch. Der Anbieter taugt für jeden
+Lauf, nicht nur für Wartungsfenster. Was bleibt: absturzkonsistent, nicht
+anwendungskonsistent — für den Rückweg nach einem missglückten Update genau
+richtig, als Ersatz für borgmatic nicht.
 
 ## MCP: Schema statt Prosa — aber nicht als Gesprächsmuster
 
@@ -319,10 +339,10 @@ ohne die Agentenschicht auszutauschen.
 5. **Contabo-Snapshot: Dauer und Wirkung.** Wie lange dauert `POST snapshots`
    auf einer 1,2-TB-Instanz, und ist die Instanz dabei benutzbar? Ein Anbieter,
    der den Host für Minuten anhält, ist für Routineläufe untauglich — das muss
-   gemessen werden, bevor er eingeplant wird. *Stand 12.09.2026:* `create`
-   misst beides selbst (`seconds`, `maxGapSeconds` — ein Takt von 0,25 s, dessen
-   größte Lücke zeigt, ob der Gast angehalten wurde). Die Messung steht aus,
-   bis der API-Zugang hinterlegt ist.
+   gemessen werden, bevor er eingeplant wird. **Beantwortet 12.09.2026:**
+   die API antwortet nach 1,08 s, die Instanz läuft ohne messbare Lücke
+   weiter (größte Lücke 0,288 s bei 0,25 s Takt über 30 s). Zahlen und
+   Vorbehalte oben unter „Gemessen".
 6. **Wechselwirkung mit borgmatic.** Ein VPS-Snapshot ist kein Ersatz für die
    Sicherung: 30 Tage Aufbewahrung, beim selben Hoster, und ein Revert löscht
    neuere Snapshots. Beides nebeneinander, mit klarer Rollenverteilung.
