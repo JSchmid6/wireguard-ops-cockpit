@@ -93,8 +93,17 @@ function restoreTree(item) {
 const scopeList = isV2 && Array.isArray(manifest.scopes) ? manifest.scopes : [];
 if (scopeList.length > 8) fail("too many scopes");
 const treeScopes = [];
+let vpsScope = false;
 for (const scope of scopeList) {
   if (!scope || typeof scope !== "object") fail("invalid scope");
+  if (scope.kind === "vps") {
+    // Kein Pfad: der Scope IST die Maschine. Ein Snapshot vor dem ersten
+    // Schritt; zurueckgerollt wird er nie automatisch (siehe unten).
+    if (vpsScope) fail("only one vps scope is allowed", 77);
+    if (Object.keys(scope).some((key) => key !== "kind")) fail("vps scope takes no parameters", 77);
+    vpsScope = true;
+    continue;
+  }
   if (scope.kind !== "tree") fail(`unsupported scope kind: ${scope.kind}`, 77);
   if (typeof scope.path !== "string" || !scope.path.startsWith("/") || scope.path.includes("\0")) fail("invalid tree scope path");
   const resolved = realpathSync(normalize(scope.path));
@@ -114,7 +123,11 @@ for (const a of treeScopes) for (const b of treeScopes) {
 // Manifest, das `contained` behauptet, ohne Scopes zu deklarieren, bekommt
 // deshalb keine Freiheit, sondern eine Freigabepflicht.
 const declaredRisky = (manifest.risk || []).some((item) => risky.has(item));
-const rollbackGuaranteed = isV2 && treeScopes.length > 0;
+// Der vps-Scope zaehlt als Rueckweg, obwohl der Executor ihn nicht selbst
+// geht: Autonomie gruendet darauf, dass ein garantierter Weg zurueck EXISTIERT
+// (Entwurf 18.08.2026). Ob man ihn geht — mit allem Kollateral seit dem
+// Snapshot — entscheidet ein Mensch per Freigabe.
+const rollbackGuaranteed = isV2 && (treeScopes.length > 0 || vpsScope);
 if (!approved && manifest.network === "host") fail("operator approval is required for host networking", 77);
 if (!approved && declaredRisky && !rollbackGuaranteed) fail("operator approval is required for exposure, data-loss, identity, or secret risk", 77);
 
@@ -153,10 +166,19 @@ const nextcloudContextHelper = "/usr/local/sbin/cockpit-nextcloud-context-action
 const exactFileReplaceHelper = "/usr/local/sbin/cockpit-exact-file-replace";
 const hermesSkillHelper = "/usr/local/lib/wireguard-ops-cockpit/cockpit-hermes-skill-action";
 const emailArchiveDeployHelper = "/usr/local/lib/wireguard-ops-cockpit/cockpit-email-archive-deploy";
+// Maschinen-Snapshot beim Hoster (Anbieter `vps`). Asymmetrisch: anlegen und
+// lesen autonom, loeschen und zurueckrollen nur mit Freigabe — ein Revert ist
+// eine Zeitmaschine fuer den ganzen Wirt, kein chirurgischer Rueckbau.
+const vpsSnapshotHelper = "/usr/local/lib/wireguard-ops-cockpit/cockpit-vps-snapshot";
+const vpsSnapshotEnv = "/etc/wireguard-ops-cockpit/contabo.env";
+const vpsAutonomous = new Set(["status", "list", "create"]);
+const vpsGated = new Set(["delete", "revert"]);
+function isVpsStep(step) { return step?.argv?.[0] === "/usr/bin/python3" && step?.argv?.[1] === vpsSnapshotHelper; }
 const readOnlyContainerCommands = new Set(["ps", "inspect", "version", "info"]);
 function stepNeedsApproval(step) {
   const executable = step?.argv?.[0] || "";
   if (executable === "/bin/sh" && step?.argv?.[1] === emailArchiveDeployHelper) return true;
+  if (isVpsStep(step)) return !vpsAutonomous.has(step?.argv?.[2] || "");
   if (executable === "/bin/sh" && step?.argv?.[1] === hermesSkillHelper && step?.argv?.[2] === "remove-empty-target") return true;
   if (dangerousExecutable.test(executable)) return true;
   if (/\/(?:docker|podman)$/.test(executable)) return !readOnlyContainerCommands.has(step?.argv?.[1] || "");
@@ -175,6 +197,27 @@ for (const [index, target] of writablePaths.entries()) {
 for (const [index, target] of treeScopes.entries()) {
   snapshot.push(snapshotTree(target, backupRoot, `tree-${index}`));
 }
+if (vpsScope) {
+  // Direkt als root, nicht im Sandkasten: der Helfer liest die Hoster-
+  // Zugangsdaten selbst und gibt nur Kennung und Messwerte zurueck.
+  const name = `cockpit-job-${envelope.jobId}`.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 60);
+  const made = spawnSync("/usr/bin/python3", [vpsSnapshotHelper, "create", name, "--wait", "900"], {
+    encoding: "utf8", timeout: 1000000, maxBuffer: 1024 * 1024, env: { PATH: "/usr/sbin:/usr/bin:/sbin:/bin", LANG: "C.UTF-8" },
+  });
+  if (made.status !== 0) fail(`machine snapshot failed, nothing was executed: ${(made.stderr || "").trim().slice(-400)}`, made.status === 69 ? 69 : 70);
+  let result;
+  try { result = JSON.parse(made.stdout); } catch { fail("machine snapshot returned no result", 70); }
+  if (!result?.snapshot?.snapshotId) fail("machine snapshot returned no id", 70);
+  // existed:true, backup:null — die Rueckspiel-Schleife unten ueberspringt
+  // ihn absichtlich. Ein Revert ist nie Teil eines automatischen Rueckbaus.
+  snapshot.push({ kind: "vps", target: "/", backup: null, existed: true, snapshotId: result.snapshot.snapshotId, name: result.snapshot.name,
+    autoDeleteDate: result.snapshot.autoDeleteDate, seconds: result.seconds, maxGapSeconds: result.maxGapSeconds, rotated: result.rotated });
+}
+const vpsSnapshot = snapshot.find((item) => item.kind === "vps") || null;
+const vpsReturnPath = vpsSnapshot
+  ? { ...vpsSnapshot, kind: undefined, target: undefined, backup: undefined, existed: undefined,
+      revert: `requires operator approval: ${vpsSnapshotHelper} revert ${vpsSnapshot.snapshotId} — restarts the host and discards everything written since` }
+  : undefined;
 writeFileSync(`${backupRoot}/manifest.json`, JSON.stringify({ manifest, snapshot }, null, 2), { mode: 0o600 });
 
 const outputs = [];
@@ -235,6 +278,19 @@ for (const [index, step] of manifest.steps.entries()) {
       "--property=BindPaths=/var/run/docker.sock",
     );
   }
+  if (isVpsStep(step)) {
+    const action = step.argv[2] || "";
+    const arity = action === "status" || action === "list" ? 3 : 4;
+    const withWait = step.argv.length === arity + 2 && step.argv[arity] === "--wait" && /^\d{1,4}$/.test(step.argv[arity + 1]);
+    if (!(vpsAutonomous.has(action) || vpsGated.has(action)) || (step.argv.length !== arity && !withWait) || runAsUser) {
+      fail(`step ${index + 1} has an invalid VPS snapshot action`, 77);
+    }
+    if (arity === 4 && !/^[A-Za-z0-9._-]{1,60}$/.test(step.argv[3])) fail(`step ${index + 1} VPS snapshot argument is invalid`, 77);
+    if (manifest.network !== "outbound") fail(`step ${index + 1} VPS snapshot requires outbound-only network`, 77);
+    // Die Zugangsdaten nur fuer diesen Schritt, nur lesend, und ohne Fehler,
+    // wenn sie fehlen: dann sagt der Helfer selbst, was zu tun ist.
+    properties.push(`--property=BindReadOnlyPaths=-${vpsSnapshotEnv}`);
+  }
   if (runAsUser) properties.push(`--property=User=${runAsUser}`);
   if (manifest.network === "none") properties.push("--property=PrivateNetwork=yes", "--property=RestrictAddressFamilies=AF_UNIX");
   if (manifest.network === "local") properties.push(
@@ -258,7 +314,7 @@ for (const [index, step] of manifest.steps.entries()) {
   const requestedTimeout = Number.isInteger(step.timeoutSeconds) ? Math.min(Math.max(step.timeoutSeconds, 1), 900) : 120;
   const timeout = step.argv[0] === nextcloudAppHelper && step.argv[1] === "exapp-register"
     ? 3000
-    : step.argv[0] === nextcloudAppHelper || step.argv[0] === nextcloudContextHelper ? Math.max(requestedTimeout, 900) : requestedTimeout;
+    : step.argv[0] === nextcloudAppHelper || step.argv[0] === nextcloudContextHelper || isVpsStep(step) ? Math.max(requestedTimeout, 900) : requestedTimeout;
   const result = spawnSync("/usr/bin/systemd-run", ["--wait", "--pipe", "--collect", "--quiet", `--property=TimeoutStartSec=${timeout}`, ...properties, "--", ...step.argv], {
     encoding: "utf8", timeout: (timeout + 10) * 1000, maxBuffer: 1024 * 1024, env: { PATH: "/usr/sbin:/usr/bin:/sbin:/bin", LANG: "C.UTF-8" },
   });
@@ -275,8 +331,9 @@ for (const [index, step] of manifest.steps.entries()) {
     process.stdout.write(JSON.stringify({
       status: rollbackErrors.length === 0 ? "failed_rolled_back" : "failed_rollback_incomplete",
       snapshot: backupRoot, outputs, rollbackErrors,
+      ...(vpsReturnPath ? { vpsSnapshot: vpsReturnPath } : {}),
     }));
     process.exit(result.status || 1);
   }
 }
-process.stdout.write(JSON.stringify({ status: "success", snapshot: backupRoot, outputs }));
+process.stdout.write(JSON.stringify({ status: "success", snapshot: backupRoot, outputs, ...(vpsReturnPath ? { vpsSnapshot: vpsReturnPath } : {}) }));

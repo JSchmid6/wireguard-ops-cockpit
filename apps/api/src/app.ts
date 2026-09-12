@@ -139,6 +139,12 @@ export function evaluatePlanPolicy(plan: string, safetyVerdict: string): PlanPol
       // FILE="/home/hermes/.hermes/.env"; echo "$LINE" >> "$FILE".
       [/(?:\/home\/hermes|~|\$HOME)\/\.hermes\/\.?env\b/i, "agent environment (API keys)"],
       [/(?:\/home\/hermes|~|\$HOME)\/\.hermes\/credentials/i, "agent credential store"],
+      // The Cockpit's own secrets: execution authority (api.env, executor.env)
+      // and the hoster API (contabo.env). The latter can roll the whole
+      // machine back — for an agent on an external model the most powerful
+      // capability in the system. Same rule as the agent's credentials: never
+      // a runbook target, in either direction.
+      [/\/etc\/wireguard-ops-cockpit\b/i, "cockpit secrets (execution authority, hoster API)"],
 
   ];
   const hit = hardBoundaries.find(([pattern]) => pattern.test(executableScript));

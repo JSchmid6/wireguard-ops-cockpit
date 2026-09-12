@@ -203,6 +203,55 @@ mächtigste Fähigkeit im System. Er gehört behandelt wie `~/.hermes/credential
 harte Grenze in `evaluatePlanPolicy`, nie in einem Manifest, nie im
 Agentenkontext. Der Executor liest ihn aus seiner eigenen Umgebung.
 
+### Umgesetzt (12.09.2026)
+
+```
+ops/cockpit-vps-snapshot            der Helfer (Python, root-eigen), installiert nach
+                                    /usr/local/lib/wireguard-ops-cockpit/
+/etc/wireguard-ops-cockpit/contabo.env   Zugang, root 600, per ops/contabo-zugang-hinterlegen.sh
+```
+
+| Aktion | Wer | Was |
+|---|---|---|
+| `status`, `list` | autonom | Instanz und vorhandene Snapshots |
+| `create <name>` | autonom | Snapshot `cockpit-<name>`; misst Dauer und ob die Instanz dabei ansprechbar blieb (`seconds`, `maxGapSeconds`) |
+| `delete <id>` | **Freigabe** | löscht einen Rückweg |
+| `revert <id>` | **Freigabe** | Neustart, alles seit dem Snapshot ist weg |
+
+Die Asymmetrie erzwingt der Executor in `stepNeedsApproval`, nicht der Helfer:
+`delete` und `revert` ohne `operatorApproved` enden mit 77, bevor irgendetwas
+läuft. Der Helfer selbst kennt nur diese Instanz — gefunden über den Hostnamen
+(`vmd…`), den Contabo als Instanznamen führt, oder festgenagelt per
+`CONTABO_INSTANCE_ID` — und keinen anderen Endpunkt.
+
+Zwei Wege in ein Manifest:
+
+* **v1, als Schritt.** `/usr/bin/python3 …/cockpit-vps-snapshot create <name>`
+  vor den eigentlichen Schritten, `network: outbound`. Der Executor hängt dem
+  Schritt nur die Zugangsdatei lesend ein (`BindReadOnlyPaths=-…`, fehlt sie,
+  sagt der Helfer das und nichts anderes). So kann der Planer ihn heute schon
+  benutzen, weil die API nur v1 parst.
+* **v2, als Scope.** `{"kind":"vps"}` neben `tree`-Scopes. Der Executor legt
+  den Snapshot als root vor dem ersten Schritt an (`cockpit-job-<jobId>`),
+  scheitert das, wird nichts ausgeführt (Exit 69/70). Der Scope zählt für
+  `rollbackGuaranteed` — `data_loss` darf damit autonom laufen —, aber die
+  Rückspiel-Schleife überspringt ihn absichtlich: Ein Revert ist nie Teil eines
+  automatischen Rückbaus. Das Ergebnis trägt stattdessen `vpsSnapshot` mit
+  Kennung, Ablaufdatum und dem Freigabe-Befehl.
+
+**Rotation.** Erreicht `create` das Limit des Tarifs, löscht der Helfer den
+ältesten Snapshot, der mit `cockpit-` beginnt, und versucht es einmal neu. Von
+Hand angelegte Snapshots rührt er nie an; gibt es keinen eigenen, bricht er ab
+und nennt den Grund. Wie viele Snapshots der Tarif erlaubt, sagt Contabos
+Dokumentation nicht — die erste Antwort der API wird es zeigen.
+
+**Harte Grenze.** `/etc/wireguard-ops-cockpit` steht jetzt in
+`evaluatePlanPolicy` neben `~/.hermes/credentials`: Ein Plan, der die Datei
+liest oder schreibt, wird blockiert, gleich was die Sicherheitsprüfung sagt.
+
+**Noch offen:** die Messung (Frage 5 unten). Das Werkzeug dafür ist eingebaut;
+es fehlt der hinterlegte Zugang.
+
 ## MCP: Schema statt Prosa — aber nicht als Gesprächsmuster
 
 `capabilityPlannerContract()` ist heute ein Prosablock von ~1700 Token, mit
@@ -265,7 +314,10 @@ ohne die Agentenschicht auszutauschen.
 5. **Contabo-Snapshot: Dauer und Wirkung.** Wie lange dauert `POST snapshots`
    auf einer 1,2-TB-Instanz, und ist die Instanz dabei benutzbar? Ein Anbieter,
    der den Host für Minuten anhält, ist für Routineläufe untauglich — das muss
-   gemessen werden, bevor er eingeplant wird.
+   gemessen werden, bevor er eingeplant wird. *Stand 12.09.2026:* `create`
+   misst beides selbst (`seconds`, `maxGapSeconds` — ein Takt von 0,25 s, dessen
+   größte Lücke zeigt, ob der Gast angehalten wurde). Die Messung steht aus,
+   bis der API-Zugang hinterlegt ist.
 6. **Wechselwirkung mit borgmatic.** Ein VPS-Snapshot ist kein Ersatz für die
    Sicherung: 30 Tage Aufbewahrung, beim selben Hoster, und ein Revert löscht
    neuere Snapshots. Beides nebeneinander, mit klarer Rollenverteilung.
