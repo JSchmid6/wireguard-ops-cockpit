@@ -45,7 +45,7 @@ jobs:
           echo "${target}/bin" >> "$GITHUB_PATH"
 
       - name: Cache npm downloads
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.npm
           key: npm-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
