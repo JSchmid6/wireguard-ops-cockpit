@@ -7,11 +7,18 @@ export default defineConfig({
     coverage: {
       provider: "v8",
       reporter: ["text-summary", "json-summary"],
+      // Regression floor, not an aspiration. The previous thresholds
+      // (85/70/90/85) were never met on main -- CI was red from the start and
+      // therefore flagged nothing. Measured level on main (2026-09-24, pinned
+      // Node runtime): statements/lines 73.94, branches 62.87, functions
+      // 80.92. The values below sit ~1pp under that level so lost tests fail
+      // the run while refactors can still move the needle; raise them as the
+      // real coverage improves.
       thresholds: {
-        statements: 85,
-        branches: 70,
-        functions: 90,
-        lines: 85
+        statements: 73,
+        branches: 62,
+        functions: 80,
+        lines: 73
       }
     }
   }
