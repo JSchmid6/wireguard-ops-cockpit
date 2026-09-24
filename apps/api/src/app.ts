@@ -42,7 +42,7 @@ import {
 } from "./registries.js";
 import { generateRunbookSafetyReview, type SafetyReviewRunner } from "./safety-review.js";
 import { runBrokerAgent } from "./agent-broker.js";
-import { runDynamicCapability, runExecutorAction } from "./executor-broker.js";
+import { runDynamicCapability, runExecutorAction, type ExecutorActionKind } from "./executor-broker.js";
 import {
   capabilityManifestHash, capabilityNeedsOperatorApproval, capabilityPlannerContract,
   parseCapabilityManifest, type CapabilityManifest,
@@ -51,6 +51,7 @@ import {
   approveExecutionEnvelope,
   buildAgentTask,
   classifyCapabilities,
+  parseTypedDiskActions,
   createExecutionEnvelope,
   hashCanonical,
   normalizeAllowedCapabilities,
@@ -1641,23 +1642,34 @@ export async function createApp(options: AppOptions = {}) {
       });
       return `## EXECUTION RESULT\nSTATUS: success\nEXIT_CODE: 0\nWHAT_RAN: ${manifest.name}\nOUTPUT: ${filterSensitiveContent(output).slice(-30000)}\nNOTES: executed from a signed, agent-authored capability manifest in the host-effect sandbox`;
     }
-    if (!envelope.capabilities.includes("service.manage")) return null;
+    const wantsService = envelope.capabilities.includes("service.manage");
+    const wantsDisk = envelope.capabilities.includes("disk.manage");
+    if (!wantsService && !wantsDisk) return null;
     if (!config.executorBrokerSocket || !config.executorBrokerSecret) {
       throw new Error("typed executor broker is not configured");
     }
     const script = planText.match(/```(?:bash|sh)\s*\n([\s\S]*?)```/i)?.[1] || "";
-    const actions = script.split("\n").flatMap((line) => {
-      const match = line.trim().match(/^(?:sudo\s+)?(?:\/usr\/bin\/)?systemctl\s+(restart|status)\s+([a-zA-Z0-9@_.-]+)$/);
-      return match ? [{ action: `service.${match[1]}` as "service.restart" | "service.status", target: match[2] }] : [];
-    });
-    if (actions.length === 0) throw new Error("service.manage plan contains no typed service action");
+    const actions: Array<{ action: ExecutorActionKind; target: string }> = [];
+    if (wantsService) {
+      for (const line of script.split("\n")) {
+        const match = line.trim().match(/^(?:sudo\s+)?(?:\/usr\/bin\/)?systemctl\s+(restart|status)\s+([a-zA-Z0-9@_.-]+)$/);
+        if (match) actions.push({ action: `service.${match[1]}` as "service.restart" | "service.status", target: match[2] });
+      }
+    }
+    if (wantsDisk) {
+      const disk = parseTypedDiskActions(script);
+      if (disk.unsupported.length > 0) throw new Error(`disk.manage plan contains an unsupported mdadm form: ${disk.unsupported[0]}`);
+      actions.push(...disk.actions);
+    }
+    if (actions.length === 0) throw new Error("typed capability plan contains no typed action");
     const outputs: string[] = [];
     for (const action of actions) {
       outputs.push(await runExecutorAction(config.executorBrokerSocket, config.executorBrokerSecret, {
         ...action, expiresAt: envelope.expiresAt, envelopeDigest: envelope.digest,
       }));
     }
-    return `## EXECUTION RESULT\nSTATUS: success\nEXIT_CODE: 0\nWHAT_RAN: typed executor service actions\nOUTPUT: ${outputs.join("\n").slice(-10000)}\nNOTES: executed by isolated capability broker`;
+    const ran = actions.map((action) => `${action.action} ${action.target}`).join(", ");
+    return `## EXECUTION RESULT\nSTATUS: success\nEXIT_CODE: 0\nWHAT_RAN: typed executor actions: ${ran}\nOUTPUT: ${outputs.join("\n").slice(-10000)}\nNOTES: executed by isolated capability broker`;
   }
 
   function explanation(input: Partial<HermesExplanation> & Pick<HermesExplanation, "phase" | "intent" | "reason">): HermesExplanation {
@@ -2473,7 +2485,7 @@ Follow these rules:
           };
         }
         const unsupportedAutonomousCapabilities = capabilities.filter((capability) =>
-          capability !== "read.host" && capability !== "service.manage" && capability !== "shell.exception"
+          capability !== "read.host" && capability !== "service.manage" && capability !== "disk.manage" && capability !== "shell.exception"
         );
         if (!manifest && policy.allowed && unsupportedAutonomousCapabilities.length > 0) {
           policy = {

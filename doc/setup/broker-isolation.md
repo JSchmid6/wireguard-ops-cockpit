@@ -6,7 +6,7 @@ Production uses three Unix identities and two non-network Unix sockets.
 
 - `wgops`: Control API; supplementary member of both client groups
 - `cockpit-agent`: primary group `cockpit-agent-client`; no sudo
-- `cockpit-executor`: primary group `cockpit-executor-client`; only the static service helper and signed capability sandbox launcher in sudoers
+- `cockpit-executor`: primary group `cockpit-executor-client`; only the static service and disk helpers and the signed capability sandbox launcher in sudoers
 
 Never add `cockpit-agent` to `cockpit-executor-client` or grant it access to Control storage.
 
@@ -28,6 +28,7 @@ The Hermes token file is `hermes:hermes` mode `0600` because Hermes must present
 - `deploy/systemd/wireguard-ops-cockpit-executor.service`
 - `deploy/systemd/wireguard-ops-cockpit-api-brokers.conf`
 - `deploy/helpers/cockpit-service-action`
+- `deploy/helpers/cockpit-disk-action` (typed IMSM maintenance on the fixed `/dev/md127` container: `status`, `remove`/`add` for whole `sd[a-z]` disks only; refuses to remove an active member of an already degraded volume and refuses to add a disk that carries a filesystem, foreign metadata, or lands while a rebuild is running; verifies through `/proc/mdstat`)
 - `deploy/helpers/cockpit-capability-action` (installed root-owned as `/usr/local/lib/wireguard-ops-cockpit/cockpit-capability-action.mjs` and pinned to the production Node 20 runtime)
 - `deploy/helpers/cockpit-exact-file-replace` (generic exact-content replacement constrained to the signed manifest's matching writable file)
 - `deploy/helpers/cockpit-nextcloud-context-action` and `deploy/helpers/nextcloud-context-test-file.php` (fixed, non-overwriting Context Chat E2E operations)

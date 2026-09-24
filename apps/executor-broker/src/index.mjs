@@ -6,9 +6,12 @@ import { spawn } from "node:child_process";
 const socketPath = process.env.COCKPIT_EXECUTOR_BROKER_SOCKET || "/run/wireguard-ops-cockpit/executor.sock";
 const secret = process.env.COCKPIT_EXECUTOR_BROKER_SECRET || "";
 const helper = "/usr/local/sbin/cockpit-service-action";
+const diskHelper = "/usr/local/sbin/cockpit-disk-action";
 const capabilityHelper = "/usr/local/lib/wireguard-ops-cockpit/cockpit-capability-action.mjs";
 const capabilityNode = "/opt/node-v20.19.1-linux-x64/bin/node";
 const services = new Set(["apache2", "wireguard-ops-cockpit-ttyd"]);
+const diskActions = new Set(["disk.status", "disk.remove", "disk.add"]);
+const diskDevice = /^sd[a-z]$/;
 
 function signature(payload) { return createHmac("sha256", secret).update(JSON.stringify(payload)).digest("hex"); }
 export function validateRequest(value, now = Date.now()) {
@@ -17,8 +20,10 @@ export function validateRequest(value, now = Date.now()) {
   const expected = signature(value.payload);
   if (!/^[a-f0-9]{64}$/.test(value.signature) || !timingSafeEqual(Buffer.from(value.signature, "hex"), Buffer.from(expected, "hex"))) throw new Error("invalid request signature");
   const { action, target, expiresAt, envelopeDigest } = value.payload;
-  if (action !== "service.restart" && action !== "service.status" && action !== "capability.execute") throw new Error("unsupported capability action");
+  if (action !== "service.restart" && action !== "service.status" && action !== "capability.execute" && !diskActions.has(action)) throw new Error("unsupported capability action");
   if (action.startsWith("service.") && !services.has(target)) throw new Error("service target is not allowlisted");
+  if (action === "disk.status" && target !== "md127") throw new Error("disk target is not allowlisted");
+  if ((action === "disk.remove" || action === "disk.add") && (typeof target !== "string" || !diskDevice.test(target))) throw new Error("disk device is not allowlisted");
   if (action === "capability.execute" && (!value.payload.manifest || !value.payload.envelope)) throw new Error("dynamic capability payload is incomplete");
   if (typeof envelopeDigest !== "string" || !/^[a-f0-9]{64}$/.test(envelopeDigest)) throw new Error("invalid envelope digest");
   if (typeof expiresAt !== "string" || now > Date.parse(expiresAt)) throw new Error("execution request expired");
@@ -40,6 +45,17 @@ export function execute(payload) {
         error: code === 0 ? null : [error, output].filter(Boolean).join("\n").slice(-50000),
       }));
       child.stdin.end(JSON.stringify({ manifest: payload.manifest, envelope: payload.envelope }));
+      return;
+    }
+    if (payload.action.startsWith("disk.")) {
+      const diskVerb = payload.action.slice("disk.".length);
+      const diskArgs = diskVerb === "status" ? [diskVerb] : [diskVerb, payload.target];
+      const child = spawn("sudo", ["-n", diskHelper, ...diskArgs], { env: { PATH: "/usr/sbin:/usr/bin:/sbin:/bin" }, stdio: ["ignore", "pipe", "pipe"] });
+      let diskOutput = ""; let diskError = "";
+      child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => { diskOutput += chunk; }); child.stderr.on("data", (chunk) => { diskError += chunk; });
+      child.on("error", (reason) => resolve({ ok: false, error: reason.message }));
+      child.on("close", (code) => resolve({ ok: code === 0, exitCode: code, output: diskOutput.slice(-20000), error: code === 0 ? null : [diskError, diskOutput].filter(Boolean).join("\n").slice(-4000) }));
       return;
     }
     const verb = payload.action === "service.restart" ? "restart" : "status";

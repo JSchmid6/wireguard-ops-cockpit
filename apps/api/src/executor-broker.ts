@@ -4,7 +4,8 @@ import { createHmac } from "node:crypto";
 import type { CapabilityManifest } from "./capability-manifest.js";
 import type { ExecutionEnvelope } from "./hermes-security.js";
 
-export interface ExecutorAction { action: "service.restart" | "service.status"; target: string; expiresAt: string; envelopeDigest: string }
+export type ExecutorActionKind = "service.restart" | "service.status" | "disk.status" | "disk.remove" | "disk.add";
+export interface ExecutorAction { action: ExecutorActionKind; target: string; expiresAt: string; envelopeDigest: string }
 export interface DynamicExecutorAction { action: "capability.execute"; manifest: CapabilityManifest; envelope: ExecutionEnvelope; expiresAt: string; envelopeDigest: string }
 export async function runExecutorAction(socketPath: string, secret: string, payload: ExecutorAction): Promise<string> {
   const signature = createHmac("sha256", secret).update(JSON.stringify(payload)).digest("hex");
