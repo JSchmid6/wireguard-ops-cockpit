@@ -6,6 +6,12 @@ on:
     branches:
       - main
 
+env:
+  # The api safety review reads the actual runbook scripts below the repository
+  # root (buildRunbookSafetyPrompt). Production defaults to
+  # /opt/wireguard-ops-cockpit; on a runner the checkout is the repository root.
+  COCKPIT_REPO_ROOT: ${{ github.workspace }}
+
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
@@ -16,11 +22,35 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - name: Install pinned Node runtime
+        # bin/with-runtime (used by `npm test`) runs commands on the exact
+        # runtime the systemd services are pinned to: /opt/node-v<version>-linux-x64,
+        # with <version> read from .node-version. Install that runtime here so
+        # the tests run on the same Node major as production instead of failing
+        # closed when the directory does not exist.
+        run: |
+          set -euo pipefail
+          version="$(tr -d ' \n\r\t' < .node-version)"
+          target="/opt/node-v${version}-linux-x64"
+          if [ -x "${target}/bin/node" ]; then
+            echo "pinned Node ${version} already installed at ${target}"
+          else
+            tarball="node-v${version}-linux-x64.tar.xz"
+            base="https://nodejs.org/dist/v${version}"
+            curl -fsSLo "${RUNNER_TEMP}/${tarball}" "${base}/${tarball}"
+            curl -fsSLo "${RUNNER_TEMP}/SHASUMS256.txt" "${base}/SHASUMS256.txt"
+            (cd "${RUNNER_TEMP}" && grep " ${tarball}\$" SHASUMS256.txt | sha256sum -c -)
+            sudo tar -xJf "${RUNNER_TEMP}/${tarball}" -C /opt
+          fi
+          echo "${target}/bin" >> "$GITHUB_PATH"
+
+      - name: Cache npm downloads
+        uses: actions/cache@v4
         with:
-          node-version: "20"
-          cache: npm
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            npm-${{ runner.os }}-
 
       - name: Install dependencies
         run: npm ci
