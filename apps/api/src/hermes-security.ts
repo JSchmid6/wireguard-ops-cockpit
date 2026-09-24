@@ -8,6 +8,7 @@ export interface UntrustedEvidence {
 export type CapabilityId =
   | "read.host"
   | "service.manage"
+  | "disk.manage"
   | "package.manage"
   | "filesystem.write"
   | "network.manage"
@@ -16,9 +17,42 @@ export type CapabilityId =
   | "shell.exception";
 
 const CAPABILITIES = new Set<CapabilityId>([
-  "read.host", "service.manage", "package.manage", "filesystem.write", "network.manage",
+  "read.host", "service.manage", "disk.manage", "package.manage", "filesystem.write", "network.manage",
   "identity.manage", "database.direct", "shell.exception",
 ]);
+
+// The only mdadm invocations the typed disk executor accepts. Everything else
+// stays shell.exception and can never be auto-executed.
+const MDADM_MANAGE_LINE = /^(?:sudo\s+)?(?:\/(?:usr\/)?sbin\/)?mdadm\s+--manage\s+\/dev\/md127\s+--(add|remove)\s+(?:\/dev\/)?(sd[a-z])$/;
+const MDADM_DETAIL_LINE = /^(?:sudo\s+)?(?:\/(?:usr\/)?sbin\/)?mdadm\s+--detail\s+\/dev\/md12[67]$/;
+
+export interface TypedDiskAction { action: "disk.status" | "disk.remove" | "disk.add"; target: string }
+
+export function isTypedDiskLine(line: string): boolean {
+  const trimmed = line.trim();
+  return MDADM_MANAGE_LINE.test(trimmed) || MDADM_DETAIL_LINE.test(trimmed);
+}
+
+export function parseTypedDiskActions(script: string): { actions: TypedDiskAction[]; unsupported: string[] } {
+  const actions: TypedDiskAction[] = [];
+  const unsupported: string[] = [];
+  for (const rawLine of script.split("\n")) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#") || /^set\s+-/.test(line)) continue;
+    if (!/\bmdadm\b/.test(line)) continue;
+    const manage = line.match(MDADM_MANAGE_LINE);
+    if (manage) {
+      actions.push({ action: manage[1] === "add" ? "disk.add" : "disk.remove", target: manage[2] });
+      continue;
+    }
+    if (MDADM_DETAIL_LINE.test(line)) {
+      actions.push({ action: "disk.status", target: "md127" });
+      continue;
+    }
+    unsupported.push(line);
+  }
+  return { actions, unsupported };
+}
 
 export function normalizeAllowedCapabilities(value: unknown): CapabilityId[] {
   if (!Array.isArray(value)) return ["read.host"];
@@ -107,6 +141,7 @@ export function classifyCapabilities(plan: string): CapabilityId[] {
   const script = plan.match(/```(?:bash|sh)\s*\n([\s\S]*?)```/i)?.[1] || "";
   const capabilities = new Set<CapabilityId>();
   if (/\b(systemctl|service)\s+(restart|start|stop|reload|enable|disable)\b/i.test(script)) capabilities.add("service.manage");
+  if (script.split("\n").some((line) => isTypedDiskLine(line))) capabilities.add("disk.manage");
   if (/\b(apt(?:-get)?|dnf|yum|rpm|dpkg|snap)\b/i.test(script)) capabilities.add("package.manage");
   if (/(?:^|[;&|]\s*)(?:cp|mv|install|truncate|touch|mkdir|chmod|chown|sed\s+-i|tee)\b|(?:^|\s)>{1,2}\s*\//im.test(script)) capabilities.add("filesystem.write");
   if (/\b(iptables|nft|ufw|ip\s+(?:addr|route|link)|wg(?:-quick)?)\b/i.test(script)) capabilities.add("network.manage");
@@ -124,7 +159,8 @@ export function classifyCapabilities(plan: string): CapabilityId[] {
       const typedMutation =
         (/^(systemctl|service)$/.test(command) && /\b(restart|start|stop|reload|enable|disable)\b/.test(segment)) ||
         (/^(apt|apt-get|dnf|yum|rpm|dpkg|snap)$/.test(command)) ||
-        (/^(iptables|nft|ufw|useradd|userdel|usermod|groupadd|groupdel)$/.test(command));
+        (/^(iptables|nft|ufw|useradd|userdel|usermod|groupadd|groupdel)$/.test(command)) ||
+        (command === "mdadm" && isTypedDiskLine(segment));
       if (!safeReadCommands.has(command) && !typedMutation) capabilities.add("shell.exception");
     }
   }

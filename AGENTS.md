@@ -41,7 +41,7 @@ POST /api/runbooks {"prompt":"...","sessionId":"..."}
 
 **Build:** `./node_modules/.bin/tsc -p apps/api/tsconfig.json`
 **Deploy:** `systemctl restart wireguard-ops-cockpit-api`
-**Test:** `npm test` (runs on the services' pinned Node via `bin/with-runtime`; `/usr/bin/node` is a different major and cannot load the native better-sqlite3 build), executor: `node test/executor-harness.mjs ops/cockpit-capability-action.mjs`, health: `curl http://127.0.0.1:3001/api/health`
+**Test:** `npm test` (runs on the services' pinned Node via `bin/with-runtime`; `/usr/bin/node` is a different major and cannot load the native better-sqlite3 build), executor: `node test/executor-harness.mjs ops/cockpit-capability-action.mjs`, disk helper: `sudo bash test/cockpit-disk-action.test.sh` (offline simulation against mdstat fixtures), health: `curl http://127.0.0.1:3001/api/health`
 
 ## System Architecture
 
@@ -109,6 +109,7 @@ Bare-metal Ubuntu VPS (161.97.86.86) running:
 - Approval is valid only for the stored, unexpired execution-envelope digest
 - Production agents run only through `/run/cockpit-agent/agent.sock`; never restore local `wgops` agent execution
 - Mutations run only through `/run/cockpit-executor/executor.sock` and a typed helper; never give the Agent socket access to the Executor group
+- The typed disk helper `cockpit-disk-action` backs `disk.manage` against the fixed IMSM container `/dev/md127`: `status` reports container members and volume redundancy; `remove`/`add` accept only whole `sd[a-z]` disks, refuse a second removal from an already degraded volume, refuse disks with a filesystem or foreign metadata, refuse while a rebuild runs, and verify every mutation against `/proc/mdstat`. Plans may use only `mdadm --manage /dev/md127 --add|--remove /dev/sdX` and `mdadm --detail /dev/md12[67]`; every other mdadm form remains a shell exception.
 - Prefer agent-authored `cockpit-capability/v1` manifests over one helper per tool command. Keep tool discovery, flags, sequencing, effects, rollback, and verification agent-owned.
 - Deterministic enforcement validates the signed manifest and actual host-effect scope. Only realistic external exposure, loss of existing data, and identity/credential/secret boundaries require a separate operator decision.
 - Retain a generated capability by digest only after independent post-execution verification.

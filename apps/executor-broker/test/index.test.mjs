@@ -20,3 +20,32 @@ test("executor broker accepts a signed dynamic manifest and rejects an incomplet
   const incompleteSignature = createHmac("sha256", "test-secret").update(JSON.stringify(incomplete)).digest("hex");
   assert.throws(() => validateRequest({ payload: incomplete, signature: incompleteSignature }, Date.parse("2029-01-01T00:00:00Z")));
 });
+
+const diskBase = { expiresAt: "2030-01-01T00:00:00.000Z", envelopeDigest: "c".repeat(64) };
+const sign = (payload) => createHmac("sha256", "test-secret").update(JSON.stringify(payload)).digest("hex");
+const validAt = Date.parse("2029-01-01T00:00:00Z");
+
+test("executor broker admits the typed disk actions on allowlisted targets", () => {
+  for (const [action, target] of [["disk.status", "md127"], ["disk.remove", "sda"], ["disk.add", "sdz"]]) {
+    const payload = { ...diskBase, action, target };
+    assert.deepEqual(validateRequest({ payload, signature: sign(payload) }, validAt), payload);
+  }
+});
+
+test("executor broker rejects disk targets and actions outside the allowlist", () => {
+  const rejected = [
+    { action: "disk.status", target: "md126" },
+    { action: "disk.status", target: "md127 " },
+    { action: "disk.remove", target: "sda1" },
+    { action: "disk.remove", target: "../sda" },
+    { action: "disk.remove", target: "/dev/sda" },
+    { action: "disk.add", target: "md127" },
+    { action: "disk.fail", target: "sda" },
+  ];
+  for (const partial of rejected) {
+    const payload = { ...diskBase, ...partial };
+    let threw = false;
+    try { validateRequest({ payload, signature: sign(payload) }, validAt); } catch { threw = true; }
+    assert.equal(threw, true, `expected rejection: ${JSON.stringify(partial)}`);
+  }
+});

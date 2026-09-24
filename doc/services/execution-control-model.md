@@ -199,7 +199,7 @@ Production separates three kernel-level identities:
 - `cockpit-agent` runs the local Agent Broker and owns only its model configuration and provider key. It cannot read Control state or the Executor socket.
 - `cockpit-executor` runs the typed Executor Broker. It cannot read Control state, provider credentials, or the Agent socket. Its only sudo entry invokes a root-owned validating helper.
 
-The Agent and Executor sockets use distinct Unix groups. When `COCKPIT_AGENT_BROKER_SOCKET` is configured, Control refuses all legacy same-process agent launches. Legacy typed service actions remain available; new autonomous work uses signed dynamic manifests and never falls back to unrestricted Agent shell execution.
+The Agent and Executor sockets use distinct Unix groups. When `COCKPIT_AGENT_BROKER_SOCKET` is configured, Control refuses all legacy same-process agent launches. Legacy typed service and disk actions remain available; new autonomous work uses signed dynamic manifests and never falls back to unrestricted Agent shell execution.
 
 ### Hooks
 

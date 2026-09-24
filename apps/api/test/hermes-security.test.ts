@@ -5,6 +5,7 @@ import {
   createExecutionEnvelope,
   normalizeEvidence,
   normalizeAllowedCapabilities,
+  parseTypedDiskActions,
   validateExecutionEnvelope,
 } from "../src/hermes-security.js";
 
@@ -48,5 +49,38 @@ describe("Hermes security contract", () => {
     expect(validateExecutionEnvelope(envelope, base, new Date("2026-01-01T00:10:00Z"))).toEqual([]);
     expect(validateExecutionEnvelope(envelope, { ...base, plan: "plan-v2" }, new Date("2026-01-01T00:10:00Z"))).toContain("plan drift");
     expect(validateExecutionEnvelope(envelope, base, new Date("2026-01-01T00:31:00Z"))).toContain("approval envelope expired");
+  });
+
+  it("accepts only the exact typed mdadm forms for the disk helper", () => {
+    const script = [
+      "# replace the failed member on the fixed IMSM container",
+      "set -euo pipefail",
+      "mdadm --manage /dev/md127 --remove /dev/sda",
+      "sudo mdadm --manage /dev/md127 --add sdb",
+      "/usr/sbin/mdadm --detail /dev/md126",
+    ].join("\n");
+    expect(parseTypedDiskActions(script)).toEqual({
+      actions: [
+        { action: "disk.remove", target: "sda" },
+        { action: "disk.add", target: "sdb" },
+        { action: "disk.status", target: "md127" },
+      ],
+      unsupported: [],
+    });
+  });
+
+  it("keeps every other mdadm invocation unsupported for the disk helper", () => {
+    const { actions, unsupported } = parseTypedDiskActions("mdadm --manage /dev/md127 --fail /dev/sda");
+    expect(actions).toEqual([]);
+    expect(unsupported).toEqual(["mdadm --manage /dev/md127 --fail /dev/sda"]);
+  });
+
+  it("classifies typed mdadm lines as disk.manage without a shell exception", () => {
+    expect(classifyCapabilities("```bash\nmdadm --manage /dev/md127 --remove /dev/sda\nmdadm --manage /dev/md127 --add /dev/sdb\n```")).toEqual(["disk.manage"]);
+    expect(classifyCapabilities("```bash\nmdadm --create /dev/md0 --level=1 --raid-devices=2 /dev/sdb /dev/sdc\n```")).toEqual(["shell.exception"]);
+  });
+
+  it("accepts disk.manage in an operator-provided allowlist", () => {
+    expect(normalizeAllowedCapabilities(["disk.manage", "become.root"])).toEqual(["disk.manage"]);
   });
 });

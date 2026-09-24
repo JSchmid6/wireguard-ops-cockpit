@@ -1,0 +1,338 @@
+#!/bin/bash
+# cockpit-disk-action — narrow mdadm maintenance helper for the Intel/IMSM
+# container on Lab0, pinned for the cockpit-executor service account.
+#
+# Usage (exactly; no other arguments are accepted):
+#   cockpit-disk-action status
+#   cockpit-disk-action remove <sdX>
+#   cockpit-disk-action add <sdX>
+#
+# Security contract:
+#   * The only mdadm target is the fixed container /dev/md127; devices are
+#     restricted to whole SCSI disks matching ^sd[a-z]$ (with or without the
+#     /dev/ prefix). Partitions, paths, symlinks, and free-form input are
+#     rejected before any command runs.
+#   * remove: the disk must be a current container member. Removing an active
+#     volume member while the volume is already degraded is refused (IMSM
+#     RAID10 near=2 house rule: never take two members down).
+#   * add: the disk must be present, whole, part of no active md array, free of
+#     filesystems or foreign metadata (blank or a previous IMSM member), and no
+#     rebuild/resync may be in flight (one disk at a time).
+#   * Every mutation is verified against /proc/mdstat before success is reported.
+#   * Output is one structured JSON line on stdout. Failures emit one JSON line
+#     on stderr and a sysexits-style exit code:
+#       64 usage | 65 device rejected | 66 state conflict | 67 environment
+#       68 verification failed | 69 mdadm failed
+#
+# Simulation harness hooks (used only by test/cockpit-disk-action.test.sh):
+#   COCKPIT_DISK_ACTION_MDSTAT, _SYSBLOCK, _MDADM, and _BLKID redirect the
+#   read-only inputs and the tool paths so the helper can run offline against
+#   fixtures. sudo(8) resets the environment (env_reset), the executor broker
+#   passes only PATH, and every mutation still requires uid 0 — a caller can
+#   never reach a redirected tool through the executor path.
+set -euo pipefail
+PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
+
+readonly CONTAINER="/dev/md127"
+readonly CONTAINER_NAME="md127"
+readonly MDSTAT="${COCKPIT_DISK_ACTION_MDSTAT:-/proc/mdstat}"
+readonly SYSBLOCK="${COCKPIT_DISK_ACTION_SYSBLOCK:-/sys/block}"
+
+ACTION="none"
+DEVICE=""
+
+json_escape() {
+  local value="${1:0:300}"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/ }"
+  value="${value//$'\r'/ }"
+  value="${value//$'\t'/ }"
+  printf '%s' "$value"
+}
+
+fail() { # fail <exit-code> <message>
+  printf '{"ok":false,"action":"%s","error":"%s","code":%s}\n' \
+    "$(json_escape "$ACTION")" "$(json_escape "$2")" "$1" >&2
+  exit "$1"
+}
+
+require_root() {
+  if [ "$(id -u)" -ne 0 ]; then fail 67 "mutating actions require root"; fi
+}
+
+resolve_mdadm() {
+  local candidate
+  if [ -n "${COCKPIT_DISK_ACTION_MDADM:-}" ]; then MDADM="$COCKPIT_DISK_ACTION_MDADM"; return 0; fi
+  for candidate in /usr/sbin/mdadm /sbin/mdadm /usr/local/sbin/mdadm; do
+    if [ -x "$candidate" ]; then MDADM="$candidate"; return 0; fi
+  done
+  fail 67 "mdadm is not installed"
+}
+
+resolve_blkid() {
+  local candidate
+  if [ -n "${COCKPIT_DISK_ACTION_BLKID:-}" ]; then BLKID="$COCKPIT_DISK_ACTION_BLKID"; return 0; fi
+  for candidate in /usr/sbin/blkid /sbin/blkid /usr/bin/blkid /bin/blkid; do
+    if [ -x "$candidate" ]; then BLKID="$candidate"; return 0; fi
+  done
+  fail 67 "blkid is not installed; refusing the add without a content check"
+}
+
+require_mdstat() {
+  if [ ! -r "$MDSTAT" ]; then fail 67 "$MDSTAT is not readable"; fi
+}
+
+normalize_device() {
+  local raw="$1"
+  case "$raw" in /dev/sd[a-z]) raw="${raw#/dev/}" ;; esac
+  if ! [[ "$raw" =~ ^sd[a-z]$ ]]; then
+    fail 65 "device is not an allowlisted whole disk (sd[a-z]): $raw"
+  fi
+  DEVICE="$raw"
+}
+
+mdstat_lines() { # $1 = md device name (md127); print that block's lines
+  awk -v want="$1" '
+    $1 == want && $2 == ":" { inblock = 1; print; next }
+    inblock && $0 ~ /^[[:space:]]*$/ { inblock = 0; next }
+    inblock { print }
+  ' "$MDSTAT"
+}
+
+block_members() { # stdin: one mdstat block; print member tokens of its first line
+  awk 'NR == 1 { for (i = 1; i <= NF; i++) if ($i ~ /^sd[a-z]\[/) print $i }'
+}
+
+container_members() {
+  mdstat_lines "$CONTAINER_NAME" | block_members
+}
+
+token_device() { # $1 token like sda[1](S) -> sda
+  if [[ "$1" =~ ^(sd[a-z])\[([0-9]+)\](\(([A-Z]+)\))?$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+  fi
+}
+
+container_has_device() { # $1 = sdX
+  local tok
+  for tok in $(container_members); do
+    if [ "$(token_device "$tok")" = "$1" ]; then return 0; fi
+  done
+  return 1
+}
+
+container_devs_json() {
+  local out="" sep="" tok
+  for tok in $(container_members); do
+    out="${out}${sep}\"$(token_device "$tok")\""
+    sep=","
+  done
+  printf '[%s]' "$out"
+}
+
+member_json_object() { # $1 = token; JSON object for a container member
+  if [[ "$1" =~ ^(sd[a-z])\[([0-9]+)\](\(([A-Z]+)\))?$ ]]; then
+    local dev="${BASH_REMATCH[1]}" slot="${BASH_REMATCH[2]}" flags="${BASH_REMATCH[4]:-}"
+    local flags_json="null" present="false"
+    if [ -n "$flags" ]; then flags_json="\"$(json_escape "$flags")\""; fi
+    if [ -e "$SYSBLOCK/$dev" ]; then present="true"; fi
+    printf '{"device":"%s","slot":%s,"flags":%s,"present":%s}' "$dev" "$slot" "$flags_json" "$present"
+  fi
+}
+
+all_md_names() {
+  awk '$2 == ":" && $1 ~ /^md[0-9]+$/ { sub(":", "", $1); print $1 }' "$MDSTAT"
+}
+
+volume_blocks() { # md blocks (besides the container) sharing container members
+  local name blk tok
+  for name in $(all_md_names); do
+    if [ "$name" = "$CONTAINER_NAME" ]; then continue; fi
+    blk="$(mdstat_lines "$name")"
+    for tok in $(container_members); do
+      if printf '%s\n' "$blk" | head -n1 | grep -qw "$(token_device "$tok")"; then
+        printf '%s\n' "$name"
+        break
+      fi
+    done
+  done
+}
+
+volume_counts() { # $1 md name; prints "<total> <active>" or nothing
+  local counts=""
+  counts="$(mdstat_lines "$1" | grep -oE '\[[0-9]+/[0-9]+\]' | head -n1 | tr -d '[]')" || true
+  printf '%s' "${counts//\// }"
+}
+
+volume_degraded() { # $1 md name; 0 = degraded or unknown (treat conservatively)
+  local counts total active
+  counts="$(volume_counts "$1")" || true
+  if [ -z "$counts" ]; then return 0; fi
+  total="${counts%% *}"; active="${counts##* }"
+  if [ "$total" = "$active" ]; then return 1; fi
+  return 0
+}
+
+volume_has_active_member() { # $1 md name, $2 sdX; 0 if listed without (F)
+  local line tok
+  line="$(mdstat_lines "$1" | head -n1)"
+  for tok in $line; do
+    if [[ "$tok" =~ ^(sd[a-z])\[ ]] && [ "${BASH_REMATCH[1]}" = "$2" ]; then
+      case "$tok" in
+        *"(F)"*) return 1 ;;
+        *) return 0 ;;
+      esac
+    fi
+  done
+  return 1
+}
+
+volume_sync() { # $1 md name; prints sync line if one is running
+  mdstat_lines "$1" | grep -oE '(recovery|resync|reshape|check)[[:space:]]*=.*' | head -n1 || true
+}
+
+status_command() {
+  local cblock line tok vol state level counts total active degraded sync s
+  local members_json="" volume_json="" sep="" vols_members="" vsep="" vt state2
+  require_mdstat
+  cblock="$(mdstat_lines "$CONTAINER_NAME")"
+  if [ -z "$cblock" ]; then
+    printf '{"ok":true,"action":"status","container":"%s","container_present":false,"members":[],"volumes":[]}\n' "$CONTAINER_NAME"
+    return 0
+  fi
+  line="$(printf '%s\n' "$cblock" | head -n1)"
+  state="$(printf '%s\n' "$line" | awk '{print $3}')"
+  for tok in $(container_members); do
+    members_json="${members_json}${sep}$(member_json_object "$tok")"
+    sep=","
+  done
+  sep=""
+  for vol in $(volume_blocks); do
+    line="$(mdstat_lines "$vol" | head -n1)"
+    state2="$(printf '%s\n' "$line" | awk '{print $3}')"
+    level="$(printf '%s\n' "$line" | awk '{print $4}')"
+    counts="$(volume_counts "$vol")" || true
+    total="null"; active="null"; degraded="true"
+    if [ -n "$counts" ]; then
+      total="${counts%% *}"; active="${counts##* }"
+      if [ "$total" = "$active" ]; then degraded="false"; fi
+    fi
+    sync="null"; s="$(volume_sync "$vol")" || true
+    if [ -n "$s" ]; then sync="\"$(json_escape "$s")\""; fi
+    vols_members=""; vsep=""
+    for vt in $(printf '%s\n' "$line" | block_members); do
+      vols_members="${vols_members}${vsep}\"$(token_device "$vt")\""
+      vsep=","
+    done
+    volume_json="${volume_json}${sep}{\"device\":\"${vol}\",\"state\":\"$(json_escape "$state2")\",\"level\":\"$(json_escape "$level")\",\"total\":${total},\"active\":${active},\"degraded\":${degraded},\"members\":[${vols_members}],\"sync\":${sync}}"
+    sep=","
+  done
+  printf '{"ok":true,"action":"status","container":"%s","container_present":true,"container_state":"%s","members":[%s],"volumes":[%s]}\n' \
+    "$CONTAINER_NAME" "$(json_escape "$state")" "$members_json" "$volume_json"
+}
+
+remove_command() {
+  local vol out i
+  require_root
+  require_mdstat
+  resolve_mdadm
+  if [ ! -e "$SYSBLOCK/$DEVICE" ]; then fail 66 "device /dev/$DEVICE is not present"; fi
+  if ! container_has_device "$DEVICE"; then fail 66 "/dev/$DEVICE is not a member of $CONTAINER_NAME"; fi
+  for vol in $(volume_blocks); do
+    if volume_degraded "$vol"; then
+      if volume_has_active_member "$vol" "$DEVICE"; then
+        fail 66 "refusing: volume $vol is already degraded and /dev/$DEVICE is an active member; finish the rebuild first (one disk at a time)"
+      fi
+    fi
+  done
+  out=""
+  if ! out="$("$MDADM" --manage "$CONTAINER" --remove "/dev/$DEVICE" 2>&1)"; then
+    fail 69 "mdadm remove failed: $out"
+  fi
+  i=0
+  while [ "$i" -lt 10 ]; do
+    if ! container_has_device "$DEVICE"; then break; fi
+    i=$((i + 1))
+    sleep 1
+  done
+  if container_has_device "$DEVICE"; then
+    fail 68 "verification failed: /dev/$DEVICE is still listed in $CONTAINER_NAME"
+  fi
+  printf '{"ok":true,"action":"remove","container":"%s","device":"%s","members_after":%s}\n' \
+    "$CONTAINER_NAME" "$DEVICE" "$(container_devs_json)"
+}
+
+add_command() {
+  local vol other fstype ptype out i s sync="null"
+  require_root
+  require_mdstat
+  resolve_mdadm
+  if [ ! -e "$SYSBLOCK/$DEVICE" ]; then fail 66 "device /dev/$DEVICE is not present"; fi
+  if container_has_device "$DEVICE"; then fail 66 "/dev/$DEVICE is already a member of $CONTAINER_NAME"; fi
+  for other in $(all_md_names); do
+    if [ "$other" = "$CONTAINER_NAME" ]; then continue; fi
+    if printf '%s\n' "$(mdstat_lines "$other")" | head -n1 | grep -qw "$DEVICE"; then
+      fail 66 "/dev/$DEVICE is already a member of $other"
+    fi
+  done
+  for vol in $(volume_blocks); do
+    if [ -n "$(volume_sync "$vol")" ]; then
+      fail 66 "a rebuild/resync is running on $vol; wait for it to finish (one disk at a time)"
+    fi
+  done
+  resolve_blkid
+  fstype="$("$BLKID" -p -o value -s TYPE "/dev/$DEVICE" 2>/dev/null || true)"
+  ptype="$("$BLKID" -p -o value -s PTTYPE "/dev/$DEVICE" 2>/dev/null || true)"
+  case "$fstype" in
+    ""|isw_raid_member) ;;
+    *) fail 66 "/dev/$DEVICE carries a filesystem or foreign metadata ($fstype); refusing to add" ;;
+  esac
+  if [ -n "$ptype" ] && [ "$fstype" != "isw_raid_member" ]; then
+    fail 66 "/dev/$DEVICE carries a partition table ($ptype); refusing to add"
+  fi
+  out=""
+  if ! out="$("$MDADM" --manage "$CONTAINER" --add "/dev/$DEVICE" 2>&1)"; then
+    fail 69 "mdadm add failed: $out"
+  fi
+  i=0
+  while [ "$i" -lt 30 ]; do
+    if container_has_device "$DEVICE"; then break; fi
+    i=$((i + 1))
+    sleep 1
+  done
+  if ! container_has_device "$DEVICE"; then
+    fail 68 "verification failed: /dev/$DEVICE did not appear in $CONTAINER_NAME within 30s"
+  fi
+  for vol in $(volume_blocks); do
+    s="$(volume_sync "$vol")" || true
+    if [ -n "$s" ]; then sync="\"$(json_escape "$s")\""; break; fi
+  done
+  printf '{"ok":true,"action":"add","container":"%s","device":"%s","members_after":%s,"volume_sync":%s}\n' \
+    "$CONTAINER_NAME" "$DEVICE" "$(container_devs_json)" "$sync"
+}
+
+main() {
+  if [ "$#" -lt 1 ]; then fail 64 "usage: cockpit-disk-action status|remove <sdX>|add <sdX>"; fi
+  local sub="$1"
+  shift
+  case "$sub" in
+    status)
+      if [ "$#" -ne 0 ]; then fail 64 "status takes no arguments"; fi
+      ACTION="status"
+      status_command
+      ;;
+    remove|add)
+      ACTION="$sub"
+      if [ "$#" -ne 1 ]; then fail 64 "$sub requires exactly one device argument"; fi
+      normalize_device "$1"
+      if [ "$sub" = "remove" ]; then remove_command; else add_command; fi
+      ;;
+    *)
+      fail 64 "unsupported subcommand: $sub"
+      ;;
+  esac
+}
+
+main "$@"

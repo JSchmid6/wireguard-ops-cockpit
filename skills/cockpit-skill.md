@@ -30,6 +30,13 @@ POST /api/hermes/runbook
 {"intent":"Restart Apache, verify HTTP health, and include rollback.","evidence":[{"source":"monitor:apache","content":"externally supplied observation"}],"allowedCapabilities":["service.manage"],"timeoutMs":50000,"execute":true}
 ```
 
+```json
+POST /api/hermes/runbook
+{"intent":"Replace the failed member /dev/sda of the IMSM container and restore redundancy.","evidence":[],"allowedCapabilities":["disk.manage"],"timeoutMs":50000,"execute":true}
+```
+
+For `disk.manage` the plan may contain only the exact typed forms `mdadm --manage /dev/md127 --remove /dev/sdX`, `mdadm --manage /dev/md127 --add /dev/sdX`, and `mdadm --detail /dev/md12[67]`; any other mdadm invocation stays blocked as a shell exception. The helper refuses a second removal while a volume is already degraded (one disk at a time) and refuses disks that carry a filesystem, foreign metadata, or arrive while a rebuild is running.
+
 Set `execute:false` to obtain a reviewed plan without mutation. The server waits at most 55 seconds in the POST request; background work continues durably for longer operations.
 
 ## Durable result contract
@@ -84,7 +91,7 @@ or use `"rejected"`. Approval is audited but never creates privilege: execution 
 - Cockpit HMAC-signs intent, evidence digests, plan, reviews, capabilities, actor, session, and expiry in the approval envelope; expired, unsigned, or drifting approvals must be replanned.
 - Mutation is successful only after independent verification; a runner success claim alone is insufficient.
 - Agents cannot access Control state or the typed Executor socket. Never request a local-shell fallback when a typed capability is unavailable.
-- Autonomous mutation currently supports only the typed service helper allowlist; `blocked_prerequisite` means a reviewed helper must be added first.
+- Autonomous mutation currently supports only the typed service helper allowlist (`systemctl restart|status` on allowlisted services) and the typed disk helper (`mdadm --manage /dev/md127 --add|--remove /dev/sdX`, `mdadm --detail /dev/md12[67]`); `blocked_prerequisite` means a reviewed helper must be added first.
 - `## Required Permissions` documents needs; it never creates sudoers rules.
 - There is no fallback to full sudo and no runtime sudoers mutation.
 - Generated proposals are job evidence, not permanently registered runbooks.
