@@ -5,6 +5,8 @@
 # Prüft den Helfer ohne echte RAID-Hardware: /proc/mdstat wird durch Fixtures
 # ersetzt, mdadm/blkid/sysfs durch Stubs (COCKPIT_DISK_ACTION_*-Hooks). Es wird
 # der ORIGINALE deploy/helpers/cockpit-disk-action ausgeführt, keine Kopie.
+# Ein eigener Fall spiegelt die Sandbox-Anordnung des Capability-Runners:
+# mdstat read-only auf neutralem Pfad (z. B. /run/mdstat), SYSBLOCK aus sysfs.
 #
 # Aufruf (kein mdadm nötig; auf Lab0 direkt als root, sonst mit sudo):
 #   sudo bash test/cockpit-disk-action.test.sh
@@ -269,6 +271,22 @@ COCKPIT_DISK_ACTION_MDSTAT="$WORK/gibt-es-nicht" "$HELPER" status >"$WORK/o" 2>"
 OUT="$(cat "$WORK/o")"; ERR="$(cat "$WORK/e")"
 assert_rc "fehlende mdstat -> 67" 67
 assert_err "fehlende mdstat gemeldet" "not readable"
+
+# ---------------------------------------------------------------------------
+# Sandbox-Anordnung: der Runner bindet die echte mdstat read-only auf einen
+# neutralen Pfad und setzt COCKPIT_DISK_ACTION_MDSTAT dorthin. Der Helfer muss
+# dann ausschließlich diese Datei lesen (nie /proc/mdstat) und normal arbeiten.
+printf '\n-- Sandbox-Anordnung (neutraler mdstat-Pfad) --\n'
+mkdir -p "$WORK/run-neutral"
+cp "$FIXTURES/degraded" "$WORK/run-neutral/mdstat"
+OUT="$(COCKPIT_DISK_ACTION_MDSTAT="$WORK/run-neutral/mdstat" \
+       COCKPIT_DISK_ACTION_SYSBLOCK="$SYSBLOCK" \
+       "$HELPER" status 2>"$WORK/stderr")"
+RC=$?; ERR="$(cat "$WORK/stderr")"
+assert_rc "neutraler mdstat-Pfad -> 0" 0
+assert_json "neutraler Pfad liefert JSON" "$OUT"
+assert_field "neutraler Pfad: vier Mitglieder" "$OUT" '[m["device"] for m in d["members"]] == ["sda","sdb","sdc","sdd"]'
+assert_field "neutraler Pfad: Volume degraded" "$OUT" 'd["volumes"][0]["degraded"] is True and d["volumes"][0]["members"] == ["sdb","sdc","sdd"]'
 
 # ---------------------------------------------------------------------------
 if [ "$(id -u)" -eq 0 ]; then

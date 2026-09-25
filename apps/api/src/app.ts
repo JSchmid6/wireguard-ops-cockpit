@@ -1658,7 +1658,7 @@ export async function createApp(options: AppOptions = {}) {
     }
     if (wantsDisk) {
       const disk = parseTypedDiskActions(script);
-      if (disk.unsupported.length > 0) throw new Error(`disk.manage plan contains an unsupported mdadm form: ${disk.unsupported[0]}`);
+      if (disk.unsupported.length > 0) throw new Error(`disk.manage plan contains an unsupported disk form: ${disk.unsupported[0]}`);
       actions.push(...disk.actions);
     }
     if (actions.length === 0) throw new Error("typed capability plan contains no typed action");
