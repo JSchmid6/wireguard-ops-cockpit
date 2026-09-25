@@ -1,0 +1,12 @@
+# Labeled exceptions for `npm warn` lines in the `npm ci` output.
+#
+# Gate: .github/scripts/check-npm-warnings.sh, run by the "Gate npm ci
+# warnings" step in .github/workflows/ci.yml. A quiet install is the default:
+# fix the dependency instead of listing it here. Only a warning that cannot be
+# removed from this repository gets an entry, and every entry must carry an
+# explicit `# <reason>` label — the gate rejects the file otherwise, so an
+# exception can never be silent. One entry per line:
+#
+#   <substring of the warning line> # <reason: why it is acceptable, when it goes away>
+
+prebuild-install@7.1.3 # better-sqlite3 (< 13) installs prebuild-install on Node 20; only better-sqlite3 >= 13 dropped it, and that version needs Node >= 22, while the services (deploy/systemd) are pinned to Node 20.19.1 via .node-version. Install-time helper only, not part of any shipped code path. Remove this entry once the pinned Node runtime is >= 22 and better-sqlite3 >= 13 is in use.
