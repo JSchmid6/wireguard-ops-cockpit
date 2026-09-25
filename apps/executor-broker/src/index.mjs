@@ -10,7 +10,7 @@ const diskHelper = "/usr/local/sbin/cockpit-disk-action";
 const capabilityHelper = "/usr/local/lib/wireguard-ops-cockpit/cockpit-capability-action.mjs";
 const capabilityNode = "/opt/node-v20.19.1-linux-x64/bin/node";
 const services = new Set(["apache2", "wireguard-ops-cockpit-ttyd"]);
-const diskActions = new Set(["disk.status", "disk.remove", "disk.add"]);
+const diskActions = new Set(["disk.status", "disk.remove", "disk.add", "disk.smart", "disk.smarttest"]);
 const diskDevice = /^sd[a-z]$/;
 
 function signature(payload) { return createHmac("sha256", secret).update(JSON.stringify(payload)).digest("hex"); }
@@ -23,7 +23,7 @@ export function validateRequest(value, now = Date.now()) {
   if (action !== "service.restart" && action !== "service.status" && action !== "capability.execute" && !diskActions.has(action)) throw new Error("unsupported capability action");
   if (action.startsWith("service.") && !services.has(target)) throw new Error("service target is not allowlisted");
   if (action === "disk.status" && target !== "md127") throw new Error("disk target is not allowlisted");
-  if ((action === "disk.remove" || action === "disk.add") && (typeof target !== "string" || !diskDevice.test(target))) throw new Error("disk device is not allowlisted");
+  if ((action === "disk.remove" || action === "disk.add" || action === "disk.smart" || action === "disk.smarttest") && (typeof target !== "string" || !diskDevice.test(target))) throw new Error("disk device is not allowlisted");
   if (action === "capability.execute" && (!value.payload.manifest || !value.payload.envelope)) throw new Error("dynamic capability payload is incomplete");
   if (typeof envelopeDigest !== "string" || !/^[a-f0-9]{64}$/.test(envelopeDigest)) throw new Error("invalid envelope digest");
   if (typeof expiresAt !== "string" || now > Date.parse(expiresAt)) throw new Error("execution request expired");

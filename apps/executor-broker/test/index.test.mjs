@@ -26,7 +26,7 @@ const sign = (payload) => createHmac("sha256", "test-secret").update(JSON.string
 const validAt = Date.parse("2029-01-01T00:00:00Z");
 
 test("executor broker admits the typed disk actions on allowlisted targets", () => {
-  for (const [action, target] of [["disk.status", "md127"], ["disk.remove", "sda"], ["disk.add", "sdz"]]) {
+  for (const [action, target] of [["disk.status", "md127"], ["disk.remove", "sda"], ["disk.add", "sdz"], ["disk.smart", "sda"], ["disk.smarttest", "sdb"]]) {
     const payload = { ...diskBase, action, target };
     assert.deepEqual(validateRequest({ payload, signature: sign(payload) }, validAt), payload);
   }
@@ -40,6 +40,10 @@ test("executor broker rejects disk targets and actions outside the allowlist", (
     { action: "disk.remove", target: "../sda" },
     { action: "disk.remove", target: "/dev/sda" },
     { action: "disk.add", target: "md127" },
+    { action: "disk.smart", target: "sda1" },
+    { action: "disk.smart", target: "/dev/sda" },
+    { action: "disk.smarttest", target: "md127" },
+    { action: "disk.smarttest", target: "sdaa" },
     { action: "disk.fail", target: "sda" },
   ];
   for (const partial of rejected) {

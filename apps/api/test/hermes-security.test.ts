@@ -78,24 +78,32 @@ describe("Hermes security contract", () => {
   it("accepts the exact disk-helper CLI forms as typed disk actions too", () => {
     const script = [
       "sudo /usr/local/sbin/cockpit-disk-action status",
+      "sudo /usr/local/sbin/cockpit-disk-action smart /dev/sda",
+      "/usr/local/sbin/cockpit-disk-action smarttest sdb",
       "/usr/local/sbin/cockpit-disk-action remove /dev/sda",
       "/usr/local/sbin/cockpit-disk-action add sdb",
     ].join("\n");
     expect(parseTypedDiskActions(script)).toEqual({
       actions: [
         { action: "disk.status", target: "md127" },
+        { action: "disk.smart", target: "sda" },
+        { action: "disk.smarttest", target: "sdb" },
         { action: "disk.remove", target: "sda" },
         { action: "disk.add", target: "sdb" },
       ],
       unsupported: [],
     });
     expect(classifyCapabilities("```bash\n/usr/local/sbin/cockpit-disk-action status\n```")).toEqual(["disk.manage"]);
+    expect(classifyCapabilities("```bash\n/usr/local/sbin/cockpit-disk-action smart /dev/sda\n```")).toEqual(["disk.manage"]);
   });
 
   it("keeps malformed or merely-mentioned disk-helper lines out of the typed path", () => {
     expect(parseTypedDiskActions("/usr/local/sbin/cockpit-disk-action fail sda").unsupported).toEqual(["/usr/local/sbin/cockpit-disk-action fail sda"]);
     expect(parseTypedDiskActions("/usr/local/sbin/cockpit-disk-action status extra").unsupported).toEqual(["/usr/local/sbin/cockpit-disk-action status extra"]);
     expect(parseTypedDiskActions("/usr/local/sbin/cockpit-disk-action remove /dev/sda1").unsupported).toEqual(["/usr/local/sbin/cockpit-disk-action remove /dev/sda1"]);
+    expect(parseTypedDiskActions("/usr/local/sbin/cockpit-disk-action smart sda1").unsupported).toEqual(["/usr/local/sbin/cockpit-disk-action smart sda1"]);
+    expect(parseTypedDiskActions("/usr/local/sbin/cockpit-disk-action smarttest").unsupported).toEqual(["/usr/local/sbin/cockpit-disk-action smarttest"]);
+    expect(parseTypedDiskActions("/usr/local/sbin/cockpit-disk-action smart sda extra").unsupported).toEqual(["/usr/local/sbin/cockpit-disk-action smart sda extra"]);
     expect(parseTypedDiskActions("ls -l /usr/local/sbin/cockpit-disk-action")).toEqual({ actions: [], unsupported: [] });
   });
 
