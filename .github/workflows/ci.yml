@@ -52,8 +52,17 @@ jobs:
           restore-keys: |
             npm-${{ runner.os }}-
 
+      # `npm ci` streams to the job log and into a file; the next step gates
+      # the file for `npm warn` lines. (npm logs to stderr — merge both.)
       - name: Install dependencies
-        run: npm ci
+        run: |
+          set -o pipefail
+          npm ci 2>&1 | tee "${RUNNER_TEMP}/npm-ci.log"
+
+      # Fail the job on every `npm warn` line that is not a labeled exception in
+      # .github/npm-warn-allowlist.txt — see .github/scripts/check-npm-warnings.sh.
+      - name: Gate npm ci warnings
+        run: bash .github/scripts/check-npm-warnings.sh "${RUNNER_TEMP}/npm-ci.log"
 
       - name: Build and test workspaces
         run: npm run check
