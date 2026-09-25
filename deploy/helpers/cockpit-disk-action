@@ -4,6 +4,8 @@
 #
 # Usage (exactly; no other arguments are accepted):
 #   cockpit-disk-action status
+#   cockpit-disk-action smart <sdX>
+#   cockpit-disk-action smarttest <sdX>
 #   cockpit-disk-action remove <sdX>
 #   cockpit-disk-action add <sdX>
 #
@@ -19,19 +21,27 @@
 #     filesystems or foreign metadata (blank or a previous IMSM member), and no
 #     rebuild/resync may be in flight (one disk at a time).
 #   * Every mutation is verified against /proc/mdstat before success is reported.
+#   * smart: read-only SMART readout (health, attributes, self-test log) of one
+#     whole disk. It changes nothing and needs no root, exactly like status —
+#     smartctl enforces the device access it needs by itself.
+#   * smarttest: starts the drive's short self-test. No data is touched and no
+#     array member changes, but the device state does, so root is required as
+#     defense in depth (same gate as remove/add).
 #   * Output is one structured JSON line on stdout. Failures emit one JSON line
 #     on stderr and a sysexits-style exit code:
 #       64 usage | 65 device rejected | 66 state conflict | 67 environment
-#       68 verification failed | 69 mdadm failed
+#       68 verification failed | 69 mdadm/smartctl failed
 #
 # Simulation harness hooks (COCKPIT_DISK_ACTION_MDSTAT, _SYSBLOCK, _MDADM,
-# _BLKID) redirect the read-only inputs and the tool paths so the helper can
-# run offline against fixtures (test/cockpit-disk-action.test.sh). sudo(8)
-# resets the environment (env_reset) and the executor broker passes only PATH,
-# so the typed executor path always sees the real tools. The capability
-# sandbox runner may pin COCKPIT_DISK_ACTION_MDSTAT to the fixed read-only
-# bind /run/mdstat for a sandboxed status; it never executes remove/add —
-# mutations have exactly one path, the typed executor with uid 0.
+# _BLKID, _SMARTCTL) redirect the read-only inputs and the tool paths so the
+# helper can run offline against fixtures (test/cockpit-disk-action.test.sh).
+# sudo(8) resets the environment (env_reset) and the executor broker passes
+# only PATH, so the typed executor path always sees the real tools. The
+# capability sandbox runner may pin COCKPIT_DISK_ACTION_MDSTAT to the fixed
+# read-only bind /run/mdstat for a sandboxed status; it never executes
+# remove/add/smart/smarttest — mutations have exactly one path, the typed
+# executor with uid 0, and SMART needs raw device access the sandbox denies by
+# design (PrivateDevices, no CAP_SYS_RAWIO, SystemCallFilter=~@raw-io).
 set -euo pipefail
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -80,6 +90,20 @@ resolve_blkid() {
     if [ -x "$candidate" ]; then BLKID="$candidate"; return 0; fi
   done
   fail 67 "blkid is not installed; refusing the add without a content check"
+}
+
+resolve_smartctl() {
+  local candidate
+  if [ -n "${COCKPIT_DISK_ACTION_SMARTCTL:-}" ]; then
+    SMARTCTL="$COCKPIT_DISK_ACTION_SMARTCTL"
+  else
+    for candidate in /usr/sbin/smartctl /sbin/smartctl /usr/bin/smartctl /usr/local/sbin/smartctl /usr/local/bin/smartctl; do
+      if [ -x "$candidate" ]; then SMARTCTL="$candidate"; break; fi
+    done
+  fi
+  if [ -z "${SMARTCTL:-}" ] || [ ! -f "$SMARTCTL" ] || [ ! -x "$SMARTCTL" ]; then
+    fail 67 "smartctl is not installed"
+  fi
 }
 
 require_mdstat() {
@@ -315,8 +339,79 @@ add_command() {
     "$CONTAINER_NAME" "$DEVICE" "$(container_devs_json)" "$sync"
 }
 
+# smartctl reports its outcome as a bit field, not a single status: bit 0 (1)
+# means the command line or the device open sequence failed, bit 1 (2) means
+# the device could not be opened at all. Both are tool failures. Every other
+# bit describes the DISK (4 = a device command failed, 8 = DISK FAILING,
+# 16 = a prefail attribute is below threshold, 32/64/128 = logged errors) —
+# that is exactly the answer the caller asked for, so those runs stay a success
+# and carry smartctl_exit_code instead.
+#
+# Observed with smartctl 7.4: -j pretty-prints the object over many lines and
+# reports open/usage errors inside that JSON on stdout (smartctl.messages),
+# leaving stderr empty. The helper therefore folds the object onto one line
+# (JSON ignores whitespace between tokens and never carries a literal newline
+# inside a string) and falls back to the JSON message when stderr is empty.
+smartctl_detail() { # $1 = stderr text, $2 = stdout; the message smartctl gave
+  local text="$1"
+  if [ -z "$text" ] && [[ "$2" =~ \"string\"[[:space:]]*:[[:space:]]*\"([^\"]*)\" ]]; then
+    text="${BASH_REMATCH[1]}"
+  fi
+  printf '%s' "$text"
+}
+
+smart_command() {
+  local errfile err out rc passed="null" model=""
+  resolve_smartctl
+  if [ ! -e "$SYSBLOCK/$DEVICE" ]; then fail 66 "device /dev/$DEVICE is not present"; fi
+  errfile="$(mktemp)"
+  rc=0
+  out="$("$SMARTCTL" -j -H -A -l selftest "/dev/$DEVICE" 2>"$errfile")" || rc=$?
+  err="$(cat "$errfile")"
+  rm -f "$errfile"
+  out="${out//$'\n'/ }"
+  out="${out//$'\r'/ }"
+  if [ $((rc & 2)) -ne 0 ]; then fail 66 "smartctl cannot open /dev/$DEVICE: $(smartctl_detail "$err" "$out")"; fi
+  if [ $((rc & 1)) -ne 0 ]; then fail 69 "smartctl invocation failed: $(smartctl_detail "$err" "$out")"; fi
+  if ! [[ "$out" =~ ^[[:space:]]*\{ ]] || ! [[ "$out" =~ \}[[:space:]]*$ ]]; then
+    fail 69 "smartctl did not return JSON output: $out"
+  fi
+  if [[ "$out" =~ \"smart_status\"[[:space:]]*:[[:space:]]*\{[[:space:]]*\"passed\"[[:space:]]*:[[:space:]]*(true|false) ]]; then
+    passed="${BASH_REMATCH[1]}"
+  fi
+  if [[ "$out" =~ \"model_name\"[[:space:]]*:[[:space:]]*\"([^\"]*)\" ]]; then
+    model="${BASH_REMATCH[1]}"
+  fi
+  # The short summary trails the raw object on purpose: downstream the output
+  # is tail-truncated (job output slice(-10000), broker slice(-20000)), so the
+  # fields an operator reads first have to be the ones that survive the cut.
+  printf '{"ok":true,"action":"smart","device":"%s","smartctl":%s,"smartctl_exit_code":%s,"smart_status_passed":%s,"model_name":"%s"}\n' \
+    "$DEVICE" "$out" "$rc" "$passed" "$(json_escape "$model")"
+}
+
+smarttest_command() {
+  local errfile err out rc
+  require_root
+  resolve_smartctl
+  if [ ! -e "$SYSBLOCK/$DEVICE" ]; then fail 66 "device /dev/$DEVICE is not present"; fi
+  errfile="$(mktemp)"
+  rc=0
+  out="$("$SMARTCTL" -j -t short "/dev/$DEVICE" 2>"$errfile")" || rc=$?
+  err="$(cat "$errfile")"
+  rm -f "$errfile"
+  out="${out//$'\n'/ }"
+  out="${out//$'\r'/ }"
+  if [ $((rc & 2)) -ne 0 ]; then fail 66 "smartctl cannot open /dev/$DEVICE: $(smartctl_detail "$err" "$out")"; fi
+  if [ $((rc & 1)) -ne 0 ]; then fail 69 "smartctl invocation failed: $(smartctl_detail "$err" "$out")"; fi
+  if ! [[ "$out" =~ ^[[:space:]]*\{ ]] || ! [[ "$out" =~ \}[[:space:]]*$ ]]; then
+    fail 69 "smartctl did not return JSON output: $out"
+  fi
+  printf '{"ok":true,"action":"smarttest","device":"%s","smartctl":%s,"smartctl_exit_code":%s}\n' \
+    "$DEVICE" "$out" "$rc"
+}
+
 main() {
-  if [ "$#" -lt 1 ]; then fail 64 "usage: cockpit-disk-action status|remove <sdX>|add <sdX>"; fi
+  if [ "$#" -lt 1 ]; then fail 64 "usage: cockpit-disk-action status|smart <sdX>|smarttest <sdX>|remove <sdX>|add <sdX>"; fi
   local sub="$1"
   shift
   case "$sub" in
@@ -324,6 +419,12 @@ main() {
       if [ "$#" -ne 0 ]; then fail 64 "status takes no arguments"; fi
       ACTION="status"
       status_command
+      ;;
+    smart|smarttest)
+      ACTION="$sub"
+      if [ "$#" -ne 1 ]; then fail 64 "$sub requires exactly one device argument"; fi
+      normalize_device "$1"
+      if [ "$sub" = "smart" ]; then smart_command; else smarttest_command; fi
       ;;
     remove|add)
       ACTION="$sub"

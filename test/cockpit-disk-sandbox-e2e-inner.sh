@@ -4,6 +4,7 @@
 # systemd). Wird von test/cockpit-disk-sandbox-e2e.sh aufgerufen; bitte dort
 # starten. Installiert Runner und Disk-Helfer an ihre Produktionspfade, legt
 # ein Test-Secret an und fährt den Runner mit signierten Envelopes.
+# Ergebnis: 9 Prüfungen (status 2, Verweigerung 4, fremde Schritte 2, mdstat 1).
 # ============================================================================
 set -u
 
@@ -79,8 +80,9 @@ const base = (steps, extra = {}) => ({
     `step=${JSON.stringify(step)?.slice(0, 260)}`);
 }
 
-// -- 2: remove/add werden vor jeder Ausführung verweigert
-for (const verb of ["remove", "add"]) {
+// -- 2: remove/add/smart/smarttest werden vor jeder Ausführung verweigert
+// (die Sandbox hat keine Blockgeräte und keine raw-IO-Caps, SMART bräuchte beides)
+for (const verb of ["remove", "add", "smart", "smarttest"]) {
   const r = run(base([{ argv: [HELPER, verb, "sdb"], timeoutSeconds: 60 }]));
   check(`${verb} wird im Sandbox verweigert (Typed-Executor-Pfad)`,
     r.status === 77 && /typed executor path/.test(r.stderr),

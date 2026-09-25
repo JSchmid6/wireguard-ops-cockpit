@@ -5,15 +5,16 @@
 #
 # Geprüft wird der AUSGELIEFERTE deploy/helpers/cockpit-capability-action:
 #   1. Helfer-status läuft im Sandbox (statt exit 67 "/proc/mdstat is not readable")
-#   2. remove/add werden VOR der Ausführung verweigert (nur der typisierte
-#      Executor-Pfad darf mutieren)
+#   2. remove/add/smart/smarttest werden VOR der Ausführung verweigert (nur der
+#      typisierte Executor-Pfad darf mutieren bzw. direkt aufs Gerät zugreifen)
 #   3. fremde Schritte bekommen weder COCKPIT_DISK_ACTION_MDSTAT noch /run/mdstat
 #   4. ein deklariertes /proc/mdstat wird auf den neutralen Pfad normalisiert
 #
 # Aufruf (auf dem VPS-Host ODER in der Hermes-Shell):
 #   bash test/cockpit-disk-sandbox-e2e.sh [out-dir]
 #
-# Ergebnis: Log unter <out-dir>/e2e-<zeitstempel>.log; Exit 0 = grün.
+# Ergebnis: Log unter <out-dir>/e2e-<zeitstempel>.log mit 9 PASS-Zeilen;
+# Exit 0 = grün.
 # Nichts am VPS oder an der Kiste wird verändert; der Container wird entfernt.
 # ============================================================================
 set -u
