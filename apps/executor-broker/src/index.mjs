@@ -7,11 +7,14 @@ const socketPath = process.env.COCKPIT_EXECUTOR_BROKER_SOCKET || "/run/wireguard
 const secret = process.env.COCKPIT_EXECUTOR_BROKER_SECRET || "";
 const helper = "/usr/local/sbin/cockpit-service-action";
 const diskHelper = "/usr/local/sbin/cockpit-disk-action";
+const selfUpdateHelper = "/usr/local/sbin/cockpit-self-update-action";
 const capabilityHelper = "/usr/local/lib/wireguard-ops-cockpit/cockpit-capability-action.mjs";
 const capabilityNode = "/opt/node-v20.19.1-linux-x64/bin/node";
 const services = new Set(["apache2", "wireguard-ops-cockpit-ttyd"]);
 const diskActions = new Set(["disk.status", "disk.remove", "disk.add", "disk.smart", "disk.smarttest"]);
 const diskDevice = /^sd[a-z]$/;
+const selfUpdateActions = new Set(["self.update", "self.status"]);
+const selfUpdateSha = /^[a-f0-9]{40}$/;
 
 function signature(payload) { return createHmac("sha256", secret).update(JSON.stringify(payload)).digest("hex"); }
 export function validateRequest(value, now = Date.now()) {
@@ -20,10 +23,12 @@ export function validateRequest(value, now = Date.now()) {
   const expected = signature(value.payload);
   if (!/^[a-f0-9]{64}$/.test(value.signature) || !timingSafeEqual(Buffer.from(value.signature, "hex"), Buffer.from(expected, "hex"))) throw new Error("invalid request signature");
   const { action, target, expiresAt, envelopeDigest } = value.payload;
-  if (action !== "service.restart" && action !== "service.status" && action !== "capability.execute" && !diskActions.has(action)) throw new Error("unsupported capability action");
+  if (action !== "service.restart" && action !== "service.status" && action !== "capability.execute" && !diskActions.has(action) && !selfUpdateActions.has(action)) throw new Error("unsupported capability action");
   if (action.startsWith("service.") && !services.has(target)) throw new Error("service target is not allowlisted");
   if (action === "disk.status" && target !== "md127") throw new Error("disk target is not allowlisted");
   if ((action === "disk.remove" || action === "disk.add" || action === "disk.smart" || action === "disk.smarttest") && (typeof target !== "string" || !diskDevice.test(target))) throw new Error("disk device is not allowlisted");
+  if (action === "self.status" && target !== "state") throw new Error("self-update status target is not allowlisted");
+  if (action === "self.update" && (typeof target !== "string" || !selfUpdateSha.test(target))) throw new Error("self-update commit is not allowlisted");
   if (action === "capability.execute" && (!value.payload.manifest || !value.payload.envelope)) throw new Error("dynamic capability payload is incomplete");
   if (typeof envelopeDigest !== "string" || !/^[a-f0-9]{64}$/.test(envelopeDigest)) throw new Error("invalid envelope digest");
   if (typeof expiresAt !== "string" || now > Date.parse(expiresAt)) throw new Error("execution request expired");
@@ -45,6 +50,19 @@ export function execute(payload) {
         error: code === 0 ? null : [error, output].filter(Boolean).join("\n").slice(-50000),
       }));
       child.stdin.end(JSON.stringify({ manifest: payload.manifest, envelope: payload.envelope }));
+      return;
+    }
+    if (payload.action === "self.update" || payload.action === "self.status") {
+      // The helper starts the one-shot deploy unit and waits for it; the unit
+      // re-verifies the allowlisted repo and the merged commit on its own.
+      const selfArgs = payload.action === "self.update" ? [payload.target] : ["status"];
+      const child = spawn("sudo", ["-n", selfUpdateHelper, ...selfArgs], { env: { PATH: "/usr/sbin:/usr/bin:/sbin:/bin" }, stdio: ["ignore", "pipe", "pipe"] });
+      let selfOutput = ""; let selfError = "";
+      child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => { selfOutput += chunk; });
+      child.stderr.on("data", (chunk) => { selfError += chunk; });
+      child.on("error", (reason) => resolve({ ok: false, error: reason.message }));
+      child.on("close", (code) => resolve({ ok: code === 0, exitCode: code, output: selfOutput.slice(-20000), error: code === 0 ? null : [selfError, selfOutput].filter(Boolean).join("\n").slice(-4000) }));
       return;
     }
     if (payload.action.startsWith("disk.")) {

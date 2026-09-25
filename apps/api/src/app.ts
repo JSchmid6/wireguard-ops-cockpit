@@ -52,6 +52,7 @@ import {
   buildAgentTask,
   classifyCapabilities,
   parseTypedDiskActions,
+  parseTypedSelfUpdates,
   createExecutionEnvelope,
   hashCanonical,
   normalizeAllowedCapabilities,
@@ -76,6 +77,10 @@ interface LoginAttemptState {
 const MAX_LOGIN_ATTEMPTS = 5;
 const LOGIN_WINDOW_MS = 10 * 60 * 1000;
 const LOGIN_BLOCK_MS = 15 * 60 * 1000;
+// A typed self-update waits for the one-shot deploy unit
+// (wireguard-ops-cockpit-self-update@<sha>.service, TimeoutStartSec=1800s);
+// the executor socket bound for that action is the unit bound plus a margin.
+const SELF_UPDATE_EXECUTOR_TIMEOUT_MS = 31 * 60 * 1000;
 
 function slugify(value: string): string {
   return value
@@ -1644,7 +1649,8 @@ export async function createApp(options: AppOptions = {}) {
     }
     const wantsService = envelope.capabilities.includes("service.manage");
     const wantsDisk = envelope.capabilities.includes("disk.manage");
-    if (!wantsService && !wantsDisk) return null;
+    const wantsSelfUpdate = envelope.capabilities.includes("self.update");
+    if (!wantsService && !wantsDisk && !wantsSelfUpdate) return null;
     if (!config.executorBrokerSocket || !config.executorBrokerSecret) {
       throw new Error("typed executor broker is not configured");
     }
@@ -1661,12 +1667,17 @@ export async function createApp(options: AppOptions = {}) {
       if (disk.unsupported.length > 0) throw new Error(`disk.manage plan contains an unsupported disk form: ${disk.unsupported[0]}`);
       actions.push(...disk.actions);
     }
+    if (wantsSelfUpdate) {
+      const selfUpdate = parseTypedSelfUpdates(script);
+      if (selfUpdate.unsupported.length > 0) throw new Error(`self.update plan contains an unsupported self-update form: ${selfUpdate.unsupported[0]}`);
+      actions.push(...selfUpdate.actions);
+    }
     if (actions.length === 0) throw new Error("typed capability plan contains no typed action");
     const outputs: string[] = [];
     for (const action of actions) {
       outputs.push(await runExecutorAction(config.executorBrokerSocket, config.executorBrokerSecret, {
         ...action, expiresAt: envelope.expiresAt, envelopeDigest: envelope.digest,
-      }));
+      }, action.action === "self.update" ? SELF_UPDATE_EXECUTOR_TIMEOUT_MS : undefined));
     }
     const ran = actions.map((action) => `${action.action} ${action.target}`).join(", ");
     return `## EXECUTION RESULT\nSTATUS: success\nEXIT_CODE: 0\nWHAT_RAN: typed executor actions: ${ran}\nOUTPUT: ${outputs.join("\n").slice(-10000)}\nNOTES: executed by isolated capability broker`;
@@ -2485,7 +2496,7 @@ Follow these rules:
           };
         }
         const unsupportedAutonomousCapabilities = capabilities.filter((capability) =>
-          capability !== "read.host" && capability !== "service.manage" && capability !== "disk.manage" && capability !== "shell.exception"
+          capability !== "read.host" && capability !== "service.manage" && capability !== "disk.manage" && capability !== "self.update" && capability !== "shell.exception"
         );
         if (!manifest && policy.allowed && unsupportedAutonomousCapabilities.length > 0) {
           policy = {

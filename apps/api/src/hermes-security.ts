@@ -9,6 +9,7 @@ export type CapabilityId =
   | "read.host"
   | "service.manage"
   | "disk.manage"
+  | "self.update"
   | "package.manage"
   | "filesystem.write"
   | "network.manage"
@@ -17,7 +18,7 @@ export type CapabilityId =
   | "shell.exception";
 
 const CAPABILITIES = new Set<CapabilityId>([
-  "read.host", "service.manage", "disk.manage", "package.manage", "filesystem.write", "network.manage",
+  "read.host", "service.manage", "disk.manage", "self.update", "package.manage", "filesystem.write", "network.manage",
   "identity.manage", "database.direct", "shell.exception",
 ]);
 
@@ -35,6 +36,13 @@ const DISK_HELPER_MANAGE_LINE = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-disk-a
 const DISK_HELPER_SMART_LINE = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-disk-action\s+smart\s+(?:\/dev\/)?(sd[a-z])$/;
 const DISK_HELPER_SMARTTEST_LINE = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-disk-action\s+smarttest\s+(?:\/dev\/)?(sd[a-z])$/;
 const DISK_HELPER_INVOCATION = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-disk-action\b/;
+// The installed self-update helper is the executor's face for rolling out a
+// merged cockpit stand: one full lowercase commit sha, or the read-only
+// status form. Everything else stays shell.exception.
+const SELF_UPDATE_HELPER = "/usr/local/sbin/cockpit-self-update-action";
+const SELF_UPDATE_COMMIT_LINE = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-self-update-action\s+([a-f0-9]{40})$/;
+const SELF_UPDATE_STATUS_LINE = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-self-update-action\s+status$/;
+const SELF_UPDATE_INVOCATION = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-self-update-action\b/;
 
 export interface TypedDiskAction { action: "disk.status" | "disk.remove" | "disk.add" | "disk.smart" | "disk.smarttest"; target: string }
 
@@ -79,6 +87,34 @@ export function parseTypedDiskActions(script: string): { actions: TypedDiskActio
     const helperSmartTest = line.match(DISK_HELPER_SMARTTEST_LINE);
     if (helperSmartTest) {
       actions.push({ action: "disk.smarttest", target: helperSmartTest[1] });
+      continue;
+    }
+    unsupported.push(line);
+  }
+  return { actions, unsupported };
+}
+
+export interface TypedSelfUpdateAction { action: "self.update" | "self.status"; target: string }
+
+export function isTypedSelfUpdateLine(line: string): boolean {
+  const trimmed = line.trim();
+  return SELF_UPDATE_COMMIT_LINE.test(trimmed) || SELF_UPDATE_STATUS_LINE.test(trimmed);
+}
+
+export function parseTypedSelfUpdates(script: string): { actions: TypedSelfUpdateAction[]; unsupported: string[] } {
+  const actions: TypedSelfUpdateAction[] = [];
+  const unsupported: string[] = [];
+  for (const rawLine of script.split("\n")) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#") || /^set\s+-/.test(line)) continue;
+    if (!SELF_UPDATE_INVOCATION.test(line)) continue;
+    const commit = line.match(SELF_UPDATE_COMMIT_LINE);
+    if (commit) {
+      actions.push({ action: "self.update", target: commit[1] });
+      continue;
+    }
+    if (SELF_UPDATE_STATUS_LINE.test(line)) {
+      actions.push({ action: "self.status", target: "state" });
       continue;
     }
     unsupported.push(line);
@@ -174,6 +210,7 @@ export function classifyCapabilities(plan: string): CapabilityId[] {
   const capabilities = new Set<CapabilityId>();
   if (/\b(systemctl|service)\s+(restart|start|stop|reload|enable|disable)\b/i.test(script)) capabilities.add("service.manage");
   if (script.split("\n").some((line) => isTypedDiskLine(line))) capabilities.add("disk.manage");
+  if (script.split("\n").some((line) => isTypedSelfUpdateLine(line))) capabilities.add("self.update");
   if (/\b(apt(?:-get)?|dnf|yum|rpm|dpkg|snap)\b/i.test(script)) capabilities.add("package.manage");
   if (/(?:^|[;&|]\s*)(?:cp|mv|install|truncate|touch|mkdir|chmod|chown|sed\s+-i|tee)\b|(?:^|\s)>{1,2}\s*\//im.test(script)) capabilities.add("filesystem.write");
   if (/\b(iptables|nft|ufw|ip\s+(?:addr|route|link)|wg(?:-quick)?)\b/i.test(script)) capabilities.add("network.manage");
@@ -193,7 +230,8 @@ export function classifyCapabilities(plan: string): CapabilityId[] {
         (/^(apt|apt-get|dnf|yum|rpm|dpkg|snap)$/.test(command)) ||
         (/^(iptables|nft|ufw|useradd|userdel|usermod|groupadd|groupdel)$/.test(command)) ||
         (command === "mdadm" && isTypedDiskLine(segment)) ||
-        (command === "cockpit-disk-action" && isTypedDiskLine(segment));
+        (command === "cockpit-disk-action" && isTypedDiskLine(segment)) ||
+        (command === "cockpit-self-update-action" && isTypedSelfUpdateLine(segment));
       if (!safeReadCommands.has(command) && !typedMutation) capabilities.add("shell.exception");
     }
   }

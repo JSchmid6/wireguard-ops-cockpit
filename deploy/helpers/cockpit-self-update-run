@@ -1,0 +1,594 @@
+#!/usr/bin/python3
+# cockpit-self-update-run — internal execution script of the Cockpit
+# self-update module on Lab0.
+#
+# Not a sudo target and not meant to be run by hand: it is started only by the
+# two fixed entry points of the module.
+#
+#   deploy   <sha>  wireguard-ops-cockpit-self-update@<sha>.service
+#   activate <sha>  one-shot activation timer scheduled by `deploy`
+#
+# deploy:   check arguments and pinned paths -> lock -> verify the pinned
+#           checkout and the allowlisted remote -> git fetch -> require <sha>
+#           to be reachable from origin/main (merged review chains only) ->
+#           run the reviewed deploy script pinned to that commit with service
+#           restarts deferred (COCKPIT_RESTART_MODE=defer) -> pre-activation
+#           verification (revision, services, sockets, API health, ttyd, web
+#           chain when reachable) -> write result + state below
+#           /var/lib/wireguard-ops-cockpit/self-update -> schedule the
+#           activation unit.
+#
+# activate: skip when superseded or when a deployment is running -> restart
+#           the four cockpit services -> post-restart verification -> merge
+#           the activation outcome into state + result. The restart of
+#           api/executor cannot happen inside the typed executor path itself
+#           (it would cut the running job and audit connection), so it is
+#           this separate, scheduled step: the deploy job completes cleanly
+#           before the activation fires.
+#
+# Security contract:
+#   * Exactly one full lowercase 40-hex commit from the allowlisted
+#     repository https://github.com/JSchmid6/wireguard-ops-cockpit.git;
+#     nothing else is accepted, and the commit must be an ancestor of
+#     origin/main.
+#   * The deploy script is the root-owned installed copy below
+#     /usr/local/lib/wireguard-ops-cockpit; the script refuses a deploy
+#     script that is not a root-owned regular file free of group/other write
+#     bits, a checkout whose origin is not the allowlisted remote, and a
+#     second concurrent deployment (flock on run.lock).
+#   * Result and state are JSON files below the state directory; one attempt
+#     log is written per run below the log directory.
+#   * Success emits the attempt JSON on stdout; failures emit one JSON line
+#     on stderr and a sysexits-style exit code:
+#       64 usage | 65 target rejected | 66 state conflict | 67 environment
+#       68 verification failed | 69 execution failed
+#
+# Simulation harness hooks (all optional, production defaults first):
+#   COCKPIT_SELF_UPDATE_REPO_DIR, _DEPLOY_SH, _STATE_DIR, _LOG_DIR, _GIT,
+#   _SYSTEMCTL, _SYSTEMD_RUN, _CURL, _IP, _ALLOWED_REMOTE, _ACTIVATION_DELAY,
+#   _SERVICES, _SOCKETS, _RUN_PATH, _WG_IP, _API_HEALTH_URL, _TTYD_URL.
+#   Hooks exist for the offline fixture test and the throwaway-container E2E;
+#   in production the module is started by the systemd units, which pass a
+#   fixed environment, and the typed executor path resets the environment
+#   (sudo env_reset + broker PATH).
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import time
+
+SHA_RE = re.compile(r"^[a-f0-9]{40}$")
+
+# Optional root-owned configuration file: lines of the form KEY=VALUE for the
+# COCKPIT_SELF_UPDATE_* keys below. It is read before the environment so
+# systemd units (clean environment by default) can be tuned without editing
+# installed files; explicit environment variables always win.
+CONFIG_FILE = "/etc/wireguard-ops-cockpit/self-update.env"
+
+
+def load_config_file():
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as handle:
+            lines = handle.readlines()
+    except FileNotFoundError:
+        return
+    except Exception:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if key.startswith("COCKPIT_SELF_UPDATE_") and key not in os.environ:
+            os.environ[key] = value.strip().strip('"').strip("'")
+
+
+load_config_file()
+
+
+def env(name, default):
+    value = os.environ.get(name)
+    return value if value else default
+
+
+REPO_DIR = env("COCKPIT_SELF_UPDATE_REPO_DIR", "/opt/wireguard-ops-cockpit")
+DEPLOY_SH = env("COCKPIT_SELF_UPDATE_DEPLOY_SH", "/usr/local/lib/wireguard-ops-cockpit/homeserver-cockpit-deploy.sh")
+STATE_DIR = env("COCKPIT_SELF_UPDATE_STATE_DIR", "/var/lib/wireguard-ops-cockpit/self-update")
+LOG_DIR = env("COCKPIT_SELF_UPDATE_LOG_DIR", "/var/log/wireguard-ops-cockpit-self-update")
+GIT = env("COCKPIT_SELF_UPDATE_GIT", "/usr/bin/git")
+SYSTEMCTL = env("COCKPIT_SELF_UPDATE_SYSTEMCTL", "/usr/bin/systemctl")
+SYSTEMD_RUN = env("COCKPIT_SELF_UPDATE_SYSTEMD_RUN", "/usr/bin/systemd-run")
+CURL = env("COCKPIT_SELF_UPDATE_CURL", "/usr/bin/curl")
+IP = env("COCKPIT_SELF_UPDATE_IP", "/usr/sbin/ip")
+ALLOWED_REMOTE = env("COCKPIT_SELF_UPDATE_ALLOWED_REMOTE", "https://github.com/JSchmid6/wireguard-ops-cockpit.git")
+ACTIVATION_DELAY = int(env("COCKPIT_SELF_UPDATE_ACTIVATION_DELAY", "600"))
+VERIFY_RETRIES = int(env("COCKPIT_SELF_UPDATE_VERIFY_RETRIES", "12"))
+VERIFY_DELAY = int(env("COCKPIT_SELF_UPDATE_VERIFY_DELAY", "5"))
+SERVICES = env("COCKPIT_SELF_UPDATE_SERVICES", "wireguard-ops-cockpit-api wireguard-ops-cockpit-agent wireguard-ops-cockpit-executor wireguard-ops-cockpit-ttyd").split()
+SOCKETS = env("COCKPIT_SELF_UPDATE_SOCKETS", "/run/cockpit-agent/agent.sock /run/cockpit-executor/executor.sock").split()
+RUN_PATH = env("COCKPIT_SELF_UPDATE_RUN_PATH", "/usr/local/lib/wireguard-ops-cockpit/cockpit-self-update-run")
+WG_IP = env("COCKPIT_SELF_UPDATE_WG_IP", "10.0.0.5")
+API_HEALTH_URL = env("COCKPIT_SELF_UPDATE_API_HEALTH_URL", "http://127.0.0.1:3001/api/health")
+TTYD_URL = env("COCKPIT_SELF_UPDATE_TTYD_URL", "http://127.0.0.1:7681/terminal/")
+
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+RESULT_FILE = os.path.join(STATE_DIR, "last-result.json")
+HISTORY_FILE = os.path.join(STATE_DIR, "history.jsonl")
+RUN_LOCK = os.path.join(STATE_DIR, "run.lock")
+
+LOG_HANDLE = None
+ACTIVE_SHA = ""
+
+
+def utcnow():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def log(message):
+    line = "[%s] %s" % (utcnow(), message)
+    print(line, flush=True)
+    if LOG_HANDLE is not None:
+        try:
+            LOG_HANDLE.write(line + "\n")
+            LOG_HANDLE.flush()
+        except Exception:
+            pass
+
+
+class Failure(Exception):
+    def __init__(self, code, phase, message):
+        super().__init__(message)
+        self.code = code
+        self.phase = phase
+        self.message = message
+
+
+def run(argv, timeout=60, env_extra=None):
+    child_env = dict(os.environ)
+    child_env.update(env_extra or {})
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=child_env)
+    except FileNotFoundError as exc:
+        raise Failure(67, "check", "required tool is missing: %s" % exc.filename)
+    except subprocess.TimeoutExpired:
+        raise Failure(67, "check", "command timed out: %s" % " ".join(argv))
+
+
+def read_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return "unreadable"
+
+
+def write_json_atomic(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(data, sort_keys=True) + "\n")
+    os.replace(tmp, path)
+
+
+def note_history(entry):
+    try:
+        with open(HISTORY_FILE, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, sort_keys=True) + "\n")
+    except Exception:
+        pass
+
+
+def ensure_dir(path):
+    if os.path.lexists(path):
+        info = os.lstat(path)
+        if not stat.S_ISDIR(info.st_mode):
+            raise Failure(67, "check", "%s exists but is not a directory" % path)
+        if info.st_uid != 0:
+            raise Failure(67, "check", "%s is not root-owned" % path)
+    else:
+        os.makedirs(path, mode=0o750)
+    os.chmod(path, 0o750)
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def git(*args, timeout=60):
+    return run([GIT, "-C", REPO_DIR, *args], timeout=timeout)
+
+
+def check_deploy_script():
+    if not os.path.exists(DEPLOY_SH):
+        raise Failure(67, "check", "deploy script is missing: %s (run the reviewed deploy script once)" % DEPLOY_SH)
+    info = os.lstat(DEPLOY_SH)
+    if not stat.S_ISREG(info.st_mode):
+        raise Failure(67, "check", "deploy script is not a regular file: %s" % DEPLOY_SH)
+    if info.st_uid != 0:
+        raise Failure(67, "check", "deploy script is not root-owned: %s" % DEPLOY_SH)
+    if info.st_mode & 0o022:
+        raise Failure(67, "check", "deploy script is group/other-writable: %s" % DEPLOY_SH)
+    return sha256_file(DEPLOY_SH)
+
+
+def check_repo_and_commit(sha):
+    if not os.path.isdir(os.path.join(REPO_DIR, ".git")):
+        raise Failure(67, "check", "pinned checkout is missing: %s" % REPO_DIR)
+    remote = git("remote", "get-url", "origin", timeout=30)
+    if remote.returncode != 0 or remote.stdout.strip() != ALLOWED_REMOTE:
+        raise Failure(65, "check", "checkout origin is not the allowlisted repository (%s)" % (remote.stdout.strip() or "unreadable"))
+    fetch = run([GIT, "-C", REPO_DIR, "fetch", "--quiet", "origin"], timeout=300,
+                env_extra={"GIT_TERMINAL_PROMPT": "0"})
+    if fetch.returncode != 0:
+        raise Failure(67, "check", "git fetch failed: %s" % (fetch.stderr.strip()[-300:] or "no output"))
+    verify = git("rev-parse", "--verify", "--quiet", "%s^{commit}" % sha, timeout=30)
+    if verify.returncode != 0:
+        raise Failure(65, "check", "commit %s is unknown after fetch" % sha)
+    ancestor = git("merge-base", "--is-ancestor", sha, "refs/remotes/origin/main", timeout=30)
+    if ancestor.returncode != 0:
+        raise Failure(65, "check", "commit %s is not merged into origin/main (merged review chains only)" % sha)
+    subject = git("show", "-s", "--format=%s", sha, timeout=30)
+    return subject.stdout.strip()[:160] if subject.returncode == 0 else ""
+
+
+def current_deployed_commit(state):
+    if isinstance(state, dict) and isinstance(state.get("deployed_commit"), str) and SHA_RE.match(state["deployed_commit"]):
+        return state["deployed_commit"]
+    head = git("rev-parse", "HEAD", timeout=30)
+    head_sha = head.stdout.strip()
+    if head.returncode == 0 and SHA_RE.match(head_sha):
+        return head_sha
+    return None
+
+
+def http_code(url, max_time=10, insecure=False):
+    args = [CURL, "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", str(max_time)]
+    if insecure:
+        args.append("-k")
+    args.append(url)
+    result = run(args, timeout=max_time + 15)
+    return result.stdout.strip() if result.returncode == 0 else "000"
+
+
+def http_body(url, max_time=10, insecure=False):
+    args = [CURL, "-fsS", "--max-time", str(max_time)]
+    if insecure:
+        args.append("-k")
+    args.append(url)
+    result = run(args, timeout=max_time + 15)
+    return result.stdout if result.returncode == 0 else ""
+
+
+def wg_ip_present():
+    result = run([IP, "-brief", "a"], timeout=15)
+    if result.returncode != 0:
+        return False
+    return re.search(r"(?:^|\s)%s(?:/\d+)?(?:\s|$)" % re.escape(WG_IP), result.stdout) is not None
+
+
+def socket_ok(path):
+    try:
+        return stat.S_ISSOCK(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def state_web_url():
+    state = read_json(STATE_FILE)
+    if isinstance(state, dict):
+        return state.get("web_url") or ""
+    return ""
+
+
+def verify_phase(retries, delay, include_web):
+    """Runs the verification checks; raises Failure(68, ...) with the first breach."""
+    checks = {}
+    revision = git("rev-parse", "HEAD", timeout=30)
+    if revision.returncode != 0 or revision.stdout.strip() != ACTIVE_SHA:
+        raise Failure(68, "verify", "checkout HEAD is not the pinned commit (%s)" % (revision.stdout.strip() or "unreadable"))
+    checks["revision"] = "ok"
+    last = ""
+    for _ in range(retries):
+        missing = [name for name in SERVICES if run([SYSTEMCTL, "is-active", "--quiet", name], timeout=15).returncode != 0]
+        if not missing:
+            break
+        last = ",".join(missing)
+        time.sleep(delay)
+    if last:
+        raise Failure(68, "verify", "services not active: %s" % last)
+    checks["services"] = "ok"
+    last = ""
+    for _ in range(retries):
+        missing = [path for path in SOCKETS if not socket_ok(path)]
+        if not missing:
+            break
+        last = ",".join(missing)
+        time.sleep(delay)
+    if last:
+        raise Failure(68, "verify", "broker sockets missing: %s" % last)
+    checks["sockets"] = "ok"
+    healthy = False
+    for _ in range(retries):
+        if '"ok":true' in http_body(API_HEALTH_URL):
+            healthy = True
+            break
+        time.sleep(delay)
+    if not healthy:
+        raise Failure(68, "verify", "API health is not ok (%s)" % API_HEALTH_URL)
+    checks["api_health"] = "ok"
+    ttyd_code = "000"
+    for _ in range(retries):
+        ttyd_code = http_code(TTYD_URL)
+        if ttyd_code == "200":
+            break
+        time.sleep(delay)
+    if ttyd_code != "200":
+        raise Failure(68, "verify", "ttyd did not answer HTTP 200 (got %s)" % ttyd_code)
+    checks["ttyd"] = "ok"
+    web_url = state_web_url()
+    if include_web and web_url and wg_ip_present():
+        web_code = "000"
+        for _ in range(retries):
+            web_code = http_code(web_url + "/", insecure=True)
+            if web_code == "200":
+                break
+            time.sleep(delay)
+        if web_code != "200":
+            raise Failure(68, "verify", "web did not answer HTTP 200 on %s/ (got %s)" % (web_url, web_code))
+        if '"ok":true' not in http_body(web_url + "/api/health", insecure=True):
+            raise Failure(68, "verify", "API health through the web chain is not ok (%s/api/health)" % web_url)
+        checks["web"] = "ok"
+    else:
+        checks["web"] = "skipped"
+    return checks
+
+
+def acquire_run_lock():
+    fd = os.open(RUN_LOCK, os.O_RDWR | os.O_CREAT, 0o640)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def open_log(prefix, sha):
+    path = os.path.join(LOG_DIR, "%s-%s-%s.log" % (time.strftime("%Y%m%d-%H%M%S"), prefix, sha[:7]))
+    global LOG_HANDLE
+    LOG_HANDLE = open(path, "a", encoding="utf-8")
+    os.chmod(path, 0o640)
+    return path
+
+
+def base_result(sha, started, phase, ok, code=None, error=None):
+    result = {
+        "ok": ok,
+        "action": "self.update",
+        "sha": sha,
+        "phase": phase,
+        "result": "ok" if ok else "failed",
+        "started_at": started,
+        "finished_at": utcnow(),
+        "unit": "wireguard-ops-cockpit-self-update@%s.service" % sha,
+    }
+    if code is not None:
+        result["code"] = code
+    if error:
+        result["error"] = error
+    if LOG_HANDLE is not None:
+        result["log"] = LOG_HANDLE.name
+    return result
+
+
+def finish(result, exit_code):
+    write_json_atomic(RESULT_FILE, result)
+    note_history({"ts": result.get("finished_at"), "sha": result.get("sha"), "phase": result.get("phase"),
+                  "result": result.get("result"), "code": result.get("code"), "log": result.get("log")})
+    if result.get("ok") is True:
+        print(json.dumps(result, sort_keys=True), flush=True)
+        sys.exit(exit_code)
+    print(json.dumps(result, sort_keys=True), flush=True, file=sys.stderr)
+    sys.exit(exit_code)
+
+
+def fail_with(result, exc):
+    result["ok"] = False
+    result["result"] = "failed"
+    result["phase"] = exc.phase
+    result["code"] = exc.code
+    result["error"] = exc.message
+    result["finished_at"] = utcnow()
+    finish(result, exc.code)
+
+
+def cmd_deploy(sha):
+    started = utcnow()
+    ensure_dir(STATE_DIR)
+    ensure_dir(LOG_DIR)
+    deploy_sha256 = check_deploy_script()
+    if acquire_run_lock() is None:
+        raise Failure(66, "check", "another self-update deployment is already running")
+    logfile = open_log("deploy", sha)
+    log("self-update deploy %s (log %s)" % (sha, logfile))
+    commit_subject = check_repo_and_commit(sha)
+    log("commit accepted: %s %s" % (sha[:12], commit_subject))
+    state = read_json(STATE_FILE)
+    previous = current_deployed_commit(state if isinstance(state, dict) else None)
+    result = base_result(sha, started, "check", True)
+    result["previous_commit"] = previous
+    result["commit_subject"] = commit_subject
+    result["deploy"] = {"script": DEPLOY_SH, "sha256": deploy_sha256, "result": "failed", "exit_code": None, "log": logfile}
+    log("previous deployed commit: %s" % (previous or "unknown"))
+    log("running the reviewed deploy script (REPO_COMMIT=%s, service restarts deferred)" % sha)
+    try:
+        child_env = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "HOME": "/root", "REPO_COMMIT": sha,
+                     "COCKPIT_RESTART_MODE": "defer", "COCKPIT_SELF_UPDATE_SOURCE": "self-update"}
+        with open(logfile, "ab") as handle:
+            proc = subprocess.run(["bash", DEPLOY_SH], stdout=handle, stderr=handle, env=child_env)
+        result["deploy"]["exit_code"] = proc.returncode
+        if proc.returncode != 0:
+            raise Failure(69, "deploy", "deploy script exited %s — see %s" % (proc.returncode, logfile))
+        result["deploy"]["result"] = "ok"
+        log("deploy script finished ok; verifying the host before activation")
+        checks = verify_phase(retries=VERIFY_RETRIES, delay=VERIFY_DELAY, include_web=True)
+        result["verification"] = checks
+        log("pre-activation verification ok: %s" % json.dumps(checks, sort_keys=True))
+        # The deploy script records the deployed commit (and web_url) itself;
+        # re-read so its fields are preserved. Fall back to the pre-deploy
+        # snapshot when the deploy script did not write state.
+        fresh = read_json(STATE_FILE)
+        new_state = dict(fresh) if isinstance(fresh, dict) else (dict(state) if isinstance(state, dict) else {})
+        if new_state.get("deployed_commit") != sha:
+            new_state["previous_commit"] = previous
+            new_state["state_seeded_by_runner"] = True
+        if "previous_commit" not in new_state:
+            new_state["previous_commit"] = previous
+        new_state.update({
+            "version": 1,
+            "deployed_commit": sha,
+            "updated_at": utcnow(),
+            "updated_by": "self-update",
+        })
+        unit_name = "wireguard-ops-cockpit-self-update-activate-%s-%d" % (sha[:7], int(time.time()))
+        schedule = run([SYSTEMD_RUN, "--collect", "--quiet", "--unit=%s" % unit_name,
+                        "--description=Cockpit self-update activation %s" % sha[:12],
+                        "--working-directory=/", "--on-active=%d" % ACTIVATION_DELAY,
+                        RUN_PATH, "activate", sha], timeout=30)
+        if schedule.returncode != 0:
+            raise Failure(69, "schedule", "activation could not be scheduled: %s" % (schedule.stderr.strip()[-300:] or "no output"))
+        activation = {"status": "scheduled", "unit": unit_name, "scheduled_at": utcnow(), "delay_seconds": ACTIVATION_DELAY}
+        result["activation"] = activation
+        result["phase"] = "awaiting-activation"
+        new_state["activation"] = {"status": "scheduled", "unit": unit_name, "checked_at": None}
+        log("activation scheduled as %s in %ss" % (unit_name, ACTIVATION_DELAY))
+        write_json_atomic(STATE_FILE, new_state)
+        finish(result, 0)
+    except Failure as exc:
+        if exc.phase in ("verify", "schedule"):
+            current = read_json(STATE_FILE)
+            if isinstance(current, dict):
+                current["activation"] = {"status": "not-activated", "checked_at": utcnow(), "detail": exc.message[:300]}
+                current["updated_at"] = utcnow()
+                write_json_atomic(STATE_FILE, current)
+        fail_with(result, exc)
+
+
+def cmd_activate(sha):
+    started = utcnow()
+    ensure_dir(STATE_DIR)
+    ensure_dir(LOG_DIR)
+    if acquire_run_lock() is None:
+        logfile = open_log("activate", sha)
+        log("a self-update deployment is running; activation for %s skipped (the running deployment schedules its own activation)" % sha[:12])
+        note_history({"ts": utcnow(), "sha": sha, "phase": "activate", "result": "skipped-busy", "log": logfile})
+        return
+    logfile = open_log("activate", sha)
+    log("self-update activation %s (log %s)" % (sha, logfile))
+    state = read_json(STATE_FILE)
+    deployed = state.get("deployed_commit") if isinstance(state, dict) else None
+    if deployed != sha:
+        log("superseded: deployed commit is %s, this activation was for %s — skipped" % (deployed or "unknown", sha))
+        note_history({"ts": utcnow(), "sha": sha, "phase": "activate", "result": "skipped-superseded",
+                      "deployed_commit": deployed, "log": logfile})
+        return
+    result = read_json(RESULT_FILE)
+    if not isinstance(result, dict) or result.get("sha") != sha:
+        result = base_result(sha, started, "awaiting-activation", True)
+        result["previous_commit"] = state.get("previous_commit")
+    log("restarting the four cockpit services to activate commit %s" % sha[:12])
+    restart = run([SYSTEMCTL, "restart"] + SERVICES, timeout=300)
+    restart_detail = restart.stderr.strip()[-300:]
+    checks = None
+    error = None
+    try:
+        checks = verify_phase(retries=VERIFY_RETRIES * 2, delay=VERIFY_DELAY, include_web=True)
+    except Failure as exc:
+        error = exc.message
+    service_timestamps = {}
+    for name in SERVICES:
+        stamp = run([SYSTEMCTL, "show", "-p", "ActiveEnterTimestamp", "--value", name], timeout=15)
+        service_timestamps[name] = stamp.stdout.strip()
+    activation = {"status": "ok" if checks and not error else "failed",
+                  "unit": "wireguard-ops-cockpit-self-update-activate-%s" % sha[:7],
+                  "started_at": started, "finished_at": utcnow(),
+                  "checks": checks, "services": service_timestamps}
+    if restart.returncode != 0:
+        activation["status"] = "failed"
+        activation["restart_exit_code"] = restart.returncode
+        activation["restart_error"] = restart_detail
+        error = error or ("service restart failed (%s)" % (restart_detail or restart.returncode))
+    result["activation"] = activation
+    result["finished_at"] = utcnow()
+    new_state = dict(state)
+    new_state["activation"] = {"status": activation["status"], "unit": activation["unit"], "checked_at": utcnow()}
+    new_state["updated_at"] = utcnow()
+    if activation["status"] == "ok":
+        result["phase"] = "activated"
+        log("activation verified: %s" % json.dumps(checks, sort_keys=True))
+        write_json_atomic(STATE_FILE, new_state)
+        finish(result, 0)
+    result["ok"] = False
+    result["result"] = "failed"
+    result["phase"] = "activate"
+    result["code"] = 68
+    result["error"] = error or "activation verification failed"
+    write_json_atomic(STATE_FILE, new_state)
+    finish(result, 68)
+
+
+def main():
+    if len(sys.argv) != 3:
+        print(json.dumps({"ok": False, "error": "usage: cockpit-self-update-run deploy|activate <sha>", "code": 64}), file=sys.stderr)
+        sys.exit(64)
+    command, sha = sys.argv[1], sys.argv[2]
+    if command not in ("deploy", "activate"):
+        print(json.dumps({"ok": False, "error": "unsupported command: %s" % command, "code": 64}), file=sys.stderr)
+        sys.exit(64)
+    if not SHA_RE.match(sha):
+        print(json.dumps({"ok": False, "error": "commit must be a full lowercase 40-hex sha", "code": 65}), file=sys.stderr)
+        sys.exit(65)
+    global ACTIVE_SHA
+    ACTIVE_SHA = sha
+    started = utcnow()
+    try:
+        if command == "deploy":
+            cmd_deploy(sha)
+        else:
+            cmd_activate(sha)
+    except Failure as exc:
+        result = base_result(sha, started, exc.phase, False, code=exc.code, error=exc.message)
+        if os.path.isdir(STATE_DIR):
+            try:
+                finish(result, exc.code)
+            except SystemExit:
+                raise
+        print(json.dumps({"ok": False, "action": "self.update", "sha": sha, "phase": exc.phase,
+                          "error": exc.message, "code": exc.code}, sort_keys=True), file=sys.stderr)
+        sys.exit(exc.code)
+    except SystemExit:
+        raise
+    except Exception as exc:  # pragma: no cover - unexpected internal error
+        result = base_result(sha, started, "internal", False, code=69, error="internal error: %s" % exc)
+        if os.path.isdir(STATE_DIR):
+            try:
+                finish(result, 69)
+            except SystemExit:
+                raise
+        print(json.dumps({"ok": False, "action": "self.update", "sha": sha, "error": "internal error", "code": 69}), file=sys.stderr)
+        sys.exit(69)
+
+
+if __name__ == "__main__":
+    main()
