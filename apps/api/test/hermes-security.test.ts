@@ -6,6 +6,7 @@ import {
   normalizeEvidence,
   normalizeAllowedCapabilities,
   parseTypedDiskActions,
+  parseTypedSelfUpdates,
   validateExecutionEnvelope,
 } from "../src/hermes-security.js";
 
@@ -106,5 +107,50 @@ describe("Hermes security contract", () => {
 
   it("accepts disk.manage in an operator-provided allowlist", () => {
     expect(normalizeAllowedCapabilities(["disk.manage", "become.root"])).toEqual(["disk.manage"]);
+  });
+
+  it("accepts only the exact typed self-update forms for the self-update helper", () => {
+    const sha = "0123456789abcdef0123456789abcdef01234567";
+    const script = [
+      "# roll the reviewed cockpit stand out (merged commit only)",
+      "set -euo pipefail",
+      `/usr/local/sbin/cockpit-self-update-action ${sha}`,
+      "sudo /usr/local/sbin/cockpit-self-update-action status",
+    ].join("\n");
+    expect(parseTypedSelfUpdates(script)).toEqual({
+      actions: [
+        { action: "self.update", target: sha },
+        { action: "self.status", target: "state" },
+      ],
+      unsupported: [],
+    });
+  });
+
+  it("keeps every other self-update invocation unsupported", () => {
+    const sha = "0123456789abcdef0123456789abcdef01234567";
+    const direct = [
+      "/usr/local/sbin/cockpit-self-update-action",
+      "/usr/local/sbin/cockpit-self-update-action main",
+      `/usr/local/sbin/cockpit-self-update-action ${sha.toUpperCase()}`,
+      `/usr/local/sbin/cockpit-self-update-action ${sha.slice(0, 12)}`,
+      "/usr/local/sbin/cockpit-self-update-action status extra",
+      "/usr/local/sbin/cockpit-self-update-action status --json",
+    ];
+    for (const line of direct) {
+      expect(parseTypedSelfUpdates(line).unsupported).toEqual([line]);
+    }
+    expect(parseTypedSelfUpdates("ls -l /usr/local/sbin/cockpit-self-update-action")).toEqual({ actions: [], unsupported: [] });
+  });
+
+  it("classifies typed self-update lines as self.update without a shell exception", () => {
+    const sha = "0123456789abcdef0123456789abcdef01234567";
+    expect(classifyCapabilities("```bash\n/usr/local/sbin/cockpit-self-update-action " + sha + "\n```")).toEqual(["self.update"]);
+    expect(classifyCapabilities("```bash\nsudo /usr/local/sbin/cockpit-self-update-action status\n```")).toEqual(["self.update"]);
+    expect(classifyCapabilities("```bash\n/usr/local/sbin/cockpit-self-update-action --force\n```")).toEqual(["shell.exception"]);
+    expect(classifyCapabilities("```bash\n/usr/local/sbin/cockpit-self-update-action " + sha.toUpperCase() + "\n```")).toEqual(["shell.exception"]);
+  });
+
+  it("accepts self.update in an operator-provided allowlist", () => {
+    expect(normalizeAllowedCapabilities(["self.update", "become.root"])).toEqual(["self.update"]);
   });
 });

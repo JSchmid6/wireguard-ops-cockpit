@@ -49,3 +49,32 @@ test("executor broker rejects disk targets and actions outside the allowlist", (
     assert.equal(threw, true, `expected rejection: ${JSON.stringify(partial)}`);
   }
 });
+
+const selfBase = { expiresAt: "2030-01-01T00:00:00.000Z", envelopeDigest: "d".repeat(64) };
+const selfSha = "0123456789abcdef0123456789abcdef01234567";
+
+test("executor broker admits the typed self-update actions on allowlisted targets", () => {
+  for (const [action, target] of [["self.update", selfSha], ["self.status", "state"]]) {
+    const payload = { ...selfBase, action, target };
+    assert.deepEqual(validateRequest({ payload, signature: sign(payload) }, validAt), payload);
+  }
+});
+
+test("executor broker rejects self-update targets outside the allowlist", () => {
+  const rejected = [
+    { action: "self.status", target: "all" },
+    { action: "self.status", target: "state " },
+    { action: "self.update", target: "main" },
+    { action: "self.update", target: selfSha.toUpperCase() },
+    { action: "self.update", target: selfSha.slice(0, 39) },
+    { action: "self.update", target: `${selfSha}f` },
+    { action: "self.update", target: `${selfSha} --force` },
+    { action: "self.reboot", target: "state" },
+  ];
+  for (const partial of rejected) {
+    const payload = { ...selfBase, ...partial };
+    let threw = false;
+    try { validateRequest({ payload, signature: sign(payload) }, validAt); } catch { threw = true; }
+    assert.equal(threw, true, `expected rejection: ${JSON.stringify(partial)}`);
+  }
+});

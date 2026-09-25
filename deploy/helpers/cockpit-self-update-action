@@ -1,0 +1,231 @@
+#!/bin/bash
+# cockpit-self-update-action — typed self-update helper for the wireguard-ops
+# cockpit on Lab0, pinned for the cockpit-executor service account.
+#
+# Usage (exactly; no other arguments are accepted):
+#   cockpit-self-update-action status
+#   cockpit-self-update-action <commit-sha>          # full lowercase 40-hex sha
+#
+# Security contract:
+#   * Fixed argument form. Nothing else is accepted: no subcommand beyond
+#     `status`, no partial/short shas, no environment-controlled behaviour on
+#     the typed executor path (sudo env_reset + broker PATH only).
+#   * `status` is read-only: it reads the self-update state below
+#     /var/lib/wireguard-ops-cockpit/self-update and, if that state is still
+#     missing, the pinned checkout's HEAD as a read-only fallback.
+#   * `<commit-sha>` starts the one-shot unit
+#     wireguard-ops-cockpit-self-update@<sha>.service and waits for it. The
+#     unit — not this helper — performs the deployment: it re-verifies that
+#     the commit is reachable from origin/main of the allowlisted repository
+#     (merged review chain only), runs the reviewed deploy script pinned to
+#     that commit, verifies the host, and schedules the activation (service
+#     restart) step. This helper never runs git, the deploy script or any
+#     other host mutation in its own, sandboxed context; it cannot deploy
+#     anything the unit would not deploy itself.
+#   * Exactly one update attempt at a time (flock on action.lock).
+#   * Success emits one JSON line on stdout. Failures emit one JSON line on
+#     stderr and a sysexits-style exit code:
+#       64 usage | 65 target rejected | 66 state conflict | 67 environment
+#       68 verification failed | 69 execution failed
+#
+# Simulation harness hooks (COCKPIT_SELF_UPDATE_STATE_DIR, _REPO_DIR,
+# _SYSTEMCTL, _GIT, _UNIT_PREFIX) redirect the state paths and the tool paths
+# so the helper can run offline against fixtures
+# (test/cockpit-self-update-action.test.sh). sudo(8) resets the environment
+# (env_reset) and the executor broker passes only PATH, so the typed executor
+# path always sees the real tools.
+set -euo pipefail
+PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
+
+readonly STATE_DIR="${COCKPIT_SELF_UPDATE_STATE_DIR:-/var/lib/wireguard-ops-cockpit/self-update}"
+readonly REPO_DIR="${COCKPIT_SELF_UPDATE_REPO_DIR:-/opt/wireguard-ops-cockpit}"
+readonly SYSTEMCTL="${COCKPIT_SELF_UPDATE_SYSTEMCTL:-/usr/bin/systemctl}"
+readonly GIT="${COCKPIT_SELF_UPDATE_GIT:-/usr/bin/git}"
+readonly UNIT_PREFIX="${COCKPIT_SELF_UPDATE_UNIT_PREFIX:-wireguard-ops-cockpit-self-update@}"
+
+ACTION="none"
+SHA=""
+RES_OK=""
+RES_CODE=""
+RES_SHA=""
+
+json_escape() {
+  local value="${1:0:300}"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/ }"
+  value="${value//$'\r'/ }"
+  value="${value//$'\t'/ }"
+  printf '%s' "$value"
+}
+
+fail() { # fail <exit-code> <message>
+  printf '{"ok":false,"action":"%s","error":"%s","code":%s}\n' \
+    "$(json_escape "$ACTION")" "$(json_escape "$2")" "$1" >&2
+  exit "$1"
+}
+
+require_root() {
+  if [ "$(id -u)" -ne 0 ]; then fail 67 "the self-update action requires root"; fi
+}
+
+normalize_sha() {
+  local raw="$1"
+  if ! [[ "$raw" =~ ^[a-f0-9]{40}$ ]]; then
+    fail 65 "commit must be a full lowercase 40-hex sha: $raw"
+  fi
+  SHA="$raw"
+}
+
+read_result() { # sets RES_OK/RES_CODE/RES_SHA; rc != 0 when unreadable
+  local file="$STATE_DIR/last-result.json" line=""
+  [ -r "$file" ] || return 1
+  line="$(python3 - "$file" <<'PY' 2>/dev/null || true
+import json
+import sys
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+except Exception:
+    print("error\t69\t")
+else:
+    ok = "true" if data.get("ok") is True else "false"
+    code = data.get("code")
+    if not isinstance(code, int) or isinstance(code, bool):
+        code = 0 if ok == "true" else 68
+    print("%s\t%d\t%s" % (ok, code, data.get("sha") or ""))
+PY
+)"
+  [ -n "$line" ] || return 1
+  RES_OK="$(cut -f1 <<<"$line")"
+  RES_CODE="$(cut -f2 <<<"$line")"
+  RES_SHA="$(cut -f3 <<<"$line")"
+}
+
+report_result() { # $1 = unit name; prints the attempt result and sets the exit code
+  local unit="$1"
+  if ! read_result || [ "$RES_SHA" != "$SHA" ]; then
+    fail 69 "unit ${unit##*/} finished without a matching result for $SHA; inspect: journalctl -u ${unit} and $STATE_DIR"
+  fi
+  if [ "$RES_OK" = "true" ]; then
+    printf '%s\n' "$(cat "$STATE_DIR/last-result.json")"
+    exit 0
+  fi
+  printf '%s\n' "$(cat "$STATE_DIR/last-result.json")" >&2
+  exit "$RES_CODE"
+}
+
+status_command() {
+  local lock_state="free" deploy_sh deploy_sha=""
+  deploy_sh="${COCKPIT_SELF_UPDATE_DEPLOY_SH:-/usr/local/lib/wireguard-ops-cockpit/homeserver-cockpit-deploy.sh}"
+  if [ -d "$STATE_DIR" ] && [ -f "$STATE_DIR/action.lock" ]; then
+    if ! flock -n "$STATE_DIR/action.lock" -c true 2>/dev/null; then lock_state="held"; fi
+  fi
+  if [ -r "$deploy_sh" ]; then deploy_sha="$(sha256sum "$deploy_sh" | cut -d' ' -f1 || true)"; fi
+  python3 - "$STATE_DIR" "$lock_state" "$REPO_DIR" "$GIT" "$deploy_sh" "$deploy_sha" <<'PY'
+import json
+import os
+import subprocess
+import sys
+
+state_dir, lock_state, repo_dir, git, deploy_sh, deploy_sha = sys.argv[1:7]
+out = {"ok": True, "action": "self.status"}
+
+
+def load(name):
+    try:
+        with open(os.path.join(state_dir, name), "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return "unreadable"
+
+
+state = load("state.json")
+result = load("last-result.json")
+if isinstance(state, dict):
+    for key in ("deployed_commit", "previous_commit", "updated_at", "updated_by", "activation"):
+        if key in state:
+            out[key] = state[key]
+else:
+    out["state"] = "missing" if state is None else "unreadable"
+    try:
+        head = subprocess.run([git, "-C", repo_dir, "rev-parse", "HEAD"],
+                              capture_output=True, text=True, timeout=15)
+        commit = head.stdout.strip()
+        if head.returncode == 0 and commit:
+            out["deployed_commit"] = commit
+            out["deployed_commit_source"] = "git-head"
+    except Exception:
+        pass
+if isinstance(result, dict):
+    out["last_attempt"] = {
+        "sha": result.get("sha"),
+        "ok": result.get("ok"),
+        "result": result.get("result"),
+        "phase": result.get("phase"),
+        "finished_at": result.get("finished_at"),
+        "log": result.get("log"),
+    }
+    activation = result.get("activation")
+    if isinstance(activation, dict) and activation.get("status") == "scheduled":
+        out["pending_activation"] = activation
+elif result == "unreadable":
+    out["last_attempt"] = "unreadable"
+out["lock"] = lock_state
+if deploy_sha:
+    out["deploy_script"] = {"path": deploy_sh, "sha256": deploy_sha}
+print(json.dumps(out, sort_keys=True))
+PY
+}
+
+update_command() {
+  require_root
+  command -v python3 >/dev/null 2>&1 || fail 67 "python3 is required but not available"
+  if [ ! -d "$STATE_DIR" ]; then
+    fail 67 "self-update state directory is missing: $STATE_DIR (install the module with the reviewed deploy script first)"
+  fi
+  if ! exec 9>"$STATE_DIR/action.lock"; then
+    fail 67 "cannot open the attempt lock below $STATE_DIR"
+  fi
+  if ! flock -n 9; then
+    fail 66 "another self-update attempt is already in progress"
+  fi
+  [ -x "$SYSTEMCTL" ] || fail 67 "systemctl is not executable: $SYSTEMCTL"
+  rm -f "$STATE_DIR/last-result.json"
+  local unit="${UNIT_PREFIX}${SHA}.service"
+  "$SYSTEMCTL" reset-failed "$unit" >/dev/null 2>&1 || true
+  if ! "$SYSTEMCTL" start "$unit"; then
+    report_result "$unit"
+  fi
+  report_result "$unit"
+}
+
+main() {
+  if [ "$#" -lt 1 ]; then
+    fail 64 "usage: cockpit-self-update-action status|<commit-sha>"
+  fi
+  local sub="$1"
+  shift
+  case "$sub" in
+    status)
+      if [ "$#" -ne 0 ]; then fail 64 "status takes no arguments"; fi
+      ACTION="status"
+      status_command
+      ;;
+    -*)
+      fail 64 "unsupported option: $sub"
+      ;;
+    *)
+      if [ "$#" -ne 0 ]; then fail 64 "update takes exactly one commit sha"; fi
+      ACTION="update"
+      normalize_sha "$sub"
+      update_command
+      ;;
+  esac
+}
+
+main "$@"
