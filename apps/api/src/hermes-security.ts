@@ -25,12 +25,21 @@ const CAPABILITIES = new Set<CapabilityId>([
 // stays shell.exception and can never be auto-executed.
 const MDADM_MANAGE_LINE = /^(?:sudo\s+)?(?:\/(?:usr\/)?sbin\/)?mdadm\s+--manage\s+\/dev\/md127\s+--(add|remove)\s+(?:\/dev\/)?(sd[a-z])$/;
 const MDADM_DETAIL_LINE = /^(?:sudo\s+)?(?:\/(?:usr\/)?sbin\/)?mdadm\s+--detail\s+\/dev\/md12[67]$/;
+// The installed disk helper is the executor's own face for the fixed IMSM
+// container, so its exact CLI is an equally typed form: a plan may name it
+// instead of spelling out mdadm. Everything beyond these two shapes stays
+// unsupported and can never be auto-executed.
+const DISK_HELPER = "/usr/local/sbin/cockpit-disk-action";
+const DISK_HELPER_STATUS_LINE = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-disk-action\s+status$/;
+const DISK_HELPER_MANAGE_LINE = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-disk-action\s+(add|remove)\s+(?:\/dev\/)?(sd[a-z])$/;
+const DISK_HELPER_INVOCATION = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-disk-action\b/;
 
 export interface TypedDiskAction { action: "disk.status" | "disk.remove" | "disk.add"; target: string }
 
 export function isTypedDiskLine(line: string): boolean {
   const trimmed = line.trim();
-  return MDADM_MANAGE_LINE.test(trimmed) || MDADM_DETAIL_LINE.test(trimmed);
+  return MDADM_MANAGE_LINE.test(trimmed) || MDADM_DETAIL_LINE.test(trimmed)
+    || DISK_HELPER_STATUS_LINE.test(trimmed) || DISK_HELPER_MANAGE_LINE.test(trimmed);
 }
 
 export function parseTypedDiskActions(script: string): { actions: TypedDiskAction[]; unsupported: string[] } {
@@ -39,7 +48,8 @@ export function parseTypedDiskActions(script: string): { actions: TypedDiskActio
   for (const rawLine of script.split("\n")) {
     const line = rawLine.trim();
     if (!line || line.startsWith("#") || /^set\s+-/.test(line)) continue;
-    if (!/\bmdadm\b/.test(line)) continue;
+    const helperInvocation = DISK_HELPER_INVOCATION.test(line);
+    if (!/\bmdadm\b/.test(line) && !helperInvocation) continue;
     const manage = line.match(MDADM_MANAGE_LINE);
     if (manage) {
       actions.push({ action: manage[1] === "add" ? "disk.add" : "disk.remove", target: manage[2] });
@@ -47,6 +57,15 @@ export function parseTypedDiskActions(script: string): { actions: TypedDiskActio
     }
     if (MDADM_DETAIL_LINE.test(line)) {
       actions.push({ action: "disk.status", target: "md127" });
+      continue;
+    }
+    if (DISK_HELPER_STATUS_LINE.test(line)) {
+      actions.push({ action: "disk.status", target: "md127" });
+      continue;
+    }
+    const helperManage = line.match(DISK_HELPER_MANAGE_LINE);
+    if (helperManage) {
+      actions.push({ action: helperManage[1] === "add" ? "disk.add" : "disk.remove", target: helperManage[2] });
       continue;
     }
     unsupported.push(line);
@@ -160,7 +179,8 @@ export function classifyCapabilities(plan: string): CapabilityId[] {
         (/^(systemctl|service)$/.test(command) && /\b(restart|start|stop|reload|enable|disable)\b/.test(segment)) ||
         (/^(apt|apt-get|dnf|yum|rpm|dpkg|snap)$/.test(command)) ||
         (/^(iptables|nft|ufw|useradd|userdel|usermod|groupadd|groupdel)$/.test(command)) ||
-        (command === "mdadm" && isTypedDiskLine(segment));
+        (command === "mdadm" && isTypedDiskLine(segment)) ||
+        (command === "cockpit-disk-action" && isTypedDiskLine(segment));
       if (!safeReadCommands.has(command) && !typedMutation) capabilities.add("shell.exception");
     }
   }

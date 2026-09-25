@@ -24,12 +24,14 @@
 #       64 usage | 65 device rejected | 66 state conflict | 67 environment
 #       68 verification failed | 69 mdadm failed
 #
-# Simulation harness hooks (used only by test/cockpit-disk-action.test.sh):
-#   COCKPIT_DISK_ACTION_MDSTAT, _SYSBLOCK, _MDADM, and _BLKID redirect the
-#   read-only inputs and the tool paths so the helper can run offline against
-#   fixtures. sudo(8) resets the environment (env_reset), the executor broker
-#   passes only PATH, and every mutation still requires uid 0 — a caller can
-#   never reach a redirected tool through the executor path.
+# Simulation harness hooks (COCKPIT_DISK_ACTION_MDSTAT, _SYSBLOCK, _MDADM,
+# _BLKID) redirect the read-only inputs and the tool paths so the helper can
+# run offline against fixtures (test/cockpit-disk-action.test.sh). sudo(8)
+# resets the environment (env_reset) and the executor broker passes only PATH,
+# so the typed executor path always sees the real tools. The capability
+# sandbox runner may pin COCKPIT_DISK_ACTION_MDSTAT to the fixed read-only
+# bind /run/mdstat for a sandboxed status; it never executes remove/add —
+# mutations have exactly one path, the typed executor with uid 0.
 set -euo pipefail
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH

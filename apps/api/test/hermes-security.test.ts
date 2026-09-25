@@ -75,6 +75,30 @@ describe("Hermes security contract", () => {
     expect(unsupported).toEqual(["mdadm --manage /dev/md127 --fail /dev/sda"]);
   });
 
+  it("accepts the exact disk-helper CLI forms as typed disk actions too", () => {
+    const script = [
+      "sudo /usr/local/sbin/cockpit-disk-action status",
+      "/usr/local/sbin/cockpit-disk-action remove /dev/sda",
+      "/usr/local/sbin/cockpit-disk-action add sdb",
+    ].join("\n");
+    expect(parseTypedDiskActions(script)).toEqual({
+      actions: [
+        { action: "disk.status", target: "md127" },
+        { action: "disk.remove", target: "sda" },
+        { action: "disk.add", target: "sdb" },
+      ],
+      unsupported: [],
+    });
+    expect(classifyCapabilities("```bash\n/usr/local/sbin/cockpit-disk-action status\n```")).toEqual(["disk.manage"]);
+  });
+
+  it("keeps malformed or merely-mentioned disk-helper lines out of the typed path", () => {
+    expect(parseTypedDiskActions("/usr/local/sbin/cockpit-disk-action fail sda").unsupported).toEqual(["/usr/local/sbin/cockpit-disk-action fail sda"]);
+    expect(parseTypedDiskActions("/usr/local/sbin/cockpit-disk-action status extra").unsupported).toEqual(["/usr/local/sbin/cockpit-disk-action status extra"]);
+    expect(parseTypedDiskActions("/usr/local/sbin/cockpit-disk-action remove /dev/sda1").unsupported).toEqual(["/usr/local/sbin/cockpit-disk-action remove /dev/sda1"]);
+    expect(parseTypedDiskActions("ls -l /usr/local/sbin/cockpit-disk-action")).toEqual({ actions: [], unsupported: [] });
+  });
+
   it("classifies typed mdadm lines as disk.manage without a shell exception", () => {
     expect(classifyCapabilities("```bash\nmdadm --manage /dev/md127 --remove /dev/sda\nmdadm --manage /dev/md127 --add /dev/sdb\n```")).toEqual(["disk.manage"]);
     expect(classifyCapabilities("```bash\nmdadm --create /dev/md0 --level=1 --raid-devices=2 /dev/sdb /dev/sdc\n```")).toEqual(["shell.exception"]);

@@ -68,6 +68,13 @@ const nextcloudContextHelper = "/usr/local/sbin/cockpit-nextcloud-context-action
 const exactFileReplaceHelper = "/usr/local/sbin/cockpit-exact-file-replace";
 const hermesSkillHelper = "/usr/local/lib/wireguard-ops-cockpit/cockpit-hermes-skill-action";
 const emailArchiveDeployHelper = "/usr/local/lib/wireguard-ops-cockpit/cockpit-email-archive-deploy";
+const diskHelper = "/usr/local/sbin/cockpit-disk-action";
+// procfs files cannot be bind-mounted at their own path inside the sandbox
+// (ProcSubset=pid hides /proc/mdstat entirely): the one kernel file the disk
+// helper reads is pinned to a fixed neutral read-only target instead.
+function readableBindProperty(item) {
+  return `--property=BindReadOnlyPaths=${item === "/proc/mdstat" ? "/proc/mdstat:/run/mdstat" : item}`;
+}
 const readOnlyContainerCommands = new Set(["ps", "inspect", "version", "info"]);
 function stepNeedsApproval(step) {
   const executable = step?.argv?.[0] || "";
@@ -100,6 +107,7 @@ for (const [index, step] of manifest.steps.entries()) {
   if (runAsUser && (!/^[a-z_][a-z0-9_-]{0,31}$/.test(runAsUser) || runAsUser === "root")) fail(`step ${index + 1} has invalid runAsUser`);
   const isHermesSkillStep = step.argv[0] === "/bin/sh" && step.argv[1] === hermesSkillHelper;
   const isEmailArchiveDeployStep = step.argv[0] === "/bin/sh" && step.argv[1] === emailArchiveDeployHelper;
+  const isDiskHelperStep = step.argv[0] === diskHelper;
   const properties = [
     "--property=Type=exec", "--property=NoNewPrivileges=yes", "--property=PrivateTmp=yes", "--property=TemporaryFileSystem=/:ro",
     `--property=ProtectHome=${isHermesSkillStep ? "read-only" : "yes"}`, "--property=ProtectKernelTunables=yes", "--property=ProtectKernelModules=yes", "--property=ProtectControlGroups=yes",
@@ -108,7 +116,7 @@ for (const [index, step] of manifest.steps.entries()) {
     "--property=RestrictNamespaces=yes", "--property=ProtectProc=invisible", "--property=ProcSubset=pid",
     "--property=SystemCallFilter=~@mount @swap @reboot @raw-io @privileged",
     "--property=BindReadOnlyPaths=/usr /bin /lib /lib64 /etc/ld.so.cache /etc/alternatives",
-    ...readablePaths.filter((item) => !writablePaths.includes(item)).map((item) => `--property=BindReadOnlyPaths=${item}`),
+    ...readablePaths.filter((item) => !writablePaths.includes(item)).map(readableBindProperty),
     ...writablePaths.map((item) => `--property=BindPaths=${item}`),
   ];
   if (step.argv[0] === nextcloudAppHelper || step.argv[0] === nextcloudContextHelper) {
@@ -145,6 +153,20 @@ for (const [index, step] of manifest.steps.entries()) {
       "--property=BindReadOnlyPaths=/home/hermes/.hermes/email-archive",
       "--property=BindPaths=/var/run/docker.sock",
     );
+  }
+  if (isDiskHelperStep) {
+    if (step.argv[1] === "remove" || step.argv[1] === "add") {
+      fail(`step ${index + 1}: disk mutations run only through the typed executor path (disk.manage), never through the capability sandbox`, 77);
+    }
+    // Read-only status: the pid-subset /proc has no mdstat, so the runner
+    // grants the host kernel's view as a read-only bind at a fixed neutral
+    // path and points the helper at it (its documented env override).
+    for (const property of [
+      "--property=BindReadOnlyPaths=/proc/mdstat:/run/mdstat",
+      "--setenv=COCKPIT_DISK_ACTION_MDSTAT=/run/mdstat",
+    ]) {
+      if (!properties.includes(property)) properties.push(property);
+    }
   }
   if (runAsUser) properties.push(`--property=User=${runAsUser}`);
   if (manifest.network === "none") properties.push("--property=PrivateNetwork=yes", "--property=RestrictAddressFamilies=AF_UNIX");
