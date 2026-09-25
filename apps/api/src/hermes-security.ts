@@ -28,11 +28,13 @@ const MDADM_MANAGE_LINE = /^(?:sudo\s+)?(?:\/(?:usr\/)?sbin\/)?mdadm\s+--manage\
 const MDADM_DETAIL_LINE = /^(?:sudo\s+)?(?:\/(?:usr\/)?sbin\/)?mdadm\s+--detail\s+\/dev\/md12[67]$/;
 // The installed disk helper is the executor's own face for the fixed IMSM
 // container, so its exact CLI is an equally typed form: a plan may name it
-// instead of spelling out mdadm. Everything beyond these two shapes stays
+// instead of spelling out mdadm. Everything beyond these shapes stays
 // unsupported and can never be auto-executed.
 const DISK_HELPER = "/usr/local/sbin/cockpit-disk-action";
 const DISK_HELPER_STATUS_LINE = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-disk-action\s+status$/;
 const DISK_HELPER_MANAGE_LINE = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-disk-action\s+(add|remove)\s+(?:\/dev\/)?(sd[a-z])$/;
+const DISK_HELPER_SMART_LINE = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-disk-action\s+smart\s+(?:\/dev\/)?(sd[a-z])$/;
+const DISK_HELPER_SMARTTEST_LINE = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-disk-action\s+smarttest\s+(?:\/dev\/)?(sd[a-z])$/;
 const DISK_HELPER_INVOCATION = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-disk-action\b/;
 // The installed self-update helper is the executor's face for rolling out a
 // merged cockpit stand: one full lowercase commit sha, or the read-only
@@ -42,12 +44,13 @@ const SELF_UPDATE_COMMIT_LINE = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-self-u
 const SELF_UPDATE_STATUS_LINE = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-self-update-action\s+status$/;
 const SELF_UPDATE_INVOCATION = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-self-update-action\b/;
 
-export interface TypedDiskAction { action: "disk.status" | "disk.remove" | "disk.add"; target: string }
+export interface TypedDiskAction { action: "disk.status" | "disk.remove" | "disk.add" | "disk.smart" | "disk.smarttest"; target: string }
 
 export function isTypedDiskLine(line: string): boolean {
   const trimmed = line.trim();
   return MDADM_MANAGE_LINE.test(trimmed) || MDADM_DETAIL_LINE.test(trimmed)
-    || DISK_HELPER_STATUS_LINE.test(trimmed) || DISK_HELPER_MANAGE_LINE.test(trimmed);
+    || DISK_HELPER_STATUS_LINE.test(trimmed) || DISK_HELPER_MANAGE_LINE.test(trimmed)
+    || DISK_HELPER_SMART_LINE.test(trimmed) || DISK_HELPER_SMARTTEST_LINE.test(trimmed);
 }
 
 export function parseTypedDiskActions(script: string): { actions: TypedDiskAction[]; unsupported: string[] } {
@@ -74,6 +77,16 @@ export function parseTypedDiskActions(script: string): { actions: TypedDiskActio
     const helperManage = line.match(DISK_HELPER_MANAGE_LINE);
     if (helperManage) {
       actions.push({ action: helperManage[1] === "add" ? "disk.add" : "disk.remove", target: helperManage[2] });
+      continue;
+    }
+    const helperSmart = line.match(DISK_HELPER_SMART_LINE);
+    if (helperSmart) {
+      actions.push({ action: "disk.smart", target: helperSmart[1] });
+      continue;
+    }
+    const helperSmartTest = line.match(DISK_HELPER_SMARTTEST_LINE);
+    if (helperSmartTest) {
+      actions.push({ action: "disk.smarttest", target: helperSmartTest[1] });
       continue;
     }
     unsupported.push(line);

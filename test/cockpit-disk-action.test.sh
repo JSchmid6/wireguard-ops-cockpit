@@ -11,9 +11,9 @@
 # Aufruf (kein mdadm nötig; auf Lab0 direkt als root, sonst mit sudo):
 #   sudo bash test/cockpit-disk-action.test.sh
 #
-# Ohne root laufen nur die nicht-mutierenden Fälle (usage/status/device); die
-# remove/add-Fälle werden übersprungen. Das Skript endet nur dann mit RC != 0,
-# wenn ein ausgeführter Fall fehlschlägt.
+# Ohne root laufen nur die nicht-mutierenden Fälle (usage/status/device/smart);
+# die remove/add/smarttest-Fälle werden übersprungen. Das Skript endet nur dann
+# mit RC != 0, wenn ein ausgeführter Fall fehlschlägt.
 # =============================================================================
 set -uo pipefail
 
@@ -37,6 +37,7 @@ assert_rc() { # name, erwartet
 assert_out() { if printf '%s' "$OUT" | grep -q -- "$2"; then ok "$1"; else bad "$1 — stdout fehlt: $2"; fi }
 assert_no_out() { if printf '%s' "$OUT" | grep -q -- "$2"; then bad "$1 — stdout enthält unerwartet: $2"; else ok "$1"; fi }
 assert_err() { if printf '%s' "$ERR" | grep -q -- "$2"; then ok "$1"; else bad "$1 — stderr fehlt: $2 (stderr: $ERR)"; fi }
+assert_log() { if grep -q -- "$2" "$WORK/mdadm.log"; then ok "$1"; else bad "$1 — Stub-Log ohne: $2"; fi }
 assert_json() { # name, json
   if printf '%s' "$2" | json_valid; then ok "$1"; else bad "$1 — kein valides JSON: $2"; fi
 }
@@ -134,7 +135,57 @@ case "$field" in
 esac
 exit 2
 STUB_EOF
-chmod +x "$WORK/stub-mdadm" "$WORK/stub-blkid"
+cat > "$WORK/stub-smartctl" <<'STUB_EOF'
+#!/bin/bash
+# stub-smartctl — simuliert smartctl -j (mehrzeiliges JSON wie das Original).
+# Verhalten über STUB_SMARTCTL_MODE: healthy (Vorgabe) | openfail | badjson |
+# healthfail. Jeder Aufruf wird mit seinen Argumenten protokolliert.
+set -u
+printf 'smartctl %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+dev=""
+for arg in "$@"; do case "$arg" in /dev/*) dev="$arg" ;; esac; done
+case "${STUB_SMARTCTL_MODE:-healthy}" in
+  openfail)
+    echo "Smartctl open device: $dev failed: No such device" >&2
+    exit 2 ;;
+  badjson)
+    echo "smartctl 7.4 2023-08-01 r5530 [x86_64-linux] (local build)"
+    echo "=== START OF INFORMATION SECTION ==="
+    exit 0 ;;
+  healthfail)
+    cat <<JSON
+{
+  "json_format_version": [1, 0],
+  "device": {"name": "$dev", "type": "sat"},
+  "model_name": "SIM-DISK-1000",
+  "serial_number": "SIM0001",
+  "smart_status": {"passed": false},
+  "ata_smart_attributes": {"table": [
+    {"id": 5, "name": "Reallocated_Sector_Ct", "value": 11, "thresh": 36, "raw": {"value": 4096}}
+  ]},
+  "ata_smart_self_test_log": {"standard": {"table": []}}
+}
+JSON
+    exit 8 ;;
+  *)
+    cat <<JSON
+{
+  "json_format_version": [1, 0],
+  "device": {"name": "$dev", "type": "sat"},
+  "model_name": "SIM-DISK-1000",
+  "serial_number": "SIM0001",
+  "smart_status": {"passed": true},
+  "ata_smart_attributes": {"table": [
+    {"id": 5, "name": "Reallocated_Sector_Ct", "value": 100, "thresh": 36, "raw": {"value": 0}},
+    {"id": 9, "name": "Power_On_Hours", "value": 88, "thresh": 0, "raw": {"value": 10432}}
+  ]},
+  "ata_smart_self_test_log": {"standard": {"table": []}}
+}
+JSON
+    exit 0 ;;
+esac
+STUB_EOF
+chmod +x "$WORK/stub-mdadm" "$WORK/stub-blkid" "$WORK/stub-smartctl"
 
 # ---------------------------------------------------------------------------
 # Fixtures (Struktur wie echte IMSM-mdstat; [4/3] = degraded, [4/4] = ok)
@@ -213,7 +264,7 @@ EOF
 # Helfer-Aufruf
 # ---------------------------------------------------------------------------
 RC=0; OUT=""; ERR=""
-STUB_BLKID_TYPE=""; STUB_BLKID_PTTYPE=""; STUB_MDADM_FAIL=""
+STUB_BLKID_TYPE=""; STUB_BLKID_PTTYPE=""; STUB_MDADM_FAIL=""; STUB_SMARTCTL_MODE=""
 
 run_helper() { # [fixture|-] args...
   local fixture="$1"; shift
@@ -223,9 +274,10 @@ run_helper() { # [fixture|-] args...
          COCKPIT_DISK_ACTION_SYSBLOCK="$SYSBLOCK" \
          COCKPIT_DISK_ACTION_MDADM="$WORK/stub-mdadm" \
          COCKPIT_DISK_ACTION_BLKID="$WORK/stub-blkid" \
+         COCKPIT_DISK_ACTION_SMARTCTL="$WORK/stub-smartctl" \
          STUB_MDSTAT="$WORK/mdstat" STUB_LOG="$WORK/mdadm.log" \
          STUB_BLKID_TYPE="$STUB_BLKID_TYPE" STUB_BLKID_PTTYPE="$STUB_BLKID_PTTYPE" \
-         STUB_MDADM_FAIL="$STUB_MDADM_FAIL" \
+         STUB_MDADM_FAIL="$STUB_MDADM_FAIL" STUB_SMARTCTL_MODE="$STUB_SMARTCTL_MODE" \
          "$HELPER" "$@" 2>"$WORK/stderr")"
   RC=$?
   ERR="$(cat "$WORK/stderr")"
@@ -251,6 +303,14 @@ run_helper degraded remove sdaa
 assert_rc "sd[a-z]-Format erzwungen -> 65" 65
 run_helper degraded remove /dev/disk/by-id/foo
 assert_rc "Pfade/symlinks abgelehnt -> 65" 65
+run_helper degraded smart
+assert_rc "smart ohne Gerät -> 64" 64
+run_helper degraded smart sda extra
+assert_rc "smart mit Extra-Argument -> 64" 64
+run_helper degraded smart /dev/sda1
+assert_rc "smart: Partition abgelehnt -> 65" 65
+run_helper degraded smarttest sdaa
+assert_rc "smarttest: sd[a-z]-Format erzwungen -> 65" 65
 
 # ---------------------------------------------------------------------------
 printf '\n-- status --\n'
@@ -287,6 +347,44 @@ assert_rc "neutraler mdstat-Pfad -> 0" 0
 assert_json "neutraler Pfad liefert JSON" "$OUT"
 assert_field "neutraler Pfad: vier Mitglieder" "$OUT" '[m["device"] for m in d["members"]] == ["sda","sdb","sdc","sdd"]'
 assert_field "neutraler Pfad: Volume degraded" "$OUT" 'd["volumes"][0]["degraded"] is True and d["volumes"][0]["members"] == ["sdb","sdc","sdd"]'
+
+# ---------------------------------------------------------------------------
+# smart ist read-only und braucht kein root: der Stub liefert mehrzeiliges
+# smartctl-JSON, der Helfer muss es als EINE Zeile einbetten und die Kurzfelder
+# anhängen. Health-Bits (rc 8/16/...) sind Plattenzustände, kein Werkzeugfehler.
+printf '\n-- smart --\n'
+run_helper degraded smart sda
+assert_rc "smart: gesunde Platte -> 0" 0
+assert_json "smart liefert JSON" "$OUT"
+assert_field "smart: ok/action/device" "$OUT" 'd["ok"] is True and d["action"] == "smart" and d["device"] == "sda"'
+assert_field "smart: smartctl_exit_code 0" "$OUT" 'd["smartctl_exit_code"] == 0'
+assert_field "smart: Health bestanden" "$OUT" 'd["smart_status_passed"] is True'
+assert_field "smart: model_name gesetzt" "$OUT" 'isinstance(d["model_name"], str) and d["model_name"] != ""'
+assert_field "smart: rohes smartctl-JSON eingebettet" "$OUT" 'd["smartctl"]["smart_status"]["passed"] is True'
+assert_log "smart fragt Health ab" "-H"
+assert_log "smart fragt Attribute ab" "-A"
+assert_log "smart liest das Selftest-Log" "-l selftest"
+assert_log "smart nennt das Gerät" "/dev/sda"
+run_helper degraded smart sdz
+assert_rc "smart: Gerät nicht vorhanden -> 66" 66
+assert_err "smart nennt fehlendes Gerät" "not present"
+STUB_SMARTCTL_MODE="openfail"; run_helper degraded smart sda
+assert_rc "smart: Gerät nicht öffenbar -> 66" 66
+assert_err "smart nennt den open-Fehler" "cannot open"
+STUB_SMARTCTL_MODE="badjson"; run_helper degraded smart sda
+assert_rc "smart: kein JSON -> 69" 69
+assert_err "smart nennt fehlendes JSON" "did not return JSON"
+STUB_SMARTCTL_MODE="healthfail"; run_helper degraded smart sda
+assert_rc "smart: sterbende Platte bleibt Erfolg -> 0" 0
+assert_field "smart: Health nicht bestanden" "$OUT" 'd["smart_status_passed"] is False'
+assert_field "smart: Health-Bit 8 durchgereicht" "$OUT" 'd["smartctl_exit_code"] == 8'
+STUB_SMARTCTL_MODE=""
+OUT="$(COCKPIT_DISK_ACTION_MDSTAT="$WORK/mdstat" COCKPIT_DISK_ACTION_SYSBLOCK="$SYSBLOCK" \
+       COCKPIT_DISK_ACTION_SMARTCTL="$WORK/gibt-es-nicht" \
+       "$HELPER" smart sda 2>"$WORK/stderr")"
+RC=$?; ERR="$(cat "$WORK/stderr")"
+assert_rc "fehlendes smartctl -> 67" 67
+assert_err "fehlendes smartctl gemeldet" "smartctl is not installed"
 
 # ---------------------------------------------------------------------------
 if [ "$(id -u)" -eq 0 ]; then
@@ -343,8 +441,23 @@ if [ "$(id -u)" -eq 0 ]; then
   run_helper foreign_member add sdf
   assert_rc "add: Mitglied eines anderen Arrays -> 66" 66
   assert_err "add nennt das andere Array" "already a member of md126"
+
+  printf '\n-- smarttest --\n'
+  run_helper degraded smarttest sda
+  assert_rc "smarttest: Kurztest gestartet -> 0" 0
+  assert_json "smarttest liefert JSON" "$OUT"
+  assert_field "smarttest: action/device/exit code" "$OUT" 'd["action"] == "smarttest" and d["device"] == "sda" and d["smartctl_exit_code"] == 0'
+  assert_log "smarttest startet den Kurztest" "-t short"
+  assert_log "smarttest nennt das Gerät" "/dev/sda"
+  STUB_SMARTCTL_MODE="openfail"; run_helper degraded smarttest sda
+  assert_rc "smarttest: Gerät nicht öffenbar -> 66" 66
+  STUB_SMARTCTL_MODE="badjson"; run_helper degraded smarttest sda
+  assert_rc "smarttest: kein JSON -> 69" 69
+  STUB_SMARTCTL_MODE=""
+  run_helper degraded smarttest sdz
+  assert_rc "smarttest: Gerät nicht vorhanden -> 66" 66
 else
-  printf '\n-- remove/add übersprungen (kein root) --\n'
+  printf '\n-- remove/add/smarttest übersprungen (kein root) --\n'
 fi
 
 # ---------------------------------------------------------------------------

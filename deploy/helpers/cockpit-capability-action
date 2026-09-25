@@ -155,8 +155,12 @@ for (const [index, step] of manifest.steps.entries()) {
     );
   }
   if (isDiskHelperStep) {
-    if (step.argv[1] === "remove" || step.argv[1] === "add") {
-      fail(`step ${index + 1}: disk mutations run only through the typed executor path (disk.manage), never through the capability sandbox`, 77);
+    // remove/add mutate the array, smart/smarttest need the raw block device:
+    // this sandbox has neither (PrivateDevices=yes hides /dev/sd*, the bounding
+    // set has no CAP_SYS_RAWIO and @raw-io is filtered, so SG_IO/ATA passthrough
+    // is refused by the kernel). All four run through the typed executor only.
+    if (step.argv[1] === "remove" || step.argv[1] === "add" || step.argv[1] === "smart" || step.argv[1] === "smarttest") {
+      fail(`step ${index + 1}: disk helper actions run only through the typed executor path (disk.manage), never through the capability sandbox`, 77);
     }
     // Read-only status: the pid-subset /proc has no mdstat, so the runner
     // grants the host kernel's view as a read-only bind at a fixed neutral
