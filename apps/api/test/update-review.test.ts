@@ -128,6 +128,9 @@ describe("self-update pre-install review", () => {
     const small = diff().excerpt[0];
     const { coverage } = buildUpdateReviewPrompt([diff({ excerpt: [small, big, section("docs/other.md", ["@@ -1 +1 @@", "-a", "+b"])] })], { nonce: NONCE, limit: 15_000 });
     expect(coverage[0]).toEqual({ sha: SHA, incomplete: [], cut: ["README.md"], omitted: ["docs/other.md"] });
+    // Cut by the runner and then left out here: listed as omitted only.
+    const runnerCut = buildUpdateReviewPrompt([diff({ excerpt: [small, big, section("docs/other.md", ["@@ -1 +1 @@", "-a", "+b"])], partialFiles: ["docs/other.md"] })], { nonce: NONCE, limit: 15_000 });
+    expect(runnerCut.coverage[0]).toEqual({ sha: SHA, incomplete: [], cut: ["README.md"], omitted: ["docs/other.md"] });
   });
 
   it("treats runner-truncated, omitted and binary focus files as incomplete", () => {

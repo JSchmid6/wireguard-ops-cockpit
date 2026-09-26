@@ -272,6 +272,7 @@ export function buildUpdateReviewPrompt(diffs: UpdateDiff[], options: { nonce?: 
     const cut: string[] = [];
     const omitted: string[] = [...diff.omittedFiles];
     const complete = new Set<string>();
+    const shown = new Set<string>();
     for (const section of diff.excerpt) {
       const text = redactSecrets(section.text.endsWith("\n") ? section.text : `${section.text}\n`);
       const size = bytes(text);
@@ -280,6 +281,7 @@ export function buildUpdateReviewPrompt(diffs: UpdateDiff[], options: { nonce?: 
       } else if (size <= remaining) {
         included.push(text);
         remaining -= size;
+        shown.add(section.path);
         if (!diff.partialFiles.includes(section.path) && !/^Binary files /m.test(text)) complete.add(section.path);
       } else if (remaining > 1024) {
         const room = Buffer.from(text, "utf8").subarray(0, remaining - 200).toString("utf8").replace(/\uFFFD+$/, "");
@@ -292,10 +294,13 @@ export function buildUpdateReviewPrompt(diffs: UpdateDiff[], options: { nonce?: 
       }
     }
     const incomplete = [...focusFiles(diff)].filter((file) => !complete.has(file)).sort();
-    coverage.push({ sha: diff.sha, incomplete, cut: [...new Set([...diff.partialFiles, ...cut])], omitted: [...new Set(omitted)] });
+    // cut: partially in the prompt (by the runner or here); omitted: not at all.
+    const cutFiles = [...new Set([...diff.partialFiles.filter((file) => shown.has(file)), ...cut])];
+    const omittedFiles = [...new Set(omitted)];
+    coverage.push({ sha: diff.sha, incomplete, cut: cutFiles, omitted: omittedFiles });
     const excerpt = included.join("");
-    const state = cut.length || omitted.length || diff.partialFiles.length
-      ? `The excerpt is INCOMPLETE. Cut: ${[...new Set([...diff.partialFiles, ...cut])].join(", ") || "none"}. Left out: ${[...new Set(omitted)].join(", ") || "none"}.`
+    const state = cutFiles.length || omittedFiles.length
+      ? `The excerpt is INCOMPLETE. Cut: ${cutFiles.join(", ") || "none"}. Left out: ${omittedFiles.join(", ") || "none"}.`
       : "The excerpt is complete (every changed file's diff section is included; lockfiles are summarized above).";
     const marker = fence(excerpt);
     blocks.push([descriptions[index], "", "## Diff excerpt", state, `${marker}diff`, excerpt.trimEnd(), marker].join("\n"));
