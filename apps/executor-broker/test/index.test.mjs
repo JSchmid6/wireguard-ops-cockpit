@@ -57,11 +57,40 @@ test("executor broker rejects disk targets and actions outside the allowlist", (
 const selfBase = { expiresAt: "2030-01-01T00:00:00.000Z", envelopeDigest: "d".repeat(64) };
 const selfSha = "0123456789abcdef0123456789abcdef01234567";
 
+const reviewedHash = "e".repeat(64);
+
 test("executor broker admits the typed self-update actions on allowlisted targets", () => {
-  for (const [action, target] of [["self.update", selfSha], ["self.status", "state"]]) {
-    const payload = { ...selfBase, action, target };
+  for (const partial of [
+    { action: "self.update", target: selfSha, diffSha256: reviewedHash },
+    { action: "self.status", target: "state" },
+    { action: "self.diff", target: selfSha },
+  ]) {
+    const payload = { ...selfBase, ...partial };
     assert.deepEqual(validateRequest({ payload, signature: sign(payload) }, validAt), payload);
   }
+});
+
+test("executor broker requires the reviewed diff hash for self.update and nowhere else", () => {
+  const rejected = [
+    { action: "self.update", target: selfSha },
+    { action: "self.update", target: selfSha, diffSha256: reviewedHash.toUpperCase() },
+    { action: "self.update", target: selfSha, diffSha256: reviewedHash.slice(1) },
+    { action: "self.update", target: selfSha, diffSha256: `${reviewedHash} --force` },
+    { action: "self.update", target: selfSha, diffSha256: 42 },
+    { action: "self.diff", target: selfSha, diffSha256: reviewedHash },
+    { action: "self.status", target: "state", diffSha256: reviewedHash },
+    { action: "service.status", target: "apache2", diffSha256: reviewedHash },
+  ];
+  for (const partial of rejected) {
+    const payload = { ...selfBase, ...partial };
+    assert.throws(() => validateRequest({ payload, signature: sign(payload) }, validAt), undefined, `expected rejection: ${JSON.stringify(partial)}`);
+  }
+});
+
+test("the reviewed diff hash is covered by the request signature", () => {
+  const payload = { ...selfBase, action: "self.update", target: selfSha, diffSha256: reviewedHash };
+  const tampered = { ...payload, diffSha256: "f".repeat(64) };
+  assert.throws(() => validateRequest({ payload: tampered, signature: sign(payload) }, validAt), /invalid request signature/);
 });
 
 test("executor broker rejects self-update targets outside the allowlist", () => {
@@ -73,10 +102,14 @@ test("executor broker rejects self-update targets outside the allowlist", () => 
     { action: "self.update", target: selfSha.slice(0, 39) },
     { action: "self.update", target: `${selfSha}f` },
     { action: "self.update", target: `${selfSha} --force` },
+    { action: "self.diff", target: "main" },
+    { action: "self.diff", target: selfSha.slice(0, 12) },
+    { action: "self.diff", target: `${selfSha} --stat` },
     { action: "self.reboot", target: "state" },
   ];
   for (const partial of rejected) {
-    const payload = { ...selfBase, ...partial };
+    // A valid reviewed hash on self.update: the target alone must be the reason.
+    const payload = { ...selfBase, ...partial, ...(partial.action === "self.update" ? { diffSha256: reviewedHash } : {}) };
     let threw = false;
     try { validateRequest({ payload, signature: sign(payload) }, validAt); } catch { threw = true; }
     assert.equal(threw, true, `expected rejection: ${JSON.stringify(partial)}`);

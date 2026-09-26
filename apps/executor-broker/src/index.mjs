@@ -13,8 +13,12 @@ const capabilityNode = "/opt/node-v20.19.1-linux-x64/bin/node";
 const services = new Set(["apache2", "wireguard-ops-cockpit-ttyd"]);
 const diskActions = new Set(["disk.status", "disk.remove", "disk.add", "disk.smart", "disk.smarttest"]);
 const diskDevice = /^sd[a-z]$/;
-const selfUpdateActions = new Set(["self.update", "self.status"]);
+const selfUpdateActions = new Set(["self.update", "self.status", "self.diff"]);
 const selfUpdateSha = /^[a-f0-9]{40}$/;
+const reviewedDiffHash = /^[a-f0-9]{64}$/;
+// The review diff carries a bounded excerpt (runner cap 200 KB plus focus-area
+// hunks, JSON-escaped); anything larger is refused instead of cut mid-JSON.
+const selfDiffOutputLimit = 2_000_000;
 
 function signature(payload) { return createHmac("sha256", secret).update(JSON.stringify(payload)).digest("hex"); }
 export function validateRequest(value, now = Date.now()) {
@@ -28,7 +32,11 @@ export function validateRequest(value, now = Date.now()) {
   if (action === "disk.status" && target !== "md127") throw new Error("disk target is not allowlisted");
   if ((action === "disk.remove" || action === "disk.add" || action === "disk.smart" || action === "disk.smarttest") && (typeof target !== "string" || !diskDevice.test(target))) throw new Error("disk device is not allowlisted");
   if (action === "self.status" && target !== "state") throw new Error("self-update status target is not allowlisted");
-  if (action === "self.update" && (typeof target !== "string" || !selfUpdateSha.test(target))) throw new Error("self-update commit is not allowlisted");
+  if ((action === "self.update" || action === "self.diff") && (typeof target !== "string" || !selfUpdateSha.test(target))) throw new Error("self-update commit is not allowlisted");
+  // Every update carries the hash of the diff the running Cockpit reviewed;
+  // the runner recomputes it and refuses a mismatch before anything deploys.
+  if (action === "self.update" && (typeof value.payload.diffSha256 !== "string" || !reviewedDiffHash.test(value.payload.diffSha256))) throw new Error("self-update requires the reviewed diff sha256");
+  if (action !== "self.update" && value.payload.diffSha256 !== undefined) throw new Error("diffSha256 is only valid for self.update");
   if (action === "capability.execute" && (!value.payload.manifest || !value.payload.envelope)) throw new Error("dynamic capability payload is incomplete");
   if (typeof envelopeDigest !== "string" || !/^[a-f0-9]{64}$/.test(envelopeDigest)) throw new Error("invalid envelope digest");
   if (typeof expiresAt !== "string" || now > Date.parse(expiresAt)) throw new Error("execution request expired");
@@ -52,17 +60,26 @@ export function execute(payload) {
       child.stdin.end(JSON.stringify({ manifest: payload.manifest, envelope: payload.envelope }));
       return;
     }
-    if (payload.action === "self.update" || payload.action === "self.status") {
+    if (selfUpdateActions.has(payload.action)) {
       // The helper starts the one-shot deploy unit and waits for it; the unit
-      // re-verifies the allowlisted repo and the merged commit on its own.
-      const selfArgs = payload.action === "self.update" ? [payload.target] : ["status"];
+      // re-verifies the allowlisted repo, the merged commit and the reviewed
+      // diff hash on its own. self.diff is the read-only review input.
+      const selfArgs = payload.action === "self.update" ? [payload.target, payload.diffSha256]
+        : payload.action === "self.diff" ? ["diff", payload.target] : ["status"];
+      const outputLimit = payload.action === "self.diff" ? selfDiffOutputLimit : 20000;
       const child = spawn("sudo", ["-n", selfUpdateHelper, ...selfArgs], { env: { PATH: "/usr/sbin:/usr/bin:/sbin:/bin" }, stdio: ["ignore", "pipe", "pipe"] });
       let selfOutput = ""; let selfError = "";
       child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
       child.stdout.on("data", (chunk) => { selfOutput += chunk; });
       child.stderr.on("data", (chunk) => { selfError += chunk; });
       child.on("error", (reason) => resolve({ ok: false, error: reason.message }));
-      child.on("close", (code) => resolve({ ok: code === 0, exitCode: code, output: selfOutput.slice(-20000), error: code === 0 ? null : [selfError, selfOutput].filter(Boolean).join("\n").slice(-4000) }));
+      child.on("close", (code) => {
+        if (code === 0 && payload.action === "self.diff" && selfOutput.length > outputLimit) {
+          resolve({ ok: false, exitCode: code, error: `self-update diff output exceeds ${outputLimit} characters` });
+          return;
+        }
+        resolve({ ok: code === 0, exitCode: code, output: selfOutput.slice(-outputLimit), error: code === 0 ? null : [selfError, selfOutput].filter(Boolean).join("\n").slice(-4000) });
+      });
       return;
     }
     if (payload.action.startsWith("disk.")) {
