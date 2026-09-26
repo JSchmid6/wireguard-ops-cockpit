@@ -105,6 +105,18 @@ const SELF_UPDATE_EXECUTOR_TIMEOUT_MS = 31 * 60 * 1000;
 // with RuntimeMaxSec=420; the socket bound sits above both.
 const SELF_DIFF_EXECUTOR_TIMEOUT_MS = 8 * 60 * 1000;
 
+// Keeps a validated capability manifest for reuse, only when the planner
+// declared the operation as recurring (`retain: true`); a one-off repair stays
+// in the job history and audit only.
+export async function retainValidatedCapability(capabilityDir: string, jobId: string, manifest: CapabilityManifest | null | undefined): Promise<string | null> {
+  if (!manifest || manifest.retain !== true) return null;
+  const digest = capabilityManifestHash(manifest);
+  await mkdir(capabilityDir, { recursive: true, mode: 0o700 });
+  const capabilityPath = path.join(capabilityDir, `${digest}.json`);
+  await writeFile(capabilityPath, JSON.stringify({ digest, validatedByJob: jobId, validatedAt: new Date().toISOString(), manifest }, null, 2), { encoding: "utf-8", mode: 0o600 });
+  return capabilityPath;
+}
+
 function slugify(value: string): string {
   return value
     .trim()
@@ -1793,15 +1805,7 @@ export async function createApp(options: AppOptions = {}) {
     return updated;
   }
 
-  async function retainValidatedCapability(jobId: string, manifest: CapabilityManifest | null | undefined): Promise<string | null> {
-    if (!manifest) return null;
-    const digest = capabilityManifestHash(manifest);
-    const capabilityDir = path.join(path.dirname(config.dbPath), "capabilities");
-    await mkdir(capabilityDir, { recursive: true, mode: 0o700 });
-    const capabilityPath = path.join(capabilityDir, `${digest}.json`);
-    await writeFile(capabilityPath, JSON.stringify({ digest, validatedByJob: jobId, validatedAt: new Date().toISOString(), manifest }, null, 2), { encoding: "utf-8", mode: 0o600 });
-    return capabilityPath;
-  }
+  const capabilityDir = path.join(path.dirname(config.dbPath), "capabilities");
 
   async function waitForHermesJob(jobId: string, actorId: string, waitMs: number): Promise<JobRecord | null> {
     const deadline = Date.now() + waitMs;
@@ -2038,7 +2042,7 @@ export async function createApp(options: AppOptions = {}) {
           ? await runIndependentVerification(actor, session, planner, intent, reviewedPlan, result)
           : "VERIFICATION_STATUS: failed\nREASON: runner did not report success";
         const success = runnerSuccess && /VERIFICATION_STATUS:\s*passed/i.test(verification);
-        const retainedCapability = success ? await retainValidatedCapability(job.id, manifest) : null;
+        const retainedCapability = success ? await retainValidatedCapability(capabilityDir, job.id, manifest) : null;
         updateHermesJob(job.id, success ? "completed" : "failed_verification", explanation({
           phase: "finished", intent,
           reason: success ? "Approved execution and verification completed." : "Approved execution did not report verified success.",
@@ -2660,7 +2664,7 @@ Follow these rules:
           verification = filterSensitiveContent(extractCleanOutput(verifierRaw) || extractAnswer(verifierRaw));
         }
         const success = runnerSuccess && /VERIFICATION_STATUS:\s*passed/i.test(verification);
-        const retainedCapability = success ? await retainValidatedCapability(job.id, manifest) : null;
+        const retainedCapability = success ? await retainValidatedCapability(capabilityDir, job.id, manifest) : null;
         updateHermesJob(job.id, success ? "completed" : "failed_verification", explanation({
           phase: "finished", intent,
           reason: success ? "Execution and runner verification completed." : "Execution finished but did not report a verified success.",

@@ -78,7 +78,7 @@ only `build-push 63f39b2`, verifies a clean exact checkout, writes only Docker
 image/tag state and the existing private registry, and is always
 operator-approval gated. AppAPI lifecycle remains a separate semantic helper.
 
-Pre-change snapshots live under `/var/lib/wireguard-ops-cockpit/capability-snapshots`, a root-only path made writable only inside the Executor service mount namespace. Control retains independently verified manifests separately under `capabilities/`.
+Pre-change snapshots live under `/var/lib/wireguard-ops-cockpit/capability-snapshots`, a root-only path made writable only inside the Executor service mount namespace. Control retains independently verified manifests separately under `capabilities/`, but only those that declare `"retain": true` (recurring operations); a one-off repair is not kept.
 
 ## Verification
 
