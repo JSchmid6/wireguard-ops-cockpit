@@ -21,6 +21,9 @@ export interface CapabilityManifest {
   verification: string[];
   rollback: string[];
   risk: CapabilityRisk[];
+  // Keep the validated manifest for reuse after a successful run. Opt-in:
+  // only for operations expected to recur; one-off repairs are not kept.
+  retain: boolean;
 }
 
 const MAX_STEPS = 24;
@@ -77,6 +80,7 @@ export function parseCapabilityManifest(plan: string): CapabilityManifest | null
     readablePaths: [...new Set(readablePaths)].sort(), writablePaths: [...new Set(writablePaths)].sort(), network,
     expectedEffects: cleanStrings(value.expectedEffects, 32), verification: cleanStrings(value.verification, 32),
     rollback: cleanStrings(value.rollback, 32), risk: [...new Set(risk)].sort(),
+    retain: value.retain === true,
   };
   if (manifest.verification.length === 0) throw new Error("capability manifest requires verification criteria");
   return manifest;
@@ -108,6 +112,7 @@ export function capabilityPlannerContract(): string {
     "To replace known content in an authorized exact regular file, invoke /usr/local/sbin/cockpit-exact-file-replace directly with the absolute target, exact old text, and exact new text, and omit runAsUser. The installed executable selects its pinned runtime itself: never copy it, wrap it with another interpreter, create a temporary helper, or request root as runAsUser. The target must also be the same entry in writablePaths. This writes the existing inode so it works inside the exact-file bind mount, requires exactly one old-text match, and relies on the executor snapshot for rollback. Do not use rename-based in-place editors such as sed -i on exact-file mounts.",
     "Risk values are contained, exposure, data_loss, identity_or_secret. Never understate risk.",
     "Include observable expectedEffects, independent verification criteria, and a concrete rollback procedure.",
-    "Example shape: {\"version\":\"cockpit-capability/v1\",\"name\":\"...\",\"purpose\":\"...\",\"steps\":[{\"argv\":[\"/usr/bin/tool\",\"arg\"],\"runAsUser\":\"service-user\"}],\"readablePaths\":[],\"writablePaths\":[],\"network\":\"none\",\"expectedEffects\":[],\"verification\":[],\"rollback\":[],\"risk\":[\"contained\"]}",
+    "Set \"retain\": true only for an operation expected to recur (maintenance, updates, routine checks) so its validated manifest is kept for reuse; never for a one-off repair of a single incident, which stays in the job history only. Omitted means false.",
+    "Example shape: {\"version\":\"cockpit-capability/v1\",\"name\":\"...\",\"purpose\":\"...\",\"steps\":[{\"argv\":[\"/usr/bin/tool\",\"arg\"],\"runAsUser\":\"service-user\"}],\"readablePaths\":[],\"writablePaths\":[],\"network\":\"none\",\"expectedEffects\":[],\"verification\":[],\"rollback\":[],\"risk\":[\"contained\"],\"retain\":false}",
   ].join("\n");
 }

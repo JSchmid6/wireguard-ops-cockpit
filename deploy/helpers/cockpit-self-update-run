@@ -5,12 +5,28 @@
 # Not a sudo target and not meant to be run by hand: it is started only by the
 # two fixed entry points of the module.
 #
-#   deploy   <sha>  wireguard-ops-cockpit-self-update@<sha>.service
-#   activate <sha>  one-shot activation timer scheduled by `deploy`
+#   deploy   <sha>-<diff-sha256>  wireguard-ops-cockpit-self-update@<sha>-<diff-sha256>.service
+#   activate <sha>                one-shot activation timer scheduled by `deploy`
+#   diff     <sha>                transient review unit started by
+#                                 `cockpit-self-update-action diff <sha>`
+#
+# diff:     read-only pre-install review input. Same checkout/remote/fetch/
+#           merged checks as deploy; base = the deployed commit (state.json,
+#           else HEAD). Emits one JSON object: base, sha, files, stat,
+#           diffSha256 (sha256 of the full `git diff base sha` bytes),
+#           focusAreas (where the new code touches the guarantees G1-G8; they
+#           steer the independent reviewer and never stop a job themselves)
+#           and a bounded excerpt (per-file diff sections, focus areas
+#           first; `truncated`, partial/omitted files named). The
+#           classification lives here on purpose: the running (old) code
+#           judges the new code, never the other way round.
 #
 # deploy:   check arguments and pinned paths -> lock -> verify the pinned
 #           checkout and the allowlisted remote -> git fetch -> require <sha>
 #           to be reachable from origin/main (merged review chains only) ->
+#           recompute the diff base..sha and refuse (65) unless it hashes to
+#           the reviewed diff-sha256 of the unit instance (the base moved or
+#           the code changed since the review) ->
 #           run the reviewed deploy script pinned to that commit with service
 #           restarts deferred (COCKPIT_RESTART_MODE=defer) -> pre-activation
 #           verification (revision, services, sockets, API health, ttyd, web
@@ -31,6 +47,9 @@
 #     repository https://github.com/JSchmid6/wireguard-ops-cockpit.git;
 #     nothing else is accepted, and the commit must be an ancestor of
 #     origin/main.
+#   * deploy only with the reviewed diff hash: a bare-sha instance (no
+#     review) is refused with 65, and so is any hash that does not match the
+#     diff recomputed right before the deploy script would run.
 #   * The deploy script is the root-owned installed copy below
 #     /usr/local/lib/wireguard-ops-cockpit; the script refuses a deploy
 #     script that is not a root-owned regular file free of group/other write
@@ -63,6 +82,61 @@ import sys
 import time
 
 SHA_RE = re.compile(r"^[a-f0-9]{40}$")
+REVIEWED_TARGET_RE = re.compile(r"^([a-f0-9]{40})-([a-f0-9]{64})$")
+
+# Pre-install review classification (see cmd_diff). The running (old) code
+# marks where the new code touches the host's guarantees (G1-G8 of the review
+# prompt, apps/api/src/update-review-prompt.ts). Focus areas only steer the
+# independent reviewer; they never stop a job by themselves.
+UPDATE_MECHANISM_FILES = (
+    "deploy/helpers/cockpit-self-update-action",
+    "deploy/helpers/cockpit-self-update-run",
+    "deploy/systemd/wireguard-ops-cockpit-self-update@.service",
+    # The API half of the review (prompt, evidence, policy, reviewed-hash binding).
+    "apps/api/src/update-review.ts",
+    "apps/api/src/update-review-prompt.ts",
+)
+# Hunk-precise focus: path -> (kind, guarantees, function names).
+SIGNING_FUNCTIONS = {
+    "apps/api/src/hermes-security.ts": ("envelope-signing", ("G2",), (
+        "signEnvelope", "verifyExecutionEnvelopeSignature", "approveExecutionEnvelope",
+        "createExecutionEnvelope", "validateExecutionEnvelope")),
+    "apps/executor-broker/src/index.mjs": ("broker-validation", ("G3", "G2"), ("validateRequest", "signature")),
+    "deploy/helpers/cockpit-capability-action": ("envelope-signing", ("G2",), ("verifyEnvelope",)),
+}
+AUTH_PATH_RE = re.compile(r"auth|token|secret|credential|password", re.I)
+CI_PATH_RE = re.compile(r"^(?:\.github/|\.gitlab/|\.gitlab-ci\.yml$)")
+TEST_PATH_RE = re.compile(r"(?:^|/)tests?/|\.(?:test|spec)\.[A-Za-z0-9]+$")
+# File-level focus: (kind, guarantees, reason, matcher).
+FILE_AREAS = (
+    ("approval-and-auth", ("G1", "G6"), "sign-in, bearer-token scopes, the approval route, configuration and secrets",
+     lambda path: path in ("apps/api/src/app.ts", "apps/api/src/auth.ts", "apps/api/src/config.ts", "apps/api/src/db.ts")
+     or bool(AUTH_PATH_RE.search(path))),
+    ("brokers-and-agents", ("G3", "G6"), "executor/agent brokers, envelope code, reviewer and agent prompts",
+     lambda path: path.startswith(("apps/executor-broker/", "apps/agent-broker/")) or path in (
+         "apps/api/src/executor-broker.ts", "apps/api/src/agent-broker.ts", "apps/api/src/hermes-security.ts",
+         "apps/api/src/safety-review.ts")),
+    ("capability-sandbox", ("G5",), "dynamic capability sandbox and protected paths",
+     lambda path: path in ("deploy/helpers/cockpit-capability-action", "apps/api/src/capability-manifest.ts")),
+    ("root-helpers", ("G4", "G5"), "root helpers, systemd units and sudoers sources",
+     lambda path: path.startswith(("deploy/helpers/", "deploy/systemd/", "deploy/sudoers/"))),
+    ("ci", ("G7",), "CI workflow definitions (the merge gate behind G7)", lambda path: bool(CI_PATH_RE.search(path))),
+)
+# Excerpt order: what the reviewer must see first comes first.
+CLASS_ORDER = {"focus-hunks": 0, "focus": 1, "dependency": 2, "test-deleted": 3, "test": 4, "other": 5, "lockfile": 6}
+EXCERPT_LIMIT = 200_000
+FOCUS_HUNK_LIMIT = 6000
+FOCUS_HUNKS_PER_FILE = 6
+FILES_LIMIT = 2000
+STAT_LIMIT = 20_000
+PACKAGES_LIMIT = 100
+REGISTRY_HOST = "registry.npmjs.org"
+# Every knob that could change the bytes of the same diff between the review
+# and the deploy is pinned; both runs go through diff_args().
+DIFF_OPTIONS = ("--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", "--no-relative", "--full-index",
+                "--src-prefix=a/", "--dst-prefix=b/", "--unified=3", "--inter-hunk-context=0",
+                "--diff-algorithm=myers", "--indent-heuristic", "--submodule=short", "-O/dev/null")
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 # Optional root-owned configuration file: lines of the form KEY=VALUE for the
 # COCKPIT_SELF_UPDATE_* keys below. It is read before the environment so
@@ -124,6 +198,7 @@ RUN_LOCK = os.path.join(STATE_DIR, "run.lock")
 
 LOG_HANDLE = None
 ACTIVE_SHA = ""
+ACTIVE_INSTANCE = ""
 
 
 def utcnow():
@@ -250,6 +325,433 @@ def current_deployed_commit(state):
     if head.returncode == 0 and SHA_RE.match(head_sha):
         return head_sha
     return None
+
+
+# --------------------------------------------------------------------------
+# Pre-install review: diff, hash, deterministic classification
+# --------------------------------------------------------------------------
+
+def run_bytes(argv, phase, timeout=300):
+    try:
+        return subprocess.run(argv, capture_output=True, timeout=timeout)
+    except FileNotFoundError as exc:
+        raise Failure(67, phase, "required tool is missing: %s" % exc.filename)
+    except subprocess.TimeoutExpired:
+        raise Failure(67, phase, "command timed out: %s" % " ".join(argv[:6]))
+
+
+def diff_args(*extra):
+    return [GIT, "-C", REPO_DIR, "-c", "core.quotePath=true", "diff", *DIFF_OPTIONS, *extra]
+
+
+def verified_base(state, phase):
+    """The review base: the deployed commit (state.json), else the checkout HEAD."""
+    base = current_deployed_commit(state)
+    if base is None:
+        raise Failure(67, phase, "the deployed base commit is unknown (no state.json and no readable checkout HEAD)")
+    known = git("rev-parse", "--verify", "--quiet", "%s^{commit}" % base, timeout=30)
+    if known.returncode != 0:
+        raise Failure(67, phase, "the deployed base commit %s is not in the pinned checkout" % base)
+    return base
+
+
+def full_diff(base, sha, phase):
+    result = run_bytes(diff_args(base, sha, "--"), phase)
+    if result.returncode != 0:
+        raise Failure(67, phase, "git diff failed: %s" % (result.stderr.decode("utf-8", "replace").strip()[-300:] or "no output"))
+    return result.stdout
+
+
+def diff_listing(base, sha, mode):
+    result = run_bytes(diff_args(mode, "-z", base, sha, "--"), "diff")
+    if result.returncode != 0:
+        raise Failure(67, "diff", "git diff %s failed" % mode)
+    return [item.decode("utf-8", "replace") for item in result.stdout.split(b"\0")]
+
+
+def c_unquote(text):
+    """Decodes one C-style quoted token as git prints it (core.quotePath)."""
+    escapes = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
+    out = bytearray()
+    index = 1
+    while index < len(text) and text[index] != '"':
+        char = text[index]
+        if char == "\\" and index + 1 < len(text):
+            following = text[index + 1]
+            if following in "01234567":
+                try:
+                    out.append(int(text[index + 1:index + 4], 8) & 0xFF)
+                except ValueError:
+                    out.append(ord(following))
+                index += 4
+                continue
+            out.append(escapes.get(following, ord(following) & 0xFF))
+            index += 2
+            continue
+        out.extend(char.encode("utf-8"))
+        index += 1
+    return out.decode("utf-8", "replace")
+
+
+def header_path(line):
+    # With --no-renames both sides name the same path: "a/P b/P" or quoted.
+    rest = line[len("diff --git "):]
+    if rest.startswith('"'):
+        return c_unquote(rest)[2:]
+    half = (len(rest) - 5) // 2
+    if half > 0 and rest.startswith("a/") and rest[2 + half:5 + half] == " b/" and rest[2:2 + half] == rest[5 + half:]:
+        return rest[2:2 + half]
+    return rest
+
+
+def split_sections(text):
+    # Only "\n" splits: a file line can never start a new section because every
+    # content line carries its " ", "+" or "-" prefix.
+    sections = []
+    for line in text.split("\n"):
+        if line.startswith("diff --git "):
+            sections.append({"path": header_path(line), "lines": [line]})
+        elif sections and line:
+            sections[-1]["lines"].append(line)
+    for section in sections:
+        head, hunks = [], []
+        old_no = new_no = 0
+        for line in section["lines"]:
+            match = HUNK_RE.match(line) if line.startswith("@@") else None
+            if match:
+                old_no, new_no = int(match.group(1)), int(match.group(3))
+                hunks.append({"lines": [line], "removed": [], "added": []})
+            elif not hunks:
+                head.append(line)
+            else:
+                hunks[-1]["lines"].append(line)
+                if line.startswith("+"):
+                    hunks[-1]["added"].append((new_no, line[1:]))
+                    new_no += 1
+                elif line.startswith("-"):
+                    hunks[-1]["removed"].append((old_no, line[1:]))
+                    old_no += 1
+                elif line.startswith(" "):
+                    old_no += 1
+                    new_no += 1
+        section["head"] = head
+        section["hunks"] = hunks
+        section["text"] = "\n".join(section["lines"]) + "\n"
+    return sections
+
+
+def block_end(lines, start):
+    """Last line (1-based) of the function whose definition is on lines[start].
+
+    Heuristic brace matching: the body is the first "{" after the parameter
+    list closes; strings and // comments are skipped. When the end cannot be
+    found the span runs to the end of the file (a wider focus, never a narrower one)."""
+    paren = brace = 0
+    seen_paren = in_body = False
+    quote = None
+    for number in range(start, len(lines)):
+        line = lines[number]
+        index = 0
+        while index < len(line):
+            char = line[index]
+            if quote:
+                if char == "\\":
+                    index += 2
+                    continue
+                if char == quote:
+                    quote = None
+            elif char in "'\"`":
+                quote = char
+            elif char == "/" and line[index + 1:index + 2] == "/":
+                break
+            elif char == "(":
+                paren += 1
+                seen_paren = True
+            elif char == ")":
+                paren -= 1
+            elif char == "{":
+                if seen_paren and paren <= 0 and brace == 0:
+                    in_body = True
+                brace += 1
+            elif char == "}":
+                brace -= 1
+                if in_body and brace == 0:
+                    return number + 1
+            index += 1
+        if quote in ("'", '"'):
+            quote = None
+    return len(lines)
+
+
+def function_spans(content, names):
+    lines = content.split("\n")
+    spans = {}
+    for name in names:
+        definition = re.compile(r"(?:^|[^\w$.])(?:function\s*\*?\s*%s\s*\(|(?:const|let|var)\s+%s\s*=)"
+                                % (re.escape(name), re.escape(name)))
+        for index, line in enumerate(lines):
+            if definition.search(line):
+                spans.setdefault(name, []).append((index + 1, block_end(lines, index)))
+    return spans
+
+
+def file_at(commit, path):
+    shown = run_bytes([GIT, "-C", REPO_DIR, "show", "%s:%s" % (commit, path)], "diff", timeout=60)
+    return shown.stdout.decode("utf-8", "replace") if shown.returncode == 0 else ""
+
+
+def signing_touches(path, names, base, sha, hunks):
+    """Names of signing/verification functions a change touches, and the hunks."""
+    old_spans = function_spans(file_at(base, path), names)
+    new_spans = function_spans(file_at(sha, path), names)
+    touched = {name for name in names if bool(old_spans.get(name)) != bool(new_spans.get(name))}
+    touching = []
+    for hunk in hunks:
+        hit = set()
+        for name in names:
+            word = re.compile(r"(?<![\w$])%s(?![\w$])" % re.escape(name))
+            if any(start <= number <= end for number, _ in hunk["removed"] for start, end in old_spans.get(name, ())) \
+                    or any(start <= number <= end for number, _ in hunk["added"] for start, end in new_spans.get(name, ())) \
+                    or any(word.search(text) for _, text in hunk["removed"] + hunk["added"]):
+                hit.add(name)
+        if hit:
+            touched |= hit
+            touching.append(hunk)
+    return sorted(touched), touching
+
+
+def sudoers_additions(hunk):
+    # "#include"/"#includedir" are sudoers directives, not comments.
+    added = []
+    for _, text in hunk["added"]:
+        stripped = text.strip()
+        if stripped and (not stripped.startswith("#") or re.match(r"#include(?:dir)?\b", stripped)):
+            added.append(stripped)
+    return added
+
+
+def quote_hunks(section, hunks):
+    quoted = []
+    for hunk in hunks[:FOCUS_HUNKS_PER_FILE]:
+        text = "\n".join(section["head"] + hunk["lines"])
+        if len(text) > FOCUS_HUNK_LIMIT:
+            text = text[:FOCUS_HUNK_LIMIT].rsplit("\n", 1)[0] + "\n[... hunk truncated ...]"
+        quoted.append(text)
+    if not quoted:
+        quoted.append("\n".join(section["head"])[:FOCUS_HUNK_LIMIT])
+    return quoted
+
+
+def hunk_area(kind, guarantees, reason, section, hunks):
+    return {"kind": kind, "guarantees": list(guarantees), "reason": reason, "files": [section["path"]],
+            "hunks": quote_hunks(section, hunks), "hunksOmitted": max(0, len(hunks) - FOCUS_HUNKS_PER_FILE)}
+
+
+def hunk_focus_areas(sections, base, sha):
+    """Hunk-precise focus areas: sudoers additions, the update mechanism, and
+    the envelope signing / broker validation functions."""
+    areas = []
+    for section in sections:
+        path, hunks = section["path"], section["hunks"]
+        binary = any(line.startswith("Binary files ") for line in section["head"])
+        if path.startswith("deploy/sudoers/"):
+            adding = [hunk for hunk in hunks if sudoers_additions(hunk)]
+            if adding or binary:
+                count = sum(len(sudoers_additions(hunk)) for hunk in adding)
+                reason = ("%d non-comment sudoers line(s) added to %s" % (count, path)) if adding \
+                    else "binary content in the sudoers source %s" % path
+                areas.append(hunk_area("sudoers-additions", ("G4",), reason, section, adding))
+        if path in UPDATE_MECHANISM_FILES:
+            areas.append(hunk_area("update-mechanism", ("G7",), "the self-update/review mechanism itself changes (%s)" % path,
+                                   section, hunks))
+        if path in SIGNING_FUNCTIONS:
+            kind, guarantees, names = SIGNING_FUNCTIONS[path]
+            touched, touching = signing_touches(path, names, base, sha, hunks)
+            if touched:
+                areas.append(hunk_area(kind, guarantees, "%s changes %s" % (path, ", ".join(touched)), section,
+                                       touching or hunks))
+    return areas
+
+
+def classify_path(path, status, precise, focus):
+    name = path.rsplit("/", 1)[-1]
+    if name == "package-lock.json":
+        return "lockfile"
+    if path in precise:
+        return "focus-hunks"
+    if name == "package.json":
+        return "dependency"
+    if TEST_PATH_RE.search(path) and status == "D":
+        return "test-deleted"
+    if path in focus:
+        return "focus"
+    if TEST_PATH_RE.search(path):
+        return "test"
+    return "other"
+
+
+def lockfile_packages(sections):
+    """Package changes named in package-lock.json hunks. Entries with an install
+    script or a source outside the npm registry are always listed in full."""
+    key_re = re.compile(r'^[ +-]\s*"((?:[^"]*/)?node_modules/(?:@[^/"]+/)?[^"/]+)": \{')
+    field_re = re.compile(r'^([+-])\s*"(version|resolved|hasInstallScript)": "?([^",]+)"?,?$')
+    changes = {}
+    for section in sections:
+        for hunk in section["hunks"]:
+            current = None
+            for line in hunk["lines"][1:]:
+                key = key_re.match(line)
+                if key:
+                    current = key.group(1).rsplit("node_modules/", 1)[-1]
+                    entry = changes.setdefault(current, {})
+                    if line.startswith("+"):
+                        entry["added"] = True
+                    elif line.startswith("-"):
+                        entry["removed"] = True
+                    continue
+                field = field_re.match(line)
+                if field and current:
+                    entry = changes.setdefault(current, {})
+                    sign, name, value = field.groups()
+                    if name == "version":
+                        entry["new" if sign == "+" else "old"] = value
+                    elif sign == "+" and name == "resolved":
+                        entry["resolved"] = value
+                    elif sign == "+" and name == "hasInstallScript" and value == "true":
+                        entry["installScript"] = True
+    risky, plain = [], []
+    for name in sorted(changes):
+        entry = changes[name]
+        if entry.get("removed") and not entry.get("added"):
+            line = "-%s@%s" % (name, entry.get("old", "?"))
+        elif entry.get("added") and not entry.get("removed"):
+            line = "+%s@%s" % (name, entry.get("new", "?"))
+        elif entry.get("old") != entry.get("new") or entry.get("resolved") or entry.get("installScript"):
+            line = "%s %s -> %s" % (name, entry.get("old", "?"), entry.get("new", "?"))
+        else:
+            continue
+        resolved = entry.get("resolved", "")
+        host = re.match(r"^[a-z+]+://([^/]+)", resolved)
+        foreign = bool(resolved) and not (host and host.group(1) == REGISTRY_HOST) and "://" in resolved \
+            or resolved.startswith(("git", "file:", "github:"))
+        notes = (["install script"] if entry.get("installScript") else []) + (["source: %s" % resolved[:120]] if foreign else [])
+        (risky if notes else plain).append(line + ("" if not notes else " (%s)" % "; ".join(notes)))
+    if len(plain) > PACKAGES_LIMIT:
+        plain = plain[:PACKAGES_LIMIT] + ["... and %d more npm-registry packages without install scripts" % (len(plain) - PACKAGES_LIMIT)]
+    return risky + plain
+
+
+def review_report(base, sha, raw):
+    text = raw.decode("utf-8", "replace")
+    sections = split_sections(text)
+    listing = diff_listing(base, sha, "--name-status")
+    numstat = diff_listing(base, sha, "--numstat")
+    counts = {}
+    for record in numstat:
+        parts = record.split("\t", 2)
+        if len(parts) == 3:
+            counts[parts[2]] = (None if parts[0] == "-" else int(parts[0]), None if parts[1] == "-" else int(parts[1]))
+    changed = [(listing[index][:1], listing[index + 1]) for index in range(0, len(listing) - 1, 2) if listing[index]]
+    areas = hunk_focus_areas(sections, base, sha)
+    precise = {path for area in areas for path in area["files"]}
+    for kind, guarantees, reason, matches in FILE_AREAS:
+        paths = [path for _, path in changed if matches(path)]
+        if paths:
+            areas.append({"kind": kind, "guarantees": list(guarantees), "reason": reason, "files": paths})
+    manifests = [path for _, path in changed if path.rsplit("/", 1)[-1] == "package.json"]
+    locks = [path for _, path in changed if path.rsplit("/", 1)[-1] == "package-lock.json"]
+    if manifests or locks:
+        # The lockfile itself is summarized, not a focus file: its hunks are
+        # noise, the package list (install scripts, foreign sources first) is not.
+        areas.append({"kind": "dependencies", "guarantees": ["G8"], "files": manifests, "lockfiles": locks,
+                      "reason": "dependency manifests changed; packages run inside the Cockpit services and CI",
+                      "packages": lockfile_packages([s for s in sections if s["path"] in locks])})
+    deleted_tests = [path for status, path in changed if status == "D" and TEST_PATH_RE.search(path)]
+    if deleted_tests:
+        areas.append({"kind": "tests-deleted", "guarantees": [], "files": deleted_tests,
+                      "reason": "test files were deleted; check which guarantee they covered"})
+    focus = {path for area in areas for path in area["files"]}
+    files = []
+    for status, path in changed:
+        added, deleted = counts.get(path, (None, None))
+        files.append({"status": status, "path": path, "added": added, "deleted": deleted,
+                      "class": classify_path(path, status, precise, focus)})
+    classes = {entry["path"]: entry["class"] for entry in files}
+    ordered = sorted(enumerate(sections), key=lambda item: (CLASS_ORDER.get(classes.get(item[1]["path"], "other"), 5), item[0]))
+    parts, omitted, partial = [], [], []
+    used = 0
+    truncated = False
+    for _, section in ordered:
+        chunk = section["text"].encode("utf-8")
+        if truncated:
+            omitted.append(section["path"])
+        elif used + len(chunk) <= EXCERPT_LIMIT:
+            parts.append({"path": section["path"], "text": section["text"]})
+            used += len(chunk)
+        else:
+            truncated = True
+            room = EXCERPT_LIMIT - used
+            if room > 2048:
+                cut = chunk[:room].decode("utf-8", "ignore").rsplit("\n", 1)[0]
+                parts.append({"path": section["path"], "text": cut + "\n[... %s truncated ...]\n" % section["path"]})
+                partial.append(section["path"])
+            else:
+                omitted.append(section["path"])
+    stat = run_bytes(diff_args("--stat=160,100", base, sha, "--"), "diff")
+    return {
+        "base": base,
+        "sha": sha,
+        "diffSha256": hashlib.sha256(raw).hexdigest(),
+        "diffBytes": len(raw),
+        "files": files[:FILES_LIMIT],
+        "filesTotal": len(files),
+        "stat": stat.stdout.decode("utf-8", "replace")[-STAT_LIMIT:],
+        "focusAreas": areas,
+        # One entry per file section of the unified diff, focus areas first;
+        # the path comes from here, so no consumer re-parses diff headers.
+        "excerpt": parts,
+        "excerptBytes": used,
+        "truncated": truncated,
+        "partialFiles": partial,
+        "omittedFiles": omitted[:FILES_LIMIT],
+    }
+
+
+def shared_run_lock():
+    """run.lock held shared while reviewing: refused (66) during a deployment,
+    and a deployment cannot start under a half-read base."""
+    try:
+        fd = os.open(RUN_LOCK, os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        raise Failure(66, "diff", "a self-update deployment is running; review the diff after it finished")
+    return fd
+
+
+def cmd_diff(sha):
+    shared_run_lock()
+    subject = check_repo_and_commit(sha)
+    state = read_json(STATE_FILE)
+    state = state if isinstance(state, dict) else None
+    base = verified_base(state, "diff")
+    report = review_report(base, sha, full_diff(base, sha, "diff"))
+    report.update({"ok": True, "action": "self.diff", "version": 1, "commitSubject": subject,
+                   "baseSource": "state" if state and state.get("deployed_commit") == base else "git-head"})
+    print(json.dumps(report, sort_keys=True), flush=True)
+
+
+def check_reviewed_diff(sha, reviewed_sha256, state):
+    base = verified_base(state, "review")
+    actual = hashlib.sha256(full_diff(base, sha, "review")).hexdigest()
+    if actual != reviewed_sha256:
+        raise Failure(65, "review", "reviewed diff mismatch: %s..%s now hashes to %s but the review covered %s "
+                      "(the deployed base moved or the code changed since the review; review again)"
+                      % (base[:12], sha[:12], actual, reviewed_sha256))
+    return {"base": base, "diff_sha256": actual, "match": True}
 
 
 def http_code(url, max_time=10, insecure=False):
@@ -381,7 +883,7 @@ def base_result(sha, started, phase, ok, code=None, error=None):
         "result": "ok" if ok else "failed",
         "started_at": started,
         "finished_at": utcnow(),
-        "unit": "wireguard-ops-cockpit-self-update@%s.service" % sha,
+        "unit": "wireguard-ops-cockpit-self-update@%s.service" % (ACTIVE_INSTANCE or sha),
     }
     if code is not None:
         result["code"] = code
@@ -413,22 +915,27 @@ def fail_with(result, exc):
     finish(result, exc.code)
 
 
-def cmd_deploy(sha):
+def cmd_deploy(sha, reviewed_sha256):
     started = utcnow()
     ensure_dir(STATE_DIR)
     ensure_dir(LOG_DIR)
     deploy_sha256 = check_deploy_script()
     if acquire_run_lock() is None:
-        raise Failure(66, "check", "another self-update deployment is already running")
+        raise Failure(66, "check", "another self-update run (deployment or review diff) is in progress")
     logfile = open_log("deploy", sha)
     log("self-update deploy %s (log %s)" % (sha, logfile))
     commit_subject = check_repo_and_commit(sha)
     log("commit accepted: %s %s" % (sha[:12], commit_subject))
     state = read_json(STATE_FILE)
-    previous = current_deployed_commit(state if isinstance(state, dict) else None)
+    # The old code reviewed exactly base..sha; anything else is refused here,
+    # before the deploy script can run.
+    review = check_reviewed_diff(sha, reviewed_sha256, state if isinstance(state, dict) else None)
+    previous = review["base"]
+    log("reviewed diff matches: %s..%s sha256 %s" % (previous[:12], sha[:12], reviewed_sha256))
     result = base_result(sha, started, "check", True)
     result["previous_commit"] = previous
     result["commit_subject"] = commit_subject
+    result["review"] = review
     result["deploy"] = {"script": DEPLOY_SH, "sha256": deploy_sha256, "result": "failed", "exit_code": None, "log": logfile}
     log("previous deployed commit: %s" % (previous or "unknown"))
     log("running the reviewed deploy script (REPO_COMMIT=%s, service restarts deferred)" % sha)
@@ -548,23 +1055,51 @@ def cmd_activate(sha):
     finish(result, 68)
 
 
+def refuse(code, message):
+    print(json.dumps({"ok": False, "error": message, "code": code}), file=sys.stderr)
+    sys.exit(code)
+
+
 def main():
     if len(sys.argv) != 3:
-        print(json.dumps({"ok": False, "error": "usage: cockpit-self-update-run deploy|activate <sha>", "code": 64}), file=sys.stderr)
-        sys.exit(64)
-    command, sha = sys.argv[1], sys.argv[2]
-    if command not in ("deploy", "activate"):
-        print(json.dumps({"ok": False, "error": "unsupported command: %s" % command, "code": 64}), file=sys.stderr)
-        sys.exit(64)
-    if not SHA_RE.match(sha):
-        print(json.dumps({"ok": False, "error": "commit must be a full lowercase 40-hex sha", "code": 65}), file=sys.stderr)
-        sys.exit(65)
-    global ACTIVE_SHA
+        refuse(64, "usage: cockpit-self-update-run deploy <sha>-<diff-sha256> | activate <sha> | diff <sha>")
+    command, target = sys.argv[1], sys.argv[2]
+    if command not in ("deploy", "activate", "diff"):
+        refuse(64, "unsupported command: %s" % command)
+    reviewed_sha256 = None
+    if command == "deploy":
+        # Every deployment carries the hash of the diff the running Cockpit
+        # reviewed; a bare sha is an unreviewed update and is refused.
+        reviewed = REVIEWED_TARGET_RE.match(target)
+        if not reviewed:
+            refuse(65, "unreviewed deploy refused: the instance must be <sha>-<reviewed diff sha256> "
+                       "(run cockpit-self-update-action diff <sha> and review it first)" if SHA_RE.match(target)
+                   else "deploy target must be <40-hex sha>-<64-hex reviewed diff sha256>")
+        sha, reviewed_sha256 = reviewed.group(1), reviewed.group(2)
+    else:
+        sha = target
+        if not SHA_RE.match(sha):
+            refuse(65, "commit must be a full lowercase 40-hex sha")
+    global ACTIVE_SHA, ACTIVE_INSTANCE
     ACTIVE_SHA = sha
+    ACTIVE_INSTANCE = target
+    if command == "diff":
+        # Read-only: never touches last-result.json, state or the history.
+        try:
+            cmd_diff(sha)
+        except Failure as exc:
+            print(json.dumps({"ok": False, "action": "self.diff", "sha": sha, "phase": exc.phase,
+                              "error": exc.message, "code": exc.code}, sort_keys=True), file=sys.stderr)
+            sys.exit(exc.code)
+        except Exception as exc:  # pragma: no cover - unexpected internal error
+            print(json.dumps({"ok": False, "action": "self.diff", "sha": sha, "error": "internal error: %s" % exc,
+                              "code": 69}, sort_keys=True), file=sys.stderr)
+            sys.exit(69)
+        return
     started = utcnow()
     try:
         if command == "deploy":
-            cmd_deploy(sha)
+            cmd_deploy(sha, reviewed_sha256)
         else:
             cmd_activate(sha)
     except Failure as exc:

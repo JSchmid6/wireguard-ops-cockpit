@@ -4,7 +4,9 @@
 # systemd). Wird von test/cockpit-self-update-e2e.sh aufgerufen; bitte dort
 # starten. Installiert das Modul an seine Produktionspfade, baut Fixtures
 # (Repository, Deploy-Skript, Dienste, Sockets, Health-Server) an den echten
-# Pfaden auf und fährt echte Selbst-Update-Läufe inklusive Aktivierung.
+# Pfaden auf und fährt echte Selbst-Update-Läufe inklusive Aktivierung. Jedes
+# Update läuft wie im Betrieb: erst `diff <sha>` (Review-Eingabe, transiente
+# Unit), dann `<sha> <diff-sha256>` mit dem geprüften Hash.
 #
 # Solange nichts anderes vermerkt ist, gelten die Produktionspfade — nur der
 # erlaubte Remote und die Aktivierungs-/Verify-Zeiten kommen aus
@@ -241,15 +243,25 @@ if visudo -cf /etc/sudoers >/dev/null 2>&1; then VS=0; else VS=1; fi
 check "sudoers-Datei gültig" "$VS" ""
 
 echo
-echo "--- S1: Update C2 im Sandbox-Nachbau des Executor-Dienstes (bis Aktivierung)"
+echo "--- S1: Review-Diff und Update C2 im Sandbox-Nachbau des Executor-Dienstes (bis Aktivierung)"
 TS_BEFORE="$(systemctl show -p ActiveEnterTimestamp --value wireguard-ops-cockpit-api)"
+# Der Diff braucht Netz (git fetch), die Sandbox hat nur AF_UNIX: der Helfer
+# muss ihn deshalb in einer eigenen transienten Unit laufen lassen.
+systemd-run --wait --pipe --collect --unit=e2e-selfupd-sandboxed-diff \
+  -p ProtectSystem=true -p ProtectHome=read-only -p RestrictAddressFamilies=AF_UNIX \
+  -- /usr/local/sbin/cockpit-self-update-action diff "$C2" > /out/s1-diff.out 2> /out/s1-diff.err
+rc=$?
+check "S1 Diff im Sandbox-Nachbau rc=0" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "rc=$rc $(head -c 300 /out/s1-diff.err)"
+expect_json "S1 Diff base=C1" /out/s1-diff.out "base" "$C1"
+H2="$(jsonv /out/s1-diff.out diffSha256)"
 systemd-run --wait --pipe --collect --unit=e2e-selfupd-sandboxed \
   -p ProtectSystem=true -p ProtectHome=read-only -p RestrictAddressFamilies=AF_UNIX \
-  -- /usr/local/sbin/cockpit-self-update-action "$C2" > /out/s1.out 2> /out/s1.err
+  -- /usr/local/sbin/cockpit-self-update-action "$C2" "$H2" > /out/s1.out 2> /out/s1.err
 rc=$?
 check "S1 Sandbox-Lauf rc=0" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "rc=$rc $(head -c 300 /out/s1.err)"
 expect_json "S1 Ergebnis ok:true" /out/s1.out "ok" "true"
 expect_json "S1 Ergebnis sha=C2" /out/s1.out "sha" "$C2"
+expect_json "S1 Ergebnis Review-Hash" /out/s1.out "review.diff_sha256" "$H2"
 check "S1 Aktivierung wird ok" "$(wait_for_activation "$C2" ok && echo 0 || echo 1)" ""
 expect_json "S1 Zustand deployed=C2" /var/lib/wireguard-ops-cockpit/self-update/state.json "deployed_commit" "$C2"
 expect_json "S1 Zustand activation=ok" /var/lib/wireguard-ops-cockpit/self-update/state.json "activation.status" "ok"
@@ -266,8 +278,12 @@ check "S2 status rc=0" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "rc=$rc $(head -
 expect_json "S2 status deployed=C2" /out/s2.out "deployed_commit" "$C2"
 
 echo
-echo "--- S3: Update C3 über die sudoers-Strecke (bis Aktivierung)"
-runuser -u cockpit-executor -- sudo -n /usr/local/sbin/cockpit-self-update-action "$C3" > /out/s3.out 2> /out/s3.err
+echo "--- S3: Review-Diff und Update C3 über die sudoers-Strecke (bis Aktivierung)"
+runuser -u cockpit-executor -- sudo -n /usr/local/sbin/cockpit-self-update-action diff "$C3" > /out/s3-diff.out 2> /out/s3-diff.err
+rc=$?
+check "S3 Diff rc=0" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "rc=$rc $(head -c 300 /out/s3-diff.err)"
+H3="$(jsonv /out/s3-diff.out diffSha256)"
+runuser -u cockpit-executor -- sudo -n /usr/local/sbin/cockpit-self-update-action "$C3" "$H3" > /out/s3.out 2> /out/s3.err
 rc=$?
 check "S3 Update rc=0" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "rc=$rc $(head -c 300 /out/s3.err)"
 check "S3 Aktivierung wird ok" "$(wait_for_activation "$C3" ok && echo 0 || echo 1)" ""
@@ -275,11 +291,21 @@ expect_json "S3 Zustand deployed=C3" /var/lib/wireguard-ops-cockpit/self-update/
 expect_json "S3 Zustand previous=C2" /var/lib/wireguard-ops-cockpit/self-update/state.json "previous_commit" "$C2"
 
 echo
-echo "--- S4: Refusal — nicht gemergter Commit"
-runuser -u cockpit-executor -- sudo -n /usr/local/sbin/cockpit-self-update-action "$C4" > /out/s4.out 2> /out/s4.err
+echo "--- S4: Refusals — nicht gemergter Commit, ungeprüftes Update, falscher Hash"
+ZERO_HASH="$(printf '0%.0s' $(seq 1 64))"
+runuser -u cockpit-executor -- sudo -n /usr/local/sbin/cockpit-self-update-action "$C4" "$ZERO_HASH" > /out/s4.out 2> /out/s4.err
 rc=$?
 check "S4 nicht gemergt -> 65" "$([ "$rc" -eq 65 ] && echo 0 || echo 1)" "rc=$rc $(head -c 300 /out/s4.err)"
 expect_json "S4 Ergebnis code=65" /var/lib/wireguard-ops-cockpit/self-update/last-result.json "code" "65"
+runuser -u cockpit-executor -- sudo -n /usr/local/sbin/cockpit-self-update-action "$C2" > /out/s4b.out 2> /out/s4b.err
+rc=$?
+check "S4 ungeprüftes Update (nur sha) -> 65" "$([ "$rc" -eq 65 ] && echo 0 || echo 1)" "rc=$rc $(head -c 300 /out/s4b.err)"
+calls_before="$(wc -l < /var/log/e2e-deploycalls.log)"
+runuser -u cockpit-executor -- sudo -n /usr/local/sbin/cockpit-self-update-action "$C2" "$ZERO_HASH" > /out/s4c.out 2> /out/s4c.err
+rc=$?
+check "S4 falscher Review-Hash -> 65" "$([ "$rc" -eq 65 ] && echo 0 || echo 1)" "rc=$rc $(head -c 300 /out/s4c.err)"
+expect_json "S4 falscher Hash: Phase review" /var/lib/wireguard-ops-cockpit/self-update/last-result.json "phase" "review"
+check "S4 falscher Hash: Deploy-Skript nicht gelaufen" "$([ "$calls_before" = "$(wc -l < /var/log/e2e-deploycalls.log)" ] && echo 0 || echo 1)" ""
 
 echo
 echo "--- S5: Aktivierungs-Fehlschlag wird berichtet (Health-Server aus)"

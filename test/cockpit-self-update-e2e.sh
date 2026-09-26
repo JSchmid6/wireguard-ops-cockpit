@@ -11,11 +11,13 @@
 # Ablauf im Container: Modul an die Produktionspfade installieren, Fixture-
 # Repository + Fixture-Deploy-Skript + Fixture-Dienste/-Sockets/-Health-Server
 # aufbauen und dann echte Läufe fahren:
-#   1. Update im Sandbox-Nachbau des Executor-Dienstes (systemd-run mit
-#      ProtectSystem/ProtectHome/RestrictAddressFamilies) bis inkl. Aktivierung
+#   1. Review-Diff und Update im Sandbox-Nachbau des Executor-Dienstes
+#      (systemd-run mit ProtectSystem/ProtectHome/RestrictAddressFamilies) bis
+#      inkl. Aktivierung; der Diff selbst läuft in einer transienten Unit
 #   2. status über die sudoers-Strecke (User cockpit-executor -> root)
-#   3. Update über dieselbe sudoers-Strecke (zweiter Commit)
-#   4. Refusal: nicht gemergter Commit (65)
+#   3. Review-Diff und Update über dieselbe sudoers-Strecke (zweiter Commit)
+#   4. Refusals: nicht gemergter Commit, ungeprüftes Update (nur sha),
+#      falscher Review-Hash (jeweils 65, Deploy-Skript läuft nicht)
 #   5. Aktivierungs-Fehlschlag wird als solcher berichtet (Health-Server aus)
 #
 # Aufruf (auf dem VPS-Host ODER in der Hermes-Shell):

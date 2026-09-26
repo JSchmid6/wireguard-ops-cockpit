@@ -61,11 +61,31 @@ import {
   type CapabilityId,
   type ExecutionEnvelope,
 } from "./hermes-security.js";
+import {
+  applyUpdateReviewPolicy,
+  buildUpdateReviewPrompt,
+  normalizeUpdateBindings,
+  parseUpdateDiff,
+  parseUpdateReviewAnswer,
+  redactSecrets,
+  reviewedDiffFor,
+  selfUpdateTargets,
+  summarizeUpdateReview,
+  updateBindings,
+  updateReviewEvidence,
+  verifyQuotes,
+  type UpdateBinding,
+  type UpdateDiff,
+  type UpdateReviewOutcome,
+} from "./update-review.js";
 
 interface AppOptions {
   config?: AppConfig;
   bootstrapUsers?: Array<{ username: string; password: string; role?: UserSummary["role"] }>;
   safetyReviewRunner?: SafetyReviewRunner;
+  // The isolated reviewer of a self-update's code (prompt in, raw answer out).
+  // Defaults to the agent broker's safety role; tests inject a stub.
+  updateReviewRunner?: (prompt: string) => Promise<string>;
 }
 
 interface LoginAttemptState {
@@ -81,6 +101,21 @@ const LOGIN_BLOCK_MS = 15 * 60 * 1000;
 // (wireguard-ops-cockpit-self-update@<sha>.service, TimeoutStartSec=1800s);
 // the executor socket bound for that action is the unit bound plus a margin.
 const SELF_UPDATE_EXECUTOR_TIMEOUT_MS = 31 * 60 * 1000;
+// The review diff runs `git fetch` (runner bound 300s) inside a transient unit
+// with RuntimeMaxSec=420; the socket bound sits above both.
+const SELF_DIFF_EXECUTOR_TIMEOUT_MS = 8 * 60 * 1000;
+
+// Keeps a validated capability manifest for reuse, only when the planner
+// declared the operation as recurring (`retain: true`); a one-off repair stays
+// in the job history and audit only.
+export async function retainValidatedCapability(capabilityDir: string, jobId: string, manifest: CapabilityManifest | null | undefined): Promise<string | null> {
+  if (!manifest || manifest.retain !== true) return null;
+  const digest = capabilityManifestHash(manifest);
+  await mkdir(capabilityDir, { recursive: true, mode: 0o700 });
+  const capabilityPath = path.join(capabilityDir, `${digest}.json`);
+  await writeFile(capabilityPath, JSON.stringify({ digest, validatedByJob: jobId, validatedAt: new Date().toISOString(), manifest }, null, 2), { encoding: "utf-8", mode: 0o600 });
+  return capabilityPath;
+}
 
 function slugify(value: string): string {
   return value
@@ -1639,7 +1674,7 @@ export async function createApp(options: AppOptions = {}) {
     ].join("\n");
   }
 
-  async function executeTypedCapabilities(planText: string, envelope: ExecutionEnvelope, manifest?: CapabilityManifest | null): Promise<string | null> {
+  async function executeTypedCapabilities(planText: string, envelope: ExecutionEnvelope, manifest?: CapabilityManifest | null, reviewedUpdates: UpdateBinding[] = []): Promise<string | null> {
     if (manifest) {
       if (!config.executorBrokerSocket || !config.executorBrokerSecret) throw new Error("sandbox executor broker is not configured");
       const output = await runDynamicCapability(config.executorBrokerSocket, config.executorBrokerSecret, {
@@ -1675,12 +1710,65 @@ export async function createApp(options: AppOptions = {}) {
     if (actions.length === 0) throw new Error("typed capability plan contains no typed action");
     const outputs: string[] = [];
     for (const action of actions) {
+      let diffSha256: string | null = null;
+      if (action.action === "self.update") {
+        // The broker passes the reviewed diff hash to the runner, which refuses
+        // to deploy anything else. Without a bound review (its input was
+        // unavailable) only an operator-approved envelope may continue; the
+        // hash is then taken now and still pins exactly that diff.
+        diffSha256 = reviewedDiffFor(action.target, envelope, reviewedUpdates);
+        if (!diffSha256) {
+          if (!envelope.operatorApproved) throw new Error(`self.update ${action.target} has no reviewed diff bound to this job`);
+          diffSha256 = parseUpdateDiff(await runExecutorAction(config.executorBrokerSocket, config.executorBrokerSecret, {
+            action: "self.diff", target: action.target, expiresAt: envelope.expiresAt, envelopeDigest: envelope.digest,
+          }, SELF_DIFF_EXECUTOR_TIMEOUT_MS), action.target).diffSha256;
+        }
+      }
       outputs.push(await runExecutorAction(config.executorBrokerSocket, config.executorBrokerSecret, {
-        ...action, expiresAt: envelope.expiresAt, envelopeDigest: envelope.digest,
+        ...action, ...(diffSha256 ? { diffSha256 } : {}), expiresAt: envelope.expiresAt, envelopeDigest: envelope.digest,
       }, action.action === "self.update" ? SELF_UPDATE_EXECUTOR_TIMEOUT_MS : undefined));
     }
     const ran = actions.map((action) => `${action.action} ${action.target}`).join(", ");
     return `## EXECUTION RESULT\nSTATUS: success\nEXIT_CODE: 0\nWHAT_RAN: typed executor actions: ${ran}\nOUTPUT: ${outputs.join("\n").slice(-10000)}\nNOTES: executed by isolated capability broker`;
+  }
+
+  // The update reviewer gets the prompt unwrapped, like the plan safety review
+  // (runIsolatedAgent would add the planner template). Without the agent
+  // broker there is no isolated reviewer: the review fails closed.
+  const updateReviewRunner = options.updateReviewRunner || (async (prompt: string) => {
+    if (!config.agentBrokerSocket) throw new Error("the isolated reviewer needs the agent broker");
+    return await runBrokerAgent(config.agentBrokerSocket, "safety", prompt);
+  });
+
+  // Pre-install review of the commits a plan would install (see
+  // update-review.ts). The reviewer prompt is written next to the proposal
+  // (<jobId>-update-review.md, 0600): it is exactly what the isolated
+  // reviewer received.
+  async function reviewSelfUpdates(
+    jobId: string, targets: string[], proposalDir: string,
+  ): Promise<{ diffs: UpdateDiff[]; reviewPath: string | null; outcome: UpdateReviewOutcome }> {
+    const diffs: UpdateDiff[] = [];
+    try {
+      if (!config.executorBrokerSocket || !config.executorBrokerSecret) throw new Error("typed executor broker is not configured");
+      for (const sha of targets) {
+        diffs.push(parseUpdateDiff(await runExecutorAction(config.executorBrokerSocket, config.executorBrokerSecret, {
+          action: "self.diff", target: sha, expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+          envelopeDigest: hashCanonical({ jobId, purpose: "self-update-review", sha }),
+        }, SELF_DIFF_EXECUTOR_TIMEOUT_MS), sha));
+      }
+    } catch (error) {
+      return { diffs: [], reviewPath: null, outcome: { bindings: [], coverage: [], unavailable: error instanceof Error ? error.message : "self.diff failed" } };
+    }
+    const { prompt, coverage } = buildUpdateReviewPrompt(diffs);
+    const reviewPath = path.join(proposalDir, `${jobId}-update-review.md`);
+    await writeFile(reviewPath, prompt, { encoding: "utf-8", mode: 0o600 });
+    const outcome: UpdateReviewOutcome = { bindings: updateBindings(diffs), coverage };
+    try {
+      outcome.answer = verifyQuotes(parseUpdateReviewAnswer(redactSecrets(await updateReviewRunner(prompt))), prompt);
+    } catch (error) {
+      outcome.reviewerError = error instanceof Error ? error.message : "reviewer failed";
+    }
+    return { diffs, reviewPath, outcome };
   }
 
   function explanation(input: Partial<HermesExplanation> & Pick<HermesExplanation, "phase" | "intent" | "reason">): HermesExplanation {
@@ -1717,15 +1805,7 @@ export async function createApp(options: AppOptions = {}) {
     return updated;
   }
 
-  async function retainValidatedCapability(jobId: string, manifest: CapabilityManifest | null | undefined): Promise<string | null> {
-    if (!manifest) return null;
-    const digest = capabilityManifestHash(manifest);
-    const capabilityDir = path.join(path.dirname(config.dbPath), "capabilities");
-    await mkdir(capabilityDir, { recursive: true, mode: 0o700 });
-    const capabilityPath = path.join(capabilityDir, `${digest}.json`);
-    await writeFile(capabilityPath, JSON.stringify({ digest, validatedByJob: jobId, validatedAt: new Date().toISOString(), manifest }, null, 2), { encoding: "utf-8", mode: 0o600 });
-    return capabilityPath;
-  }
+  const capabilityDir = path.join(path.dirname(config.dbPath), "capabilities");
 
   async function waitForHermesJob(jobId: string, actorId: string, waitMs: number): Promise<JobRecord | null> {
     const deadline = Date.now() + waitMs;
@@ -1953,7 +2033,8 @@ export async function createApp(options: AppOptions = {}) {
         const reviewedPlan = typeof job.output?.plan === "string" ? job.output.plan : "";
         const envelope = running.output?.envelope as ExecutionEnvelope;
         const manifest = running.output?.manifest as CapabilityManifest | null | undefined;
-        const typedResult = await executeTypedCapabilities(reviewedPlan, envelope, manifest);
+        const reviewedUpdates = normalizeUpdateBindings((running.output?.updateReview as Record<string, unknown> | undefined)?.bindings);
+        const typedResult = await executeTypedCapabilities(reviewedPlan, envelope, manifest, reviewedUpdates);
         const raw = typedResult || await runIsolatedAgent(actor, session, planner, "runner", isolatedRunnerPrompt(proposalPath, reviewedPlan), "-runner", 10 * 60_000);
         const result = typedResult || filterSensitiveContent(extractRunnerHandoff(raw));
         const runnerSuccess = /STATUS:\s*success/i.test(result);
@@ -1961,7 +2042,7 @@ export async function createApp(options: AppOptions = {}) {
           ? await runIndependentVerification(actor, session, planner, intent, reviewedPlan, result)
           : "VERIFICATION_STATUS: failed\nREASON: runner did not report success";
         const success = runnerSuccess && /VERIFICATION_STATUS:\s*passed/i.test(verification);
-        const retainedCapability = success ? await retainValidatedCapability(job.id, manifest) : null;
+        const retainedCapability = success ? await retainValidatedCapability(capabilityDir, job.id, manifest) : null;
         updateHermesJob(job.id, success ? "completed" : "failed_verification", explanation({
           phase: "finished", intent,
           reason: success ? "Approved execution and verification completed." : "Approved execution did not report verified success.",
@@ -2454,16 +2535,28 @@ Follow these rules:
           workflowSteps: [{ id: "execute", label: "Execute reviewed proposal", description: intent, kind: "runbook" }],
         };
 
+        const manifest = parseCapabilityManifest(planText);
+        const updateTargets = manifest ? [] : selfUpdateTargets(planText);
+        let updateReview: Awaited<ReturnType<typeof reviewSelfUpdates>> | null = null;
+        if (updateTargets.length > 0) {
+          updateHermesJob(job.id, "running", explanation({
+            phase: "reviewing", intent, reason: "The running Cockpit is reviewing the code of the self-update before it can be installed.",
+            completed: ["Structured planner proposal"], evidence: [proposalPath, ...updateTargets.map((sha) => `self.update ${sha}`)],
+          }), { plan: planText, proposalPath });
+          updateReview = await reviewSelfUpdates(job.id, updateTargets, proposalDir);
+        }
+        const reviewRecord = updateReview ? { updateReview: summarizeUpdateReview(updateReview.diffs, updateReview.outcome, updateReview.reviewPath) } : {};
+        const reviewedSteps = ["Planner proposal", ...(updateReview ? ["Pre-install code review"] : []), "Safety review", "Policy evaluation"];
+
         updateHermesJob(job.id, "running", explanation({
           phase: "reviewing", intent, reason: "Independent safety review and hard-boundary policy are evaluating the proposal.",
-          completed: ["Structured planner proposal"], evidence: [proposalPath],
-        }), { plan: planText, proposalPath });
+          completed: ["Structured planner proposal", ...(updateReview ? ["Pre-install code review"] : [])], evidence: [proposalPath],
+        }), { plan: planText, proposalPath, ...reviewRecord });
         const review = await safetyReviewRunner({
           runbook: proposal, runbookVersionHash: computeRunbookVersionHash(proposal), riskClass: "moderate",
           sessionId: session.id, trigger: "manual", scheduleId: null,
         }, { ...config, opencodeModel: config.safetyOpencodeModel });
         let policy = evaluatePlanPolicy(planText, review.verdict);
-        const manifest = parseCapabilityManifest(planText);
         const manifestHash = manifest ? capabilityManifestHash(manifest) : undefined;
         const nextcloudMutationModes = new Set(["php-install", "php-enable", "exapp-catalog-refresh", "exapp-register", "exapp-reinitialize", "exapp-restart-reinitialize"]);
         const contextMutationModes = new Set(["create-test", "search-test", "prompt-test"]);
@@ -2516,9 +2609,13 @@ Follow these rules:
             neededToContinue: ["Confirm this exact signed capability manifest."],
           };
         }
+        // The review of the new code decides only here, after every plan check:
+        // a stop turns an allowed plan into an operator decision.
+        if (updateReview) policy = applyUpdateReviewPolicy(policy, updateReview.outcome);
         const envelope = createExecutionEnvelope({
           jobId: job.id, actorId: actor.id, sessionId: session.id, intent,
-          evidence: untrustedEvidence, plan: planText, safety: review, policy, capabilities,
+          evidence: [...untrustedEvidence, ...updateReviewEvidence(updateReview?.outcome.bindings ?? [])],
+          plan: planText, safety: review, policy, capabilities,
           manifestHash, ttlMinutes: config.approvalTtlMinutes, signingSecret: config.executionEnvelopeSecret,
         });
         const provenance = {
@@ -2530,29 +2627,29 @@ Follow these rules:
         if (!policy.allowed) {
           updateHermesJob(job.id, policy.status === "ready" ? "failed_execution" : policy.status, explanation({
             phase: "finished", intent, reason: policy.reason,
-            completed: ["Planner proposal", "Safety review", "Policy evaluation"],
+            completed: reviewedSteps,
             evidence: [review.summary, ...policy.evidence], neededToContinue: policy.neededToContinue,
             recommendedAction: policy.status === "blocked_user_approval" ? "Ask the operator to approve or narrow the plan." : "Revise the plan as indicated.",
             rollbackAvailable: policy.rollbackAvailable,
-          }), { plan: planText, safety: review, policy, capabilities, manifest, envelope, provenance, proposalPath });
+          }), { plan: planText, safety: review, policy, capabilities, manifest, envelope, provenance, proposalPath, ...reviewRecord });
           return;
         }
         if (!shouldExecute) {
           updateHermesJob(job.id, "completed", explanation({
             phase: "finished", intent, reason: "Plan-only request completed without execution.",
-            completed: ["Planner proposal", "Safety review", "Policy evaluation"],
+            completed: reviewedSteps,
             evidence: [review.summary, ...policy.evidence], recommendedAction: "Submit an execution request if this plan should run.",
             rollbackAvailable: policy.rollbackAvailable,
-          }), { plan: planText, safety: review, policy, capabilities, manifest, envelope, provenance, proposalPath, result: "" });
+          }), { plan: planText, safety: review, policy, capabilities, manifest, envelope, provenance, proposalPath, ...reviewRecord, result: "" });
           return;
         }
 
         updateHermesJob(job.id, "running", explanation({
           phase: "executing", intent, reason: policy.reason,
-          completed: ["Planner proposal", "Safety review", "Policy evaluation"],
+          completed: reviewedSteps,
           evidence: [review.summary, ...policy.evidence], rollbackAvailable: policy.rollbackAvailable,
-        }), { plan: planText, safety: review, policy, capabilities, manifest, envelope, provenance, proposalPath });
-        const typedResult = await executeTypedCapabilities(planText, envelope, manifest);
+        }), { plan: planText, safety: review, policy, capabilities, manifest, envelope, provenance, proposalPath, ...reviewRecord });
+        const typedResult = await executeTypedCapabilities(planText, envelope, manifest, updateReview?.outcome.bindings ?? []);
         const runnerRaw = typedResult || await runIsolatedAgent(actor, session, planner, "runner", isolatedRunnerPrompt(proposalPath, planText), "-runner", 10 * 60_000);
         const result = typedResult || filterSensitiveContent(extractRunnerHandoff(runnerRaw));
         if (!result) throw new Error("runner produced no structured execution result");
@@ -2567,16 +2664,16 @@ Follow these rules:
           verification = filterSensitiveContent(extractCleanOutput(verifierRaw) || extractAnswer(verifierRaw));
         }
         const success = runnerSuccess && /VERIFICATION_STATUS:\s*passed/i.test(verification);
-        const retainedCapability = success ? await retainValidatedCapability(job.id, manifest) : null;
+        const retainedCapability = success ? await retainValidatedCapability(capabilityDir, job.id, manifest) : null;
         updateHermesJob(job.id, success ? "completed" : "failed_verification", explanation({
           phase: "finished", intent,
           reason: success ? "Execution and runner verification completed." : "Execution finished but did not report a verified success.",
-          completed: ["Planner proposal", "Safety review", "Policy evaluation", "Runner execution", "Independent verification", "Result collection"],
+          completed: [...reviewedSteps, "Runner execution", "Independent verification", "Result collection"],
           evidence: [review.summary, ...policy.evidence, ...(retainedCapability ? [`validated capability: ${retainedCapability}`] : []), `elapsedMs=${Date.now() - startedAt}`],
           neededToContinue: success ? [] : ["Inspect the structured runner result and complete the failed verification."],
           recommendedAction: success ? "No further action is required." : "Correct the reported issue or perform rollback.",
           rollbackAvailable: policy.rollbackAvailable,
-        }), { plan: planText, safety: review, policy, capabilities, manifest, envelope, provenance, proposalPath, retainedCapability, result, verification, elapsedMs: Date.now() - startedAt });
+        }), { plan: planText, safety: review, policy, capabilities, manifest, envelope, provenance, proposalPath, ...reviewRecord, retainedCapability, result, verification, elapsedMs: Date.now() - startedAt });
       } catch (error) {
         const preservedOutput = database.getJobForActor(job.id, actor.id)?.output || {};
         updateHermesJob(job.id, "failed_execution", explanation({

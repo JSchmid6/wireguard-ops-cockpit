@@ -14,6 +14,16 @@ test("agent broker accepts only bounded roles and prompts", () => {
   assert.throws(() => validateRequest({ requestId: "12345678", role: "root", prompt: "inspect" }), /invalid agent role/);
 });
 
+test("only the safety role gets the larger budget for the pre-install review", () => {
+  const review = "d".repeat(90000);
+  assert.equal(validateRequest({ requestId: "12345678", role: "safety", prompt: review }).prompt.length, 90000);
+  assert.throws(() => validateRequest({ requestId: "12345678", role: "planner", prompt: review }), /prompt length is invalid/);
+  assert.throws(() => validateRequest({ requestId: "12345678", role: "safety", prompt: "d".repeat(100001) }), /prompt length is invalid/);
+  // 50,000 three-byte characters stay under the character limit but exceed
+  // the single-argv byte bound opencode is started with.
+  assert.throws(() => validateRequest({ requestId: "12345678", role: "safety", prompt: "\u20ac".repeat(50000) }), /prompt length is invalid/);
+});
+
 test("agent broker creates a private role-scoped workspace and removes only that workspace", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-agent-test-"));
   const workspace = createSessionWorkspace({ requestId: "12345678", role: "planner", prompt: "inspect" }, root);

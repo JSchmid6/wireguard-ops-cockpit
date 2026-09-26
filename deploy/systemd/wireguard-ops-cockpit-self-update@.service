@@ -7,18 +7,21 @@ After=network-online.target
 [Service]
 # One-shot deployment unit of the typed self-update module. It is started only
 # by /usr/local/sbin/cockpit-self-update-action with exactly one instance name:
-# the full lowercase 40-hex commit that is to be deployed. The instance is
-# re-validated inside the runner, and the runner itself re-verifies that the
-# commit is an ancestor of origin/main of the allowlisted repository before
-# anything is deployed.
+# <sha>-<diff-sha256>, the full lowercase 40-hex commit that is to be deployed
+# and the sha256 of the diff (deployed base..sha) the running Cockpit reviewed.
+# The instance is re-validated inside the runner; a bare-sha instance is
+# refused. The runner re-verifies that the commit is an ancestor of origin/main
+# of the allowlisted repository and that the diff still hashes to the reviewed
+# value before anything is deployed.
 #
 # This unit deliberately runs with full host access: a cockpit rollout
 # performs apt/git/npm work across /usr, /opt, /etc and /var and restarts
 # services, so a unit sandbox would break it. The security boundary of this
 # module is the typed helper contract (fixed argument form, allowlisted
-# repository, merged-review commit pin, root-owned deploy script) — not a
-# unit sandbox. Nothing else can start this unit with an effect: the runner
-# refuses any input that is not one merged commit of the allowlisted repo.
+# repository, merged-review commit pin, reviewed-diff hash, root-owned deploy
+# script) — not a unit sandbox. Nothing else can start this unit with an
+# effect: the runner refuses any input that is not one merged commit of the
+# allowlisted repo together with the hash of its reviewed diff.
 Type=oneshot
 TimeoutStartSec=1800
 # Collect one-shot instances once they are inactive so retries and future

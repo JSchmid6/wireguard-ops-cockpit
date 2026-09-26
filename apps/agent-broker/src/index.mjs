@@ -12,11 +12,21 @@ const opencodeConfig = process.env.COCKPIT_OPENCODE_CONFIG || "/var/lib/wireguar
 const contextRoot = new URL("../context/", import.meta.url);
 const staleWorkspaceAgeMs = 24 * 60 * 60 * 1000;
 const allowedRoles = new Set(["planner", "research", "runner", "safety", "verifier"]);
+// The safety role also reviews the diff of a Cockpit self-update (a bounded
+// excerpt, see apps/api/src/update-review.ts), so it gets a larger budget. The
+// prompt is one argv element of opencode: Linux caps a single argument at
+// 128 KiB (MAX_ARG_STRLEN), hence the byte bound.
+const promptLimits = { safety: 100000 };
+const defaultPromptLimit = 30000;
+const promptByteLimit = 120000;
+const requestLineLimit = 1048576;
 
 export function validateRequest(value) {
   if (!value || typeof value !== "object") throw new Error("request must be an object");
   if (!allowedRoles.has(value.role)) throw new Error("invalid agent role");
-  if (typeof value.prompt !== "string" || value.prompt.length < 1 || value.prompt.length > 30000) throw new Error("prompt length is invalid");
+  const promptLimit = promptLimits[value.role] || defaultPromptLimit;
+  if (typeof value.prompt !== "string" || value.prompt.length < 1 || value.prompt.length > promptLimit) throw new Error("prompt length is invalid");
+  if (Buffer.byteLength(value.prompt, "utf8") > promptByteLimit) throw new Error("prompt length is invalid");
   if (typeof value.requestId !== "string" || !/^[a-f0-9-]{8,64}$/i.test(value.requestId)) throw new Error("requestId is invalid");
   return { requestId: value.requestId, role: value.role, prompt: value.prompt };
 }
@@ -113,7 +123,7 @@ if (process.env.NODE_ENV !== "test") {
     let input = ""; let handled = false;
     connection.setEncoding("utf8");
     connection.on("data", async (chunk) => {
-      input += chunk; if (input.length > 65536) { connection.destroy(); return; }
+      input += chunk; if (input.length > requestLineLimit) { connection.destroy(); return; }
       if (handled || !input.includes("\n")) return;
       handled = true;
       try {

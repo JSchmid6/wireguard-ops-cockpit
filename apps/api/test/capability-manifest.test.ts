@@ -1,4 +1,8 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { retainValidatedCapability } from "../src/app.js";
 import { capabilityManifestHash, capabilityNeedsOperatorApproval, capabilityPlannerContract, parseCapabilityManifest } from "../src/capability-manifest.js";
 
 const contained = `\`\`\`capability
@@ -47,5 +51,34 @@ describe("dynamic capability manifest", () => {
     const standalone = contained.replace(/^```capability\n|\n```$/g, "");
     expect(parseCapabilityManifest(standalone)?.name).toBe("adapt tool");
     expect(parseCapabilityManifest(`Plan: ${standalone}`)).toBeNull();
+  });
+
+  it("keeps retention opt-in and binds it into the manifest hash", () => {
+    const plain = parseCapabilityManifest(contained)!;
+    const recurring = parseCapabilityManifest(contained.replace('"risk":["contained"]', '"risk":["contained"],"retain":true'))!;
+    const stringy = parseCapabilityManifest(contained.replace('"risk":["contained"]', '"risk":["contained"],"retain":"true"'))!;
+    expect(plain.retain).toBe(false);
+    expect(recurring.retain).toBe(true);
+    expect(stringy.retain).toBe(false);
+    expect(capabilityManifestHash(recurring)).not.toBe(capabilityManifestHash(plain));
+    expect(capabilityManifestHash(stringy)).toBe(capabilityManifestHash(plain));
+    expect(capabilityPlannerContract()).toContain('Set "retain": true only for an operation expected to recur');
+  });
+
+  it("retains a validated manifest only when it asks for it", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-retain-"));
+    try {
+      const capabilityDir = path.join(root, "capabilities");
+      expect(await retainValidatedCapability(capabilityDir, "job-once", parseCapabilityManifest(contained))).toBeNull();
+      expect(await retainValidatedCapability(capabilityDir, "job-none", null)).toBeNull();
+      expect(fs.existsSync(capabilityDir)).toBe(false);
+      const recurring = parseCapabilityManifest(contained.replace('"risk":["contained"]', '"risk":["contained"],"retain":true'))!;
+      const retained = await retainValidatedCapability(capabilityDir, "job-recurring", recurring);
+      expect(retained).toBe(path.join(capabilityDir, `${capabilityManifestHash(recurring)}.json`));
+      expect(fs.statSync(retained!).mode & 0o777).toBe(0o600);
+      expect(JSON.parse(fs.readFileSync(retained!, "utf8"))).toMatchObject({ validatedByJob: "job-recurring", manifest: { retain: true } });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });
