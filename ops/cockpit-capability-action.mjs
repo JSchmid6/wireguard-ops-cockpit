@@ -136,12 +136,24 @@ const _unusedForbidden = new Set(["/", "/bin", "/boot", "/dev", "/etc", "/home",
 const protectedPath = protectedPathEarly;
 const _unusedProtected = /(?:^|\/)(?:\.ssh|sudoers(?:\.d)?|shadow|gshadow|passwd|group|ssh|wireguard|secrets?|credentials?|private|keys?)(?:\/|$)|\.(?:key|pem|p12|env|db|sqlite3?)$|^\/(?:opt\/nextcloud|opt\/gitlab|var\/www\/nextcloud\/config|var\/lib\/wireguard-ops-cockpit)(?:\/|$)/i;
 const paths = Array.isArray(manifest.writablePaths) ? manifest.writablePaths : [];
+// Readable scopes get a deterministic guard too (27.09.2026, found by Hermes in the
+// PR #10 review; earlier manifests really bound /var/run/docker.sock and /run/mysqld).
+// Two layers: (1) a secret read is a secret leaked, so the protected names, device,
+// kernel and container-state trees and root's home need operator approval (the fixed
+// /proc/mdstat bind excepted); (2) sockets: see socketFamilyFor below —
+// without approval a step cannot open a Unix socket at all, wherever one is bound.
+const readableNeedsApproval = /^\/(?:dev|proc|sys|root)(?:\/|$)|^\/var\/lib\/(?:docker|containerd)(?:\/|$)/;
+const readableFixed = new Set(["/proc/mdstat"]);
 const readPaths = Array.isArray(manifest.readablePaths) ? manifest.readablePaths : [];
 if (readPaths.length > 32) fail("too many readable paths");
 const readablePaths = readPaths.map((item) => {
   if (typeof item !== "string" || !item.startsWith("/") || item.includes("\0")) fail("invalid readable path");
   const resolved = realpathSync(normalize(item));
   if (forbiddenRoots.has(resolved)) fail(`readable scope is too broad: ${resolved}`, 77);
+  if (!approved && !readableFixed.has(resolved)) {
+    if (protectedPath.test(resolved) || readableNeedsApproval.test(resolved)) fail(`protected readable path requires operator approval: ${resolved}`, 77);
+    if (lstatSync(resolved).isSocket()) fail(`a socket is never an autonomous readable scope: ${resolved}`, 77);
+  }
   return resolved;
 });
 if (paths.length > 32) fail("too many writable paths");
@@ -292,19 +304,24 @@ for (const [index, step] of manifest.steps.entries()) {
     properties.push(`--property=BindReadOnlyPaths=-${vpsSnapshotEnv}`);
   }
   if (runAsUser) properties.push(`--property=User=${runAsUser}`);
-  if (manifest.network === "none") properties.push("--property=PrivateNetwork=yes", "--property=RestrictAddressFamilies=AF_UNIX");
+  // A Unix socket reaches root services (Docker, systemd, D-Bus, MariaDB) no matter
+  // how it got into the sandbox. Only operator-approved steps and the fixed helpers
+  // that bind their own sockets (Nextcloud: /run/mysqld, Email Archive: docker.sock)
+  // may open one; for everyone else AF_UNIX is not an address family at all.
+  const unixFamily = approved || step.argv[0] === nextcloudAppHelper || step.argv[0] === nextcloudContextHelper || isEmailArchiveDeployStep ? "AF_UNIX " : "";
+  if (manifest.network === "none") properties.push("--property=PrivateNetwork=yes", `--property=RestrictAddressFamilies=${unixFamily}AF_INET`);
   if (manifest.network === "local") properties.push(
-    "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6", "--property=SocketBindDeny=any",
+    `--property=RestrictAddressFamilies=${unixFamily}AF_INET AF_INET6`, "--property=SocketBindDeny=any",
     "--property=IPAddressDeny=any", "--property=IPAddressAllow=localhost",
     ...["/etc/nsswitch.conf", "/etc/hosts"].filter((item) => !writablePaths.includes(item)).map((item) => `--property=BindReadOnlyPaths=${item}`),
   );
   if (manifest.network === "outbound") properties.push(
-    "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6", "--property=SocketBindDeny=any",
+    `--property=RestrictAddressFamilies=${unixFamily}AF_INET AF_INET6`, "--property=SocketBindDeny=any",
     ...["/etc/resolv.conf", "/etc/nsswitch.conf", "/etc/hosts", "/etc/ssl/certs", "/etc/ca-certificates.conf"]
       .filter((item) => !writablePaths.includes(item))
       .map((item) => `--property=BindReadOnlyPaths=${item}`),
   );
-  if (manifest.network === "host") properties.push("--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6");
+  if (manifest.network === "host") properties.push(`--property=RestrictAddressFamilies=${unixFamily}AF_INET AF_INET6`);
   if (step.cwd) {
     const cwd = realpathSync(step.cwd);
     if (!approved && cwd !== "/tmp" && cwd !== "/var/tmp") fail(`host working-directory access requires operator approval; use direct paths for contained execution: ${cwd}`, 77);
