@@ -215,3 +215,26 @@ under the state directory — never a bare exit code.
   waits for the real activation timer, and re-runs the flow over the sudoers
   path as `cockpit-executor`, including the unreviewed and wrong-hash
   refusals.
+
+## VPS (Contabo vmd61162, WireGuard 10.0.0.1)
+
+The VPS has no Lab0 package script; its reviewed deploy script is
+`deploy/vps/vps-cockpit-deploy.sh` (installed to
+`/usr/local/lib/wireguard-ops-cockpit/vps-cockpit-deploy.sh`). It follows the
+same contract (`REPO_COMMIT=<sha>`, `COCKPIT_RESTART_MODE=defer`, writes
+`state.json` with `web_url=http://10.0.0.1:8080`), installs all helpers, the
+sudoers file (validated first) and the unit template, rebuilds the web
+container only when `apps/web` changed, and rolls back checkout, build and
+helpers when anything fails before the state is written. It also creates
+`/etc/wireguard-ops-cockpit/self-update.env` (deploy script path, WireGuard IP
+10.0.0.1) when missing.
+
+First install, once, as root (take a Contabo snapshot before):
+
+```bash
+cd /opt/wireguard-ops-cockpit && git fetch origin
+REPO_COMMIT=$(git rev-parse origin/main) bash deploy/vps/vps-cockpit-deploy.sh
+```
+
+After that, updates are Cockpit jobs with the plan line
+`/usr/local/sbin/cockpit-self-update-action <sha>`, reviewed before install.
