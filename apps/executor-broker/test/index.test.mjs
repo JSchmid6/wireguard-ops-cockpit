@@ -115,3 +115,30 @@ test("executor broker rejects self-update targets outside the allowlist", () => 
     assert.equal(threw, true, `expected rejection: ${JSON.stringify(partial)}`);
   }
 });
+
+test("executor broker admits the typed dienste-update actions with the same strictness", () => {
+  for (const partial of [
+    { action: "dienste.update", target: selfSha, diffSha256: reviewedHash },
+    { action: "dienste.status", target: "state" },
+    { action: "dienste.diff", target: selfSha },
+  ]) {
+    const payload = { ...selfBase, ...partial };
+    assert.deepEqual(validateRequest({ payload, signature: sign(payload) }, validAt), payload);
+  }
+  const rejected = [
+    { action: "dienste.update", target: selfSha },
+    { action: "dienste.update", target: selfSha, diffSha256: reviewedHash.slice(1) },
+    { action: "dienste.update", target: "main", diffSha256: reviewedHash },
+    { action: "dienste.update", target: `${selfSha} --force`, diffSha256: reviewedHash },
+    { action: "dienste.diff", target: selfSha.slice(0, 12) },
+    { action: "dienste.diff", target: selfSha, diffSha256: reviewedHash },
+    { action: "dienste.status", target: "all" },
+    { action: "dienste.restart", target: "state" },
+  ];
+  for (const partial of rejected) {
+    const payload = { ...selfBase, ...partial };
+    let threw = false;
+    try { validateRequest({ payload, signature: sign(payload) }, validAt); } catch { threw = true; }
+    assert.equal(threw, true, `expected rejection: ${JSON.stringify(partial)}`);
+  }
+});

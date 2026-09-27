@@ -5,6 +5,7 @@ import {
   createExecutionEnvelope,
   normalizeEvidence,
   normalizeAllowedCapabilities,
+  parseTypedDiensteUpdates,
   parseTypedDiskActions,
   parseTypedSelfUpdates,
   validateExecutionEnvelope,
@@ -160,5 +161,36 @@ describe("Hermes security contract", () => {
 
   it("accepts self.update in an operator-provided allowlist", () => {
     expect(normalizeAllowedCapabilities(["self.update", "become.root"])).toEqual(["self.update"]);
+  });
+});
+
+describe("typed server-dienste install (dienste.update)", () => {
+  const SHA = "0123456789abcdef0123456789abcdef01234567";
+  const plan = (lines: string[]) => ["```bash", ...lines, "```"].join("\n");
+
+  it("classifies the helper's exact forms as dienste.update, everything else as shell.exception", () => {
+    expect(classifyCapabilities(plan([`sudo /usr/local/sbin/cockpit-dienste-update-action ${SHA}`]))).toEqual(["dienste.update"]);
+    expect(classifyCapabilities(plan(["/usr/local/sbin/cockpit-dienste-update-action status"]))).toEqual(["dienste.update"]);
+    for (const line of [
+      `/usr/local/sbin/cockpit-dienste-update-action ${SHA} ${"e".repeat(64)}`,
+      `/usr/local/sbin/cockpit-dienste-update-action ${SHA.slice(0, 12)}`,
+      `/usr/local/sbin/cockpit-dienste-update-action diff ${SHA}`,
+      `/usr/local/sbin/cockpit-dienste-update-action ${SHA}; rm -rf /`,
+      `/tmp/cockpit-dienste-update-action ${SHA}`,
+    ]) {
+      expect(classifyCapabilities(plan([line])), line).toContain("shell.exception");
+    }
+  });
+
+  it("parses installs and status, reports unsupported forms", () => {
+    const parsed = parseTypedDiensteUpdates([`/usr/local/sbin/cockpit-dienste-update-action ${SHA}`,
+      "/usr/local/sbin/cockpit-dienste-update-action status", "/usr/local/sbin/cockpit-dienste-update-action restart", "echo nichts"].join("\n"));
+    expect(parsed.actions).toEqual([{ action: "dienste.update", target: SHA }, { action: "dienste.status", target: "state" }]);
+    expect(parsed.unsupported).toEqual(["/usr/local/sbin/cockpit-dienste-update-action restart"]);
+    expect(parseTypedSelfUpdates(`/usr/local/sbin/cockpit-dienste-update-action ${SHA}`).actions).toEqual([]);
+  });
+
+  it("accepts dienste.update as an authorizable capability", () => {
+    expect(normalizeAllowedCapabilities(["dienste.update", "nonsense"])).toEqual(["dienste.update"]);
   });
 });

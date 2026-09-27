@@ -8,12 +8,17 @@ const secret = process.env.COCKPIT_EXECUTOR_BROKER_SECRET || "";
 const helper = "/usr/local/sbin/cockpit-service-action";
 const diskHelper = "/usr/local/sbin/cockpit-disk-action";
 const selfUpdateHelper = "/usr/local/sbin/cockpit-self-update-action";
+const diensteUpdateHelper = "/usr/local/sbin/cockpit-dienste-update-action";
 const capabilityHelper = "/usr/local/lib/wireguard-ops-cockpit/cockpit-capability-action.mjs";
 const capabilityNode = "/opt/node-v20.19.1-linux-x64/bin/node";
 const services = new Set(["apache2", "wireguard-ops-cockpit-ttyd"]);
 const diskActions = new Set(["disk.status", "disk.remove", "disk.add", "disk.smart", "disk.smarttest"]);
 const diskDevice = /^sd[a-z]$/;
 const selfUpdateActions = new Set(["self.update", "self.status", "self.diff"]);
+// server-dienste (the root supervisor of the agent's Docker services): the same
+// three forms, installed by its own helper, reviewed with its own guarantees.
+const diensteUpdateActions = new Set(["dienste.update", "dienste.status", "dienste.diff"]);
+const reviewedUpdates = new Set(["self.update", "dienste.update"]);
 const selfUpdateSha = /^[a-f0-9]{40}$/;
 const reviewedDiffHash = /^[a-f0-9]{64}$/;
 // The review diff carries a bounded excerpt (runner cap 200 KB plus focus-area
@@ -27,16 +32,18 @@ export function validateRequest(value, now = Date.now()) {
   const expected = signature(value.payload);
   if (!/^[a-f0-9]{64}$/.test(value.signature) || !timingSafeEqual(Buffer.from(value.signature, "hex"), Buffer.from(expected, "hex"))) throw new Error("invalid request signature");
   const { action, target, expiresAt, envelopeDigest } = value.payload;
-  if (action !== "service.restart" && action !== "service.status" && action !== "capability.execute" && !diskActions.has(action) && !selfUpdateActions.has(action)) throw new Error("unsupported capability action");
+  if (action !== "service.restart" && action !== "service.status" && action !== "capability.execute" && !diskActions.has(action) && !selfUpdateActions.has(action) && !diensteUpdateActions.has(action)) throw new Error("unsupported capability action");
   if (action.startsWith("service.") && !services.has(target)) throw new Error("service target is not allowlisted");
   if (action === "disk.status" && target !== "md127") throw new Error("disk target is not allowlisted");
   if ((action === "disk.remove" || action === "disk.add" || action === "disk.smart" || action === "disk.smarttest") && (typeof target !== "string" || !diskDevice.test(target))) throw new Error("disk device is not allowlisted");
   if (action === "self.status" && target !== "state") throw new Error("self-update status target is not allowlisted");
   if ((action === "self.update" || action === "self.diff") && (typeof target !== "string" || !selfUpdateSha.test(target))) throw new Error("self-update commit is not allowlisted");
+  if (action === "dienste.status" && target !== "state") throw new Error("dienste status target is not allowlisted");
+  if ((action === "dienste.update" || action === "dienste.diff") && (typeof target !== "string" || !selfUpdateSha.test(target))) throw new Error("dienste commit is not allowlisted");
   // Every update carries the hash of the diff the running Cockpit reviewed;
   // the runner recomputes it and refuses a mismatch before anything deploys.
-  if (action === "self.update" && (typeof value.payload.diffSha256 !== "string" || !reviewedDiffHash.test(value.payload.diffSha256))) throw new Error("self-update requires the reviewed diff sha256");
-  if (action !== "self.update" && value.payload.diffSha256 !== undefined) throw new Error("diffSha256 is only valid for self.update");
+  if (reviewedUpdates.has(action) && (typeof value.payload.diffSha256 !== "string" || !reviewedDiffHash.test(value.payload.diffSha256))) throw new Error(`${action} requires the reviewed diff sha256`);
+  if (!reviewedUpdates.has(action) && value.payload.diffSha256 !== undefined) throw new Error("diffSha256 is only valid for self.update and dienste.update");
   if (action === "capability.execute" && (!value.payload.manifest || !value.payload.envelope)) throw new Error("dynamic capability payload is incomplete");
   if (typeof envelopeDigest !== "string" || !/^[a-f0-9]{64}$/.test(envelopeDigest)) throw new Error("invalid envelope digest");
   if (typeof expiresAt !== "string" || now > Date.parse(expiresAt)) throw new Error("execution request expired");
@@ -60,22 +67,24 @@ export function execute(payload) {
       child.stdin.end(JSON.stringify({ manifest: payload.manifest, envelope: payload.envelope }));
       return;
     }
-    if (selfUpdateActions.has(payload.action)) {
+    if (selfUpdateActions.has(payload.action) || diensteUpdateActions.has(payload.action)) {
       // The helper starts the one-shot deploy unit and waits for it; the unit
       // re-verifies the allowlisted repo, the merged commit and the reviewed
-      // diff hash on its own. self.diff is the read-only review input.
-      const selfArgs = payload.action === "self.update" ? [payload.target, payload.diffSha256]
-        : payload.action === "self.diff" ? ["diff", payload.target] : ["status"];
-      const outputLimit = payload.action === "self.diff" ? selfDiffOutputLimit : 20000;
-      const child = spawn("sudo", ["-n", selfUpdateHelper, ...selfArgs], { env: { PATH: "/usr/sbin:/usr/bin:/sbin:/bin" }, stdio: ["ignore", "pipe", "pipe"] });
+      // diff hash on its own. *.diff is the read-only review input.
+      const verb = payload.action.slice(payload.action.indexOf(".") + 1);
+      const selfArgs = verb === "update" ? [payload.target, payload.diffSha256]
+        : verb === "diff" ? ["diff", payload.target] : ["status"];
+      const outputLimit = verb === "diff" ? selfDiffOutputLimit : 20000;
+      const updateHelper = diensteUpdateActions.has(payload.action) ? diensteUpdateHelper : selfUpdateHelper;
+      const child = spawn("sudo", ["-n", updateHelper, ...selfArgs], { env: { PATH: "/usr/sbin:/usr/bin:/sbin:/bin" }, stdio: ["ignore", "pipe", "pipe"] });
       let selfOutput = ""; let selfError = "";
       child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
       child.stdout.on("data", (chunk) => { selfOutput += chunk; });
       child.stderr.on("data", (chunk) => { selfError += chunk; });
       child.on("error", (reason) => resolve({ ok: false, error: reason.message }));
       child.on("close", (code) => {
-        if (code === 0 && payload.action === "self.diff" && selfOutput.length > outputLimit) {
-          resolve({ ok: false, exitCode: code, error: `self-update diff output exceeds ${outputLimit} characters` });
+        if (code === 0 && verb === "diff" && selfOutput.length > outputLimit) {
+          resolve({ ok: false, exitCode: code, error: `${payload.action} output exceeds ${outputLimit} characters` });
           return;
         }
         resolve({ ok: code === 0, exitCode: code, output: selfOutput.slice(-outputLimit), error: code === 0 ? null : [selfError, selfOutput].filter(Boolean).join("\n").slice(-4000) });

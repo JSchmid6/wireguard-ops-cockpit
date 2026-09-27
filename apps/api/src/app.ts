@@ -52,6 +52,7 @@ import {
   buildAgentTask,
   classifyCapabilities,
   parseTypedDiskActions,
+  parseTypedDiensteUpdates,
   parseTypedSelfUpdates,
   createExecutionEnvelope,
   hashCanonical,
@@ -69,14 +70,17 @@ import {
   parseUpdateReviewAnswer,
   redactSecrets,
   reviewedDiffFor,
-  selfUpdateTargets,
   summarizeUpdateReview,
   updateBindings,
   updateReviewEvidence,
+  updateTargets as reviewedUpdateTargets,
   verifyQuotes,
+  UPDATE_KINDS,
   type UpdateBinding,
   type UpdateDiff,
+  type UpdateKind,
   type UpdateReviewOutcome,
+  type UpdateTarget,
 } from "./update-review.js";
 
 interface AppOptions {
@@ -104,6 +108,9 @@ const SELF_UPDATE_EXECUTOR_TIMEOUT_MS = 31 * 60 * 1000;
 // The review diff runs `git fetch` (runner bound 300s) inside a transient unit
 // with RuntimeMaxSec=420; the socket bound sits above both.
 const SELF_DIFF_EXECUTOR_TIMEOUT_MS = 8 * 60 * 1000;
+// dienste.update: fetch, tests of the new stand as nobody, fast-forward and the
+// supervisor's health check run in one transient unit (RuntimeMaxSec=900).
+const DIENSTE_UPDATE_EXECUTOR_TIMEOUT_MS = 16 * 60 * 1000;
 
 // Keeps a validated capability manifest for reuse, only when the planner
 // declared the operation as recurring (`retain: true`); a one-off repair stays
@@ -1685,7 +1692,8 @@ export async function createApp(options: AppOptions = {}) {
     const wantsService = envelope.capabilities.includes("service.manage");
     const wantsDisk = envelope.capabilities.includes("disk.manage");
     const wantsSelfUpdate = envelope.capabilities.includes("self.update");
-    if (!wantsService && !wantsDisk && !wantsSelfUpdate) return null;
+    const wantsDiensteUpdate = envelope.capabilities.includes("dienste.update");
+    if (!wantsService && !wantsDisk && !wantsSelfUpdate && !wantsDiensteUpdate) return null;
     if (!config.executorBrokerSocket || !config.executorBrokerSecret) {
       throw new Error("typed executor broker is not configured");
     }
@@ -1707,26 +1715,32 @@ export async function createApp(options: AppOptions = {}) {
       if (selfUpdate.unsupported.length > 0) throw new Error(`self.update plan contains an unsupported self-update form: ${selfUpdate.unsupported[0]}`);
       actions.push(...selfUpdate.actions);
     }
+    if (wantsDiensteUpdate) {
+      const diensteUpdate = parseTypedDiensteUpdates(script);
+      if (diensteUpdate.unsupported.length > 0) throw new Error(`dienste.update plan contains an unsupported form: ${diensteUpdate.unsupported[0]}`);
+      actions.push(...diensteUpdate.actions);
+    }
     if (actions.length === 0) throw new Error("typed capability plan contains no typed action");
     const outputs: string[] = [];
     for (const action of actions) {
       let diffSha256: string | null = null;
-      if (action.action === "self.update") {
+      const kind: UpdateKind | null = action.action === "self.update" ? "self" : action.action === "dienste.update" ? "dienste" : null;
+      if (kind) {
         // The broker passes the reviewed diff hash to the runner, which refuses
         // to deploy anything else. Without a bound review (its input was
         // unavailable) only an operator-approved envelope may continue; the
         // hash is then taken now and still pins exactly that diff.
-        diffSha256 = reviewedDiffFor(action.target, envelope, reviewedUpdates);
+        diffSha256 = reviewedDiffFor(action.target, envelope, reviewedUpdates, kind);
         if (!diffSha256) {
-          if (!envelope.operatorApproved) throw new Error(`self.update ${action.target} has no reviewed diff bound to this job`);
+          if (!envelope.operatorApproved) throw new Error(`${action.action} ${action.target} has no reviewed diff bound to this job`);
           diffSha256 = parseUpdateDiff(await runExecutorAction(config.executorBrokerSocket, config.executorBrokerSecret, {
-            action: "self.diff", target: action.target, expiresAt: envelope.expiresAt, envelopeDigest: envelope.digest,
-          }, SELF_DIFF_EXECUTOR_TIMEOUT_MS), action.target).diffSha256;
+            action: UPDATE_KINDS[kind].diffAction, target: action.target, expiresAt: envelope.expiresAt, envelopeDigest: envelope.digest,
+          }, SELF_DIFF_EXECUTOR_TIMEOUT_MS), action.target, kind).diffSha256;
         }
       }
       outputs.push(await runExecutorAction(config.executorBrokerSocket, config.executorBrokerSecret, {
         ...action, ...(diffSha256 ? { diffSha256 } : {}), expiresAt: envelope.expiresAt, envelopeDigest: envelope.digest,
-      }, action.action === "self.update" ? SELF_UPDATE_EXECUTOR_TIMEOUT_MS : undefined));
+      }, kind === "self" ? SELF_UPDATE_EXECUTOR_TIMEOUT_MS : kind === "dienste" ? DIENSTE_UPDATE_EXECUTOR_TIMEOUT_MS : undefined));
     }
     const ran = actions.map((action) => `${action.action} ${action.target}`).join(", ");
     return `## EXECUTION RESULT\nSTATUS: success\nEXIT_CODE: 0\nWHAT_RAN: typed executor actions: ${ran}\nOUTPUT: ${outputs.join("\n").slice(-10000)}\nNOTES: executed by isolated capability broker`;
@@ -1745,24 +1759,28 @@ export async function createApp(options: AppOptions = {}) {
   // (<jobId>-update-review.md, 0600): it is exactly what the isolated
   // reviewer received.
   async function reviewSelfUpdates(
-    jobId: string, targets: string[], proposalDir: string,
+    jobId: string, targets: UpdateTarget[], proposalDir: string,
   ): Promise<{ diffs: UpdateDiff[]; reviewPath: string | null; outcome: UpdateReviewOutcome }> {
     const diffs: UpdateDiff[] = [];
+    const kind: UpdateKind = targets[0]?.kind ?? "self";
     try {
+      // One review covers one repository (one set of guarantees). A plan that
+      // installs both is not reviewable as a whole and stops for the operator.
+      if (targets.some((target) => target.kind !== kind)) throw new Error("the plan mixes self.update and dienste.update; install one repository per job");
       if (!config.executorBrokerSocket || !config.executorBrokerSecret) throw new Error("typed executor broker is not configured");
-      for (const sha of targets) {
+      for (const { sha } of targets) {
         diffs.push(parseUpdateDiff(await runExecutorAction(config.executorBrokerSocket, config.executorBrokerSecret, {
-          action: "self.diff", target: sha, expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
-          envelopeDigest: hashCanonical({ jobId, purpose: "self-update-review", sha }),
-        }, SELF_DIFF_EXECUTOR_TIMEOUT_MS), sha));
+          action: UPDATE_KINDS[kind].diffAction, target: sha, expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+          envelopeDigest: hashCanonical({ jobId, purpose: UPDATE_KINDS[kind].evidencePrefix, sha }),
+        }, SELF_DIFF_EXECUTOR_TIMEOUT_MS), sha, kind));
       }
     } catch (error) {
-      return { diffs: [], reviewPath: null, outcome: { bindings: [], coverage: [], unavailable: error instanceof Error ? error.message : "self.diff failed" } };
+      return { diffs: [], reviewPath: null, outcome: { kind, bindings: [], coverage: [], unavailable: error instanceof Error ? error.message : `${UPDATE_KINDS[kind].diffAction} failed` } };
     }
     const { prompt, coverage } = buildUpdateReviewPrompt(diffs);
     const reviewPath = path.join(proposalDir, `${jobId}-update-review.md`);
     await writeFile(reviewPath, prompt, { encoding: "utf-8", mode: 0o600 });
-    const outcome: UpdateReviewOutcome = { bindings: updateBindings(diffs), coverage };
+    const outcome: UpdateReviewOutcome = { kind, bindings: updateBindings(diffs), coverage };
     try {
       outcome.answer = verifyQuotes(parseUpdateReviewAnswer(redactSecrets(await updateReviewRunner(prompt))), prompt);
     } catch (error) {
@@ -2536,12 +2554,12 @@ Follow these rules:
         };
 
         const manifest = parseCapabilityManifest(planText);
-        const updateTargets = manifest ? [] : selfUpdateTargets(planText);
+        const updateTargets = manifest ? [] : reviewedUpdateTargets(planText);
         let updateReview: Awaited<ReturnType<typeof reviewSelfUpdates>> | null = null;
         if (updateTargets.length > 0) {
           updateHermesJob(job.id, "running", explanation({
-            phase: "reviewing", intent, reason: "The running Cockpit is reviewing the code of the self-update before it can be installed.",
-            completed: ["Structured planner proposal"], evidence: [proposalPath, ...updateTargets.map((sha) => `self.update ${sha}`)],
+            phase: "reviewing", intent, reason: `The running Cockpit is reviewing ${UPDATE_KINDS[updateTargets[0].kind].subject} before it can be installed.`,
+            completed: ["Structured planner proposal"], evidence: [proposalPath, ...updateTargets.map((target) => `${UPDATE_KINDS[target.kind].updateAction} ${target.sha}`)],
           }), { plan: planText, proposalPath });
           updateReview = await reviewSelfUpdates(job.id, updateTargets, proposalDir);
         }
@@ -2589,7 +2607,8 @@ Follow these rules:
           };
         }
         const unsupportedAutonomousCapabilities = capabilities.filter((capability) =>
-          capability !== "read.host" && capability !== "service.manage" && capability !== "disk.manage" && capability !== "self.update" && capability !== "shell.exception"
+          capability !== "read.host" && capability !== "service.manage" && capability !== "disk.manage" && capability !== "self.update"
+          && capability !== "dienste.update" && capability !== "shell.exception"
         );
         if (!manifest && policy.allowed && unsupportedAutonomousCapabilities.length > 0) {
           policy = {
