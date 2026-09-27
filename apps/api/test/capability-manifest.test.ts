@@ -21,6 +21,10 @@ describe("dynamic capability manifest", () => {
   it("documents the semantic Nextcloud helper without granting arbitrary occ", () => {
     expect(capabilityPlannerContract()).toContain("cockpit-nextcloud-app-action");
     expect(capabilityPlannerContract()).toContain("cockpit-nextcloud-context-action");
+    // Reviewed installs are typed shell lines, not manifests: the API binds the diff hash itself.
+    expect(capabilityPlannerContract()).toContain("`/usr/local/sbin/cockpit-dienste-update-action <sha>`");
+    expect(capabilityPlannerContract()).toContain("`/usr/local/sbin/cockpit-self-update-action <sha>`");
+    expect(capabilityPlannerContract()).toContain("never ask for a diff hash");
     expect(capabilityPlannerContract()).toContain("cockpit-exact-file-replace");
     expect(capabilityPlannerContract()).toContain("no disable, uninstall, or arbitrary occ");
     expect(capabilityPlannerContract()).toContain("whole subtree");
