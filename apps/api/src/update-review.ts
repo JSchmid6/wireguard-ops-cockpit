@@ -2,11 +2,13 @@ import { randomBytes } from "node:crypto";
 
 import {
   hashCanonical,
+  parseTypedDiensteUpdates,
   parseTypedSelfUpdates,
   type ExecutionEnvelope,
   type UntrustedEvidence,
 } from "./hermes-security.js";
 import {
+  DIENSTE_REVIEW_INSTRUCTIONS,
   UPDATE_REVIEW_INSTRUCTIONS,
   updateReviewClosingReminder,
   updateReviewDataNotice,
@@ -25,6 +27,12 @@ import {
 // incomplete inside a focus area, the reviewer failed, its answer does not
 // parse, or it answered VERDICT flag. Touching a focus area is never a stop by
 // itself.
+//
+// The same review guards a second repository: `dienste.update <sha>` installs a
+// merged commit of server-dienste (the root supervisor that runs James' Docker
+// services). Its runner answers `dienste.diff`, its reviewer gets the
+// supervisor's own guarantees (D1-D8), and its bindings carry their own
+// evidence source, so a review of one repository never unlocks the other.
 
 // Bytes of the whole reviewer prompt. Stays below the agent broker's
 // safety-role bounds (100,000 characters, 120,000 bytes: one argv element).
@@ -33,6 +41,40 @@ const FILE_LIST_BUDGET = 8_000;
 const EVIDENCE_ITEM_LIMIT = 4_000;
 const SHA = /^[a-f0-9]{40}$/;
 const DIFF_HASH = /^[a-f0-9]{64}$/;
+
+export type UpdateKind = "self" | "dienste";
+
+export interface UpdateKindSpec {
+  diffAction: "self.diff" | "dienste.diff";
+  updateAction: "self.update" | "dienste.update";
+  evidencePrefix: string;
+  instructions: string;
+  subject: string;
+}
+
+export const UPDATE_KINDS: Record<UpdateKind, UpdateKindSpec> = {
+  self: {
+    diffAction: "self.diff", updateAction: "self.update", evidencePrefix: "self-update-review",
+    instructions: UPDATE_REVIEW_INSTRUCTIONS, subject: "the new Cockpit code",
+  },
+  dienste: {
+    diffAction: "dienste.diff", updateAction: "dienste.update", evidencePrefix: "dienste-update-review",
+    instructions: DIENSTE_REVIEW_INSTRUCTIONS, subject: "the new server-dienste stand (root supervisor)",
+  },
+};
+
+function kindOf(value: unknown): UpdateKind {
+  return value === "dienste" ? "dienste" : "self";
+}
+
+function kindField(value: unknown): { kind?: UpdateKind } {
+  return kindOf(value) === "self" ? {} : { kind: kindOf(value) };
+}
+
+export interface UpdateTarget {
+  kind: UpdateKind;
+  sha: string;
+}
 
 export interface UpdateFocusArea {
   kind: string;
@@ -58,6 +100,7 @@ export interface UpdateDiffSection {
 }
 
 export interface UpdateDiff {
+  kind?: UpdateKind;
   base: string;
   sha: string;
   diffSha256: string;
@@ -74,6 +117,7 @@ export interface UpdateDiff {
 }
 
 export interface UpdateBinding {
+  kind?: UpdateKind;
   base: string;
   sha: string;
   diffSha256: string;
@@ -106,6 +150,7 @@ export interface UpdateReviewAnswer {
 }
 
 export interface UpdateReviewOutcome {
+  kind?: UpdateKind;
   bindings: UpdateBinding[];
   unavailable?: string | null;
   coverage: UpdateReviewCoverage[];
@@ -133,23 +178,38 @@ function clip(value: string, limit: number): string {
 }
 
 export function selfUpdateTargets(plan: string): string[] {
+  return updateTargets(plan).filter((target) => target.kind === "self").map((target) => target.sha);
+}
+
+// Every reviewed install a plan would run, in plan order, deduplicated.
+export function updateTargets(plan: string): UpdateTarget[] {
   const script = plan.match(/```(?:bash|sh)\s*\n([\s\S]*?)```/i)?.[1] || "";
-  const targets = parseTypedSelfUpdates(script).actions.filter((action) => action.action === "self.update").map((action) => action.target);
-  return [...new Set(targets)];
+  const found: UpdateTarget[] = [
+    ...parseTypedSelfUpdates(script).actions.filter((action) => action.action === "self.update").map((action) => ({ kind: "self" as const, sha: action.target })),
+    ...parseTypedDiensteUpdates(script).actions.filter((action) => action.action === "dienste.update").map((action) => ({ kind: "dienste" as const, sha: action.target })),
+  ];
+  const seen = new Set<string>();
+  return found.filter((target) => {
+    const key = `${target.kind}:${target.sha}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 // Strict reading of the runner's `diff` JSON: anything malformed is an
 // unavailable review input, never a partially trusted one.
-export function parseUpdateDiff(raw: string, expectedSha: string): UpdateDiff {
+export function parseUpdateDiff(raw: string, expectedSha: string, kind: UpdateKind = "self"): UpdateDiff {
+  const action = UPDATE_KINDS[kind].diffAction;
   let value: unknown;
-  try { value = JSON.parse(raw); } catch { throw new Error("self.diff returned no JSON"); }
-  if (!value || typeof value !== "object") throw new Error("self.diff returned no object");
+  try { value = JSON.parse(raw); } catch { throw new Error(`${action} returned no JSON`); }
+  if (!value || typeof value !== "object") throw new Error(`${action} returned no object`);
   const data = value as Record<string, unknown>;
-  if (data.ok !== true || data.action !== "self.diff") throw new Error("self.diff returned an unexpected answer");
-  if (data.sha !== expectedSha) throw new Error("self.diff answered for a different commit");
-  if (typeof data.base !== "string" || !SHA.test(data.base)) throw new Error("self.diff returned no valid base commit");
-  if (typeof data.diffSha256 !== "string" || !DIFF_HASH.test(data.diffSha256)) throw new Error("self.diff returned no valid diff sha256");
-  if (!Array.isArray(data.files) || !Array.isArray(data.focusAreas) || !Array.isArray(data.excerpt)) throw new Error("self.diff returned an incomplete review input");
+  if (data.ok !== true || data.action !== action) throw new Error(`${action} returned an unexpected answer`);
+  if (data.sha !== expectedSha) throw new Error(`${action} answered for a different commit`);
+  if (typeof data.base !== "string" || !SHA.test(data.base)) throw new Error(`${action} returned no valid base commit`);
+  if (typeof data.diffSha256 !== "string" || !DIFF_HASH.test(data.diffSha256)) throw new Error(`${action} returned no valid diff sha256`);
+  if (!Array.isArray(data.files) || !Array.isArray(data.focusAreas) || !Array.isArray(data.excerpt)) throw new Error(`${action} returned an incomplete review input`);
   const files = data.files.flatMap((item): UpdateDiffFile[] => {
     if (!item || typeof item !== "object") return [];
     const file = item as Record<string, unknown>;
@@ -175,8 +235,9 @@ export function parseUpdateDiff(raw: string, expectedSha: string): UpdateDiff {
     const section = item as Record<string, unknown>;
     return typeof section.path === "string" && typeof section.text === "string" ? [{ path: section.path, text: section.text }] : [];
   });
-  if (excerpt.length !== data.excerpt.length) throw new Error("self.diff returned a malformed excerpt");
+  if (excerpt.length !== data.excerpt.length) throw new Error(`${action} returned a malformed excerpt`);
   return {
+    kind,
     base: data.base, sha: data.sha, diffSha256: data.diffSha256,
     baseSource: typeof data.baseSource === "string" ? data.baseSource : "unknown",
     commitSubject: typeof data.commitSubject === "string" ? data.commitSubject.slice(0, 200) : "",
@@ -261,7 +322,11 @@ function describeUpdate(diff: UpdateDiff, index: number, total: number): string 
 export function buildUpdateReviewPrompt(diffs: UpdateDiff[], options: { nonce?: string; limit?: number } = {}): { prompt: string; coverage: UpdateReviewCoverage[] } {
   const nonce = options.nonce || randomBytes(8).toString("hex");
   const limit = options.limit ?? UPDATE_REVIEW_PROMPT_LIMIT;
-  const head = [UPDATE_REVIEW_INSTRUCTIONS, "", updateReviewDataNotice(nonce), "", `BEGIN_REVIEW_DATA ${nonce}`].join("\n");
+  // One reviewer, one set of guarantees: a prompt never mixes repositories.
+  const kinds = new Set(diffs.map((diff) => kindOf(diff.kind)));
+  if (kinds.size > 1) throw new Error("one review covers one repository; the plan mixes self.update and dienste.update");
+  const instructions = UPDATE_KINDS[kindOf(diffs[0]?.kind)].instructions;
+  const head = [instructions, "", updateReviewDataNotice(nonce), "", `BEGIN_REVIEW_DATA ${nonce}`].join("\n");
   const tail = [`END_REVIEW_DATA ${nonce}`, "", updateReviewClosingReminder(nonce)].join("\n");
   const descriptions = diffs.map((diff, index) => describeUpdate(diff, index, diffs.length));
   let remaining = limit - bytes(head) - bytes(tail) - descriptions.reduce((sum, text) => sum + bytes(text) + 400, 0);
@@ -383,8 +448,9 @@ export function verifyQuotes(answer: UpdateReviewAnswer, prompt: string): Update
   const material = begin >= 0 && end > begin ? prompt.slice(begin, end) : "";
   const haystack = normalize(material.split("\n").map((line) => line.replace(/^[+\- ]/, "")).join("\n"));
   const findings = answer.findings.map((finding) => {
+    // Models often escape quotes inside a quote (\" for "); that is not a different line.
     const quoted = finding.code.split("\n")
-      .map((line) => normalize(line.replace(/^\s*[+-]?\s?/, "")))
+      .map((line) => normalize(line.replace(/^\s*[+-]?\s?/, "").replace(/\\(["'])/g, "$1")))
       .filter((line) => line.length >= 8 && !/^\.{3}|^\[\.\.\./.test(line));
     return { ...finding, quoteFound: quoted.length > 0 && quoted.every((line) => haystack.includes(line)) };
   });
@@ -411,7 +477,7 @@ export function updateReviewFindings(outcome: UpdateReviewOutcome): { reasons: s
   if (outcome.unavailable) {
     reasons.push(`the review input is unavailable (${outcome.unavailable.slice(0, 300)})`);
     evidence.push(`review input unavailable: ${outcome.unavailable.slice(0, 600)}`);
-    needed.push("Inspect the commit yourself (or retry once self.diff works); approving installs it without a completed code review.");
+    needed.push(`Inspect the commit yourself (or retry once ${UPDATE_KINDS[kindOf(outcome.kind)].diffAction} works); approving installs it without a completed code review.`);
   }
   const incomplete = outcome.coverage.filter((item) => item.incomplete.length > 0);
   if (incomplete.length > 0) {
@@ -449,7 +515,7 @@ export function updateReviewFindings(outcome: UpdateReviewOutcome): { reasons: s
 export function applyUpdateReviewPolicy<P extends ReviewedPolicy>(policy: P, outcome: UpdateReviewOutcome): P {
   const { reasons, evidence, needed } = updateReviewFindings(outcome);
   if (reasons.length === 0) return { ...policy, evidence: [...policy.evidence, ...evidence] };
-  const reason = `The pre-install review of the new Cockpit code stopped for the operator: ${reasons.join("; ")}.`;
+  const reason = `The pre-install review of ${UPDATE_KINDS[kindOf(outcome.kind)].subject} stopped for the operator: ${reasons.join("; ")}.`;
   if (policy.allowed) {
     return { ...policy, zone: "red", allowed: false, status: "blocked_user_approval", reason, evidence: [...policy.evidence, ...evidence], neededToContinue: needed };
   }
@@ -457,7 +523,8 @@ export function applyUpdateReviewPolicy<P extends ReviewedPolicy>(policy: P, out
 }
 
 export function updateBindings(diffs: UpdateDiff[]): UpdateBinding[] {
-  return diffs.map((diff) => ({ base: diff.base, sha: diff.sha, diffSha256: diff.diffSha256 }));
+  // A self-update binding keeps its original shape; only other repositories carry their kind.
+  return diffs.map((diff) => ({ ...kindField(diff.kind), base: diff.base, sha: diff.sha, diffSha256: diff.diffSha256 }));
 }
 
 export function normalizeUpdateBindings(value: unknown): UpdateBinding[] {
@@ -467,7 +534,7 @@ export function normalizeUpdateBindings(value: unknown): UpdateBinding[] {
     const binding = item as Record<string, unknown>;
     return typeof binding.base === "string" && SHA.test(binding.base) && typeof binding.sha === "string" && SHA.test(binding.sha)
       && typeof binding.diffSha256 === "string" && DIFF_HASH.test(binding.diffSha256)
-      ? [{ base: binding.base, sha: binding.sha, diffSha256: binding.diffSha256 }] : [];
+      ? [{ ...kindField(binding.kind), base: binding.base, sha: binding.sha, diffSha256: binding.diffSha256 }] : [];
   });
 }
 
@@ -475,7 +542,7 @@ export function normalizeUpdateBindings(value: unknown): UpdateBinding[] {
 // the reviewed (base, sha, diffSha256).
 export function updateReviewEvidence(bindings: UpdateBinding[]): UntrustedEvidence[] {
   return bindings.map((binding) => ({
-    source: `self-update-review:${binding.sha}`,
+    source: `${UPDATE_KINDS[kindOf(binding.kind)].evidencePrefix}:${binding.sha}`,
     content: JSON.stringify({ base: binding.base, sha: binding.sha, diffSha256: binding.diffSha256 }),
   }));
 }
@@ -484,10 +551,10 @@ export function updateReviewEvidence(bindings: UpdateBinding[]): UntrustedEviden
 // null: no review was bound for this commit (its input was unavailable).
 // Throws when the stored binding is missing or differs from the one the
 // signed envelope carries.
-export function reviewedDiffFor(target: string, envelope: ExecutionEnvelope, bindings: UpdateBinding[]): string | null {
-  const binding = bindings.find((item) => item.sha === target);
+export function reviewedDiffFor(target: string, envelope: ExecutionEnvelope, bindings: UpdateBinding[], kind: UpdateKind = "self"): string | null {
+  const binding = bindings.find((item) => item.sha === target && kindOf(item.kind) === kind);
   if (!binding) {
-    if (envelope.evidence.some((entry) => entry.source === `self-update-review:${target}`)) {
+    if (envelope.evidence.some((entry) => entry.source === `${UPDATE_KINDS[kind].evidencePrefix}:${target}`)) {
       throw new Error(`the reviewed diff record of ${target} is missing from the job`);
     }
     return null;
@@ -502,6 +569,7 @@ export function reviewedDiffFor(target: string, envelope: ExecutionEnvelope, bin
 // What the job keeps: the decision and its grounds, not the excerpt.
 export function summarizeUpdateReview(diffs: UpdateDiff[], outcome: UpdateReviewOutcome, reviewPath: string | null): Record<string, unknown> {
   return {
+    kind: kindOf(outcome.kind),
     reviewPath,
     bindings: outcome.bindings,
     updates: diffs.map((diff) => ({

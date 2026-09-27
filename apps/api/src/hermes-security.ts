@@ -10,6 +10,7 @@ export type CapabilityId =
   | "service.manage"
   | "disk.manage"
   | "self.update"
+  | "dienste.update"
   | "package.manage"
   | "filesystem.write"
   | "network.manage"
@@ -18,7 +19,7 @@ export type CapabilityId =
   | "shell.exception";
 
 const CAPABILITIES = new Set<CapabilityId>([
-  "read.host", "service.manage", "disk.manage", "self.update", "package.manage", "filesystem.write", "network.manage",
+  "read.host", "service.manage", "disk.manage", "self.update", "dienste.update", "package.manage", "filesystem.write", "network.manage",
   "identity.manage", "database.direct", "shell.exception",
 ]);
 
@@ -43,6 +44,11 @@ const SELF_UPDATE_HELPER = "/usr/local/sbin/cockpit-self-update-action";
 const SELF_UPDATE_COMMIT_LINE = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-self-update-action\s+([a-f0-9]{40})$/;
 const SELF_UPDATE_STATUS_LINE = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-self-update-action\s+status$/;
 const SELF_UPDATE_INVOCATION = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-self-update-action\b/;
+// The same form for server-dienste (the root supervisor of James' Docker
+// services): one merged commit, reviewed like a self-update, or status.
+const DIENSTE_UPDATE_COMMIT_LINE = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-dienste-update-action\s+([a-f0-9]{40})$/;
+const DIENSTE_UPDATE_STATUS_LINE = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-dienste-update-action\s+status$/;
+const DIENSTE_UPDATE_INVOCATION = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-dienste-update-action\b/;
 
 export interface TypedDiskAction { action: "disk.status" | "disk.remove" | "disk.add" | "disk.smart" | "disk.smarttest"; target: string }
 
@@ -115,6 +121,34 @@ export function parseTypedSelfUpdates(script: string): { actions: TypedSelfUpdat
     }
     if (SELF_UPDATE_STATUS_LINE.test(line)) {
       actions.push({ action: "self.status", target: "state" });
+      continue;
+    }
+    unsupported.push(line);
+  }
+  return { actions, unsupported };
+}
+
+export interface TypedDiensteUpdateAction { action: "dienste.update" | "dienste.status"; target: string }
+
+export function isTypedDiensteUpdateLine(line: string): boolean {
+  const trimmed = line.trim();
+  return DIENSTE_UPDATE_COMMIT_LINE.test(trimmed) || DIENSTE_UPDATE_STATUS_LINE.test(trimmed);
+}
+
+export function parseTypedDiensteUpdates(script: string): { actions: TypedDiensteUpdateAction[]; unsupported: string[] } {
+  const actions: TypedDiensteUpdateAction[] = [];
+  const unsupported: string[] = [];
+  for (const rawLine of script.split("\n")) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#") || /^set\s+-/.test(line)) continue;
+    if (!DIENSTE_UPDATE_INVOCATION.test(line)) continue;
+    const commit = line.match(DIENSTE_UPDATE_COMMIT_LINE);
+    if (commit) {
+      actions.push({ action: "dienste.update", target: commit[1] });
+      continue;
+    }
+    if (DIENSTE_UPDATE_STATUS_LINE.test(line)) {
+      actions.push({ action: "dienste.status", target: "state" });
       continue;
     }
     unsupported.push(line);
@@ -211,6 +245,7 @@ export function classifyCapabilities(plan: string): CapabilityId[] {
   if (/\b(systemctl|service)\s+(restart|start|stop|reload|enable|disable)\b/i.test(script)) capabilities.add("service.manage");
   if (script.split("\n").some((line) => isTypedDiskLine(line))) capabilities.add("disk.manage");
   if (script.split("\n").some((line) => isTypedSelfUpdateLine(line))) capabilities.add("self.update");
+  if (script.split("\n").some((line) => isTypedDiensteUpdateLine(line))) capabilities.add("dienste.update");
   if (/\b(apt(?:-get)?|dnf|yum|rpm|dpkg|snap)\b/i.test(script)) capabilities.add("package.manage");
   if (/(?:^|[;&|]\s*)(?:cp|mv|install|truncate|touch|mkdir|chmod|chown|sed\s+-i|tee)\b|(?:^|\s)>{1,2}\s*\//im.test(script)) capabilities.add("filesystem.write");
   if (/\b(iptables|nft|ufw|ip\s+(?:addr|route|link)|wg(?:-quick)?)\b/i.test(script)) capabilities.add("network.manage");
@@ -231,7 +266,8 @@ export function classifyCapabilities(plan: string): CapabilityId[] {
         (/^(iptables|nft|ufw|useradd|userdel|usermod|groupadd|groupdel)$/.test(command)) ||
         (command === "mdadm" && isTypedDiskLine(segment)) ||
         (command === "cockpit-disk-action" && isTypedDiskLine(segment)) ||
-        (command === "cockpit-self-update-action" && isTypedSelfUpdateLine(segment));
+        (command === "cockpit-self-update-action" && isTypedSelfUpdateLine(segment)) ||
+        (command === "cockpit-dienste-update-action" && isTypedDiensteUpdateLine(segment));
       if (!safeReadCommands.has(command) && !typedMutation) capabilities.add("shell.exception");
     }
   }

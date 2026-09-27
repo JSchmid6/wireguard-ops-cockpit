@@ -1,0 +1,101 @@
+#!/bin/bash
+# cockpit-dienste-update-action — typed install helper for server-dienste, the
+# repository behind the root supervisor through which the agent operates the
+# host's Docker services. Pinned for the cockpit-executor service account.
+#
+# Usage (exactly; no other arguments are accepted):
+#   cockpit-dienste-update-action status
+#   cockpit-dienste-update-action diff <commit-sha>
+#   cockpit-dienste-update-action <commit-sha> <diff-sha256>
+#     commit-sha: full lowercase 40-hex; diff-sha256: full lowercase 64-hex
+#
+# Security contract:
+#   * Fixed argument form; nothing else is accepted. A bare <commit-sha> (the
+#     pre-review form) is refused with 65: every install comes from a job whose
+#     diff the running Cockpit reviewed (update-review.ts, guarantees D1-D8).
+#   * The helper never runs git or touches the repository in its own sandboxed
+#     context (the executor has no network). It starts the repository's runner
+#     (<repo>/bin/uebernehmen) in a transient, collected unit and passes its
+#     JSON through. The runner is the one of the INSTALLED stand: a change to
+#     it is part of the reviewed diff before it ever runs.
+#   * Before starting it, the helper checks that the runner and the repository
+#     are root-owned and not writable by group or others, so a non-root user
+#     cannot swap the code that runs as root.
+#   * The runner re-verifies on its own: allowlisted origin, commit merged into
+#     origin/main, fast-forward from the installed stand, diff hash equals the
+#     reviewed one; it tests the new stand as nobody, then fast-forwards,
+#     restarts the supervisor and rolls back when its health check fails.
+#   * Exit codes: 64 usage | 65 target rejected | 66 state | 67 environment |
+#     68 verification failed | 69 execution failed (the runner's own codes
+#     pass through).
+#
+# Harness hooks (COCKPIT_DIENSTE_REPO_DIR, _SYSTEMD_RUN, _PYTHON, _SKIP_OWNER_CHECK)
+# redirect paths for offline tests. sudo(8) resets the environment
+# (env_reset) and the executor broker passes only PATH, so the typed executor
+# path always sees the real ones.
+set -euo pipefail
+PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
+
+readonly REPO_DIR="${COCKPIT_DIENSTE_REPO_DIR:-/opt/server-dienste}"
+readonly SYSTEMD_RUN="${COCKPIT_DIENSTE_SYSTEMD_RUN:-/usr/bin/systemd-run}"
+readonly PYTHON="${COCKPIT_DIENSTE_PYTHON:-/usr/bin/python3}"
+readonly RUNNER="$REPO_DIR/bin/uebernehmen"
+
+ACTION="none"
+
+json_escape() {
+  local value="${1:0:300}"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/ }"
+  value="${value//$'\r'/ }"
+  value="${value//$'\t'/ }"
+  printf '%s' "$value"
+}
+
+fail() { # fail <exit-code> <message>
+  printf '{"ok":false,"action":"%s","error":"%s","code":%s}\n' \
+    "$(json_escape "$ACTION")" "$(json_escape "$2")" "$1" >&2
+  exit "$1"
+}
+
+check_owner() { # the code that runs as root must be root's alone
+  local path
+  if [ "${COCKPIT_DIENSTE_SKIP_OWNER_CHECK:-}" = "1" ]; then return 0; fi
+  for path in "$REPO_DIR" "$REPO_DIR/bin" "$RUNNER" "$REPO_DIR/.git"; do
+    [ -e "$path" ] || fail 67 "missing: $path"
+    if [ -L "$path" ]; then fail 67 "symlink not allowed: $path"; fi
+    if [ "$(stat -c %u "$path")" != "0" ]; then fail 67 "not root-owned: $path"; fi
+    if [ $(( 0$(stat -c %a "$path") & 022 )) -ne 0 ]; then fail 67 "writable by group or others: $path"; fi
+  done
+}
+
+run_runner() { # run_runner <runtime-max-sec> <args...>
+  local max="$1"; shift
+  check_owner
+  exec "$SYSTEMD_RUN" --wait --collect --pipe --quiet \
+    --unit="server-dienste-uebernahme-$(date +%s)-$$" \
+    --description="server-dienste: $ACTION" \
+    -p RuntimeMaxSec="$max" -p Nice=5 \
+    "$PYTHON" "$RUNNER" "$@"
+}
+
+if [ "$#" -eq 1 ] && [ "$1" = "status" ]; then
+  ACTION="dienste.status"
+  run_runner 60 stand
+elif [ "$#" -eq 2 ] && [ "$1" = "diff" ]; then
+  ACTION="dienste.diff"
+  [[ "$2" =~ ^[a-f0-9]{40}$ ]] || fail 65 "commit must be a full lowercase 40-hex sha"
+  run_runner 420 diff "$2"
+elif [ "$#" -eq 2 ]; then
+  ACTION="dienste.update"
+  [[ "$1" =~ ^[a-f0-9]{40}$ ]] || fail 65 "commit must be a full lowercase 40-hex sha"
+  [[ "$2" =~ ^[a-f0-9]{64}$ ]] || fail 65 "reviewed diff hash must be a full lowercase 64-hex sha256"
+  run_runner 900 einspielen "$1" "$2"
+elif [ "$#" -eq 1 ] && [[ "$1" =~ ^[a-f0-9]{40}$ ]]; then
+  ACTION="dienste.update"
+  fail 65 "an install needs the reviewed diff hash; run it as a Cockpit job"
+else
+  fail 64 "usage: cockpit-dienste-update-action status | diff <sha> | <sha> <diff-sha256>"
+fi
