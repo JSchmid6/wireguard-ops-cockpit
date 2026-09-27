@@ -124,6 +124,7 @@ export function capabilityNeedsOperatorApproval(manifest: CapabilityManifest): b
 export function capabilityPlannerContract(): string {
   return [
     "For a change, include exactly one fenced `capability` JSON manifest using version cockpit-capability/v1.",
+    "Exception — reviewed installs: to install a merged commit of the Cockpit itself or of server-dienste, never write a capability manifest and never ask for a diff hash. Emit a ```bash fence whose only line is exactly `/usr/local/sbin/cockpit-self-update-action <sha>` (Cockpit) or `/usr/local/sbin/cockpit-dienste-update-action <sha>` (server-dienste), with the full 40-hex sha. The API fetches the diff, has it reviewed and binds its hash itself; these helpers do not run inside the capability sandbox (the repositories are not visible there).",
     "Render the complete manifest JSON on one physical line between the opening and closing fence. Do not pretty-print it: the unattended OpenCode console can omit brace-only and array-only display lines.",
     "Describe tools with direct absolute argv arrays, not shell syntax; discover current tool help/version before relying on unstable flags. Omit cwd unless host-directory visibility is essential.",
     "For a step that must run as a non-root service account, declare runAsUser instead of invoking sudo or runuser.",
