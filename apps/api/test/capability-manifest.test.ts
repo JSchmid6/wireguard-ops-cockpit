@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { retainValidatedCapability } from "../src/app.js";
-import { capabilityManifestHash, capabilityNeedsOperatorApproval, capabilityPlannerContract, parseCapabilityManifest } from "../src/capability-manifest.js";
+import { capabilityManifestHash, capabilityNeedsOperatorApproval, capabilityPlannerContract, parseCapabilityManifest, readablePathsNeedingApproval } from "../src/capability-manifest.js";
 
 const contained = `\`\`\`capability
 {"version":"cockpit-capability/v1","name":"adapt tool","purpose":"Apply a reversible config change","steps":[{"argv":["/usr/bin/tool","--current-flag"],"cwd":"/tmp","runAsUser":"www-data"}],"readablePaths":["/var/www/nextcloud"],"writablePaths":["/tmp/example.conf"],"network":"none","expectedEffects":["configuration updated"],"verification":["tool reports target state"],"rollback":["restore snapshot"],"risk":["contained"]}
@@ -15,7 +15,6 @@ describe("dynamic capability manifest", () => {
     expect(manifest?.steps[0].argv).toEqual(["/usr/bin/tool", "--current-flag"]);
     expect(manifest?.steps[0].runAsUser).toBe("www-data");
     expect(manifest?.readablePaths).toEqual(["/var/www/nextcloud"]);
-    expect(capabilityNeedsOperatorApproval(manifest!)).toBe(false);
     expect(capabilityManifestHash(manifest!)).toMatch(/^[a-f0-9]{64}$/);
   });
 
@@ -24,13 +23,38 @@ describe("dynamic capability manifest", () => {
     expect(capabilityPlannerContract()).toContain("cockpit-nextcloud-context-action");
     expect(capabilityPlannerContract()).toContain("cockpit-exact-file-replace");
     expect(capabilityPlannerContract()).toContain("no disable, uninstall, or arbitrary occ");
+    expect(capabilityPlannerContract()).toContain("whole subtree");
+    expect(capabilityPlannerContract()).toContain("backup variants");
   });
 
   it("requires operator approval only for high-impact effect classes", () => {
-    const manifest = parseCapabilityManifest(contained)!;
+    const manifest = { ...parseCapabilityManifest(contained)!, readablePaths: ["/var/tmp/cockpit-read"] };
     expect(capabilityNeedsOperatorApproval({ ...manifest, risk: ["data_loss"] })).toBe(true);
     expect(capabilityNeedsOperatorApproval({ ...manifest, network: "local" })).toBe(false);
     expect(capabilityNeedsOperatorApproval({ ...manifest, network: "host" })).toBe(true);
+  });
+
+  it("keeps protected readable paths and their subtrees on the operator side", () => {
+    const manifest = parseCapabilityManifest(contained)!;
+    // Binding /var/www/nextcloud exposes the protected config/ subtree; that needs
+    // the operator exactly like declaring the protected path itself.
+    expect(readablePathsNeedingApproval(manifest)).toEqual(["/var/www/nextcloud"]);
+    expect(capabilityNeedsOperatorApproval(manifest)).toBe(true);
+    for (const readable of [
+      "/var/www/nextcloud/config", "/var/lib", "/var/lib/docker", "/opt/gitlab",
+      "/dev/mapper/sda", "/proc/1/environ", "/sys/kernel", "/root/.bash_history",
+      "/etc/shadow-", "/var/backups", "/srv/keys/id_rsa",
+    ]) {
+      expect(readablePathsNeedingApproval({ ...manifest, readablePaths: [readable] }), readable).toEqual([readable]);
+    }
+  });
+
+  it("leaves contained and the fixed mdstat readable paths autonomous", () => {
+    const manifest = parseCapabilityManifest(contained)!;
+    for (const readable of ["/var/tmp/cockpit-read", "/srv/app/data", "/proc/mdstat"]) {
+      expect(readablePathsNeedingApproval({ ...manifest, readablePaths: [readable] }), readable).toEqual([]);
+      expect(capabilityNeedsOperatorApproval({ ...manifest, readablePaths: [readable] }), readable).toBe(false);
+    }
   });
 
   it("rejects shell-shaped and unverifiable manifests", () => {
