@@ -45,7 +45,7 @@ import { runBrokerAgent } from "./agent-broker.js";
 import { runDynamicCapability, runExecutorAction, type ExecutorActionKind } from "./executor-broker.js";
 import {
   capabilityManifestHash, capabilityNeedsOperatorApproval, capabilityPlannerContract,
-  parseCapabilityManifest, type CapabilityManifest,
+  parseCapabilityManifest, readablePathsNeedingApproval, type CapabilityManifest,
 } from "./capability-manifest.js";
 import {
   approveExecutionEnvelope,
@@ -2624,7 +2624,12 @@ Follow these rules:
           policy = {
             ...policy, zone: "red", allowed: false, status: "blocked_user_approval",
             reason: "The dynamic capability can expose a service, lose existing data, or cross an identity/secret boundary.",
-            evidence: [...policy.evidence, ...manifest.risk.map((risk) => `declared risk: ${risk}`), `network: ${manifest.network}`],
+            evidence: [
+              ...policy.evidence,
+              ...manifest.risk.map((risk) => `declared risk: ${risk}`),
+              `network: ${manifest.network}`,
+              ...readablePathsNeedingApproval(manifest).map((item) => `readable path needs operator approval: ${item}`),
+            ],
             neededToContinue: ["Confirm this exact signed capability manifest."],
           };
         }

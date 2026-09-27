@@ -1,3 +1,5 @@
+import path from "node:path";
+
 import { hashCanonical } from "./hermes-security.js";
 
 export type CapabilityRisk = "contained" | "exposure" | "data_loss" | "identity_or_secret";
@@ -90,8 +92,33 @@ export function capabilityManifestHash(manifest: CapabilityManifest): string {
   return hashCanonical(manifest);
 }
 
+// The capability executor refuses these readable paths without operator approval;
+// both helper copies carry the same rules, and a bound path exposes its whole
+// subtree. Keep the lists in step with deploy/helpers/cockpit-capability-action
+// and ops/cockpit-capability-action.mjs.
+const READABLE_PROTECTED_PATH = /(?:^|\/)(?:\.ssh|sudoers(?:\.d)?|shadow|gshadow|passwd|group|ssh|wireguard|secrets?|credentials?|private|keys?|backups?)(?:[._~-]|\/|$)|(?:\.(?:key|pem|p12|env|db|sqlite3?|bak|backup|old|orig|save|swp|dpkg-[a-z]+|rpmnew|rpmsave)|~)$|^\/(?:opt\/nextcloud|opt\/gitlab|var\/www\/nextcloud\/config|var\/lib\/wireguard-ops-cockpit)(?:\/|$)/i;
+const READABLE_APPROVAL_TREES = /^\/(?:dev|proc|sys|root)(?:\/|$)|^\/var\/lib\/(?:docker|containerd)(?:\/|$)/;
+const READABLE_FIXED_PATHS = new Set(["/proc/mdstat"]);
+// Fixed boundaries (as in the executor's protectedPath): a tree that contains
+// one of them needs the operator, exactly like the boundary itself.
+const READABLE_PROTECTED_BOUNDARIES = [
+  "/opt/nextcloud", "/opt/gitlab", "/var/www/nextcloud/config",
+  "/var/lib/wireguard-ops-cockpit", "/var/lib/docker", "/var/lib/containerd",
+];
+
+export function readablePathsNeedingApproval(manifest: CapabilityManifest): string[] {
+  return manifest.readablePaths.filter((item) => {
+    const normalized = path.posix.normalize(item);
+    if (READABLE_FIXED_PATHS.has(normalized)) return false;
+    return READABLE_PROTECTED_PATH.test(normalized)
+      || READABLE_APPROVAL_TREES.test(normalized)
+      || READABLE_PROTECTED_BOUNDARIES.some((boundary) => boundary.startsWith(`${normalized}/`));
+  });
+}
+
 export function capabilityNeedsOperatorApproval(manifest: CapabilityManifest): boolean {
-  return manifest.network === "host" || manifest.risk.some((risk) => risk === "exposure" || risk === "data_loss" || risk === "identity_or_secret");
+  return manifest.network === "host" || manifest.risk.some((risk) => risk === "exposure" || risk === "data_loss" || risk === "identity_or_secret")
+    || readablePathsNeedingApproval(manifest).length > 0;
 }
 
 export function capabilityPlannerContract(): string {
@@ -100,7 +127,7 @@ export function capabilityPlannerContract(): string {
     "Render the complete manifest JSON on one physical line between the opening and closing fence. Do not pretty-print it: the unattended OpenCode console can omit brace-only and array-only display lines.",
     "Describe tools with direct absolute argv arrays, not shell syntax; discover current tool help/version before relying on unstable flags. Omit cwd unless host-directory visibility is essential.",
     "For a step that must run as a non-root service account, declare runAsUser instead of invoking sudo or runuser.",
-    "Steps cannot open Unix sockets (AF_UNIX is not available without operator approval), so never list a socket or a socket directory (docker.sock, /run/mysqld, /run/systemd, /run/dbus) in readablePaths; readable paths under /dev, /proc, /sys, /root, /var/lib/docker or with protected names (shadow, keys, .env, credentials, wireguard) also need operator approval.",
+    "Steps cannot open Unix sockets (AF_UNIX is not available without operator approval), so never list a socket or a socket directory (docker.sock, /run/mysqld, /run/systemd, /run/dbus) in readablePaths; a readable path exposes its whole subtree read-only, so it needs operator approval as soon as that subtree is, contains, or lies inside a protected location — the device, kernel and root trees (/dev, /proc, /sys, /root), the container state (/var/lib/docker, /var/lib/containerd), the policy boundaries (opt/nextcloud, opt/gitlab, var/www/nextcloud including config/, var/lib/wireguard-ops-cockpit), or protected names and their backup variants (shadow, shadow-, keys, .env, credentials, wireguard, *.bak, /var/backups).",
     "For Nextcloud app lifecycle changes, use /usr/local/sbin/cockpit-nextcloud-app-action with php-install, php-enable, php-status, exapp-catalog-refresh, exapp-register, exapp-reinitialize, exapp-restart-reinitialize, or exapp-status plus a syntactically valid app id, runAsUser www-data, outbound network, and empty readablePaths/writablePaths. The helper supplies its fixed internal scopes; never guess apps-external or other implementation paths. exapp-catalog-refresh resets only the regenerable AppAPI app-store catalog through Nextcloud AppData and immediately refetches it. exapp-reinitialize repeats the supported initialization and enable handshake of an already registered ExApp without unregistering it or recreating its container or persistent volume. exapp-restart-reinitialize first performs a supported AppAPI stop/start to reset failed child processes, then repeats initialization; it still does not unregister, recreate, update, or delete the app or volume. This semantic helper intentionally offers no disable, uninstall, or arbitrary occ action; the stop/start exists only as an inseparable part of bounded recovery.",
     "For a bounded Nextcloud Context Chat end-to-end check, use /usr/local/sbin/cockpit-nextcloud-context-action with create-test, inspect-test, stats, search-test, or prompt-test plus a syntactically valid user id and unique lowercase marker, runAsUser www-data, outbound network, and empty readablePaths/writablePaths. create-test writes only a new non-overwriting text file below Cockpit E2E Tests through the Nextcloud Files API; inspect-test reports that exact marker file's path, id, and size without changing it; the other modes expose only fixed Context Chat commands and prompts. File evidence is duplicated to stderr because the Nextcloud bootstrap may consume stdout. The helper intentionally offers no arbitrary path, content, deletion, or occ command.",
     "For installing the reviewed FullDialog Hermes skill, use /bin/sh /usr/local/lib/wireguard-ops-cockpit/cockpit-hermes-skill-action install present-work-view with no runAsUser, no network, and empty readablePaths/writablePaths. The fixed root-owned helper requires the reviewed source tree, refuses an existing target, installs exactly three allowlisted files as hermes, and verifies hashes. Only after explicit operator approval to remove the known empty failed-install directories, use one manifest containing exactly two ordered steps: remove-empty-target present-work-view followed by install present-work-view. The first rejects any unexpected entry and removes only those two empty directories with rmdir as root; the second runs as Hermes through the semantic executor boundary and installs the three files without privileged ownership syscalls.",
