@@ -4,10 +4,13 @@
 #
 # A fixture "origin" repository carries every source file of the script's table
 # (dummy contents) and the script itself; a fixture host root holds part of the
-# targets (old bytes) and lacks the rest; systemctl, visudo, docker and the build
-# are stubs that log and can be told to fail. Checks: a clean install, the
-# byte-exact rollback when the install fails half-way, a build failure before
-# anything is installed, an unmerged commit, and the deferred restart.
+# targets (old bytes), lacks the rest, and has the service user's data directory
+# (0750); systemctl, visudo, docker and the build are stubs that log and can be
+# told to fail. Checks: a clean install, the byte-exact rollback when the install
+# fails half-way, the web image tag rollback when the web build fails, a build
+# failure before anything is installed, an unmerged commit, the deferred restart,
+# the web unit start (only when inactive, before the new image exists), and that
+# the data directory's mode survives every run.
 #
 # Everything lives below one fresh mktemp directory under /tmp; the harness
 # refuses to run otherwise. Call as root (install -o root):
@@ -43,9 +46,22 @@ SEITE=$(git -C "$FIX/work" rev-parse HEAD)
 
 # --- stubs ------------------------------------------------------------------
 mkdir -p "$FIX/stub"
-for tool in systemctl docker; do
-  printf '#!/bin/bash\necho "%s $*" >> "%s/calls.log"\n' "$tool" "$FIX" > "$FIX/stub/$tool"
-done
+cat > "$FIX/stub/systemctl" <<EOF
+#!/bin/bash
+echo "systemctl \$*" >> "$FIX/calls.log"
+if [ "\$1" = "is-active" ]; then [ -e "$FIX/web-active" ] && exit 0; exit 3; fi
+exit 0
+EOF
+cat > "$FIX/stub/docker" <<EOF
+#!/bin/bash
+echo "docker \$*" >> "$FIX/calls.log"
+case "\$*" in
+  *"config --images web"*) echo "wireguard-ops-cockpit-web" ;;
+  "image inspect --format {{.Id}} wireguard-ops-cockpit-web") echo "sha256:alt" ;;
+  *"compose"*"build web"*) [ -e "$FIX/fail-webbuild" ] && exit 1 ;;
+esac
+exit 0
+EOF
 cat > "$FIX/stub/visudo" <<EOF
 #!/bin/bash
 echo "visudo \$*" >> "$FIX/calls.log"
@@ -55,8 +71,12 @@ exit 0
 EOF
 chmod 755 "$FIX/stub/"*
 
+targets() { grep -oE '^  "[^"|]+\|[^"|]+\|' "$SCRIPT" | cut -d'|' -f2 | sed -E \
+  -e 's#\$LIB#/usr/local/lib/wireguard-ops-cockpit#' -e 's#\$SBIN#/usr/local/sbin#' \
+  -e 's#\$UNITS#/etc/systemd/system#' -e 's#\$SUDOERS#/etc/sudoers.d/cockpit-executor#'; }
 fresh_host() { # host root: half the targets with old bytes, the other half absent; repo at A
-  rm -rf "$FIX/root" "$FIX/repo" "$FIX/calls.log" "$FIX/fail-visudo" "$FIX/fail-build"
+  rm -rf "$FIX/root" "$FIX/repo" "$FIX/calls.log" "$FIX/fail-visudo" "$FIX/fail-build" "$FIX/fail-webbuild" "$FIX/web-active"
+  mkdir -p "$FIX/root/var/lib/wireguard-ops-cockpit"; chmod 750 "$FIX/root/var/lib/wireguard-ops-cockpit"
   g clone -q "$FIX/origin.git" "$FIX/repo" 2>/dev/null; git -C "$FIX/repo" checkout -q -B main "$A"
   local i=0 target
   while IFS= read -r target; do
@@ -65,9 +85,6 @@ fresh_host() { # host root: half the targets with old bytes, the other half abse
   done < <(targets)
   (cd "$FIX/root" && find . -type f -exec sha256sum {} + | sort) > "$FIX/vorher.sums"
 }
-targets() { grep -oE '^  "[^"|]+\|[^"|]+\|' "$SCRIPT" | cut -d'|' -f2 | sed -E \
-  -e 's#\$LIB#/usr/local/lib/wireguard-ops-cockpit#' -e 's#\$SBIN#/usr/local/sbin#' \
-  -e 's#\$UNITS#/etc/systemd/system#' -e 's#\$SUDOERS#/etc/sudoers.d/cockpit-executor#'; }
 deploy() { # deploy <sha> [mode]
   env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root REPO_COMMIT="$1" COCKPIT_RESTART_MODE="${2:-now}" \
     VPS_DEPLOY_ROOT="$FIX/root" VPS_DEPLOY_REPO="$FIX/repo" VPS_DEPLOY_ORIGIN="$FIX/origin.git" \
@@ -79,16 +96,20 @@ fails=0
 check() { if eval "$2"; then echo "GRÜN $1"; else echo "ROT  $1"; sed 's/^/     | /' "$FIX/out.log" | tail -8; fails=$((fails + 1)); fi; }
 after_sums() { (cd "$FIX/root" && find . -type f -not -path './var/lib/wireguard-ops-cockpit/*' -exec sha256sum {} + | sort); }
 count_B() { local n=0 t; while IFS= read -r t; do grep -q '^B ' "$FIX/root$t" 2>/dev/null && n=$((n + 1)); done < <(targets); echo "$n"; }
+parent_mode() { stat -c %a "$FIX/root/var/lib/wireguard-ops-cockpit"; }
+start_before_build() { awk '/systemctl start wireguard-ops-cockpit-web/{s=NR} /compose.*build web/{b=NR} END{exit !(s && b && s < b)}' "$FIX/calls.log"; }
 
-# 1: clean install, restart now
+# 1: clean install, restart now (web unit inactive: first install)
 fresh_host; code=0; deploy "$B" now || code=$?
 check "Erfolg: Exit 0" '[ "$code" = 0 ]'
 check "Erfolg: alle Ziele mit neuen Bytes (außer dem Skript selbst)" '[ "$(count_B)" = "$(( $(targets | wc -l) - 1 ))" ]'
 check "Erfolg: self-update.env mit Web-Unit in der Dienstliste" 'grep -q "COCKPIT_SELF_UPDATE_SERVICES=.*wireguard-ops-cockpit-web" "$FIX/root/etc/wireguard-ops-cockpit/self-update.env"'
 check "Erfolg: state.json verbucht B" 'grep -q "\"deployed_commit\": \"$B\"" "$FIX/root/var/lib/wireguard-ops-cockpit/self-update/state.json"'
-check "Erfolg: Web-Abbild gebaut, nicht per up umgeschaltet" 'grep -q "^docker compose .* build web" "$FIX/calls.log" && ! grep -q "docker compose .* up" "$FIX/calls.log"'
+check "Erfolg: Web-Abbild gebaut, nicht per up umgeschaltet" 'grep -q "^docker compose .* build web" "$FIX/calls.log" && ! grep -q "^docker compose .* up" "$FIX/calls.log"'
+check "Erfolg: inaktive Web-Unit vor dem Web-Bau gestartet" 'start_before_build'
 check "Erfolg: Neustart inkl. Web-Unit" 'grep -q "^systemctl restart .*wireguard-ops-cockpit-web" "$FIX/calls.log"'
-check "Erfolg: Sicherungsordner entfernt" '[ -z "$(ls -d "$FIX"/root/var/lib/wireguard-ops-cockpit/deploy-backup.* 2>/dev/null)" ]'
+check "Erfolg: Sicherungsordner entfernt" '[ -z "$(ls -d "$FIX"/root/var/lib/wireguard-ops-cockpit/self-update/deploy-backup.* 2>/dev/null)" ]'
+check "Erfolg: Datenordner des Dienstes bleibt 750" '[ "$(parent_mode)" = 750 ]'
 
 # 2: install fails half-way (sudoers check after install) -> byte-exact rollback
 fresh_host; : > "$FIX/fail-visudo"; code=0; deploy "$B" now || code=$?
@@ -97,19 +118,26 @@ check "Rückfall: Host-Dateien bytegenau wie vorher (fehlende wieder weg)" '[ "$
 check "Rückfall: Checkout wieder auf A" '[ "$(git -C "$FIX/repo" rev-parse HEAD)" = "$A" ]'
 check "Rückfall: vollständig gemeldet, kein Neustart" 'grep -q "rollback complete" "$FIX/out.log" && ! grep -q "^systemctl restart" "$FIX/calls.log"'
 check "Rückfall: kein state.json geschrieben" '[ ! -e "$FIX/root/var/lib/wireguard-ops-cockpit/self-update/state.json" ]'
+check "Rückfall: Datenordner des Dienstes bleibt 750" '[ "$(parent_mode)" = 750 ]'
 
-# 3: build of B fails before anything is installed
+# 3: the web build fails after the install -> files restored, web tag back on the old image
+fresh_host; : > "$FIX/fail-webbuild"; code=0; deploy "$B" now || code=$?
+check "Web-Bau scheitert: Exit ungleich 0, Dateien bytegenau zurück" '[ "$code" != 0 ] && [ "$(after_sums)" = "$(cat "$FIX/vorher.sums")" ]'
+check "Web-Bau scheitert: Abbild-Tag zurück auf das alte Abbild" 'grep -q "^docker image tag sha256:alt wireguard-ops-cockpit-web" "$FIX/calls.log" && grep -q "rollback complete" "$FIX/out.log"'
+
+# 4: build of B fails before anything is installed
 fresh_host; : > "$FIX/fail-build"; code=0; deploy "$B" now || code=$?
 check "Build-Fehler: Exit ungleich 0, nichts installiert" '[ "$code" != 0 ] && [ "$(after_sums)" = "$(cat "$FIX/vorher.sums")" ]'
 check "Build-Fehler: Checkout wieder auf A" '[ "$(git -C "$FIX/repo" rev-parse HEAD)" = "$A" ]'
 
-# 4: commit not merged into origin/main
+# 5: commit not merged into origin/main
 fresh_host; code=0; deploy "$SEITE" now || code=$?
 check "Nicht gemergt: Exit 65, nichts angefasst" '[ "$code" = 65 ] && [ "$(after_sums)" = "$(cat "$FIX/vorher.sums")" ] && [ "$(git -C "$FIX/repo" rev-parse HEAD)" = "$A" ]'
 
-# 5: deferred restart (the runner activates later)
-fresh_host; code=0; deploy "$B" defer || code=$?
-check "Defer: Exit 0, installiert, aber kein Neustart" '[ "$code" = 0 ] && [ "$(count_B)" -gt 20 ] && ! grep -q "^systemctl restart" "$FIX/calls.log"'
+# 6: deferred restart (the runner activates later), web unit already active
+fresh_host; : > "$FIX/web-active"; code=0; deploy "$B" defer || code=$?
+check "Defer: Exit 0, installiert, kein Neustart" '[ "$code" = 0 ] && [ "$(count_B)" -gt 20 ] && ! grep -q "^systemctl restart" "$FIX/calls.log"'
+check "Defer: aktive Web-Unit nicht erneut gestartet (nichts schaltet vor der Aktivierung)" '! grep -q "^systemctl start" "$FIX/calls.log"'
 
 echo
 [ "$fails" = 0 ] && echo "alles grün" || { echo "$fails rot"; exit 1; }

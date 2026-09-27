@@ -50,6 +50,8 @@ readonly CONFIG="$ROOT/etc/wireguard-ops-cockpit/self-update.env"
 readonly WEB_URL=http://10.0.0.1:8080
 readonly SERVICES=(wireguard-ops-cockpit-api wireguard-ops-cockpit-agent wireguard-ops-cockpit-executor wireguard-ops-cockpit-ttyd wireguard-ops-cockpit-web)
 readonly COMPOSE=("$DOCKER" compose --env-file .env -f docker-compose.vps.yml)
+WEB_IMAGE=""      # the compose image name of the web service
+WEB_BEFORE=""     # its image id before this deploy (the rollback target)
 
 # source (repo) | target (host) | mode — the whole footprint of this script.
 readonly TABLE=(
@@ -61,6 +63,7 @@ readonly TABLE=(
   "deploy/helpers/nextcloud-exapp-reinitialize.php|$LIB/nextcloud-exapp-reinitialize.php|644"
   "deploy/helpers/cockpit-self-update-run|$LIB/cockpit-self-update-run|755"
   "ops/cockpit-vps-snapshot|$LIB/cockpit-vps-snapshot|644"
+  "deploy/helpers/cockpit-gitlab-runner-rootless-dind|$LIB/cockpit-gitlab-runner-rootless-dind|644"
   "deploy/vps/vps-cockpit-deploy.sh|$LIB/vps-cockpit-deploy.sh|755"
   "deploy/helpers/cockpit-service-action|$SBIN/cockpit-service-action|755"
   "deploy/helpers/cockpit-disk-action|$SBIN/cockpit-disk-action|755"
@@ -73,6 +76,7 @@ readonly TABLE=(
   "ops/cockpit-wordpress-update|$SBIN/cockpit-wordpress-update|755"
   "deploy/sudoers/cockpit-executor|$SUDOERS|440"
   "deploy/systemd/wireguard-ops-cockpit-api.service|$UNITS/wireguard-ops-cockpit-api.service|644"
+  "deploy/systemd/wireguard-ops-cockpit-api-brokers.conf|$UNITS/wireguard-ops-cockpit-api.service.d/brokers.conf|644"
   "deploy/systemd/wireguard-ops-cockpit-agent.service|$UNITS/wireguard-ops-cockpit-agent.service|644"
   "deploy/systemd/wireguard-ops-cockpit-executor.service|$UNITS/wireguard-ops-cockpit-executor.service|644"
   "deploy/systemd/wireguard-ops-cockpit-ttyd.service|$UNITS/wireguard-ops-cockpit-ttyd.service|644"
@@ -90,8 +94,10 @@ cd "$REPO"
 git fetch --quiet origin
 git merge-base --is-ancestor "$REPO_COMMIT" refs/remotes/origin/main || { log "$REPO_COMMIT is not merged into origin/main"; exit 65; }
 readonly OLD="$(git rev-parse HEAD)"
-install -d -m 0700 "$ROOT/var/lib/wireguard-ops-cockpit"
-BACKUP="$(mktemp -d "$ROOT/var/lib/wireguard-ops-cockpit/deploy-backup.XXXXXX")"
+# Only our own subdirectory: the parent belongs to the service user (wgops, 0750) and holds
+# the database and the executor's snapshots — its owner and mode are none of our business.
+[ -d "$STATE_DIR" ] || install -d -m 0700 -o root -g root "$STATE_DIR"
+BACKUP="$(mktemp -d "$STATE_DIR/deploy-backup.XXXXXX")"
 readonly BACKUP
 INSTALLED=0
 
@@ -132,6 +138,17 @@ install_table() {
   "$VISUDO" -c >/dev/null
   "$SYSTEMCTL" daemon-reload
   "$SYSTEMCTL" enable --quiet wireguard-ops-cockpit-web.service
+  # The runner requires the unit to be active. Start it only when it is not: that is the
+  # first install (or a boot where it failed) and happens BEFORE the new web image exists,
+  # so it (re)creates the container from the image that is running now.
+  "$SYSTEMCTL" is-active --quiet wireguard-ops-cockpit-web.service || "$SYSTEMCTL" start wireguard-ops-cockpit-web.service
+}
+
+build_web() { # new image under the compose tag; the old id is kept for the rollback
+  WEB_IMAGE="$("${COMPOSE[@]}" config --images web | head -n 1)"
+  [ -n "$WEB_IMAGE" ]
+  WEB_BEFORE="$("$DOCKER" image inspect --format '{{.Id}}' "$WEB_IMAGE" 2>/dev/null || true)"
+  "${COMPOSE[@]}" build web
 }
 
 restore_targets() { # exactly the saved bytes back; files that did not exist go away
@@ -161,6 +178,15 @@ rollback() {
     fi
     "$SYSTEMCTL" daemon-reload || { log "rollback: daemon-reload FAILED"; step_failed=1; }
   fi
+  if [ -n "$WEB_IMAGE" ]; then
+    if [ -n "$WEB_BEFORE" ] && "$DOCKER" image tag "$WEB_BEFORE" "$WEB_IMAGE"; then
+      log "rollback: web image tag back on the previous image"
+    elif [ -z "$WEB_BEFORE" ]; then
+      log "rollback: there was no web image before; the new one stays unused (web unit not restarted)"
+    else
+      log "rollback: web image tag could NOT be restored"; step_failed=1
+    fi
+  fi
   if git checkout -q -B main "$OLD"; then log "rollback: checkout back at $OLD"; else log "rollback: checkout of $OLD FAILED"; step_failed=1; fi
   if build >/dev/null 2>&1; then log "rollback: old build ok"; else log "rollback: old build FAILED"; step_failed=1; fi
   [ "$step_failed" = 0 ] && log "rollback complete; running services were not restarted" || log "rollback INCOMPLETE — see the lines above"
@@ -171,10 +197,10 @@ trap rollback ERR
 log "deploying $REPO_COMMIT over $OLD (restart mode: ${COCKPIT_RESTART_MODE:-now}, backup $BACKUP)"
 git checkout -q -B main "$REPO_COMMIT"
 build
-"${COMPOSE[@]}" build web
 save_targets
 INSTALLED=1
 install_table
+build_web
 
 python3 - "$STATE_DIR/state.json" "$REPO_COMMIT" "$OLD" "$WEB_URL" "${COCKPIT_SELF_UPDATE_SOURCE:-manual}" <<'PY'
 import json, os, sys, datetime

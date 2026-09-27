@@ -228,13 +228,17 @@ The VPS has no Lab0 package script; its reviewed deploy script is
 root helpers the executor and the capability sandbox dispatch to (capability
 action, hermes-skill, email-archive deploy and auto-deploy, the three Nextcloud
 PHP helpers, service, disk, exact-file-replace, Nextcloud app/context,
-dienste-update, self-update action and runner, VPS snapshot, WordPress update),
+dienste-update, self-update action and runner, VPS snapshot, WordPress update,
+GitLab rootless-DinD policy),
 the sudoers file (checked with `visudo -cf` before and `visudo -c` after), the
-four service units, the email-archive auto-deploy service/timer, the
+four service units and the API's broker drop-in, the email-archive auto-deploy
+service/timer, the
 self-update unit template, the web unit and this script, plus
 `/etc/wireguard-ops-cockpit/self-update.env`. Besides the table it writes only
 `state.json`, the web image, the web unit's enable link and a backup directory
-it removes on success. VPS-specific service settings live in drop-ins
+below its own `self-update/` (0700) that it removes on success; the service
+user's data directory `/var/lib/wireguard-ops-cockpit` (wgops, 0750) is never
+changed. VPS-specific service settings live in drop-ins
 (`*.service.d/`) and are not touched. `homeserver-cockpit-deploy.sh` is Lab0's
 and is not installed here.
 
@@ -244,14 +248,17 @@ switched by the deploy: `wireguard-ops-cockpit-web.service` (oneshot,
 `docker compose up -d --no-build web`) does that when restarted, and
 `self-update.env` puts it into `COCKPIT_SELF_UPDATE_SERVICES`, so the runner
 switches web together with the four services at the activation, after its
-pre-activation checks.
+pre-activation checks. The unit is started by the deploy only when it is not
+active (first install), before the new image exists — so nothing switches early.
 
 **Rollback:** every target is saved (or recorded as absent) before the install.
 Any failure until `state.json` is written restores exactly those bytes, removes
-files that did not exist, checks the old commit out and rebuilds it; each step
+files that did not exist, puts the web image tag back on the previous image,
+checks the old commit out and rebuilds it; each step
 is logged and a partial rollback says so. `test/vps-cockpit-deploy.test.sh`
-exercises install, byte-exact rollback, build failure, unmerged commit and the
-deferred restart offline (fixture repo, stub systemctl/visudo/docker).
+exercises install, byte-exact rollback, web image rollback, build failure,
+unmerged commit, the deferred restart, the web unit start rule and the data
+directory's mode offline (fixture repo, stub systemctl/visudo/docker).
 
 First install, once, as root (take a Contabo snapshot before):
 
