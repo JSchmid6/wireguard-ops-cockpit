@@ -67,6 +67,7 @@ readonly TABLE=(
   "deploy/vps/vps-cockpit-deploy.sh|$LIB/vps-cockpit-deploy.sh|755"
   "deploy/helpers/cockpit-service-action|$SBIN/cockpit-service-action|755"
   "deploy/helpers/cockpit-disk-action|$SBIN/cockpit-disk-action|755"
+  "deploy/helpers/cockpit-borg-action|$SBIN/cockpit-borg-action|755"
   "deploy/helpers/cockpit-exact-file-replace|$SBIN/cockpit-exact-file-replace|755"
   "deploy/helpers/cockpit-nextcloud-app-action|$SBIN/cockpit-nextcloud-app-action|755"
   "deploy/helpers/cockpit-nextcloud-context-action|$SBIN/cockpit-nextcloud-context-action|755"

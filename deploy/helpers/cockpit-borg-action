@@ -1,0 +1,255 @@
+#!/bin/bash
+# =============================================================================
+# cockpit-borg-action — der eine sudo-exponierte Einstieg für den Borg-Betrieb.
+# -----------------------------------------------------------------------------
+# Aufruf (gepinnte Grammatik, alles andere endet mit 64):
+#   cockpit-borg-action status     lesend: Zustand des Backups, beider Seiten
+#   cockpit-borg-action check      startet einen Repo-Check (lesend, detached)
+#   cockpit-borg-action repair     startet check --repair --force (detached)
+#
+# Warum detached: Ein Repo-Check über ~4,7 TB läuft Stunden. Der typisierte
+# Executor ist eine Anfrage/Antwort-Strecke; ein Helper, der zwei Stunden im
+# Executor-Slot hängt, ist ein kaputter Executor. check/repair setzen darum
+# eine abgesetzte Sitzung in eine Logdatei ab und kehren sofort zurück; der
+# Fortschritt ist über `status` sichtbar (Logschwanz + laufende Sitzung).
+#
+# Grenzen (bewusst):
+#   * Der Repo-Schlüssel und /etc/borgmatic/config.yaml werden NIE gelesen und
+#     nie ausgegeben — die Datei hält Klartext-Zugangsdaten (mysqldump, borg).
+#     Es laufen ausschliesslich borgmatic-Kommandos, die den Schlüssel selbst
+#     benutzen (als root) und nur ihre Zusammenfassung ausgeben.
+#   * Keine freien Argumente: die drei Verben sind die ganze Fläche.
+#   * Kein Lauf parallel zum nächtlichen borgmatic-Timer und kein zweiter Lauf
+#     gleichzeitig (Sperrdatei) — ein zweiter Lauf auf demselben Repo endet in
+#     "Failed to create/acquire the lock" und macht den Timer-Lauf kaputt
+#     (genau das passierte am 22.09.).
+#   * check/repair laufen auf dem VPS (dort liegen borgmatic und der Schlüssel);
+#     auf einem Host ohne borgmatic berichtet `status` die Kiste-Seite.
+#
+# Rückgabewerte: 0 ok · 2 Repo nicht erreichbar (nur status) · 3 schon in Arbeit
+# · 64 Aufruffehler · 67 falscher Host (check/repair ohne borgmatic).
+# =============================================================================
+set -uo pipefail
+umask 027
+
+readonly BORG_ACTION_LOCK="${COCKPIT_BORG_ACTION_LOCK:-/run/lock/cockpit-borg.lock}"
+readonly BORG_ACTION_LOGDIR="${COCKPIT_BORG_ACTION_LOGDIR:-/var/log/wireguard-ops-cockpit-borg}"
+readonly BORG_ACTION_KISTE_URL="${COCKPIT_BORG_ACTION_KISTE_URL:-http://10.0.0.5:8088/status.txt}"
+readonly BORG_ACTION_KISTE_REPO="${COCKPIT_BORG_ACTION_KISTE_REPO:-/media/RAID/backup_VServer/borg}"
+readonly BORG_ACTION_STATE_DIR="${COCKPIT_BORG_ACTION_STATE_DIR:-/var/lib/wireguard-ops-cockpit/borg}"
+readonly BORG_ACTION_CONFIG="${COCKPIT_BORG_ACTION_CONFIG:-/etc/borgmatic/config.yaml}"
+readonly BORG_ACTION_MAX_LOG_LINES="${COCKPIT_BORG_ACTION_MAX_LOG_LINES:-25}"
+
+usage() {
+  cat <<'EOF'
+cockpit-borg-action — Borg-Betrieb auf diesem Host.
+
+  status   Backup-Zustand lesen: borgmatic-Timer und letzte Läufe, jüngste
+           Archive, Repo-Kennzahlen und der Zustand der Kiste (Statusdatei).
+  check    Einen Repo-Check starten (lesend, läuft abgesetzt weiter).
+  repair   Einen Repo-Check mit --repair --force starten (kann beschädigte
+           Archive entfernen), abgesetzt; verlangt die Freigabe des Operators
+           in der Plan-Policy der Cockpit-API.
+
+Alles andere wird abgelehnt. Der Repo-Schlüssel bleibt auf diesem Host.
+EOF
+}
+
+die() { printf '%s\n' "$1" >&2; exit "${2:-64}"; }
+section() { printf '\n== %s ==\n' "$1"; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# borgmatic nur, wenn Konfiguration UND Programm da sind — die Kiste hat keins.
+borgmatic_here() { have borgmatic && [ -r "$BORG_ACTION_CONFIG" ]; }
+
+# Laufende Sitzung dieses Helpers? (Logdatei der jüngsten Sitzung + PID-Datei)
+state_pid_file() { printf '%s/last.pid' "$BORG_ACTION_STATE_DIR"; }
+state_kind_file() { printf '%s/last.kind' "$BORG_ACTION_STATE_DIR"; }
+state_log_file() { printf '%s/last.log' "$BORG_ACTION_STATE_DIR"; }
+
+running_pid() {
+  local pidfile pid
+  pidfile="$(state_pid_file)"
+  [ -f "$pidfile" ] || return 1
+  pid="$(cat "$pidfile" 2>/dev/null || true)"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  printf '%s' "$pid"
+}
+
+lock_held() { # hält irgendwer die Sperrdatei?
+  [ -e "$BORG_ACTION_LOCK" ] || return 1
+  have flock || return 1
+  if flock -n "$BORG_ACTION_LOCK" true 2>/dev/null; then return 1; fi
+  return 0
+}
+
+borgmatic_busy() {
+  have systemctl || return 1
+  systemctl is-active --quiet borgmatic.service 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# status
+# ---------------------------------------------------------------------------
+show_kiste_status() { # Zustand der Kiste ohne SSH: die Statusdatei des Dateidienstes
+  section "Kiste (Statusdatei $BORG_ACTION_KISTE_URL)"
+  if ! have curl; then
+    printf '%s\n' "curl fehlt auf diesem Host — Kiste nicht abgefragt."
+    return 0
+  fi
+  local body
+  if ! body="$(curl -fsS --max-time 10 "$BORG_ACTION_KISTE_URL" 2>&1)"; then
+    printf 'Statusdatei nicht erreichbar: %s\n' "$body"
+    return 0
+  fi
+  printf '%s\n' "$body" | grep -E '^(DATE|UPTIME|LOAD|FAILED:|FAILED-UNIT|MDSTAT|md1|DF)' | head -n 20
+  printf '%s\n' "$body" | grep -qE '\[4/4\] *\[UUUU\]' && printf '%s\n' "-> Array vollständig (4/4, [UUUU])."
+  return 0
+}
+
+show_kiste_local() { # auf der Kiste selbst: Mount, Platz und das Repo-Verzeichnis
+  section "Kiste: /media/RAID"
+  df -h /media/RAID 2>/dev/null || printf '%s\n' "/media/RAID nicht eingehängt."
+  section "Kiste: Repo-Verzeichnis $BORG_ACTION_KISTE_REPO"
+  if [ -d "$BORG_ACTION_KISTE_REPO" ]; then
+    printf 'vorhanden: ja\n'
+    printf 'letzte Änderung: %s\n' "$(date -r "$BORG_ACTION_KISTE_REPO" --iso-8601=seconds 2>/dev/null || stat -c %y "$BORG_ACTION_KISTE_REPO")"
+    printf 'Grösse (du -sh): %s\n' "$(du -sh "$BORG_ACTION_KISTE_REPO" 2>/dev/null | cut -f1)"
+    printf 'Segmente: %s\n' "$(find "$BORG_ACTION_KISTE_REPO/data" -type f 2>/dev/null | wc -l)"
+    printf 'jüngstes Datensegment: %s\n' "$(find "$BORG_ACTION_KISTE_REPO/data" -type f -printf '%TY-%Tm-%TdT%TH:%TM:%TS %p\n' 2>/dev/null | sort | tail -n 1)"
+  else
+    printf '%s\n' "vorhanden: nein ($BORG_ACTION_KISTE_REPO fehlt)"
+  fi
+  return 0
+}
+
+status_borgmatic() {
+  section "VPS: borgmatic"
+  if have systemctl; then
+    printf 'Timer: %s\n' "$(systemctl is-active borgmatic.timer 2>/dev/null || true)"
+    printf 'Dienst jetzt: %s\n' "$(systemctl is-active borgmatic.service 2>/dev/null || true)"
+    systemctl list-timers borgmatic.timer --no-pager 2>/dev/null | head -n 2
+  else
+    printf '%s\n' "systemctl fehlt — Timerzustand unbekannt."
+  fi
+
+  section "VPS: letzte Läufe (Journal)"
+  if have journalctl; then
+    journalctl -u borgmatic.service --since '-14 days' --no-pager -o short-iso 2>/dev/null \
+      | grep -aE 'Starting borgmatic|Finished borgmatic|borgmatic.service: (Succeeded|Failed|Deactivated)|CRITICAL|ERROR|Error|Failed' \
+      | tail -n 20 || true
+    journalctl -u borgmatic.service --since '-14 days' --no-pager -o short-iso 2>/dev/null | grep -qa . \
+      || printf '%s\n' "keine Journalzeilen lesbar (Rechte?)"
+  else
+    printf '%s\n' "journalctl fehlt — Laufhistorie unbekannt."
+  fi
+
+  section "VPS: Archive (borgmatic list --last 5)"
+  local archives
+  archives="$(borgmatic --verbosity 0 list --last 5 2>&1)"
+  if [ $? -eq 0 ]; then REPO_REACHABLE="ja"; else REPO_REACHABLE="nein"; fi
+  printf '%s\n' "$archives" | tail -n 12
+
+  section "VPS: Repo-Kennzahlen (borgmatic info --last 1)"
+  borgmatic --verbosity 0 info --last 1 2>&1 \
+    | grep -aE 'Archive name|Time \(start\)|Time \(end\)|Duration|Number of files|Original size|This archive:|All archives:|Deduplicated size' \
+    | tail -n 12
+
+  section "VPS: laufende Wartung"
+  local pid
+  if pid="$(running_pid)"; then
+    printf 'läuft: ja (PID %s, Art %s)\n' "$pid" "$(cat "$(state_kind_file)" 2>/dev/null || printf '?')"
+    printf 'Log: %s\n' "$(state_log_file)"
+    tail -n "$BORG_ACTION_MAX_LOG_LINES" "$(state_log_file)" 2>/dev/null || true
+  elif lock_held; then
+    printf '%s\n' "Sperrdatei $BORG_ACTION_LOCK ist belegt (Lauf ohne PID-Datei, z. B. abgesetzt gestartet)."
+  else
+    printf '%s\n' "läuft: nein"
+    [ -f "$(state_log_file)" ] && { printf 'letztes Log: %s\n' "$(state_log_file)"; tail -n "$BORG_ACTION_MAX_LOG_LINES" "$(state_log_file)"; }
+  fi
+  # Ein nicht erreichbares Repo ist der Befund, nicht eine Randnotiz: rc=2.
+  [ "$REPO_REACHABLE" = "ja" ] || return 2
+  return 0
+}
+
+run_status() {
+  printf 'cockpit-borg-action status — %s\n' "$(date --iso-8601=seconds)"
+  printf 'Host: %s\n' "$(hostname -f 2>/dev/null || hostname)"
+  local rc=0
+  REPO_REACHABLE="n/a (Kiste)"
+  if borgmatic_here; then
+    printf '%s\n' "Rolle: VPS (borgmatic vorhanden, Repo-Schlüssel bleibt hier)"
+    status_borgmatic || rc=$?
+    show_kiste_status
+  else
+    printf '%s\n' "Rolle: Kiste (kein borgmatic — Sicht auf das empfangende Repo)"
+    show_kiste_local
+    show_kiste_status
+  fi
+  section "ZUSAMMENFASSUNG"
+  printf 'repo_erreichbar: %s\n' "$REPO_REACHABLE"
+  printf 'borgmatic_busy: %s\n' "$(borgmatic_busy && printf ja || printf nein)"
+  printf 'wartung_laeuft: %s\n' "$(running_pid >/dev/null 2>&1 && printf ja || printf nein)"
+  return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# check / repair (abgesetzt)
+# ---------------------------------------------------------------------------
+start_maintenance() { # verb (check|repair)
+  local verb="$1"
+  borgmatic_here || die "borgmatic (und $BORG_ACTION_CONFIG) fehlen auf diesem Host — check/repair laufen auf dem VPS." 67
+  if running_pid >/dev/null 2>&1; then
+    die "es läuft bereits eine Wartung (PID $(running_pid)) — Fortschritt mit 'status' ansehen." 3
+  fi
+  if borgmatic_busy; then
+    die "borgmatic.service ist gerade aktiv (nächtliches Backup). Kein zweiter Lauf auf demselben Repo." 3
+  fi
+  if lock_held; then
+    die "$BORG_ACTION_LOCK ist belegt — ein anderer Lauf hält das Repo." 3
+  fi
+
+  install -d -m 0750 -o root -g root "$BORG_ACTION_STATE_DIR"
+  install -d -m 0750 -o root -g root "$BORG_ACTION_LOGDIR"
+  local stamp log
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  log="$BORG_ACTION_LOGDIR/$verb-$stamp.log"
+
+  local args=(--verbosity 1 check)
+  [ "$verb" = "repair" ] && args+=(--repair --force)
+
+  # Der abgesetzte Lauf hält die Sperre für seine ganze Dauer; BORG_CHECK_… wird
+  # nur im Repair-Fall gesetzt (borg fragt sonst interaktiv nach "YES").
+  local pid
+  if [ "$verb" = "repair" ]; then
+    setsid env BORG_CHECK_I_KNOW_WHAT_I_AM_DOING=YES flock -n "$BORG_ACTION_LOCK" \
+      borgmatic "${args[@]}" >>"$log" 2>&1 &
+  else
+    setsid flock -n "$BORG_ACTION_LOCK" \
+      borgmatic "${args[@]}" >>"$log" 2>&1 &
+  fi
+  pid=$!
+  printf '%s\n' "$pid" > "$(state_pid_file)"
+  printf '%s\n' "$verb" > "$(state_kind_file)"
+  ln -sfn "$log" "$(state_log_file)"
+
+  printf 'gestartet: borgmatic %s\n' "${args[*]}"
+  printf 'PID: %s\n' "$pid"
+  printf 'Log: %s\n' "$log"
+  printf '%s\n' "Fortschritt: 'cockpit-borg-action status' (Logschwanz) oder 'tail -f $log'."
+  printf '%s\n' "Der Lauf überlebt diese Sitzung; ein zweiter Lauf wird von der Sperre abgewiesen."
+  return 0
+}
+
+[ "$#" -eq 1 ] || { usage >&2; exit 64; }
+[ "$(id -u)" -eq 0 ] || die "cockpit-borg-action läuft als root über den typisierten Executor." 77
+
+case "$1" in
+  status) run_status ;;
+  check) start_maintenance check ;;
+  repair) start_maintenance repair ;;
+  -h|--help|help) usage; exit 0 ;;
+  *) usage >&2; die "unbekanntes Verb: $1" 64 ;;
+esac

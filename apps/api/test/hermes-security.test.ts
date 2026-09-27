@@ -5,9 +5,11 @@ import {
   createExecutionEnvelope,
   normalizeEvidence,
   normalizeAllowedCapabilities,
+  parseTypedBorgActions,
   parseTypedDiensteUpdates,
   parseTypedDiskActions,
   parseTypedSelfUpdates,
+  requestsBorgRepair,
   validateExecutionEnvelope,
 } from "../src/hermes-security.js";
 
@@ -192,5 +194,51 @@ describe("typed server-dienste install (dienste.update)", () => {
 
   it("accepts dienste.update as an authorizable capability", () => {
     expect(normalizeAllowedCapabilities(["dienste.update", "nonsense"])).toEqual(["dienste.update"]);
+  });
+});
+
+describe("typed borg maintenance (borg.manage)", () => {
+  const plan = (lines: string[]) => ["```bash", ...lines, "```"].join("\n");
+
+  it("parses the three pinned forms and reports everything else as unsupported", () => {
+    const parsed = parseTypedBorgActions([
+      "/usr/local/sbin/cockpit-borg-action status",
+      "sudo /usr/local/sbin/cockpit-borg-action check",
+      "/usr/local/sbin/cockpit-borg-action repair",
+      "/usr/local/sbin/cockpit-borg-action restore",
+      "echo nichts",
+    ].join("\n"));
+    expect(parsed.actions).toEqual([
+      { action: "borg.status", target: "state" },
+      { action: "borg.check", target: "repo" },
+      { action: "borg.repair", target: "repo" },
+    ]);
+    expect(parsed.unsupported).toEqual(["/usr/local/sbin/cockpit-borg-action restore"]);
+  });
+
+  it("keeps every other borg-helper invocation out of the typed path", () => {
+    for (const line of [
+      "/usr/local/sbin/cockpit-borg-action status extra",
+      "/usr/local/sbin/cockpit-borg-action check --repair",
+      "/usr/local/sbin/cockpit-borg-action repair --force",
+      "/tmp/cockpit-borg-action status",
+      "borgmatic check --repair",
+      "borg delete ::archive",
+    ]) {
+      expect(classifyCapabilities(plan([line])), line).toContain("shell.exception");
+    }
+    expect(classifyCapabilities(plan(["/usr/local/sbin/cockpit-borg-action status"]))).toEqual(["borg.manage"]);
+    expect(classifyCapabilities(plan(["sudo /usr/local/sbin/cockpit-borg-action repair"]))).toEqual(["borg.manage"]);
+  });
+
+  it("marks only the repair form as the submitter of a destructive run", () => {
+    expect(requestsBorgRepair("/usr/local/sbin/cockpit-borg-action repair")).toBe(true);
+    expect(requestsBorgRepair("/usr/local/sbin/cockpit-borg-action check")).toBe(false);
+    expect(requestsBorgRepair("/usr/local/sbin/cockpit-borg-action status")).toBe(false);
+    expect(requestsBorgRepair("borg delete ::archive")).toBe(false);
+  });
+
+  it("accepts borg.manage as an authorizable capability", () => {
+    expect(normalizeAllowedCapabilities(["borg.manage", "become.root"])).toEqual(["borg.manage"]);
   });
 });

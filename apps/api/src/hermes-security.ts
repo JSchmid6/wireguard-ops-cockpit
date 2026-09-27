@@ -9,6 +9,7 @@ export type CapabilityId =
   | "read.host"
   | "service.manage"
   | "disk.manage"
+  | "borg.manage"
   | "self.update"
   | "dienste.update"
   | "package.manage"
@@ -19,7 +20,7 @@ export type CapabilityId =
   | "shell.exception";
 
 const CAPABILITIES = new Set<CapabilityId>([
-  "read.host", "service.manage", "disk.manage", "self.update", "dienste.update", "package.manage", "filesystem.write", "network.manage",
+  "read.host", "service.manage", "disk.manage", "borg.manage", "self.update", "dienste.update", "package.manage", "filesystem.write", "network.manage",
   "identity.manage", "database.direct", "shell.exception",
 ]);
 
@@ -37,6 +38,15 @@ const DISK_HELPER_MANAGE_LINE = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-disk-a
 const DISK_HELPER_SMART_LINE = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-disk-action\s+smart\s+(?:\/dev\/)?(sd[a-z])$/;
 const DISK_HELPER_SMARTTEST_LINE = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-disk-action\s+smarttest\s+(?:\/dev\/)?(sd[a-z])$/;
 const DISK_HELPER_INVOCATION = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-disk-action\b/;
+// Borg-Betrieb (Backup VPS -> Kiste). Der installierte Helper ist die einzige
+// Form: lesender Zustand, ein Check, ein Check mit Repair. Alles andere bleibt
+// shell.exception und läuft nie automatisch. Ein Repair kann beschädigte
+// Archive entfernen — die API verlangt dafür die Freigabe des Operators
+// (blocked_user_approval), bevor der Executor den Lauf startet.
+const BORG_HELPER_STATUS_LINE = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-borg-action\s+status$/;
+const BORG_HELPER_CHECK_LINE = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-borg-action\s+check$/;
+const BORG_HELPER_REPAIR_LINE = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-borg-action\s+repair$/;
+const BORG_HELPER_INVOCATION = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-borg-action\b/;
 // The installed self-update helper is the executor's face for rolling out a
 // merged cockpit stand: one full lowercase commit sha, or the read-only
 // status form. Everything else stays shell.exception.
@@ -98,6 +108,41 @@ export function parseTypedDiskActions(script: string): { actions: TypedDiskActio
     unsupported.push(line);
   }
   return { actions, unsupported };
+}
+
+export interface TypedBorgAction { action: "borg.status" | "borg.check" | "borg.repair"; target: string }
+
+export function isTypedBorgLine(line: string): boolean {
+  const trimmed = line.trim();
+  return BORG_HELPER_STATUS_LINE.test(trimmed) || BORG_HELPER_CHECK_LINE.test(trimmed) || BORG_HELPER_REPAIR_LINE.test(trimmed);
+}
+
+export function parseTypedBorgActions(script: string): { actions: TypedBorgAction[]; unsupported: string[] } {
+  const actions: TypedBorgAction[] = [];
+  const unsupported: string[] = [];
+  for (const rawLine of script.split("\n")) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#") || /^set\s+-/.test(line)) continue;
+    if (!BORG_HELPER_INVOCATION.test(line)) continue;
+    if (BORG_HELPER_STATUS_LINE.test(line)) {
+      actions.push({ action: "borg.status", target: "state" });
+      continue;
+    }
+    if (BORG_HELPER_CHECK_LINE.test(line)) {
+      actions.push({ action: "borg.check", target: "repo" });
+      continue;
+    }
+    if (BORG_HELPER_REPAIR_LINE.test(line)) {
+      actions.push({ action: "borg.repair", target: "repo" });
+      continue;
+    }
+    unsupported.push(line);
+  }
+  return { actions, unsupported };
+}
+
+export function requestsBorgRepair(script: string): boolean {
+  return parseTypedBorgActions(script).actions.some((action) => action.action === "borg.repair");
 }
 
 export interface TypedSelfUpdateAction { action: "self.update" | "self.status"; target: string }
@@ -244,6 +289,7 @@ export function classifyCapabilities(plan: string): CapabilityId[] {
   const capabilities = new Set<CapabilityId>();
   if (/\b(systemctl|service)\s+(restart|start|stop|reload|enable|disable)\b/i.test(script)) capabilities.add("service.manage");
   if (script.split("\n").some((line) => isTypedDiskLine(line))) capabilities.add("disk.manage");
+  if (script.split("\n").some((line) => isTypedBorgLine(line))) capabilities.add("borg.manage");
   if (script.split("\n").some((line) => isTypedSelfUpdateLine(line))) capabilities.add("self.update");
   if (script.split("\n").some((line) => isTypedDiensteUpdateLine(line))) capabilities.add("dienste.update");
   if (/\b(apt(?:-get)?|dnf|yum|rpm|dpkg|snap)\b/i.test(script)) capabilities.add("package.manage");
@@ -266,6 +312,7 @@ export function classifyCapabilities(plan: string): CapabilityId[] {
         (/^(iptables|nft|ufw|useradd|userdel|usermod|groupadd|groupdel)$/.test(command)) ||
         (command === "mdadm" && isTypedDiskLine(segment)) ||
         (command === "cockpit-disk-action" && isTypedDiskLine(segment)) ||
+        (command === "cockpit-borg-action" && isTypedBorgLine(segment)) ||
         (command === "cockpit-self-update-action" && isTypedSelfUpdateLine(segment)) ||
         (command === "cockpit-dienste-update-action" && isTypedDiensteUpdateLine(segment));
       if (!safeReadCommands.has(command) && !typedMutation) capabilities.add("shell.exception");

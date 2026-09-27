@@ -94,9 +94,14 @@ Bare-metal Ubuntu VPS (161.97.86.86) running:
 - Restart: `docker compose -f /usr/local/lib/hermes-agent/docker-compose.yml restart gateway`
 
 ### Borgmatic Backup
-- Timer: `systemctl list-timers borgmatic.timer`
-- Repo: `ssh://root@10.0.0.5/media/RAID/backup_VServer/borg`
-- Home server: 10.0.0.5 (WireGuard peer)
+- Timer: `systemctl list-timers borgmatic.timer` (daily ~02:26, `Persistent=true`)
+- Repo: `ssh://borg@10.0.0.5/media/RAID/backup_VServer/borg` (service channel `borg`,
+  forced command `borg serve --restrict-to-path`; the repository key exists only here)
+- Home server: 10.0.0.5 (WireGuard peer); its status file: `http://10.0.0.5:8088/status.txt`
+- Config `/etc/borgmatic/config.yaml` holds live credentials — never read it into a job,
+  never cat it in a plan; only borgmatic itself may use it.
+- Typed path (`borg.manage`): `cockpit-borg-action status|check|repair`, see
+  `doc/setup/borg-maintenance.md`. `repair` always needs the operator's approval.
 
 ### Cockpit Runbooks
 - All host operations go through Cockpit Runbooks API

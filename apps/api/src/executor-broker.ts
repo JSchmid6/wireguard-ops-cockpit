@@ -4,7 +4,7 @@ import { createHmac } from "node:crypto";
 import type { CapabilityManifest } from "./capability-manifest.js";
 import type { ExecutionEnvelope } from "./hermes-security.js";
 
-export type ExecutorActionKind = "service.restart" | "service.status" | "disk.status" | "disk.remove" | "disk.add" | "disk.smart" | "disk.smarttest" | "self.update" | "self.status" | "self.diff" | "dienste.update" | "dienste.status" | "dienste.diff";
+export type ExecutorActionKind = "service.restart" | "service.status" | "disk.status" | "disk.remove" | "disk.add" | "disk.smart" | "disk.smarttest" | "self.update" | "self.status" | "self.diff" | "dienste.update" | "dienste.status" | "dienste.diff" | "borg.status" | "borg.check" | "borg.repair";
 // diffSha256: only on self.update and dienste.update — the hash of the diff the pre-install review covered.
 export interface ExecutorAction { action: ExecutorActionKind; target: string; diffSha256?: string; expiresAt: string; envelopeDigest: string }
 export interface DynamicExecutorAction { action: "capability.execute"; manifest: CapabilityManifest; envelope: ExecutionEnvelope; expiresAt: string; envelopeDigest: string }

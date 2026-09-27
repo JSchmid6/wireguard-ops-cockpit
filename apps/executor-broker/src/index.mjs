@@ -14,6 +14,10 @@ const capabilityNode = "/opt/node-v20.19.1-linux-x64/bin/node";
 const services = new Set(["apache2", "wireguard-ops-cockpit-ttyd"]);
 const diskActions = new Set(["disk.status", "disk.remove", "disk.add", "disk.smart", "disk.smarttest"]);
 const diskDevice = /^sd[a-z]$/;
+// Borg-Betrieb: status ist lesend, check/repair starten einen abgesetzten Lauf
+// (der Helper hält die Repo-Sperre) und kehren sofort zurück.
+const borgHelper = "/usr/local/sbin/cockpit-borg-action";
+const borgActions = new Set(["borg.status", "borg.check", "borg.repair"]);
 const selfUpdateActions = new Set(["self.update", "self.status", "self.diff"]);
 // server-dienste (the root supervisor of the agent's Docker services): the same
 // three forms, installed by its own helper, reviewed with its own guarantees.
@@ -32,8 +36,10 @@ export function validateRequest(value, now = Date.now()) {
   const expected = signature(value.payload);
   if (!/^[a-f0-9]{64}$/.test(value.signature) || !timingSafeEqual(Buffer.from(value.signature, "hex"), Buffer.from(expected, "hex"))) throw new Error("invalid request signature");
   const { action, target, expiresAt, envelopeDigest } = value.payload;
-  if (action !== "service.restart" && action !== "service.status" && action !== "capability.execute" && !diskActions.has(action) && !selfUpdateActions.has(action) && !diensteUpdateActions.has(action)) throw new Error("unsupported capability action");
+  if (action !== "service.restart" && action !== "service.status" && action !== "capability.execute" && !diskActions.has(action) && !selfUpdateActions.has(action) && !diensteUpdateActions.has(action) && !borgActions.has(action)) throw new Error("unsupported capability action");
   if (action.startsWith("service.") && !services.has(target)) throw new Error("service target is not allowlisted");
+  if (action === "borg.status" && target !== "state") throw new Error("borg status target is not allowlisted");
+  if ((action === "borg.check" || action === "borg.repair") && target !== "repo") throw new Error("borg maintenance target is not allowlisted");
   if (action === "disk.status" && target !== "md127") throw new Error("disk target is not allowlisted");
   if ((action === "disk.remove" || action === "disk.add" || action === "disk.smart" || action === "disk.smarttest") && (typeof target !== "string" || !diskDevice.test(target))) throw new Error("disk device is not allowlisted");
   if (action === "self.status" && target !== "state") throw new Error("self-update status target is not allowlisted");
@@ -89,6 +95,20 @@ export function execute(payload) {
         }
         resolve({ ok: code === 0, exitCode: code, output: selfOutput.slice(-outputLimit), error: code === 0 ? null : [selfError, selfOutput].filter(Boolean).join("\n").slice(-4000) });
       });
+      return;
+    }
+    if (borgActions.has(payload.action)) {
+      // Three pinned verbs. status is read-only; check/repair start a detached
+      // run inside the helper and return at once (the run holds the repo lock),
+      // so this slot never waits for the hours-long check.
+      const borgVerb = payload.action.slice("borg.".length);
+      const child = spawn("sudo", ["-n", borgHelper, borgVerb], { env: { PATH: "/usr/sbin:/usr/bin:/sbin:/bin" }, stdio: ["ignore", "pipe", "pipe"] });
+      let borgOutput = ""; let borgError = "";
+      child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => { borgOutput += chunk; });
+      child.stderr.on("data", (chunk) => { borgError += chunk; });
+      child.on("error", (reason) => resolve({ ok: false, error: reason.message }));
+      child.on("close", (code) => resolve({ ok: code === 0, exitCode: code, output: borgOutput.slice(-40000), error: code === 0 ? null : [borgError, borgOutput].filter(Boolean).join("\n").slice(-4000) }));
       return;
     }
     if (payload.action.startsWith("disk.")) {
