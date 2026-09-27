@@ -220,14 +220,38 @@ under the state directory — never a bare exit code.
 
 The VPS has no Lab0 package script; its reviewed deploy script is
 `deploy/vps/vps-cockpit-deploy.sh` (installed to
-`/usr/local/lib/wireguard-ops-cockpit/vps-cockpit-deploy.sh`). It follows the
-same contract (`REPO_COMMIT=<sha>`, `COCKPIT_RESTART_MODE=defer`, writes
-`state.json` with `web_url=http://10.0.0.1:8080`), installs all helpers, the
-sudoers file (validated first) and the unit template, rebuilds the web
-container only when `apps/web` changed, and rolls back checkout, build and
-helpers when anything fails before the state is written. It also creates
-`/etc/wireguard-ops-cockpit/self-update.env` (deploy script path, WireGuard IP
-10.0.0.1) when missing.
+`/usr/local/lib/wireguard-ops-cockpit/vps-cockpit-deploy.sh`). Same contract
+(`REPO_COMMIT=<sha>` merged into `origin/main`, `COCKPIT_RESTART_MODE=defer`,
+`state.json` with `web_url=http://10.0.0.1:8080`).
+
+**Footprint — exactly the table at the top of the script, nothing else:** the
+root helpers the executor and the capability sandbox dispatch to (capability
+action, hermes-skill, email-archive deploy and auto-deploy, the three Nextcloud
+PHP helpers, service, disk, exact-file-replace, Nextcloud app/context,
+dienste-update, self-update action and runner, VPS snapshot, WordPress update),
+the sudoers file (checked with `visudo -cf` before and `visudo -c` after), the
+four service units, the email-archive auto-deploy service/timer, the
+self-update unit template, the web unit and this script, plus
+`/etc/wireguard-ops-cockpit/self-update.env`. Besides the table it writes only
+`state.json`, the web image, the web unit's enable link and a backup directory
+it removes on success. VPS-specific service settings live in drop-ins
+(`*.service.d/`) and are not touched. `homeserver-cockpit-deploy.sh` is Lab0's
+and is not installed here.
+
+**Web:** the image is always built (the Docker cache makes an unchanged build
+cheap; a list of build inputs would miss some). The running container is never
+switched by the deploy: `wireguard-ops-cockpit-web.service` (oneshot,
+`docker compose up -d --no-build web`) does that when restarted, and
+`self-update.env` puts it into `COCKPIT_SELF_UPDATE_SERVICES`, so the runner
+switches web together with the four services at the activation, after its
+pre-activation checks.
+
+**Rollback:** every target is saved (or recorded as absent) before the install.
+Any failure until `state.json` is written restores exactly those bytes, removes
+files that did not exist, checks the old commit out and rebuilds it; each step
+is logged and a partial rollback says so. `test/vps-cockpit-deploy.test.sh`
+exercises install, byte-exact rollback, build failure, unmerged commit and the
+deferred restart offline (fixture repo, stub systemctl/visudo/docker).
 
 First install, once, as root (take a Contabo snapshot before):
 
