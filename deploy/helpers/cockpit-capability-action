@@ -1,6 +1,6 @@
 #!/usr/bin/node
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync, copyFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync, copyFileSync } from "node:fs";
 import { dirname, normalize, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
@@ -36,7 +36,36 @@ const risky = new Set(["exposure", "data_loss", "identity_or_secret"]);
 if (!approved && (manifest.network === "host" || (manifest.risk || []).some((item) => risky.has(item)))) fail("operator approval is required for exposure, data-loss, identity, or secret risk", 77);
 
 const forbiddenRoots = new Set(["/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib64", "/opt", "/proc", "/root", "/run", "/sbin", "/sys", "/usr", "/var"]);
-const protectedPath = /(?:^|\/)(?:\.ssh|sudoers(?:\.d)?|shadow|gshadow|passwd|group|ssh|wireguard|secrets?|credentials?|private|keys?)(?:\/|$)|\.(?:key|pem|p12|env|db|sqlite3?)$|^\/(?:opt\/nextcloud|opt\/gitlab|var\/www\/nextcloud\/config|var\/lib\/wireguard-ops-cockpit)(?:\/|$)/i;
+const protectedPath = /(?:^|\/)(?:\.ssh|sudoers(?:\.d)?|shadow|gshadow|passwd|group|ssh|wireguard|secrets?|credentials?|private|keys?|backups?)(?:[._~-]|\/|$)|(?:\.(?:key|pem|p12|env|db|sqlite3?|bak|backup|old|orig|save|swp|dpkg-[a-z]+|rpmnew|rpmsave)|~)$|^\/(?:opt\/nextcloud|opt\/gitlab|var\/www\/nextcloud\/config|var\/lib\/wireguard-ops-cockpit)(?:\/|$)/i;
+
+// BindReadOnlyPaths and BindPaths bind the WHOLE subtree, not just the declared
+// path: without this check a parent directory defeats the boundaries (re-review of
+// PR #11: readablePaths ["/var/www/nextcloud"] bound config/config.php with
+// dbpassword/secret/passwordsalt, ["/var/lib"] bound wireguard-ops-cockpit and
+// docker/). Every entry of a bound tree must respect the same boundaries as a
+// directly declared path; a tree that cannot be proven clean needs the operator.
+// Symlinks are not followed: a link is only reachable if its target is bound (and
+// therefore checked) in the sandbox anyway. Sockets inside a tree are left to the
+// AF_UNIX switch below, which governs their reachability for every bound socket;
+// only a directly declared socket is refused outright.
+const readableNeedsApproval = /^\/(?:dev|proc|sys|root)(?:\/|$)|^\/var\/lib\/(?:docker|containerd)(?:\/|$)/;
+const BOUND_TREE_SCAN_LIMIT = 200000;
+function assertBoundTreeClean(root) {
+  const queue = [root];
+  let entries = 0;
+  for (let index = 0; index < queue.length; index += 1) {
+    let children;
+    try { children = readdirSync(queue[index], { withFileTypes: true }); }
+    catch (error) { fail(`cannot prove bound tree is clean: ${queue[index]} (${error.code || error.message})`, 77); }
+    for (const child of children) {
+      entries += 1;
+      if (entries > BOUND_TREE_SCAN_LIMIT) fail(`bound tree is too large to prove clean, operator approval required: ${root}`, 77);
+      const childPath = `${queue[index]}/${child.name}`;
+      if (protectedPath.test(childPath) || readableNeedsApproval.test(childPath)) fail(`protected path inside bound tree requires operator approval: ${childPath} (tree ${root})`, 77);
+      if (child.isDirectory()) queue.push(childPath);
+    }
+  }
+}
 const paths = Array.isArray(manifest.writablePaths) ? manifest.writablePaths : [];
 // Readable scopes get a deterministic guard too (27.09.2026, found by Hermes in the
 // PR #10 review; earlier manifests really bound /var/run/docker.sock and /run/mysqld).
@@ -44,7 +73,9 @@ const paths = Array.isArray(manifest.writablePaths) ? manifest.writablePaths : [
 // kernel and container-state trees and root's home need operator approval (the fixed
 // /proc/mdstat bind excepted); (2) sockets: see socketFamilyFor below —
 // without approval a step cannot open a Unix socket at all, wherever one is bound.
-const readableNeedsApproval = /^\/(?:dev|proc|sys|root)(?:\/|$)|^\/var\/lib\/(?:docker|containerd)(?:\/|$)/;
+// The declared path is checked first (protectedPath/readableNeedsApproval above);
+// assertBoundTreeClean then proves the whole subtree it binds — a parent directory
+// must not smuggle a protected path past the boundary (re-review of PR #11).
 const readableFixed = new Set(["/proc/mdstat"]);
 const readPaths = Array.isArray(manifest.readablePaths) ? manifest.readablePaths : [];
 if (readPaths.length > 32) fail("too many readable paths");
@@ -54,7 +85,9 @@ const readablePaths = readPaths.map((item) => {
   if (forbiddenRoots.has(resolved)) fail(`readable scope is too broad: ${resolved}`, 77);
   if (!approved && !readableFixed.has(resolved)) {
     if (protectedPath.test(resolved) || readableNeedsApproval.test(resolved)) fail(`protected readable path requires operator approval: ${resolved}`, 77);
-    if (lstatSync(resolved).isSocket()) fail(`a socket is never an autonomous readable scope: ${resolved}`, 77);
+    const stat = lstatSync(resolved);
+    if (stat.isSocket()) fail(`a socket is never an autonomous readable scope: ${resolved}`, 77);
+    if (stat.isDirectory()) assertBoundTreeClean(resolved);
   }
   return resolved;
 });

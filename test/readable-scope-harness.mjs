@@ -5,7 +5,7 @@
 //   sudo node test/readable-scope-harness.mjs deploy/helpers/cockpit-capability-action
 //   sudo node test/readable-scope-harness.mjs ops/cockpit-capability-action.mjs
 import { createHash, createHmac } from "node:crypto";
-import { mkdtempSync, readFileSync, existsSync, rmSync, chmodSync } from "node:fs";
+import { mkdtempSync, readFileSync, existsSync, rmSync, chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 
 const EXECUTOR = process.argv[2];
@@ -73,6 +73,77 @@ const auf = run(manifest([dir], probe), { approved: true });
 check("Socket mit Freigabe erreichbar", auf.status === 0 && /VERBUNDEN/.test(auf.out), auf.out);
 server.kill();
 rmSync(dir, { recursive: true, force: true });
+
+// ── Nachbesserung aus dem Re-Review von PR #11 (27.09.2026) ──────────────────
+// Befund 1: gebunden wird der ganze Unterbaum — ein Elternverzeichnis darf
+// geschuetzte Pfade darin nicht mehr durchlassen. Befund 2: Sicherungs- und
+// Variantedateien (shadow-, *.bak, /var/backups) brauchen die Freigabe.
+{
+  const dir = mkdtempSync("/var/tmp/readable-harness-bak-");
+  chmodSync(dir, 0o755);
+  writeFileSync(`${dir}/shadow-`, "nur-ein-test\n");
+  const r = run(manifest([`${dir}/shadow-`], ["/bin/true"]));
+  check("Befund 2: Sicherungskopie shadow- ohne Freigabe abgewiesen", r.status === 77 && /requires operator approval/.test(r.out), r.out);
+  const auf = run(manifest([`${dir}/shadow-`], ["/bin/true"]), { approved: true });
+  check("Befund 2: Sicherungskopie shadow- mit Freigabe erlaubt (Validierung)", auf.status !== 77, auf.out);
+  rmSync(dir, { recursive: true, force: true });
+}
+{
+  const dir = mkdtempSync("/var/tmp/readable-harness-bak2-");
+  chmodSync(dir, 0o755);
+  writeFileSync(`${dir}/config.bak`, "nur-ein-test\n");
+  const r = run(manifest([`${dir}/config.bak`], ["/bin/true"]));
+  check("Befund 2: Sicherungskopie *.bak ohne Freigabe abgewiesen", r.status === 77 && /requires operator approval/.test(r.out), r.out);
+  rmSync(dir, { recursive: true, force: true });
+}
+{
+  const dir = mkdtempSync("/var/tmp/readable-harness-tree-");
+  chmodSync(dir, 0o755);
+  mkdirSync(`${dir}/keys`);
+  writeFileSync(`${dir}/keys/id_rsa`, "nur-ein-test\n");
+  const r = run(manifest([dir], ["/bin/true"]));
+  check("Befund 1: Elternverzeichnis mit geschuetztem Unterbaum abgewiesen", r.status === 77 && /inside bound tree/.test(r.out) && /requires operator approval/.test(r.out), r.out);
+  const auf = run(manifest([dir], ["/bin/true"]), { approved: true });
+  check("Befund 1: Elternverzeichnis mit Freigabe erlaubt (Validierung)", auf.status !== 77, auf.out);
+  rmSync(dir, { recursive: true, force: true });
+}
+{
+  const dir = mkdtempSync("/var/tmp/readable-harness-deep-");
+  chmodSync(dir, 0o755);
+  mkdirSync(`${dir}/sub/dir`, { recursive: true });
+  writeFileSync(`${dir}/sub/dir/shadow-`, "nur-ein-test\n");
+  const r = run(manifest([dir], ["/bin/true"]));
+  check("Befund 1+2: tief verschachtelte Sicherungskopie abgewiesen", r.status === 77 && /inside bound tree/.test(r.out), r.out);
+  rmSync(dir, { recursive: true, force: true });
+}
+{
+  if (!existsSync("/var/backups")) console.log("SKIP  /var/backups (fehlt hier)");
+  else {
+    const r = run(manifest(["/var/backups"], ["/bin/true"]));
+    check("Befund 2: /var/backups ohne Freigabe abgewiesen", r.status === 77 && /requires operator approval/.test(r.out), r.out);
+  }
+}
+{
+  if (!existsSync("/etc/ssl/private")) console.log("SKIP  /etc/ssl (kein private/)");
+  else {
+    const r = run(manifest(["/etc/ssl"], ["/bin/true"]));
+    check("Befund 1: /etc/ssl mit private/ ohne Freigabe abgewiesen", r.status === 77 && /inside bound tree/.test(r.out), r.out);
+  }
+}
+// v2-Baum-Scopes tragen dieselbe Unterbaum-Regel (nur Fassungen, die v2 kennen).
+if (/\bcapability\/v2\b/.test(readFileSync(EXECUTOR, "utf8"))) {
+  const dir = mkdtempSync("/var/tmp/readable-harness-scope-");
+  chmodSync(dir, 0o755);
+  mkdirSync(`${dir}/keys`);
+  const r = run({
+    version: "cockpit-capability/v2", name: "readable-scope-harness", risk: ["contained"], network: "none",
+    readablePaths: [], writablePaths: [], scopes: [{ kind: "tree", path: dir }], steps: [{ argv: ["/bin/true"] }], verification: [], rollback: [],
+  });
+  check("tree-Scope mit geschuetztem Unterbaum braucht Freigabe", r.status === 77 && /requires operator approval/.test(r.out), r.out);
+  rmSync(dir, { recursive: true, force: true });
+} else {
+  console.log("SKIP  tree-Scope (Fassung kennt nur v1)");
+}
 
 console.log(failed ? `\n${failed} FAIL` : "\nalles grün");
 process.exit(failed ? 1 : 0);
