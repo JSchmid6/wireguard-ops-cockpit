@@ -1318,6 +1318,174 @@ describe("control API", () => {
     });
   });
 
+  // ── Angehaltene Change-Jobs in der Freigabe-Ansicht ─────────────────────
+  // Befund vom 28.09.2026: Das Update war im Web nirgends freizugeben — der Job
+  // stand auf `blocked_user_approval`, die Ansicht las aber nur die
+  // Approvals-Tabelle, und die Route des Jobs rief niemand auf.
+  describe("Freigabe-Ansicht für angehaltene Change-Jobs", () => {
+    async function seedBlockedChangeJob(dbPath: string, name: string, intent: string) {
+      const database = new (await import("../src/db.js")).CockpitDatabase(dbPath);
+      database.initialize();
+      // Die Sitzung braucht einen Besitzer: die Freigabe bindet die Ausführung an
+      // ihn, und ohne Besitzer wäre die Entscheidung nicht zuzuordnen.
+      const owner = database.authenticateUser("admin", "test-password")!;
+      const session = database.upsertSession({
+        name,
+        ownerId: owner.id,
+        tmuxSessionName: `cockpit-${name}`,
+        tmuxBackend: "tmux",
+        terminalUrl: null
+      });
+      const job = database.createJob({
+        sessionId: session.id,
+        kind: "runbook",
+        subjectId: "hermes-change",
+        status: "blocked_user_approval",
+        requiresApproval: false,
+        output: {
+          plan: "# Plan: Email-Archive-Image aktualisieren\n\n1. Image ziehen\n2. Container neu starten\n",
+          explanation: {
+            phase: "finished",
+            intent,
+            reason: "The plan needs the operator: it replaces a running container image.",
+            evidence: ["Safety review: no rollback for the image swap."]
+          },
+          envelope: { expiresAt: "2026-09-28T14:30:00.000Z" }
+        }
+      });
+      database.close();
+      return job;
+    }
+
+    it("zeigt dem Admin Titel, Planzeile, Befunde und Ablaufzeit", async () => {
+      const dbPath = createTempDbPath(tempDirectories);
+      const app = await createTestApp(openApps, { dbPath });
+      const cookie = await login(app);
+      const job = await seedBlockedChangeJob(dbPath, "hermes-change-list", "Update the Email Archive image");
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/approvals?status=pending",
+        headers: { cookie }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().changeApprovals).toEqual([
+        {
+          jobId: job.id,
+          title: "Update the Email Archive image",
+          planSummary: "Plan: Email-Archive-Image aktualisieren",
+          reason: "The plan needs the operator: it replaces a running container image.",
+          findings: ["Safety review: no rollback for the image swap."],
+          expiresAt: "2026-09-28T14:30:00.000Z"
+        }
+      ]);
+
+      // Nur offene Entscheidungen: eine Liste bereits entschiedener Freigaben
+      // mischt sonst angehaltene Jobs unter beschiedene Vorgänge.
+      const decided = await app.inject({
+        method: "GET",
+        url: "/api/approvals?status=approved",
+        headers: { cookie }
+      });
+      expect(decided.statusCode).toBe(200);
+      expect(decided.json().changeApprovals).toBeUndefined();
+    });
+
+    it("entscheidet den Job über die bestehende Route und nimmt ihn aus der Liste", async () => {
+      const dbPath = createTempDbPath(tempDirectories);
+      const app = await createTestApp(openApps, { dbPath });
+      const cookie = await login(app);
+      const job = await seedBlockedChangeJob(dbPath, "hermes-change-decide", "Update the Email Archive image");
+
+      const rejected = await app.inject({
+        method: "POST",
+        url: `/api/hermes/jobs/${job.id}/approval`,
+        headers: { cookie },
+        payload: { decision: "rejected", reason: "Das Bild bleibt auf dem geprüften Stand" }
+      });
+
+      expect(rejected.statusCode).toBe(200);
+      expect(rejected.json().job.status).toBe("rejected");
+
+      const remaining = await app.inject({
+        method: "GET",
+        url: "/api/approvals?status=pending",
+        headers: { cookie }
+      });
+      expect(remaining.json().changeApprovals).toEqual([]);
+
+      // Der Grund steht im Audit: nachvollziehbar, wer wann warum entschieden hat.
+      const audits = await app.inject({ method: "GET", url: "/api/audits?limit=20", headers: { cookie } });
+      const decision = audits
+        .json()
+        .audits.find((entry: { action: string }) => entry.action === "hermes.change.rejected");
+      expect(decision).toMatchObject({
+        targetType: "job",
+        targetId: job.id,
+        details: { reason: "Das Bild bleibt auf dem geprüften Stand" }
+      });
+    });
+
+    it("lässt den Agenten-Token weder den Bestand sehen noch freigeben", async () => {
+      const dbPath = createTempDbPath(tempDirectories);
+      const app = await createTestApp(openApps, { dbPath }, {
+        bootstrapUsers: [{ username: "hermes-automation", password: "unusable-random-password", role: "automation" }]
+      });
+      const adminCookie = await login(app);
+      const job = await seedBlockedChangeJob(dbPath, "hermes-change-agent", "Install the reviewed cockpit build");
+
+      const database = new (await import("../src/db.js")).CockpitDatabase(dbPath);
+      database.initialize();
+      const automation = database.authenticateUser("hermes-automation", "unusable-random-password")!;
+      // Selbst wenn der Token die Route ausdrücklich als Scope bekäme, bleibt es
+      // beim 403: entscheiden darf nur der Operator in der Admin-Sitzung (G1).
+      const token = database.rotateApiToken(automation.id, "hermes", [
+        "GET /api/hermes/jobs/:jobId",
+        "POST /api/hermes/jobs/:jobId/approval",
+        "GET /api/approvals"
+      ]);
+      database.close();
+
+      const listed = await app.inject({
+        method: "GET",
+        url: "/api/approvals?status=pending",
+        headers: { authorization: `Bearer ${token}` }
+      });
+      expect(listed.statusCode).toBe(200);
+      expect(listed.json().approvals).toEqual([]);
+      expect(listed.json().changeApprovals).toBeUndefined();
+
+      const decided = await app.inject({
+        method: "POST",
+        url: `/api/hermes/jobs/${job.id}/approval`,
+        headers: { authorization: `Bearer ${token}` },
+        payload: { decision: "approved", reason: "self approval" }
+      });
+      expect(decided.statusCode).toBe(403);
+
+      // Ohne den Scope bleibt auch die Liste selbst verschlossen (Betriebsfall).
+      const narrow = new (await import("../src/db.js")).CockpitDatabase(dbPath);
+      narrow.initialize();
+      const narrowToken = narrow.rotateApiToken(automation.id, "hermes", ["GET /api/hermes/jobs/:jobId"]);
+      narrow.close();
+      const blocked = await app.inject({
+        method: "GET",
+        url: "/api/approvals?status=pending",
+        headers: { authorization: `Bearer ${narrowToken}` }
+      });
+      expect(blocked.statusCode).toBe(403);
+
+      // Und der Job ist unangetastet — ein 403 ist keine stille Freigabe.
+      const untouched = await app.inject({
+        method: "GET",
+        url: `/api/hermes/jobs/${job.id}`,
+        headers: { cookie: adminCookie }
+      });
+      expect(untouched.json().job.status).toBe("blocked_user_approval");
+    });
+  });
+
   // Der Zustandsbereich für Borg: read-only, über die typisierte Leseaktion
   // `borg.status`. Die Tests schieben die Helfer-Ausgabe ein, damit die Route
   // ohne Host prüfbar ist — gemessen wird im echten Betrieb.
