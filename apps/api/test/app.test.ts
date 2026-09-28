@@ -1424,7 +1424,9 @@ describe("control API", () => {
 
       const first = await app.inject({ method: "GET", url: "/api/borg/status", headers: { cookie } });
       expect(first.statusCode).toBe(200);
-      expect(["measuring", "fresh"]).toContain(first.json().state);
+      // "antwortet sofort": die Messung laeuft noch, also "measuring" - nicht
+      // "fresh". Eine Liste ["measuring","fresh"] liesse eine wartende Route durch.
+      expect(first.json().state).toBe("measuring");
 
       await new Promise((resolve) => setTimeout(resolve, 20));
       const second = await app.inject({ method: "GET", url: "/api/borg/status", headers: { cookie } });

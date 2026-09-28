@@ -288,9 +288,12 @@ describe("createBorgStatusService", () => {
     clock += 5000;
     expect(service.view().state).toBe("stale");
     const background = await service.measure({ waitMs: 0 });
-    // Der alte Stand bleibt sichtbar, während im Hintergrund gemessen wird.
-    expect(["stale", "fresh"]).toContain(background.state);
-    expect(reads).toBeGreaterThanOrEqual(1);
+    // Der alte Stand bleibt sichtbar, während im Hintergrund gemessen wird — und
+    // der Aufruf kehrt zurück, bevor die Messung fertig ist: "stale" mit laufender
+    // Messung, nicht "fresh". Eine Liste ["stale","fresh"] liesse den blockierenden
+    // Fall durch; die Anzahl der Läufe wird unten genau geprüft (2).
+    expect(background.state).toBe("stale");
+    expect(background.measuring).toBe(true);
     await new Promise((resolve) => setTimeout(resolve, 5));
     expect(reads).toBe(2);
     expect(service.view().state).toBe("fresh");
