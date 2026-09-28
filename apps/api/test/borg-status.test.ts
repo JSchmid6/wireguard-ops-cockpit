@@ -270,8 +270,10 @@ describe("createBorgStatusService", () => {
 
   it("erzwingt auf Wunsch eine neue Messung", async () => {
     let reads = 0;
-    const service = createBorgStatusService({ readReport: async () => { reads += 1; return VPS_BLOCK; } });
+    let clock = 0;
+    const service = createBorgStatusService({ readReport: async () => { reads += 1; return VPS_BLOCK; }, now: () => clock });
     await service.measure({ waitMs: 1000 });
+    clock += 60_000; // Mindestabstand abgewartet
     await service.measure({ waitMs: 1000, force: true });
     expect(reads).toBe(2);
   });
@@ -285,7 +287,7 @@ describe("createBorgStatusService", () => {
       ttlMs: 1000,
     });
     await service.measure({ waitMs: 1000 });
-    clock += 5000;
+    clock += 61_000; // über TTL und Mindestabstand hinaus
     expect(service.view().state).toBe("stale");
     const background = await service.measure({ waitMs: 0 });
     // Der alte Stand bleibt sichtbar, während im Hintergrund gemessen wird.
@@ -353,17 +355,133 @@ describe("createBorgStatusService", () => {
 
   it("behält den letzten guten Stand sichtbar, wenn die neue Messung scheitert", async () => {
     let failNow = false;
+    let clock = 0;
     const service = createBorgStatusService({
       readReport: async () => {
         if (failNow) throw new Error("executor broker timed out");
         return VPS_BLOCK;
       },
+      now: () => clock,
     });
     await service.measure({ waitMs: 1000 });
     failNow = true;
+    clock += 60_000;
     const view = await service.measure({ waitMs: 1000, force: true });
     expect(view.state).toBe("fresh");
     expect(view.note).toContain("timed out");
     expect(view.borg?.lastRun.result).toBe("success");
+  });
+});
+
+describe("createBorgStatusService — Mindestabstand und Logzeile", () => {
+  function counted(clock: { now: number }, extra: { minIntervalMs?: number; fail?: boolean } = {}) {
+    const lines: string[] = [];
+    let reads = 0;
+    const service = createBorgStatusService({
+      readReport: async () => {
+        reads += 1;
+        if (extra.fail) throw new Error("executor broker timed out");
+        return VPS_BLOCK;
+      },
+      now: () => clock.now,
+      log: (line) => lines.push(line),
+      ...(extra.minIntervalMs === undefined ? {} : { minIntervalMs: extra.minIntervalMs }),
+    });
+    return { service, lines, reads: () => reads };
+  }
+
+  it("misst mit force innerhalb von 60 s nicht erneut und liefert den letzten Stand", async () => {
+    const clock = { now: 1_000_000 };
+    const { service, lines, reads } = counted(clock);
+    await service.measure({ waitMs: 1000, force: true });
+    clock.now += 59_999;
+    const view = await service.measure({ waitMs: 1000, force: true });
+    expect(reads()).toBe(1);
+    expect(view.state).toBe("fresh");
+    expect(view.measuredAt).toBe(new Date(1_000_000).toISOString());
+    expect(view.measuring).toBe(false);
+    expect(lines).toHaveLength(1);
+  });
+
+  it("misst nach 60 s wieder und schreibt je gestarteter Messung genau eine Zeile", async () => {
+    const clock = { now: Date.parse("2026-09-28T12:00:00.000Z") };
+    const { service, lines, reads } = counted(clock);
+    await service.measure({ waitMs: 1000, force: true });
+    clock.now += 10_000;
+    await service.measure({ waitMs: 1000, force: true }); // gedrosselt: keine Zeile
+    clock.now += 50_000;
+    await service.measure({ waitMs: 1000, force: true });
+    expect(reads()).toBe(2);
+    expect(lines).toEqual([
+      "borg-status: Messung gestartet (refresh) 2026-09-28T12:00:00.000Z",
+      "borg-status: Messung gestartet (refresh) 2026-09-28T12:01:00.000Z",
+    ]);
+  });
+
+  it("nennt eine Messung aus abgelaufener Frische ttl und schreibt ohne Messung keine Zeile", async () => {
+    const clock = { now: Date.parse("2026-09-28T12:00:00.000Z") };
+    const { service, lines, reads } = counted(clock);
+    await service.measure({ waitMs: 1000 });
+    await service.measure({ waitMs: 1000 }); // frisch: keine Messung, keine Zeile
+    expect(reads()).toBe(1);
+    expect(lines).toEqual(["borg-status: Messung gestartet (ttl) 2026-09-28T12:00:00.000Z"]);
+  });
+
+  it("gibt bei laufender Messung dieselbe Zusage weiter und schreibt keine zweite Zeile", async () => {
+    const clock = { now: 0 };
+    const lines: string[] = [];
+    let reads = 0;
+    let release: (value: string) => void = () => undefined;
+    const service = createBorgStatusService({
+      readReport: () => { reads += 1; return new Promise<string>((resolve) => { release = resolve; }); },
+      now: () => clock.now,
+      log: (line) => lines.push(line),
+    });
+    const first = service.measure({ waitMs: 1000, force: true });
+    const second = service.measure({ waitMs: 1000, force: true });
+    release(VPS_BLOCK);
+    const [a, b] = await Promise.all([first, second]);
+    expect(reads).toBe(1);
+    expect(lines).toHaveLength(1);
+    expect(a.state).toBe("fresh");
+    expect(b.state).toBe("fresh");
+  });
+
+  it("lässt den Mindestabstand konfigurieren", async () => {
+    const clock = { now: 0 };
+    const { service, lines, reads } = counted(clock, { minIntervalMs: 1000 });
+    await service.measure({ waitMs: 1000, force: true });
+    clock.now += 1000;
+    await service.measure({ waitMs: 1000, force: true });
+    expect(reads()).toBe(2);
+    expect(lines).toHaveLength(2);
+  });
+
+  it("drosselt auch nach einer gescheiterten Messung", async () => {
+    const clock = { now: 0 };
+    const { service, lines, reads } = counted(clock, { fail: true });
+    const first = await service.measure({ waitMs: 1000, force: true });
+    expect(first.state).toBe("failed");
+    clock.now += 30_000;
+    const again = await service.measure({ waitMs: 1000, force: true });
+    expect(reads()).toBe(1);
+    expect(again.state).toBe("failed");
+    expect(lines).toHaveLength(1);
+    clock.now += 30_000;
+    await service.measure({ waitMs: 1000, force: true });
+    expect(reads()).toBe(2);
+  });
+
+  it("schreibt ohne Senke nichts auf stdout", async () => {
+    const service = createBorgStatusService({ readReport: async () => VPS_BLOCK });
+    const original = console.log;
+    const seen: unknown[] = [];
+    console.log = (...args: unknown[]) => { seen.push(args); };
+    try {
+      await service.measure({ waitMs: 1000, force: true });
+    } finally {
+      console.log = original;
+    }
+    expect(seen).toHaveLength(0);
   });
 });

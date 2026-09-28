@@ -259,6 +259,13 @@ export interface BorgStatusServiceOptions {
   ttlMs?: number;
   /** Obergrenze für das Warten in einer Anfrage. */
   maxWaitMs?: number;
+  /**
+   * Mindestabstand zwischen zwei Messbeginnen — auch `force` misst nicht öfter.
+   * Innerhalb des Abstands kommt der letzte Stand zurück.
+   */
+  minIntervalMs?: number;
+  /** Senke für eine Zeile je gestarteter Messung; Vorgabe: keine Ausgabe. */
+  log?: (line: string) => void;
 }
 
 export interface BorgStatusService {
@@ -269,6 +276,7 @@ export interface BorgStatusService {
 
 const DEFAULT_TTL_MS = 10 * 60 * 1000;
 const DEFAULT_MAX_WAIT_MS = 25_000;
+const DEFAULT_MIN_INTERVAL_MS = 60_000;
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => {
@@ -288,11 +296,16 @@ export function createBorgStatusService(options: BorgStatusServiceOptions): Borg
   const now = options.now ?? (() => Date.now());
   const ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
   const maxWaitMs = options.maxWaitMs ?? DEFAULT_MAX_WAIT_MS;
+  const minIntervalMs = options.minIntervalMs ?? DEFAULT_MIN_INTERVAL_MS;
+  const log = options.log ?? (() => undefined);
 
   let snapshot: BorgSnapshot | null = null;
   let measuredAt: number | null = null;
   let failure: string | null = null;
   let inFlight: Promise<void> | null = null;
+  // Beginn der letzten Messung, nicht ihr Ergebnis: auch eine gescheiterte oder
+  // langsame Messung sperrt die nächste für `minIntervalMs`.
+  let lastStartedAt: number | null = null;
 
   async function runMeasurement(): Promise<void> {
     try {
@@ -324,13 +337,20 @@ export function createBorgStatusService(options: BorgStatusServiceOptions): Borg
     }
   }
 
-  function startMeasurement(): Promise<void> {
+  function startMeasurement(trigger: "refresh" | "ttl"): Promise<void> {
     if (inFlight) return inFlight;
+    lastStartedAt = now();
+    // Eine Zeile je gestarteter Messung — ohne Pfade, Adressen oder Ausgabe.
+    log(`borg-status: Messung gestartet (${trigger}) ${new Date(lastStartedAt).toISOString()}`);
     const pending = runMeasurement().finally(() => {
       inFlight = null;
     });
     inFlight = pending;
     return pending;
+  }
+
+  function throttled(): boolean {
+    return lastStartedAt !== null && now() - lastStartedAt < minIntervalMs;
   }
 
   function isStale(): boolean {
@@ -355,8 +375,8 @@ export function createBorgStatusService(options: BorgStatusServiceOptions): Borg
   }
 
   async function measure(opts: { waitMs?: number; force?: boolean } = {}): Promise<BorgStatusView> {
-    if (opts.force === true || isStale()) {
-      const pending = startMeasurement();
+    if ((opts.force === true || isStale()) && (inFlight !== null || !throttled())) {
+      const pending = startMeasurement(opts.force === true ? "refresh" : "ttl");
       const waitMs = Math.min(Math.max(opts.waitMs ?? 0, 0), maxWaitMs);
       if (waitMs > 0) await Promise.race([pending, delay(waitMs)]);
     }

@@ -48,13 +48,15 @@ async function createTestApp(
     bootstrapUsers?: Array<{ username: string; password: string; role?: "admin" | "automation" }>;
     safetyReviewRunner?: SafetyReviewRunner;
     borgStatusReader?: () => Promise<string>;
+    borgStatusLog?: (line: string) => void;
   } = {}
 ): Promise<TestApp> {
   const app = await createApp({
     config: buildConfig(overrides),
     bootstrapUsers: options.bootstrapUsers,
     safetyReviewRunner: options.safetyReviewRunner,
-    borgStatusReader: options.borgStatusReader
+    borgStatusReader: options.borgStatusReader,
+    borgStatusLog: options.borgStatusLog
   });
   openApps.push(app);
   return app;
@@ -1423,6 +1425,34 @@ describe("control API", () => {
       const second = await app.inject({ method: "GET", url: "/api/borg/status", headers: { cookie } });
       expect(second.json().state).toBe("fresh");
       expect(reads).toBe(1);
+    });
+
+    it("misst über refresh höchstens alle 60 s und schreibt je Messung eine Logzeile", async () => {
+      let reads = 0;
+      const lines: string[] = [];
+      const app = await createTestApp(openApps, {}, {
+        borgStatusReader: async () => { reads += 1; return borgReport; },
+        borgStatusLog: (line) => lines.push(line),
+      });
+      const cookie = await login(app);
+
+      const first = await app.inject({ method: "POST", url: "/api/borg/status/refresh", headers: { cookie } });
+      const second = await app.inject({ method: "POST", url: "/api/borg/status/refresh", headers: { cookie } });
+      expect(first.statusCode).toBe(200);
+      expect(second.statusCode).toBe(200);
+      expect(reads).toBe(1);
+      // Der gedrosselte Aufruf liefert den letzten Stand, keinen leeren.
+      expect(second.json().state).toBe("fresh");
+      expect(second.json().measuredAt).toBe(first.json().measuredAt);
+      expect(second.json().borg.host).toBe("vmd61162.contaboserver.net");
+
+      expect(lines).toHaveLength(1);
+      const [line] = lines;
+      expect(line).toMatch(/^borg-status: Messung gestartet \(refresh\) \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+      expect(line).not.toContain("/usr/local/sbin");
+      expect(line).not.toContain("/");
+      expect(line).not.toContain("10.0.0.5");
+      expect(line).not.toContain("passphrase");
     });
   });
 });
