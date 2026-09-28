@@ -101,7 +101,9 @@ ExecStartPre=/usr/bin/flock /run/lock/cockpit-borg.lock /bin/true
 länger dauert als gedacht, lässt das nächtliche `create` also **warten** statt
 scheitern. `borgmatic.service` ist `Type=oneshot` und hat damit keinen
 Start-Timeout — Warten kostet hier nichts; die Unit steht solange auf
-`activating`, und `status` zeigt den Wartenden als belegtes Repo.
+`activating`, und `status` zeigt den Wartenden als belegtes Repo. Dasselbe gilt
+für die kurzen Repo-Abfragen der Anzeige: `status` hält die Sperre für
+`list`/`info` ein paar Sekunden, ein genau dann startendes Backup wartet so lange.
 
 Eigenschaften des Riegels:
 
@@ -145,13 +147,31 @@ lassen sich nicht mehr wiederherstellen. Der Weg:
 Was `repair` **nicht** tut: den Repo-Schlüssel anfassen, Konfiguration ändern, den
 Timer abschalten oder Backups löschen, die noch lesbar sind.
 
-## status: bei belegtem Repo wird nicht abgefragt
+## status: bei belegtem Repo oder belegter Sperre wird nicht abgefragt
 
 Während Backup oder Wartung hält borg die Repo-Sperre. `borgmatic list/info`
 scheiterten dann und das Repo sähe „nicht erreichbar“ aus (rc=2), obwohl es nur
 belegt ist. `status` fragt darum **gar nicht** ab, sondern meldet
 `repo: belegt (Backup|check|repair läuft)` mit rc=0. `rc=2` („Repo nicht
 erreichbar“) heisst weiterhin genau das.
+
+Läuft nichts, nimmt `status` für seine Abfragen selbst die Sperre
+`/run/lock/cockpit-borg.lock` — **einmal** um `list` und `info`, frei gleich nach
+`info`. Die Anzeige misst alle 10 Minuten, solange jemand sie offen hat; ohne die
+Sperre könnte der nächtliche Timer genau dann starten und `create` an der
+Repo-Sperre von borg scheitern (borg wartet von selbst nur 1 s). Mit ihr wartet
+das Backup über das Drop-in die paar Sekunden ab.
+
+* Ist die Sperre nach 60 s nicht frei, fragt `status` nicht ab und meldet
+  `repo: belegt (Sperre /run/lock/cockpit-borg.lock nach 60 s nicht frei)`,
+  `repo_erreichbar: belegt (nicht abgefragt)`, rc=0.
+* Ist die Sperre gar nicht nehmbar (`flock` fehlt oder scheitert), endet `status`
+  mit rc=67 — ohne Sperre wird nicht abgefragt.
+* Das Warten läuft gegen das Zeitbudget der status-Unit (`RuntimeMaxSec=200`) und
+  bleibt gedeckelt: 60 s Warten, danach nur der kurze Belegt-Ausgang.
+* Umgekehrt weist `check`/`repair` (Riegel 1) mit rc=3 ab, solange eine
+  status-Abfrage die Sperre hält. Das Fenster ist Sekunden kurz und gewollt: beide
+  teilen dieselbe Sperre.
 
 ## Dateien
 
@@ -160,7 +180,7 @@ erreichbar“) heisst weiterhin genau das.
 | `/usr/local/sbin/cockpit-borg-action` | `deploy/helpers/cockpit-borg-action` | der einzige sudo-exponierte Einstieg; gepinnte Grammatik `status\|check\|repair` |
 | `/etc/sudoers.d/cockpit-executor` | `deploy/sudoers/cockpit-executor` | Zeile `cockpit-executor ALL=(root) NOPASSWD: /usr/local/sbin/cockpit-borg-action *` |
 | `/var/lib/wireguard-ops-cockpit/borg/last.unit`, `last.kind` | Laufzeit | zuletzt gestartete Wartungs-Unit und ihre Art, 0750 root — nur für die Anzeige; **der Laufzustand kommt aus systemd** (`systemctl is-active <unit>`) |
-| `/run/lock/cockpit-borg.lock` | Laufzeit | Sperre gegen zwei gleichzeitige Läufe auf demselben Repo |
+| `/run/lock/cockpit-borg.lock` | Laufzeit | Sperre gegen zwei gleichzeitige Läufe auf demselben Repo: `check`/`repair` halten sie für die Dauer des Laufs, die Repo-Abfragen von `status` kurz (ist sie nach 60 s nicht frei, meldet `status` „belegt“ mit rc=0); das nächtliche Backup wartet auf sie |
 | `/etc/systemd/system/borgmatic.service.d/cockpit-borg-lock.conf` | `deploy/systemd/borgmatic-cockpit-borg-lock.conf` | Drop-in: das nächtliche Backup wartet auf die Sperre, statt an ihr zu scheitern |
 | Journal der Unit | systemd | Fortschritt und Ergebnis jedes Laufs (`journalctl -u cockpit-borg-<verb>-<stamp>`); ein eigenes Logverzeichnis gibt es nicht mehr |
 
@@ -212,7 +232,7 @@ eines Auftrags. Read-only, mit Quelle und Zeitstempel je Wert:
 | Route | Wirkung |
 | --- | --- |
 | `GET /api/borg/status` | liefert den letzten gemessenen Stand; ist er älter als 10 Minuten, stösst die Route im Hintergrund eine neue Messung an und antwortet trotzdem sofort |
-| `POST /api/borg/status/refresh` | misst jetzt und wartet bis zu 25 s auf das Ergebnis |
+| `POST /api/borg/status/refresh` | misst jetzt und wartet bis zu 25 s auf das Ergebnis — höchstens eine Messung je 60 s seit dem letzten Messbeginn (auch eine gescheiterte zählt); innerhalb davon kommt sofort der letzte Stand zurück. Jede gestartete Messung schreibt genau eine Zeile ins API-Log (`borg-status: Messung gestartet (refresh\|ttl) <Zeit>`), ohne Pfade oder Adressen |
 
 Beide Routen verlangen eine Anmeldung (Operator-Sitzung oder ein Bearer-Token
 mit genau diesem Scope). `borg.status` ist lesend — es gibt dafür **keine**
