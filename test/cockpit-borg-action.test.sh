@@ -21,6 +21,13 @@
 #   * status bei unerreichbarem Repo (rc=2 durch die Unit hindurch),
 #   * status bei belegtem Repo: Backup oder Wartungs-Unit aktiv => keine
 #     list/info-Abfrage, "repo: belegt", rc=0 (Befund B4),
+#   * W1: das oneshot-Backup steht während des Laufs auf `activating` (bzw. beim
+#     Stoppen auf `deactivating`) und `systemctl is-active` gibt dafür rc=3 wie
+#     für `inactive` — der systemctl-Stub stellt genau das nach. status meldet
+#     dann `borgmatic_busy: ja` und "repo: belegt (Backup läuft, <Zustand>)" ohne
+#     list/info (rc=0); check UND repair werden mit rc=3 und dem Zustand im
+#     Grund abgewiesen, ohne systemd-run-Start; eine Wartungs-Unit im Zustand
+#     `deactivating` zählt ebenfalls als laufende Wartung,
 #   * N1: status nimmt für list/info die Repo-Sperre selbst — einmal um beide
 #     Abfragen (der borgmatic-Stub prüft bei jeder Abfrage, dass die Sperre
 #     gehalten ist, das nächtliche Backup also warten würde); ist sie belegt,
@@ -144,7 +151,9 @@ printf '%s\n' "# borgmatic — Klartext-Zugangsdaten" "PASSWORD=GEHEIM" > "$WORK
 # nennen statt eines erfundenen Erfolgs.
 : > "$WORK/borgmatic-here"
 # borgmatic.service gilt als aktiv, solange "$WORK/borgmatic-busy" existiert; die
-# Tests setzen die Datei dort, wo das nächtliche Backup laufen soll.
+# Tests setzen die Datei dort, wo das nächtliche Backup laufen soll. W1:
+# "$WORK/borgmatic-activating" bzw. "-deactivating" stellen den Zustand nach, den
+# echtes systemd für die oneshot-Unit meldet — Text `activating`, aber rc=3.
 FIXTURE_STATUS="$WORK/status.txt"
 cat > "$FIXTURE_STATUS" <<'EOF'
 DATE: 2026-09-27T23:09:42+02:00
@@ -289,11 +298,20 @@ case "\$cmd" in
     for a in "\$@"; do case "\$a" in --quiet|-q) quiet=1 ;; -*) ;; *) unit="\$a" ;; esac; done
     case "\$unit" in
       borgmatic.service)
-        if [ -e "$WORK/borgmatic-busy" ]; then state=active; rc=0; else state=inactive; rc=3; fi ;;
+        # W1: wie echtes systemd — nur `active` gibt rc=0; `activating` (oneshot
+        # während des ganzen Laufs) und `deactivating` geben rc=3 wie `inactive`.
+        if [ -e "$WORK/borgmatic-busy" ]; then state=active; rc=0
+        elif [ -e "$WORK/borgmatic-activating" ]; then state=activating; rc=3
+        elif [ -e "$WORK/borgmatic-deactivating" ]; then state=deactivating; rc=3
+        else state=inactive; rc=3; fi ;;
       borgmatic.timer)
         if [ -e "$WORK/timer-off" ]; then state=inactive; rc=3; else state=active; rc=0; fi ;;
       *)
-        if [ -f "\$UNITDIR/\${unit%.service}.rc" ]; then
+        if [ -f "\$UNITDIR/\${unit%.service}.state" ]; then
+          # W1: fester Zustand einer Wartungs-Unit; rc=0 nur für active.
+          state="\$(cat "\$UNITDIR/\${unit%.service}.state")"
+          [ "\$state" = active ] && rc=0 || rc=3
+        elif [ -f "\$UNITDIR/\${unit%.service}.rc" ]; then
           [ "\$(cat "\$UNITDIR/\${unit%.service}.rc")" = 0 ] && state=inactive || state=failed
           rc=3
         else
@@ -482,7 +500,7 @@ echo "== B4: status bei belegtem Repo (Backup läuft) =="
 : > "$WORK/borgmatic.log"
 run_helper status
 assert_rc "status bleibt rc=0, wenn nur das Backup läuft" 0
-assert_out "Repo als belegt gemeldet" "repo: belegt (Backup läuft)"
+assert_out "Repo als belegt gemeldet" "repo: belegt (Backup läuft, active)"
 assert_out "Zusammenfassung nennt belegt" "repo_erreichbar: belegt (nicht abgefragt)"
 assert_out "Backup aktiv gemeldet" "borgmatic_busy: ja"
 if grep -qE "list --last 5|info --last 1" "$WORK/borgmatic.log"; then
@@ -491,6 +509,25 @@ else
   ok "status überspringt list/info während des Backups"
 fi
 rm -f "$WORK/borgmatic-busy"
+
+# W1: borgmatic.service ist Type=oneshot und steht während des Backups auf
+# `activating` (rc=3). status muss das als belegt lesen, nicht als "läuft nicht".
+for w1_state in activating deactivating; do
+  echo "== W1: status bei Backup im Zustand $w1_state =="
+  : > "$WORK/borgmatic-$w1_state"
+  : > "$WORK/borgmatic.log"
+  run_helper status
+  assert_rc "W1: status bleibt rc=0 bei $w1_state" 0
+  assert_out "W1: Backup $w1_state gilt als belegt" "borgmatic_busy: ja"
+  assert_out "W1: Repo als belegt gemeldet, Zustand genannt ($w1_state)" "repo: belegt (Backup läuft, $w1_state)"
+  assert_out "W1: Zusammenfassung nennt belegt ($w1_state)" "repo_erreichbar: belegt (nicht abgefragt)"
+  if grep -qE "list --last 5|info --last 1" "$WORK/borgmatic.log"; then
+    bad "W1: status hat das Repo bei $w1_state abgefragt: $(cat "$WORK/borgmatic.log")"
+  else
+    ok "W1: status überspringt list/info bei $w1_state"
+  fi
+  rm -f "$WORK/borgmatic-$w1_state"
+done
 
 echo "== N1: status hält die Repo-Sperre während list/info =="
 : > "$WORK/borgmatic.log"; : > "$WORK/lock-probe.log"
@@ -613,7 +650,7 @@ wait_for_file "$WORK/repo/data/check.run" && sleep 0.3
 run_helper status
 assert_rc "status bleibt rc=0, wenn nur die Wartung läuft" 0
 assert_out "laufende Wartung mit Unit und Art" "läuft: ja (Unit $HOLD_UNIT, Art check)"
-assert_out "Repo als belegt gemeldet" "repo: belegt (check läuft)"
+assert_out "Repo als belegt gemeldet" "repo: belegt (check läuft, active)"
 assert_out "Wartung in der Zusammenfassung" "wartung_laeuft: ja"
 assert_out "Unit in der Zusammenfassung" "wartung_unit: $HOLD_UNIT"
 assert_out "Journal der laufenden Unit" "Unit $HOLD_UNIT: borgmatic --verbosity 1 check --force"
@@ -672,7 +709,41 @@ echo "== Ablehnungen (rc=3) =="
 run_helper check
 assert_rc "check während borgmatic läuft wird abgewiesen" 3
 assert_err "Grund genannt" "nächtliches Backup"
+assert_err "Zustand genannt" "Backup läuft (active)"
 rm -f "$WORK/borgmatic-busy"
+
+# W1: dieselbe Ablehnung, wenn das oneshot-Backup auf `activating` bzw.
+# `deactivating` steht (rc=3 von is-active) — und KEIN systemd-run-Start.
+for w1_state in activating deactivating; do
+  : > "$WORK/borgmatic-$w1_state"
+  for w1_verb in check repair; do
+    : > "$WORK/systemd-run.log"
+    run_helper "$w1_verb"
+    assert_rc "W1: $w1_verb bei Backup $w1_state wird abgewiesen" 3
+    assert_err "W1: $w1_verb nennt den Zustand ($w1_state)" "Backup läuft ($w1_state)"
+    if [ -s "$WORK/systemd-run.log" ]; then
+      bad "W1: $w1_verb bei $w1_state hat trotzdem eine Unit gestartet: $(cat "$WORK/systemd-run.log")"
+    else
+      ok "W1: $w1_verb bei $w1_state startet keine Unit"
+    fi
+  done
+  rm -f "$WORK/borgmatic-$w1_state"
+done
+
+# W1: eine Wartungs-Unit, die gerade gestoppt wird (`deactivating`, rc=3),
+# hält die Repo-Sperre noch — auch sie zählt als laufende Wartung.
+W1_UNIT="$PREFIX-check-20260928T000000Z"
+W1_LAST_UNIT="$(cat "$WORK/state/last.unit" 2>/dev/null || true)"
+W1_LAST_KIND="$(cat "$WORK/state/last.kind" 2>/dev/null || true)"
+printf '%s\n' "$W1_UNIT" > "$WORK/state/last.unit"; printf 'check\n' > "$WORK/state/last.kind"
+printf 'deactivating\n' > "$WORK/units/$W1_UNIT.state"
+: > "$WORK/systemd-run.log"
+run_helper check
+assert_rc "W1: check bei Wartungs-Unit im Zustand deactivating wird abgewiesen" 3
+assert_err "W1: Grund nennt Unit und Zustand" "es läuft bereits eine Wartung: Unit $W1_UNIT (check, deactivating)"
+if [ -s "$WORK/systemd-run.log" ]; then bad "W1: trotzdem gestartet"; else ok "W1: keine neue Unit neben der stoppenden"; fi
+rm -f "$WORK/units/$W1_UNIT.state"
+printf '%s\n' "$W1_LAST_UNIT" > "$WORK/state/last.unit"; printf '%s\n' "$W1_LAST_KIND" > "$WORK/state/last.kind"
 
 exec 9>>"$WORK/borg.lock"
 flock -n 9 && ok "Sperre im Harness gehalten" || bad "Sperre nicht haltbar"

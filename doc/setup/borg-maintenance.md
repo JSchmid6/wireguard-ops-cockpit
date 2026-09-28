@@ -62,6 +62,18 @@ gestartete Unit; `--collect` räumt jede Unit nach ihrem Ende ab.
    ist, `borgmatic.service` läuft (nächtliches Backup) oder die Sperrdatei
    `/run/lock/cockpit-borg.lock` belegt ist. Der gestartete Lauf hält die Sperre
    selbst, solange er dauert; systemd räumt sie mit der Unit ab.
+
+   „Läuft“ heisst für jede dieser Units: Zustand `active`, **`activating`**,
+   `deactivating` oder `reloading`. Der Helfer liest dafür den Zustandstext von
+   `systemctl is-active <unit>`, nicht dessen Rückgabecode: `borgmatic.service` ist
+   `Type=oneshot` und steht während des **ganzen** Backups auf `activating` —
+   und `systemctl is-active --quiet` gibt dafür rc=3, dieselbe Zahl wie für
+   `inactive`. Nur nach dem Rückgabecode hielte der Helfer ein laufendes Backup
+   für beendet und startete einen `check` mitten hinein (Befund W1). Die
+   Wartungs-Units (`Type=exec`) stehen nur bis zum Start auf `activating`, beim
+   Stoppen aber auf `deactivating`, während borg noch die Repo-Sperre hält — sie
+   gehen deshalb über dieselbe Regel. Der Ablehnungsgrund nennt den Zustand,
+   z. B. `Backup läuft (activating)`.
 2. **Frist bis zum Timer (rc=3).** `check`/`repair` starten nicht, wenn der nächste
    `borgmatic.timer`-Lauf in weniger als 8 h ansteht. Die Zeit kommt aus
    `systemctl list-timers borgmatic.timer --output=json`: dort steht `next` in
@@ -152,7 +164,9 @@ Timer abschalten oder Backups löschen, die noch lesbar sind.
 Während Backup oder Wartung hält borg die Repo-Sperre. `borgmatic list/info`
 scheiterten dann und das Repo sähe „nicht erreichbar“ aus (rc=2), obwohl es nur
 belegt ist. `status` fragt darum **gar nicht** ab, sondern meldet
-`repo: belegt (Backup|check|repair läuft)` mit rc=0. `rc=2` („Repo nicht
+`repo: belegt (Backup|check|repair läuft, <Zustand>)` mit rc=0 — belegt nach
+derselben Regel wie Riegel 1, also auch bei `activating` (das oneshot-Backup
+während seines ganzen Laufs) und `deactivating`. `rc=2` („Repo nicht
 erreichbar“) heisst weiterhin genau das.
 
 Läuft nichts, nimmt `status` für seine Abfragen selbst die Sperre

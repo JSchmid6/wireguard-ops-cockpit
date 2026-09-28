@@ -51,7 +51,11 @@
 #     `status` ist eine kurze Abfrage und bleibt davon unberührt.
 #   * Kein zweiter Lauf gleichzeitig: eine aktive borg-Wartungs-Unit, ein
 #     laufendes borgmatic.service und die Sperrdatei werden vorher geprüft; der
-#     Lauf hält die Sperre selbst, solange er dauert.
+#     Lauf hält die Sperre selbst, solange er dauert. "Läuft" heisst für jede
+#     Unit: Zustand active, activating, deactivating oder reloading (unit_busy).
+#     borgmatic.service ist Type=oneshot und steht das ganze Backup über auf
+#     `activating` — `systemctl is-active --quiet` gibt dafür rc=3 wie für
+#     `inactive` und darf deshalb nie allein entscheiden (Befund W1).
 #   * `check` läuft mit --force: borgmatic überspringt Checks, die innerhalb der
 #     konfigurierten Frequenz liegen ("Skipping archives check due to configured
 #     frequency") — ohne --force wäre der Lauf ein No-op, der wie ein grüner
@@ -182,12 +186,35 @@ maintenance_unit_candidates() { # jede Unit, die eine Wartung sein könnte
     | awk 'NF { print $1 }' || true
 }
 
+unit_busy() { # unit_busy <unit>: Zustand auf stdout und rc=0, wenn die Unit belegt ist
+  # Belegt heisst: active, activating, deactivating oder reloading. Gelesen wird
+  # der Zustandstext, NIE nur der Rückgabecode: `systemctl is-active` liefert rc=0
+  # allein für `active`, für `activating` aber rc=3 — dieselbe Zahl wie für
+  # `inactive`. borgmatic.service ist `Type=oneshot` und steht während des GANZEN
+  # Backups auf `activating` (auch solange es im ExecStartPre des Drop-ins auf die
+  # Sperre wartet); `is-active --quiet` hielte es für nicht laufend (Befund W1).
+  local state
+  have systemctl || return 1
+  state="$(systemctl is-active "$1" 2>/dev/null || true)"
+  state="${state%%$'\n'*}"
+  case "$state" in
+    active|activating|deactivating|reloading) printf '%s' "$state"; return 0 ;;
+  esac
+  return 1
+}
+
 active_maintenance_unit() { # erste aktive Wartungs-Unit auf stdout, rc=1 wenn keine
+  # Die Wartungs-Units sind `systemd-run --property=Type=exec`: sie stehen nur bis
+  # zum exec() auf `activating` und laufen danach als `active` — `is-active
+  # --quiet` wäre hier fast immer richtig. Sie gehen trotzdem über unit_busy:
+  # eine Unit, die gestoppt wird (RuntimeMaxSec, `systemctl stop`), steht auf
+  # `deactivating`, während borg noch abbricht und die Repo-Sperre hält. Eine
+  # Regel für beide Arten von Unit, keine zweite Sonderregel.
   local unit
   have systemctl || return 1
   while read -r unit; do
     [ -n "$unit" ] || continue
-    if systemctl is-active --quiet "$unit" 2>/dev/null; then
+    if unit_busy "$unit" >/dev/null; then
       printf '%s' "${unit%.service}"
       return 0
     fi
@@ -215,9 +242,8 @@ lock_held() { # hält irgendwer die Sperrdatei?
   return 0
 }
 
-borgmatic_busy() {
-  have systemctl || return 1
-  systemctl is-active --quiet "$BORG_ACTION_SERVICE" 2>/dev/null
+borgmatic_busy() { # Zustand des Backups auf stdout, rc=0 solange es belegt ist
+  unit_busy "$BORG_ACTION_SERVICE"
 }
 
 # ---------------------------------------------------------------------------
@@ -264,13 +290,13 @@ guard_timer_headroom() {
 }
 
 guard_no_run() {
-  local unit
+  local unit state
   have flock || die "flock fehlt auf diesem Host — ohne die Sperre gäbe es keinen Schutz gegen einen zweiten Lauf auf demselben Repo." 67
   if unit="$(active_maintenance_unit)"; then
-    die "es läuft bereits eine Wartung: Unit $unit ($(unit_kind "$unit")). Fortschritt mit 'status' oder 'journalctl -u $unit' ansehen." 3
+    die "es läuft bereits eine Wartung: Unit $unit ($(unit_kind "$unit"), $(unit_busy "$unit" || printf '?')). Fortschritt mit 'status' oder 'journalctl -u $unit' ansehen." 3
   fi
-  if borgmatic_busy; then
-    die "$BORG_ACTION_SERVICE ist gerade aktiv (nächtliches Backup). Kein zweiter Lauf auf demselben Repo." 3
+  if state="$(borgmatic_busy)"; then
+    die "Backup läuft ($state): $BORG_ACTION_SERVICE (nächtliches Backup) hält das Repo. Kein zweiter Lauf auf demselben Repo." 3
   fi
   if lock_held; then
     die "$BORG_ACTION_LOCK ist belegt — ein anderer Lauf hält das Repo (nicht als borg-Unit, z. B. von Hand gestartet)." 3
@@ -357,12 +383,15 @@ status_borgmatic() {
   # B4: Ein laufendes Backup oder eine Wartung hält die Repo-Sperre. `list` und
   # `info` scheiterten dann und das Repo sähe "nicht erreichbar" aus (rc=2),
   # obwohl es nur belegt ist. Deshalb hier NICHT abfragen, sondern melden.
-  local busy=""
-  if unit="$(active_maintenance_unit)"; then busy="$(unit_kind "$unit")"; fi
-  if [ -z "$busy" ] && borgmatic_busy; then busy="Backup"; fi
+  # Belegt zählt nach unit_busy: auch `activating` (oneshot-Backup, Befund W1).
+  local busy="" busy_state=""
+  if unit="$(active_maintenance_unit)"; then
+    busy="$(unit_kind "$unit")"; busy_state="$(unit_busy "$unit" || printf '?')"
+  fi
+  if [ -z "$busy" ] && busy_state="$(borgmatic_busy)"; then busy="Backup"; fi
   if [ -n "$busy" ]; then
     section "VPS: Repo — nicht abgefragt"
-    printf 'repo: belegt (%s läuft)\n' "$busy"
+    printf 'repo: belegt (%s läuft, %s)\n' "$busy" "$busy_state"
     printf '%s\n' "borg hält gerade die Repo-Sperre; list/info würden sie nur sehen und das Repo fälschlich als nicht erreichbar melden. Nach dem Lauf erneut fragen."
     REPO_REACHABLE="belegt (nicht abgefragt)"
   else
@@ -550,7 +579,7 @@ run_status() {
   if unit="$(active_maintenance_unit)"; then running="ja"; else unit="-"; fi
   section "ZUSAMMENFASSUNG"
   printf 'repo_erreichbar: %s\n' "$REPO_REACHABLE"
-  printf 'borgmatic_busy: %s\n' "$(borgmatic_busy && printf ja || printf nein)"
+  printf 'borgmatic_busy: %s\n' "$(borgmatic_busy >/dev/null && printf ja || printf nein)"
   printf 'wartung_laeuft: %s\n' "$running"
   printf 'wartung_unit: %s\n' "$unit"
   # Der maschinenlesbare Block steht immer am Ende: die Cockpit-Anzeige liest nur
