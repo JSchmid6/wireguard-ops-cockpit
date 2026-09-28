@@ -6,6 +6,7 @@ import { DIENSTE_REVIEW_INSTRUCTIONS, UPDATE_REVIEW_INSTRUCTIONS } from "../src/
 import {
   applyUpdateReviewPolicy,
   buildUpdateReviewPrompt,
+  materialOrder,
   normalizeUpdateBindings,
   parseUpdateDiff,
   parseUpdateReviewAnswer,
@@ -159,6 +160,52 @@ describe("self-update pre-install review", () => {
     const { prompt } = buildUpdateReviewPrompt([diff({ files: [diff().files[0], ...files], filesTotal: 401 })], { nonce: NONCE });
     expect(prompt).toContain("M apps/api/src/hermes-security.ts (+1 -1) [focus-hunks]");
     expect(prompt).toMatch(/\.\.\. \d+ more changed file\(s\) outside the focus areas/);
+  });
+
+  it("put the deploy material in front of tests and docs, so it survives the budget", () => {
+    const deploy = section("deploy/vps/vps-cockpit-deploy.sh", ["@@ -1,3 +1,4 @@", " set -euo pipefail", "+install -m 0755 deploy/helpers/cockpit-borg-action /usr/local/sbin/", " borgmatic install"]);
+    const tests = section("apps/api/test/app.test.ts", ["@@ -1,300 +1,300 @@", ...Array.from({ length: 300 }, (_, index) => `+test ${index} ${"x".repeat(60)}`)]);
+    const docs = section("doc/setup/borg-maintenance.md", ["@@ -1 +1,2 @@", " borg ops", "+repair needs the operator"]);
+    // The runner orders by file class, so its excerpt puts the test file (class
+    // test) in front of deploy/vps (class other) — the shape of 28.09.2026, when
+    // vps-cockpit-deploy.sh fell out of the material although it runs as root.
+    const runnerOrder = diff({
+      files: [
+        { status: "M", path: "deploy/vps/vps-cockpit-deploy.sh", added: 1, deleted: 0, class: "other" },
+        { status: "M", path: "apps/api/test/app.test.ts", added: 300, deleted: 300, class: "test" },
+        { status: "M", path: "doc/setup/borg-maintenance.md", added: 1, deleted: 0, class: "other" },
+      ],
+      filesTotal: 3, focusAreas: [], excerpt: [tests, deploy, docs],
+    });
+    expect(materialOrder(runnerOrder.excerpt).map((item) => item.path))
+      .toEqual(["deploy/vps/vps-cockpit-deploy.sh", "apps/api/test/app.test.ts", "doc/setup/borg-maintenance.md"]);
+    const { prompt, coverage } = buildUpdateReviewPrompt([runnerOrder], { nonce: NONCE, limit: 15_000 });
+    // The deploy script is in the material up to its last line; the big test file
+    // took the rest of the budget and is named as cut.
+    expect(prompt).toContain("+install -m 0755 deploy/helpers/cockpit-borg-action /usr/local/sbin/");
+    expect(prompt).toContain("+test 0 ");
+    expect(prompt).not.toContain("+test 299 ");
+    expect(coverage[0].cut).toContain("apps/api/test/app.test.ts");
+    expect(coverage[0].omitted).toContain("doc/setup/borg-maintenance.md");
+    expect(prompt).toContain("Cut: apps/api/test/app.test.ts");
+    expect(prompt).toContain("Left out: doc/setup/borg-maintenance.md");
+    // Deploy material is not a focus area: naming it never stops the update by itself.
+    expect(coverage[0].incomplete).toEqual([]);
+  });
+
+  it("names deploy material the runner never excerpted", () => {
+    const { prompt, coverage } = buildUpdateReviewPrompt([diff({
+      files: [
+        { status: "M", path: "deploy/vps/vps-cockpit-deploy.sh", added: 10, deleted: 3, class: "other" },
+        ...diff().files,
+      ],
+      filesTotal: 3,
+    })], { nonce: NONCE });
+    expect(coverage[0].omitted).toContain("deploy/vps/vps-cockpit-deploy.sh");
+    expect(coverage[0].incomplete).toEqual([]);
+    expect(prompt).toContain("Left out: deploy/vps/vps-cockpit-deploy.sh");
+    const policy = applyUpdateReviewPolicy(readyPolicy, outcome({ coverage, answer: parseUpdateReviewAnswer("VERDICT: approve") }));
+    expect(policy).toMatchObject({ allowed: true, status: "ready" });
   });
 
   it("parses approve, flag and garbage deterministically", () => {
