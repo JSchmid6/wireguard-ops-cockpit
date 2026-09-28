@@ -1,7 +1,35 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, configure, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
+
+// Der RTL-Standard von 1000 ms fuer asynchrone Zusicherungen reicht auf dieser
+// Maschine unter Last nicht: `findByText("Open terminal bridge")` laeuft in den
+// Timeout, sobald die beiden Runden der App — erst das Dashboard (/api/me,
+// /api/sessions, /api/runbooks, ...), danach das Sitzungsdetail
+// (/api/sessions/<id>) — nicht in einer Sekunde durch sind. Die Sonden messen
+// dafuer 681-1500 ms bis zum Dashboard und weitere 284-2209 ms bis zum
+// Sitzungsdetail, zusammen 1,3-2,9 s (load 4-14 auf 8 vCPU). 5 s liegen ueber
+// dieser Streuung und bleiben unter dem `testTimeout` aus vite.config.ts. Die
+// Zusicherungen selbst bleiben unveraendert — eine echte Haengung faellt weiter
+// auf, nur spaeter.
+configure({ asyncUtilTimeout: 5000 });
+
+// Die App sperrt waehrend jeder laufenden Anfrage ALLE Knoepfe (`busy`). Ein
+// Klick auf einen gesperrten Knopf geht still verloren — userEvent wirft nicht,
+// der Handler feuert nicht (Mechanik-Sonde) — und der Test wartet danach
+// vergeblich auf die Wirkung. Nach dem Signal, auf das der Test wartet, bleibt
+// der Knopf gemessen 715-810 ms gesperrt, waehrend zwischen zwei Klicks des
+// Durchlaufs nur ~1,0-2,4 s liegen. Deshalb erst auf den bedienbaren Knopf
+// warten, dann klicken.
+async function clickWhenReady(user: ReturnType<typeof userEvent.setup>, name: string, index = 0) {
+  let knopf: HTMLButtonElement | undefined;
+  await waitFor(() => {
+    knopf = screen.getAllByRole("button", { name })[index] as HTMLButtonElement | undefined;
+    expect(knopf?.disabled).toBe(false);
+  });
+  await user.click(knopf as HTMLButtonElement);
+}
 
 function makeSession(id: string, name: string) {
   return {
@@ -836,6 +864,12 @@ describe("App", () => {
     expect(screen.getByText(/approval required · supervision session-observed · authority advisory-only/)).toBeTruthy();
   });
 
+  // Der Durchlauf faehrt die ganze Reise (Sitzung, Zeitplan, Runbook, Agent,
+  // Freigabe, Checkpoint, Abmelden) durch jsdom: auf dieser Maschine unter Last
+  // gemessen 22,4 s (acht parallel laufende Container auf 8 vCPU), in CI laut
+  // dem Kommentar am `testTimeout` in vite.config.ts 3,2-5,2 s. Das eigene
+  // Zeitbudget von 60 s (2,7x des gemessenen Worst Case) gilt nur fuer diesen
+  // einen Test; eine echte Haengung faellt weiter auf.
   it("handles session creation, runbook execution, approvals, agent launch and logout", async () => {
     const { fetchMock } = makeServer(true);
     const user = userEvent.setup();
@@ -848,12 +882,12 @@ describe("App", () => {
     const initialCallCount = fetchMock.mock.calls.length;
     await user.clear(sessionInput);
     await user.type(sessionInput, "   ");
-    await user.click(screen.getByRole("button", { name: "Create or resume" }));
+    await clickWhenReady(user, "Create or resume");
     expect(fetchMock.mock.calls.length).toBe(initialCallCount);
 
     await user.clear(sessionInput);
     await user.type(sessionInput, "nightly-maintenance");
-    await user.click(screen.getByRole("button", { name: "Create or resume" }));
+    await clickWhenReady(user, "Create or resume");
 
     await waitFor(() => {
       expect(
@@ -877,7 +911,7 @@ describe("App", () => {
     await user.clear(screen.getByLabelText("Time UTC"));
     await user.type(screen.getByLabelText("Time UTC"), "07:30");
     await user.selectOptions(screen.getByLabelText("Mode"), "scheduled-auto");
-    await user.click(screen.getByRole("button", { name: "Create weekly schedule" }));
+    await clickWhenReady(user, "Create weekly schedule");
 
     await waitFor(() => {
       expect(
@@ -890,7 +924,7 @@ describe("App", () => {
       ).toBe(true);
     });
 
-    await user.click(screen.getAllByRole("button", { name: "Activate" })[0]);
+    await clickWhenReady(user, "Activate");
     await waitFor(() => {
       expect(
         fetchMock.mock.calls.some(
@@ -900,7 +934,7 @@ describe("App", () => {
       ).toBe(true);
     });
 
-    await user.click(screen.getByRole("button", { name: "Plan and execute" }));
+    await clickWhenReady(user, "Plan and execute");
     await waitFor(() => {
       expect(
         fetchMock.mock.calls.some(
@@ -915,7 +949,7 @@ describe("App", () => {
     const promptInput = screen.getByLabelText("Prompt");
     await user.clear(promptInput);
     await user.type(promptInput, "Investigate recent job history.");
-    await user.click(screen.getByRole("button", { name: "Plan and launch in selected session" }));
+    await clickWhenReady(user, "Plan and launch in selected session");
     await waitFor(() => {
       expect(
         fetchMock.mock.calls.some(
@@ -928,7 +962,7 @@ describe("App", () => {
     expect(await screen.findByText(/Agent launched\./)).toBeTruthy();
     expect(screen.getByText(/agent · executed · moderate/)).toBeTruthy();
 
-    await user.click(screen.getByRole("button", { name: "Request supervised launch in selected session" }));
+    await clickWhenReady(user, "Request supervised launch in selected session");
     await waitFor(() => {
       expect(
         fetchMock.mock.calls.some(
@@ -940,18 +974,17 @@ describe("App", () => {
     });
     expect(await screen.findByText(/agent · pending_approval · high/)).toBeTruthy();
 
-    await user.click(screen.getAllByRole("button", { name: "Approve" })[0]);
+    await clickWhenReady(user, "Approve");
     expect((await screen.findAllByText(/Checkpoint contract/)).length).toBeGreaterThan(0);
-    const checkpointButtons = await screen.findAllByRole("button", { name: "Mark checkpoint reviewed" });
-    await user.click(checkpointButtons[0]);
+    await clickWhenReady(user, "Mark checkpoint reviewed");
     expect(await screen.findByText(/waiting at checkpoint Choose the next bounded follow-up/i)).toBeTruthy();
 
-    await user.click((await screen.findAllByRole("button", { name: "Approve" }))[0]);
+    await clickWhenReady(user, "Approve");
     expect(await screen.findByText("No pending approvals.")).toBeTruthy();
 
-    await user.click(screen.getByRole("button", { name: "Sign out" }));
+    await clickWhenReady(user, "Sign out");
     expect(await screen.findByRole("button", { name: "Sign in" })).toBeTruthy();
-  });
+  }, 60000);
 
   it("zeigt den Borg-Zustand mit Quelle und Zeitstempel je Wert", async () => {
     makeServer(true);
