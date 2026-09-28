@@ -182,9 +182,10 @@ oder zu wenig Frist bis zum Timer · `64` Aufruffehler · `67` falscher Host
   Unit selbst setzt — und `sudo` lässt ohne SETENV keine Umgebung durch.
 * Kein Runtime-Sudo: die Zeile steht in der versionierten, vom Deploy geprüften
   sudoers-Datei; die API kann sich keine Rechte bauen.
-* Kein tmux-Runbook für borg: Runbook-Sitzungen laufen als `wgops`, der
-  Repo-Schlüssel gehört root. Der lesende Weg ist die typisierte Aktion, nicht
-  eine Shell-Sitzung.
+* Kein tmux-Runbook für den **Wartungsteil**: Runbook-Sitzungen laufen als
+  `wgops`, der Repo-Schlüssel gehört root. `check` und `repair` sind darum
+  ausschliesslich typisierte Aktionen. Der Katalog-Eintrag `borg-status` ist die
+  Ausnahme — und zwar nur für das Lesen (siehe unten).
 
 ## Zustand der Kiste (Baustein „Sichtbarkeit“)
 
@@ -198,3 +199,58 @@ oder zu wenig Frist bis zum Timer · `64` Aufruffehler · `67` falscher Host
   Grösse, Anzahl Datensegmente und das jüngste Segment. Ein nicht erreichbares
   Repo meldet `status` mit rc=2 und `repo_erreichbar: nein`, damit der Job als
   Befund endet und nicht als „alles gut“.
+
+## Katalog-Einstieg: `borg-status` (lesend, unprivilegiert)
+
+Der Borg-Betrieb soll im Katalog der Oberfläche sichtbar und anwählbar sein —
+ohne dass dafür eine neue Rechte-Regel nötig wird. Das ist dieses Runbook:
+
+| Feld | Wert | Warum |
+| --- | --- | --- |
+| Runbook | `borg-status` („Borg backup state (read-only)“) | Einstieg in der Oberfläche |
+| Skript | `bin/borg-status.sh` | `bin/`-Skript wie die anderen Runbooks, kein Helfer |
+| Integration | `host-tmux` | läuft in der Runbook-Sitzung — als `wgops` |
+| `requiresApproval` | `true` | die Borg-Familie bleibt hinter einer Freigabe, auch lesend |
+| `privilegedHelperRequested` | `false` | es wird **kein** privilegierter Helfer angefordert: kein `sudo`, kein `cockpit-borg-action`, kein Verb |
+| `scriptIds` | `script-borg-status` | Anzeige im Katalog unter den Skripten |
+
+Was es zeigt: Statusdatei der Kiste, Zustand und nächster Lauf des
+`borgmatic.timer`, die letzten Journalzeilen von `borgmatic.service` — und einen
+Hinweis, wo die vollständige Sicht herkommt. Was es **nicht** zeigt: die
+Kennzahlen des Repos (Archivliste, Grösse, Integrität). Dafür braucht es den
+Schlüssel, also `borg.status` über den Executor.
+
+Warum nicht `sudo -n /usr/local/sbin/cockpit-borg-action status` im Katalog?
+
+* Der Helfer ist root-only, die Runbook-Sitzung ist `wgops`. Ein solcher Eintrag
+  liefe erst, wenn `wgops` eine eigene sudo-Regel bekäme — das wäre eine neue
+  Rechte-Regel für eine reine Anzeige. Genau das soll die Sicherheitslinie
+  vermeiden („Rechte nur über die versionierte Datei, kein Runtime-Sudo“), und
+  die Kennzahlen des Repos gibt es ohne Freigabe über `borg.status`.
+* Die bestehende `wgops`-Datei im Repo (`deploy/sudoers/wireguard-ops-cockpit`)
+  wird von **keinem** Mechanismus installiert — sie steht weder in der Tabelle
+  von `deploy/vps/vps-cockpit-deploy.sh` noch in einem anderen Skript. Ein
+  `sudo -n`-Eintrag wäre auf dem VPS also ein toter Knopf, bis jemand zusätzlich
+  die Installation dieser Datei baut.
+
+Wenn der Operator den Helfer trotzdem im Katalog will, sind es zwei Schritte:
+`bin/borg-status.sh` ruft `sudo -n /usr/local/sbin/cockpit-borg-action status`
+auf, `privilegedHelperRequested` wird `true`, und die enge Regel
+`wgops ALL=(root) NOPASSWD: /usr/local/sbin/cockpit-borg-action status`
+(ohne `*`, damit `check`/`repair` unerreichbar bleiben) muss versioniert und vom
+Deploy installiert werden. Beides gehört in **einen** Schritt mit eigenem
+Review — der Shell-Weg zum Repair darf dabei nicht entstehen.
+
+## Rollback
+
+Jede Änderung an diesem Betrieb ist in einem Schritt zurücknehmbar:
+
+| Änderung | Rücknahme |
+| --- | --- |
+| Katalog-Eintrag `borg-status` (dieses Kapitel) | `git revert <commit>` und den Selbst-Update auf den vorherigen Stand bestellen — der Eintrag ist reine Software, es gibt keine Host-Datei und keine sudo-Regel zu entfernen. |
+| Helfer `/usr/local/sbin/cockpit-borg-action` | Rücknahme des Selbst-Updates auf den vorherigen Commit: `deploy/vps/vps-cockpit-deploy.sh` stellt Dateien und Units aus seinem eigenen Stand wieder her (Rückfallpfad im Skript, inklusive `visudo`-Prüfung der sudoers-Datei). |
+| Drop-in `borgmatic.service.d/cockpit-borg-lock.conf` | Der Rückfall des Skripts entfernt **nur** diese Datei und lässt andere Drop-ins liegen (`nach-gitlab-backup.conf`). |
+| Datenbank-/Jobzustand | Jobs und Freigaben liegen in `/var/lib/wireguard-ops-cockpit/cockpit.sqlite`; ein Katalog-Eintrag erzeugt dort nur bei Ausführung Spuren. |
+
+Ein Katalog-Eintrag startet nichts von selbst: er ist erst nach Freigabe und nur
+innerhalb einer Runbook-Sitzung wirksam.

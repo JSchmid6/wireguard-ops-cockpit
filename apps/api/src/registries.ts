@@ -109,6 +109,15 @@ export const SCRIPTS: ScriptDefinition[] = [
     privilegedHelperRequested: true,
     reviewStatus: "allowlisted",
     sourcePath: "bin/restart-nextcloud-web-stack.sh"
+  },
+  {
+    id: "script-borg-status",
+    name: "Borg state (read-only)",
+    summary: "Shows the Kiste's backup status file, the borgmatic timer, and the last journal lines. No privileged helper, no repository key, no check or repair.",
+    integration: "host-tmux",
+    privilegedHelperRequested: false,
+    reviewStatus: "allowlisted",
+    sourcePath: "bin/borg-status.sh"
   }
 ];
 
@@ -437,6 +446,39 @@ export const RUNBOOKS: RunbookDefinition[] = [
         id: "verify-service-health",
         label: "Verify service health",
         description: "Check that the restart restored the intended web service state before the session is closed.",
+        kind: "verify"
+      }
+    ]
+  },
+  {
+    id: "borg-status",
+    name: "Borg backup state (read-only)",
+    summary: "Catalog entry for the Borg backup: the Kiste's status file, the borgmatic timer, and the last journal lines. Repository metrics and check/repair stay on the typed, audited executor path (borg.status/borg.check/borg.repair) because they need root.",
+    requiresSession: true,
+    requiresApproval: true,
+    integration: "host-tmux",
+    privilegedHelperRequested: false,
+    reviewStatus: "allowlisted",
+    scriptIds: ["script-borg-status"],
+    workflowSteps: [
+      {
+        id: "confirm-read-only-scope",
+        label: "Confirm the read-only scope",
+        description: "This entry only reads: Kiste status file, timer state, journal. It never touches the repository key and never starts a check or repair.",
+        kind: "approval",
+        approvalHint: "Borg maintenance stays behind explicit approval, even for the read-only entry point."
+      },
+      {
+        id: "collect-borg-visibility",
+        label: "Collect Borg visibility",
+        description: "Run the read-only helper inside the selected session: Kiste status file, borgmatic timer state and next run, last journal lines.",
+        kind: "runbook",
+        runbookId: "borg-status"
+      },
+      {
+        id: "hand-off-to-typed-actions",
+        label: "Hand off to the typed borg actions",
+        description: "Repository metrics come from the typed action borg.status; a repository check from borg.check; a repair only from borg.repair after operator approval. There is no shell path to any of them.",
         kind: "verify"
       }
     ]
@@ -863,6 +905,13 @@ export function buildRunbookDispatch(
     "service-restart-request": {
       windowName: "web-restart",
       commandLine: `sudo -n ${shellQuote(path.resolve(repoRoot, "bin/restart-nextcloud-web-stack.sh"))}`
+    },
+    // Read-only Borg entry point. Deliberately WITHOUT `sudo -n`: the Borg
+    // maintenance verbs (check/repair) live behind the typed executor path and
+    // must never be reachable from a tmux runbook session, which runs as wgops.
+    "borg-status": {
+      windowName: "borg-status",
+      commandLine: `${shellQuote(path.resolve(repoRoot, "bin/borg-status.sh"))}`
     }
   };
 

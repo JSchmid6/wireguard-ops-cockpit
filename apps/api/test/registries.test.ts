@@ -242,6 +242,36 @@ describe("registries", () => {
     expect(rollbackDispatch.command.args[1]).toContain("nextcloud-rollback-restore.sh");
   });
 
+  it("registers a read-only borg catalogue entry without a shell path to check or repair", () => {
+    const runbook = findRunbook("borg-status");
+    expect(runbook).toMatchObject({
+      id: "borg-status",
+      requiresSession: true,
+      requiresApproval: true,
+      privilegedHelperRequested: false,
+      scriptIds: ["script-borg-status"]
+    });
+    expect(listScripts()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "script-borg-status",
+          reviewStatus: "allowlisted",
+          sourcePath: "bin/borg-status.sh"
+        })
+      ])
+    );
+
+    const dispatch = buildRunbookDispatch("/workspace/repo", runbook!);
+    expect(dispatch.windowName).toBe("borg-status");
+    expect(dispatch.command.executable).toBe("bash");
+    expect(dispatch.command.args[1]).toContain("bin/borg-status.sh");
+    // The borg maintenance verbs live behind the typed executor path. A tmux
+    // runbook session runs as wgops and must never ask for sudo or reach a verb.
+    expect(dispatch.command.args[1]).not.toContain("sudo -n");
+    expect(dispatch.command.args[1]).not.toMatch(/cockpit-borg-action/);
+    expect(dispatch.command.args[1]).not.toMatch(/\b(check|repair)\b/);
+  });
+
   it("builds a bounded OpenCode planner command", () => {
     const command = buildAgentCommand(
       "/workspace/repo",
