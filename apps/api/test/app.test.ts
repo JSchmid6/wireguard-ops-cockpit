@@ -47,12 +47,14 @@ async function createTestApp(
   options: {
     bootstrapUsers?: Array<{ username: string; password: string; role?: "admin" | "automation" }>;
     safetyReviewRunner?: SafetyReviewRunner;
+    borgStatusReader?: () => Promise<string>;
   } = {}
 ): Promise<TestApp> {
   const app = await createApp({
     config: buildConfig(overrides),
     bootstrapUsers: options.bootstrapUsers,
-    safetyReviewRunner: options.safetyReviewRunner
+    safetyReviewRunner: options.safetyReviewRunner,
+    borgStatusReader: options.borgStatusReader
   });
   openApps.push(app);
   return app;
@@ -1313,6 +1315,113 @@ describe("control API", () => {
       });
       expect(rejected.statusCode).toBe(200);
       expect(rejected.json().job.status).toBe("rejected");
+    });
+  });
+
+  // Der Zustandsbereich für Borg: read-only, über die typisierte Leseaktion
+  // `borg.status`. Die Tests schieben die Helfer-Ausgabe ein, damit die Route
+  // ohne Host prüfbar ist — gemessen wird im echten Betrieb.
+  describe("borg status", () => {
+    const borgReport = [
+      "cockpit-borg-action status — 2026-09-28T11:40:00+02:00",
+      "== DATEN (cockpit-borg-status/v1) ==",
+      "measured_at=2026-09-28T11:40:00+02:00",
+      "host=vmd61162.contaboserver.net",
+      "role=vps",
+      "timer_unit=borgmatic.timer",
+      "timer_active=active",
+      "timer_next=2026-09-29T23:53:08Z",
+      "last_run_start=2026-09-28T02:26:10+02:00",
+      "last_run_end=2026-09-28T02:56:06+02:00",
+      "last_run_result=success",
+      "last_run_exit=0",
+      "maintenance_running=no",
+      "maintenance_unit=cockpit-borg-check-20260921T034512Z",
+      "maintenance_kind=check",
+      "maintenance_rc=2",
+      "maintenance_end=2026-09-21T05:12:44+02:00",
+      "maintenance_source=unit-journal",
+      "scheduled_check=skipped",
+      "scheduled_check_at=2026-09-28T02:56:05+02:00",
+      "",
+    ].join("\n");
+
+    it("verlangt Anmeldung und gibt einem fremden Token keinen Einblick", async () => {
+      const dbPath = createTempDbPath(tempDirectories);
+      const app = await createTestApp(openApps, { dbPath }, {
+        bootstrapUsers: [{ username: "hermes-automation", password: "unusable-random-password", role: "automation" }],
+        borgStatusReader: async () => borgReport,
+      });
+
+      const anonymous = await app.inject({ method: "GET", url: "/api/borg/status" });
+      expect(anonymous.statusCode).toBe(401);
+
+      const database = new (await import("../src/db.js")).CockpitDatabase(dbPath);
+      database.initialize();
+      const automation = database.authenticateUser("hermes-automation", "unusable-random-password")!;
+      // Ohne den Scope dieser Route bleibt sie zu — die Anzeige ist kein
+      // Nebeneingang zum Backup-Betrieb.
+      const token = database.rotateApiToken(automation.id, "hermes", ["GET /api/runbooks"]);
+      database.close();
+
+      const forbidden = await app.inject({ method: "GET", url: "/api/borg/status", headers: { authorization: `Bearer ${token}` } });
+      expect(forbidden.statusCode).toBe(403);
+    });
+
+    it("zeigt letzter Lauf, Exit-Status und Check-Ergebnis samt Quelle", async () => {
+      const app = await createTestApp(openApps, {}, { borgStatusReader: async () => borgReport });
+      const cookie = await login(app);
+
+      const response = await app.inject({ method: "POST", url: "/api/borg/status/refresh", headers: { cookie } });
+      expect(response.statusCode).toBe(200);
+
+      const view = response.json();
+      expect(view.state).toBe("fresh");
+      expect(view.measuring).toBe(false);
+      expect(view.measuredAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+      expect(view.borg.host).toBe("vmd61162.contaboserver.net");
+      expect(view.borg.lastRun.end).toBe("2026-09-28T02:56:06+02:00");
+      expect(view.borg.lastRun.result).toBe("success");
+      expect(view.borg.lastRun.exitStatus).toBe(0);
+      expect(view.borg.lastRun.source).toContain("journalctl -u borgmatic");
+      expect(view.borg.check.state).toBe("failed");
+      expect(view.borg.check.rc).toBe(2);
+      expect(view.borg.check.at).toBe("2026-09-21T05:12:44+02:00");
+      expect(view.borg.check.source).toBe("journalctl -u cockpit-borg-check-20260921T034512Z");
+      // Der übersprungene Nachtcheck steht getrennt: er sieht grün aus, ist
+      // aber kein Check.
+      expect(view.borg.scheduledCheck.state).toBe("skipped");
+      expect(JSON.stringify(view)).not.toContain("passphrase");
+    });
+
+    it("sagt ohne Helfer ehrlich failed, statt Werte zu erfinden", async () => {
+      const app = await createTestApp(openApps, {}, {
+        borgStatusReader: async () => { throw new Error("sudo: /usr/local/sbin/cockpit-borg-action: command not found"); },
+      });
+      const cookie = await login(app);
+
+      const response = await app.inject({ method: "POST", url: "/api/borg/status/refresh", headers: { cookie } });
+      expect(response.statusCode).toBe(200);
+      expect(response.json().state).toBe("failed");
+      expect(response.json().borg).toBeNull();
+      expect(response.json().note).toContain("cockpit-borg-action");
+    });
+
+    it("stösst beim GET eine veraltete Messung an und antwortet sofort", async () => {
+      let reads = 0;
+      const app = await createTestApp(openApps, {}, {
+        borgStatusReader: async () => { reads += 1; return borgReport; },
+      });
+      const cookie = await login(app);
+
+      const first = await app.inject({ method: "GET", url: "/api/borg/status", headers: { cookie } });
+      expect(first.statusCode).toBe(200);
+      expect(["measuring", "fresh"]).toContain(first.json().state);
+
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const second = await app.inject({ method: "GET", url: "/api/borg/status", headers: { cookie } });
+      expect(second.json().state).toBe("fresh");
+      expect(reads).toBe(1);
     });
   });
 });

@@ -126,6 +126,10 @@ wait_for_rc_file() { # wait_for_rc_file <unit> — bis die Unit abgeräumt ist
 # --- Fixtures ---------------------------------------------------------------
 mkdir -p "$WORK/state" "$WORK/repo/data"
 printf '%s\n' "# borgmatic — Klartext-Zugangsdaten" "PASSWORD=GEHEIM" > "$WORK/config.yaml"
+# Marker: dieser Host hat borgmatic (der VPS). Die Kiste-Prüfung nimmt ihn weg —
+# dort gibt es weder Dienst noch Journal, und der Datenblock muss das "unbekannt"
+# nennen statt eines erfundenen Erfolgs.
+: > "$WORK/borgmatic-here"
 # borgmatic.service gilt als aktiv, solange "$WORK/borgmatic-busy" existiert; die
 # Tests setzen die Datei dort, wo das nächtliche Backup laufen soll.
 FIXTURE_STATUS="$WORK/status.txt"
@@ -189,6 +193,21 @@ case "\$*" in
 esac
 [ -e "$WORK/hold-check" ] && sleep 6
 exit 0
+EOF
+
+# Fixture: Journal des borgmatic-Dienstes in der Form `-o short-iso` (so liest es
+# der VPS). Enthält bewusst beides: den übersprungenen Konsistenz-Check des
+# nächtlichen Laufs (borgmatic fährt ihn nur nach seiner Frequenz — deshalb ist
+# "kein Check" kein grüner Check) und eine ältere CRITICAL-Zeile eines echten
+# fehlgeschlagenen Checks. Tests, die den roten Fall wollen, überschreiben die
+# Fixture über $WORK/journal-borgmatic.txt.
+cat > "$WORK/journal-borgmatic.default" <<'EOF'
+2026-09-21T03:45:06+02:00 vmd61162 borgmatic[456]: CRITICAL Command 'borg check --glob-archives {hostname}-* --info ssh://borg@10.0.0.5/media/RAID/backup_VServer/borg' returned non-zero exit status 2.
+2026-09-27T02:39:04+02:00 vmd61162 systemd[1]: Starting borgmatic.service - borgmatic backup...
+2026-09-27T02:49:36+02:00 vmd61162 borgmatic[123]: INFO home_server: Running consistency checks
+2026-09-27T02:49:36+02:00 vmd61162 borgmatic[123]: INFO Skipping archives check due to configured frequency; 25 days, 1:21:54.018526 until next check (use --force to check anyway)
+2026-09-27T02:49:36+02:00 vmd61162 systemd[1]: Finished borgmatic.service - borgmatic backup.
+2026-09-27T02:49:36+02:00 vmd61162 systemd[1]: borgmatic.service: Succeeded.
 EOF
 
 # _payload-run: führt eine gestartete (nicht wartende) Unit aus und schreibt
@@ -269,6 +288,34 @@ case "\$cmd" in
     esac
     printf '%s\n' "NEXT                         LEFT     LAST                         PASSED UNIT            ACTIVATES" "Mon 2026-09-28 02:26:08 CEST 3h 10min Sun 2026-09-27 02:39:04 CEST 20h ago borgmatic.timer borgmatic.service"
     exit 0 ;;
+  show)
+    # `systemctl show <unit> -p Result -p ExecMainStatus`: genau die zwei Werte,
+    # die der Datenblock für den letzten Backup-Lauf übernimmt. Über
+    # \$WORK/borgmatic-failed lässt sich ein fehlgeschlagener Lauf nachstellen.
+    unit=""
+    while [ "\$#" -gt 0 ]; do
+      case "\$1" in
+        -p|--property) shift 2 ;;
+        -*) shift ;;
+        *) unit="\$1"; shift ;;
+      esac
+    done
+    case "\$unit" in
+      borgmatic.service)
+        [ -f "$WORK/borgmatic-here" ] || { printf 'Unit %s could not be found.\\n' "\$unit" >&2; exit 4; }
+        if [ -e "$WORK/borgmatic-failed" ]; then
+          printf 'Result=exit-code\nExecMainStatus=1\n'
+        else
+          printf 'Result=success\nExecMainStatus=0\n'
+        fi
+        exit 0 ;;
+      *)
+        # Wie echtes systemd für eine unbekannte Unit: keine Eigenschaften, rc=4.
+        # Auf der Kiste gibt es keinen borgmatic-Dienst — dort bleiben die Werte
+        # „unbekannt" statt eines erfundenen Erfolgs.
+        printf 'Unit %s could not be found.\\n' "\$unit" >&2
+        exit 4 ;;
+    esac ;;
   list-units)
     # Nur noch nicht abgeräumte (aktive) borg-Unit-*.service zeigen — genau das,
     # was systemd mit --collect übrig lässt.
@@ -304,10 +351,10 @@ case "\$unit" in
     if [ -n "\$lines" ]; then tail -n "\$lines" "\$f"; else cat "\$f"; fi
     exit 0 ;;
 esac
-printf '%s\n' "2026-09-27T02:39:04+02:00 vmd61162 borgmatic[123]: Starting borgmatic" "2026-09-27T02:49:36+02:00 vmd61162 borgmatic[123]: Finished borgmatic in 8 minutes" "2026-09-27T02:49:36+02:00 vmd61162 systemd[1]: borgmatic.service: Succeeded."
+[ -f "$WORK/borgmatic-here" ] || exit 0
+if [ -f "$WORK/journal-borgmatic.txt" ]; then cat "$WORK/journal-borgmatic.txt"; else cat "$WORK/journal-borgmatic.default"; fi
 exit 0
 EOF
-
 cat > "$STUBS/curl" <<EOF
 #!/usr/bin/env bash
 cat "$FIXTURE_STATUS"
@@ -647,6 +694,119 @@ OUT="$(PATH="$WORK/kiste-bin:/usr/bin:/bin" COCKPIT_BORG_ACTION_LOCK="$WORK/borg
 ERR="$(cat "$WORK/stderr")"
 assert_rc "repair ohne borgmatic (Kiste) wird abgewiesen" 67
 assert_err "Grund genannt (VPS nötig)" "check/repair laufen auf dem VPS"
+
+echo "== status: Datenblock für die Cockpit-Anzeige =="
+# Der Datenblock ist die einzige Schnittstelle zwischen Helfer und Anzeige
+# (apps/api/src/borg-status.ts). Geprüft wird nicht nur, dass er da ist, sondern
+# dass er nur trägt, was er tragen darf: ISO-Zeit mit Zone, Zahlen, Einheiten,
+# feste Aufzählungen — keine Pfade, keine Zugangsdaten, keine leeren Werte.
+block_has() { if grep -qF -- "$2" <<<"$BLOCK"; then ok "$1"; else bad "$1 — Block ohne: $2"; fi; }
+block_grep() { if grep -qE -- "$2" <<<"$BLOCK"; then ok "$1"; else bad "$1 — Block ohne Muster: $2"; fi; }
+read_block() { BLOCK="$(sed -n '/^== DATEN (cockpit-borg-status\/v1) ==$/,$p' <<<"$OUT")"; }
+
+# Ein abgeschlossener Cockpit-Check: die Unit räumt sich mit --collect selbst ab,
+# ihr Journal bleibt — daraus kommt rc.
+printf '%s\n' \
+  "Unit $PREFIX-check-block1: borgmatic --verbosity 1 check --force" \
+  "Start: 2026-09-28T11:00:00+02:00" \
+  "Ende: 2026-09-28T12:41:12+02:00 (rc=0)" > "$WORK/units/$PREFIX-check-block1.log"
+printf '0\n' > "$WORK/units/$PREFIX-check-block1.rc"
+printf '%s\n' "$PREFIX-check-block1" > "$WORK/state/last.unit"
+printf '%s\n' "check" > "$WORK/state/last.kind"
+
+run_helper status
+assert_rc "status liefert den Datenblock" 0
+read_block
+if [ -n "$BLOCK" ]; then ok "Datenblock vorhanden"; else bad "Datenblock fehlt"; fi
+block_has "Schema" "schema=cockpit-borg-status/v1"
+block_grep "Messzeitpunkt mit Zone" '^measured_at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{2}:[0-9]{2}$'
+block_has "Rolle VPS" "role=vps"
+block_has "letzter Lauf: Beginn aus dem Journal" "last_run_start=2026-09-27T02:39:04+02:00"
+block_has "letzter Lauf: Ende aus dem Journal" "last_run_end=2026-09-27T02:49:36+02:00"
+block_has "letzter Lauf: Ergebnis aus systemd" "last_run_result=success"
+block_has "letzter Lauf: Exit-Status aus systemd" "last_run_exit=0"
+block_has "Nachtcheck ist übersprungen (kein grüner Check)" "scheduled_check=skipped"
+block_has "Nachtcheck mit seinem Zeitstempel" "scheduled_check_at=2026-09-27T02:49:36+02:00"
+block_has "Wartung: Ergebnis aus dem Unit-Journal" "maintenance_rc=0"
+block_has "Wartung: Ende aus dem Unit-Journal" "maintenance_end=2026-09-28T12:41:12+02:00"
+block_has "Wartung: Quelle benannt" "maintenance_source=unit-journal"
+block_has "Wartung: Art benannt" "maintenance_kind=check"
+block_has "Wartung: läuft nicht" "maintenance_running=no"
+block_grep "Timer: nächster Lauf als UTC-Zeit" '^timer_next=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
+
+VALUES="$(grep -E '^[a-z][a-z0-9_]*=' <<<"$BLOCK" | grep -v '^schema=')"
+if grep -q '/' <<<"$VALUES"; then bad "Datenblock enthält einen Pfad"; else ok "Datenblock enthält keinen Pfad"; fi
+if grep -qE 'GEHEIM|passphrase|password|ssh://|BEGIN ' <<<"$BLOCK"; then bad "Datenblock enthält Zugangsdaten"; else ok "Datenblock enthält keine Zugangsdaten"; fi
+if grep -qE '^[a-z][a-z0-9_]*=$' <<<"$VALUES"; then bad "Datenblock enthält einen leeren Wert"; else ok "Datenblock enthält keine leeren Werte"; fi
+if grep -qE '^[A-Za-z_]+=.*[;|&$`]' <<<"$VALUES"; then bad "Datenblock enthält Shell-Metazeichen"; else ok "Datenblock enthält keine Shell-Metazeichen"; fi
+
+echo "== status: roter Check im nächtlichen Journal =="
+cat > "$WORK/journal-borgmatic.txt" <<'EOF'
+2026-09-28T02:26:10+02:00 vmd61162 systemd[1]: Starting borgmatic.service - borgmatic backup...
+2026-09-28T02:56:06+02:00 vmd61162 borgmatic[123]: CRITICAL Command 'borg check --glob-archives {hostname}-* --info ssh://borg@10.0.0.5/media/RAID/backup_VServer/borg' returned non-zero exit status 2.
+EOF
+run_helper status
+read_block
+block_has "roter Nachtcheck wird als failed gemeldet" "scheduled_check=failed"
+block_has "roter Nachtcheck mit seinem Zeitstempel" "scheduled_check_at=2026-09-28T02:56:06+02:00"
+# Die alte CRITICAL-Zeile bleibt im Block draussen — nur die jüngste zählt, und
+# die ist der übersprungene Check. Genau das war der Befund vom 28.09.
+rm -f "$WORK/journal-borgmatic.txt"
+run_helper status
+read_block
+block_has "jüngste Zeile entscheidet (wieder skipped)" "scheduled_check=skipped"
+if grep -q 'returned non-zero exit status' <<<"$BLOCK"; then
+  bad "Block trägt Journal-Prosa (die alte CRITICAL-Zeile) hinein"
+else
+  ok "Block trägt nur Werte, keine Journal-Prosa"
+fi
+
+echo "== status: fehlgeschlagener Backup-Lauf =="
+: > "$WORK/borgmatic-failed"
+run_helper status
+read_block
+block_has "Ergebnis des Laufs kommt von systemd" "last_run_result=exit-code"
+block_has "Exit-Status des Laufs" "last_run_exit=1"
+rm -f "$WORK/borgmatic-failed"
+
+echo "== status: laufende Wartung =="
+printf '%s\n' "Unit $PREFIX-repair-block2: borgmatic --verbosity 1 check --repair --force" \
+  "Start: 2026-09-28T13:00:00+02:00" > "$WORK/units/$PREFIX-repair-block2.log"
+printf '%s\n' "$PREFIX-repair-block2" > "$WORK/state/last.unit"
+printf '%s\n' "repair" > "$WORK/state/last.kind"
+run_helper status
+read_block
+block_has "laufende Wartung gemeldet" "maintenance_running=yes"
+block_has "laufende Wartung: Art repair" "maintenance_kind=repair"
+block_has "laufende Wartung: noch kein Ergebnis" "maintenance_rc=unknown"
+block_has "laufende Wartung: Quelle ist der Laufzustand" "maintenance_source=running-unit"
+rm -f "$WORK/units/$PREFIX-repair-block2.log"
+printf '%s\n' "$PREFIX-check-block1" > "$WORK/state/last.unit"
+printf '%s\n' "check" > "$WORK/state/last.kind"
+
+echo "== status: Datenblock bleibt bei unerreichbarem Repo =="
+: > "$WORK/state/fail-repo"
+run_helper status
+assert_rc "unerreichbares Repo meldet weiter rc=2" 2
+read_block
+if [ -n "$BLOCK" ]; then ok "Datenblock kommt auch bei rc=2"; else bad "Datenblock fehlt bei rc=2"; fi
+block_has "Befund und Zustand gleichzeitig" "last_run_exit=0"
+rm -f "$WORK/state/fail-repo"
+
+echo "== status (Kiste): Datenblock erfindet nichts =="
+rm -f "$WORK/state/last.unit" "$WORK/state/last.kind" "$WORK/borgmatic-here"
+OUT="$(PATH="$WORK/kiste-bin:/usr/bin:/bin" COCKPIT_BORG_ACTION_LOCK="$WORK/borg.lock" \
+  COCKPIT_BORG_ACTION_STATE_DIR="$WORK/state" COCKPIT_BORG_ACTION_CONFIG="$WORK/config.yaml" \
+  COCKPIT_BORG_ACTION_KISTE_REPO="$WORK/repo" \
+  COCKPIT_BORG_ACTION_KISTE_URL="http://10.0.0.5:8088/status.txt" "$BASH_BIN" "$HELPER" status 2>"$WORK/stderr")"; RC=$?
+ERR="$(cat "$WORK/stderr")"
+assert_rc "status auf der Kiste liefert den Block" 0
+read_block
+block_has "Kiste: Rolle" "role=kiste"
+block_has "Kiste: kein Backup-Lauf bekannt" "last_run_end=unknown"
+block_has "Kiste: kein Ergebnis behauptet" "last_run_result=unknown"
+block_has "Kiste: keine Wartung bekannt" "maintenance_rc=unknown"
+: > "$WORK/borgmatic-here"
 
 echo
 printf 'bestanden: %s, fehlgeschlagen: %s\n' "$PASS" "$FAIL"

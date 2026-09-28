@@ -163,6 +163,45 @@ function makeServer(initiallyAuthenticated: boolean) {
     nextScheduleNumber: 2,
     lastSupervisedPrompt: "Review the current Nextcloud maintenance blockers.",
     lastSupervisedSessionId: alphaSession.id,
+    // Der Borg-Zustand, den der Anzeige-Bereich beim Rendern abholt (read-only).
+    borgStatus: {
+      state: "fresh",
+      measuring: false,
+      measuredAt: "2026-09-28T09:40:00.000Z",
+      ageSeconds: 42,
+      note: null,
+      borg: {
+        generatedAt: "2026-09-28T11:40:00+02:00",
+        host: "vmd61162.contaboserver.net",
+        role: "vps",
+        timer: {
+          unit: "borgmatic.timer",
+          active: "active",
+          next: "2026-09-29T23:53:08Z",
+          source: "systemctl list-timers <timer> --output=json"
+        },
+        lastRun: {
+          start: "2026-09-28T02:26:10+02:00",
+          end: "2026-09-28T02:56:06+02:00",
+          result: "success",
+          exitStatus: 0,
+          source: "journalctl -u borgmatic + systemctl show borgmatic.service"
+        },
+        check: {
+          state: "failed",
+          rc: 2,
+          at: "2026-09-21T05:12:44+02:00",
+          unit: "cockpit-borg-check-20260921T034512Z",
+          kind: "check",
+          source: "journalctl -u cockpit-borg-check-20260921T034512Z"
+        },
+        scheduledCheck: {
+          state: "skipped",
+          at: "2026-09-28T02:56:05+02:00",
+          source: "journalctl -u borgmatic (Konsistenzprüfung)"
+        }
+      }
+    },
     sessions: initiallyAuthenticated ? [alphaSession, betaSession] : [alphaSession],
     schedules: [
       {
@@ -542,6 +581,12 @@ function makeServer(initiallyAuthenticated: boolean) {
       return okResponse({ user: state.user });
     }
 
+    // Borg-Zustand: der Anzeige-Bereich holt beim Rendern den letzten Stand und
+    // stösst höchstens eine Messung an (read-only).
+    if (url === "/api/borg/status" || url === "/api/borg/status/refresh") {
+      return okResponse(state.borgStatus);
+    }
+
     if (url === "/api/sessions" && method === "GET") {
       return okResponse({ sessions: state.sessions });
     }
@@ -906,5 +951,29 @@ describe("App", () => {
 
     await user.click(screen.getByRole("button", { name: "Sign out" }));
     expect(await screen.findByRole("button", { name: "Sign in" })).toBeTruthy();
+  });
+
+  it("zeigt den Borg-Zustand mit Quelle und Zeitstempel je Wert", async () => {
+    makeServer(true);
+
+    render(<App />);
+
+    expect(await screen.findByText("Borg backup")).toBeTruthy();
+
+    const lastRun = screen.getByTestId("borg-last-run");
+    expect(lastRun.textContent).toContain("2026-09-28 02:56:06+02:00");
+    expect(lastRun.textContent).toContain("success");
+    expect(lastRun.textContent).toContain("exit 0");
+    expect(lastRun.textContent).toContain("journalctl -u borgmatic");
+
+    const check = screen.getByTestId("borg-check");
+    expect(check.textContent).toContain("failed");
+    expect(check.textContent).toContain("rc 2");
+    expect(check.textContent).toContain("cockpit-borg-check-20260921T034512Z");
+
+    // Der übersprungene Nachtcheck steht getrennt — er ist kein grüner Check.
+    expect(screen.getByTestId("borg-scheduled-check").textContent).toContain("skipped");
+    expect(screen.getByTestId("borg-timer").textContent).toContain("borgmatic.timer");
+    expect(screen.getByTestId("borg-freshness").textContent).toContain("fresh");
   });
 });

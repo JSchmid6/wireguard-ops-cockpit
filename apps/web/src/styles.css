@@ -242,3 +242,47 @@ small {
   }
 }
 
+
+/* Borg-Zustand: read-only Anzeige mit Quelle je Wert (BorgPanel.tsx). */
+.borg-panel {
+  align-content: start;
+}
+
+.borg-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.borg-list li {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.borg-value {
+  font-variant-numeric: tabular-nums;
+}
+
+.borg-state-ok {
+  color: #6ee7b7;
+}
+
+.borg-state-failed {
+  color: #fda4af;
+}
+
+.borg-state-running {
+  color: #7dd3fc;
+}
+
+.borg-state-skipped,
+.borg-state-unknown {
+  color: #fcd34d;
+}
+
+.borg-meta,
+.borg-note {
+  color: #94a3b8;
+  font-size: 0.85rem;
+}

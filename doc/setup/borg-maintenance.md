@@ -198,3 +198,64 @@ oder zu wenig Frist bis zum Timer · `64` Aufruffehler · `67` falscher Host
   Grösse, Anzahl Datensegmente und das jüngste Segment. Ein nicht erreichbares
   Repo meldet `status` mit rc=2 und `repo_erreichbar: nein`, damit der Job als
   Befund endet und nicht als „alles gut“.
+
+## Den Zustand im Cockpit sehen
+
+Der Zustand ist jetzt ein Feld der Cockpit-Anzeige, nicht mehr nur die Ausgabe
+eines Auftrags. Read-only, mit Quelle und Zeitstempel je Wert:
+
+| Route | Wirkung |
+| --- | --- |
+| `GET /api/borg/status` | liefert den letzten gemessenen Stand; ist er älter als 10 Minuten, stösst die Route im Hintergrund eine neue Messung an und antwortet trotzdem sofort |
+| `POST /api/borg/status/refresh` | misst jetzt und wartet bis zu 25 s auf das Ergebnis |
+
+Beide Routen verlangen eine Anmeldung (Operator-Sitzung oder ein Bearer-Token
+mit genau diesem Scope). `borg.status` ist lesend — es gibt dafür **keine**
+Freigabe und keinen Audit-Eintrag; `check`/`repair` bleiben der auditierte,
+freigabepflichtige Weg über die Policy.
+
+Angezeigt werden:
+
+* **letzter borgmatic-Lauf** — Beginn und Ende (Zeitstempel aus
+  `journalctl -u borgmatic`, ISO mit Zone), Ergebnis und Exit-Status aus
+  `systemctl show borgmatic.service -p Result -p ExecMainStatus`,
+* **letzter Repo-Check** — Zustand, `rc`, Zeitpunkt und Unit, wenn das Cockpit
+  einen Check gestartet hat; das Ergebnis kommt aus dem Journal der Unit
+  (`Ende: <ISO> (rc=<n>)`), die Unit selbst ist mit `--collect` nach dem Lauf weg,
+  * **Konsistenzprüfung des nächtlichen Laufs** — getrennt geführt und meist
+  `skipped`: borgmatic fährt den Check nur nach seiner konfigurierten Frequenz.
+  Ein übersprungener Check ist **kein** grüner Check; „ok" wird hier nur aus einem
+  wirklich gelaufenen Check mit `rc=0`.
+
+### Woher die Werte kommen (und was sie nicht enthalten)
+
+Der Helfer endet mit einem maschinenlesbaren Block
+`== DATEN (cockpit-borg-status/v1) ==`: ein Schlüssel je Zeile, als Wert nur
+ISO-Zeit mit Zone, ganze Zahl, Einheitenname oder feste Aufzählung. Die API
+(`apps/api/src/borg-status.ts`) liest **ausschliesslich** diesen Block und
+verwirft jede Zeile, die nicht in das Muster passt; überlange Werte werden
+verworfen, nicht abgeschnitten. Damit landen weder Pfade noch Zugangsdaten oder
+etwas aus `/etc/borgmatic/config.yaml` in der Anzeige oder im Log — der Offline-Test
+`test/cockpit-borg-action.test.sh` prüft genau das, und
+`apps/api/test/borg-status.test.ts` prüft die Gegenseite (Fremdzeilen,
+Pfad-Injektion, fehlender Block).
+
+Fehlt der Helfer auf dem Host oder ist er älter als dieser Stand, sagt die
+Anzeige `failed`/`unknown` samt Grund — sie erfindet keine Werte. Dasselbe gilt
+für alle drei Werte einzeln, solange keine Quelle vorliegt.
+
+### Ausrollen und zurücknehmen
+
+Das Ausrollen ist der normale Weg dieses Repos: Pin auf einen Commit ziehen, der
+`cockpit-borg-action` **und** das systemd-Drop-in mitbringt
+(`deploy/vps/vps-cockpit-deploy.sh` installiert beides), also ≥ `d5b6a0d` für den
+Helfer und ≥ dem Commit dieses Abschnitts für den Datenblock. Ohne diesen Stand
+gibt es den Block nicht, und die Anzeige bleibt bei `unknown` — sie zeigt dann
+nichts Falsches, nur nichts.
+
+Zurücknehmen heisst: den Pin wieder auf den alten Commit ziehen. Der Deploy
+baut den alten Stand neu, stellt die installierten Dateien aus seinem Backup
+wieder her und startet die laufenden Dienste **nicht** neu (siehe Rollback im
+Deploy-Skript). Die Anzeige ist rein lesend, es gibt keine Daten und keinen
+Zustand, der dabei verloren gehen könnte; ältere Helfer ohne Datenblock werden von
+der API als „kein Block" erkannt.
