@@ -160,7 +160,7 @@ export default function BorgPanel() {
             </span>
           </li>
           <li data-testid="borg-check">
-            <strong>Repository check</strong>
+            <strong>Repository check{borg.check.kind ? ` (${borg.check.kind})` : ""}</strong>
             <span className={`borg-value borg-state-${borg.check.state}`}>
               {CHECK_LABELS[borg.check.state]}
               {borg.check.rc === null ? "" : ` · rc ${borg.check.rc}`}

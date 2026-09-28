@@ -225,11 +225,23 @@ export function borgStatusRequestDigest(payload: { action: string; target: strin
     .digest("hex");
 }
 
-/** Eine Zeile, gedeckelt — Fehlertexte sind Belege, keine Datenhalden. */
+/**
+ * Eine Zeile, gedeckelt — Fehlertexte sind Belege, keine Datenhalden.
+ *
+ * Auf dem Fehlerpfad liefert der Executor-Broker die rohe Helfer-Ausgabe mit
+ * (apps/executor-broker/src/index.mjs: `error: [stderr, stdout].join("\n")`).
+ * Darin stehen auch Pfade, URLs und Adressen (z. B. `ssh://borg@10.0.0.5/…`,
+ * `/media/RAID/backup_VServer/borg`). Sie dürfen genauso wenig in die Anzeige
+ * wie Zugangsdaten — deshalb wird hier nicht nur geschwärzt, sondern jedes
+ * Token mit einem Pfadtrenner, jede URL und jede IPv4-Adresse ersetzt.
+ */
 export function sanitizeReason(text: string): string {
   return text
     .replace(/[\u0000-\u001f\u007f]+/g, " ")
     .replace(/\b(passphrase|password|secret|token)\b\s*[:=]\s*\S+/gi, "$1=[redacted]")
+    .replace(/\b[a-z][a-z0-9+.-]*:\/\/\S+/gi, "[pfad]")
+    .replace(/\S*\/\S*/g, "[pfad]")
+    .replace(/\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b/g, "[adresse]")
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 200);
@@ -290,7 +302,21 @@ export function createBorgStatusService(options: BorgStatusServiceOptions): Borg
       measuredAt = now();
       failure = null;
     } catch (error) {
-      failure = sanitizeReason(error instanceof Error ? error.message : String(error));
+      const raw = error instanceof Error ? error.message : String(error);
+      const note = sanitizeReason(raw);
+      // Bei einem Befund-Exitcode (z. B. rc=2 "Repo nicht erreichbar") schreibt
+      // der Helfer den Datenblock trotzdem; der Broker reicht die Ausgabe im
+      // Fehlertext durch. Ein gültiger Block darin sind echte Messwerte —
+      // verwerfen hieße, genau dann nichts zu zeigen, wenn es darauf ankommt.
+      // Der Grund bleibt daneben stehen, die Anzeige behauptet nichts.
+      const recovered = parseBorgStatusReport(raw);
+      if (recovered) {
+        snapshot = recovered;
+        measuredAt = now();
+        failure = sanitizeReason(`Messung mit Befund: ${raw}`);
+      } else {
+        failure = note;
+      }
     }
   }
 

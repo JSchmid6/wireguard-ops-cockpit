@@ -211,6 +211,19 @@ describe("sanitizeReason", () => {
   it("deckelt lange Texte", () => {
     expect(sanitizeReason("x".repeat(500)).length).toBe(200);
   });
+
+  it("entfernt Pfade, URLs und Adressen — der Fehlerpfad trägt die rohe Helfer-Ausgabe", () => {
+    const reason = sanitizeReason(
+      "CRITICAL ssh://borg@10.0.0.5/media/RAID/backup_VServer/borg: Connection refused; host 10.0.0.5:22 unreachable\npassphrase=hunter2",
+    );
+    expect(reason).not.toContain("/media");
+    expect(reason).not.toContain("ssh://");
+    expect(reason).not.toContain("10.0.0.5");
+    expect(reason).not.toContain("hunter2");
+    expect(reason).toContain("[pfad]");
+    expect(reason).toContain("[adresse]");
+    expect(reason).toContain("Connection refused");
+  });
 });
 
 describe("createBorgStatusService", () => {
@@ -290,14 +303,34 @@ describe("createBorgStatusService", () => {
     expect(view.borg).toBeNull();
   });
 
-  it("meldet einen gescheiterten Lauf als Zustand samt Grund", async () => {
+  it("meldet einen gescheiterten Lauf als Zustand samt Grund — ohne Pfade", async () => {
     const service = createBorgStatusService({
       readReport: async () => { throw new Error("sudo: /usr/local/sbin/cockpit-borg-action: command not found"); },
     });
     const view = await service.measure({ waitMs: 1000 });
     expect(view.state).toBe("failed");
-    expect(view.note).toContain("cockpit-borg-action");
+    expect(view.note).toContain("command not found");
+    expect(view.note).not.toContain("/usr/local/sbin");
+    expect(view.note).toContain("[pfad]");
     expect(view.borg).toBeNull();
+  });
+
+  it("übernimmt die Werte, wenn der Helfer mit Befund endet (rc≠0) — und nennt den Grund", async () => {
+    // So sieht der Fehlerpfad wirklich aus: der Broker hängt stderr und die
+    // Helfer-Ausgabe aneinander, der Datenblock steht am Ende darin.
+    const raw = [
+      "CRITICAL ssh://borg@10.0.0.5/media/RAID/backup_VServer/borg: Connection refused",
+      VPS_BLOCK,
+    ].join("\n");
+    const service = createBorgStatusService({ readReport: async () => { throw new Error(raw); } });
+    const view = await service.measure({ waitMs: 1000 });
+    expect(view.borg?.lastRun.end).toBe("2026-09-28T02:56:06+02:00");
+    expect(view.borg?.lastRun.exitStatus).toBe(0);
+    expect(view.borg?.check.state).toBe("failed");
+    expect(view.note).toMatch(/^Messung mit Befund:/);
+    expect(view.note).not.toContain("/media");
+    expect(view.note).not.toContain("10.0.0.5");
+    expect(view.note).not.toContain("ssh://");
   });
 
   it("bleibt bei einer Ausgabe ohne Datenblock bei failed und erfindet keine Werte", async () => {

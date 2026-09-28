@@ -219,9 +219,10 @@ Angezeigt werden:
 * **letzter borgmatic-Lauf** — Beginn und Ende (Zeitstempel aus
   `journalctl -u borgmatic`, ISO mit Zone), Ergebnis und Exit-Status aus
   `systemctl show borgmatic.service -p Result -p ExecMainStatus`,
-* **letzter Repo-Check** — Zustand, `rc`, Zeitpunkt und Unit, wenn das Cockpit
-  einen Check gestartet hat; das Ergebnis kommt aus dem Journal der Unit
-  (`Ende: <ISO> (rc=<n>)`), die Unit selbst ist mit `--collect` nach dem Lauf weg,
+* **letzter Repo-Check** — Art (`check`/`repair`), Zustand, `rc`, Zeitpunkt und
+  Unit, wenn das Cockpit einen Check gestartet hat; das Ergebnis kommt aus dem
+  Journal der Unit (`Ende: <ISO> (rc=<n>)`), die Unit selbst ist mit `--collect`
+  nach dem Lauf weg,
   * **Konsistenzprüfung des nächtlichen Laufs** — getrennt geführt und meist
   `skipped`: borgmatic fährt den Check nur nach seiner konfigurierten Frequenz.
   Ein übersprungener Check ist **kein** grüner Check; „ok" wird hier nur aus einem
@@ -243,6 +244,20 @@ Pfad-Injektion, fehlender Block).
 Fehlt der Helfer auf dem Host oder ist er älter als dieser Stand, sagt die
 Anzeige `failed`/`unknown` samt Grund — sie erfindet keine Werte. Dasselbe gilt
 für alle drei Werte einzeln, solange keine Quelle vorliegt.
+
+**Der Grund wird geschwärzt.** Auf dem Fehlerpfad reicht der Executor-Broker die
+rohe Helfer-Ausgabe durch (`error: [stderr, stdout].join("\n")`); darin stehen
+Pfade, URLs und Adressen (`ssh://borg@…/media/…`, `/usr/local/sbin/…`). Bevor
+etwas davon in die Anzeige kommt, ersetzt `sanitizeReason` jedes Token mit einem
+Pfadtrenner, jede URL und jede IPv4-Adresse — geprüft in
+`apps/api/test/borg-status.test.ts`.
+
+**Ein Befund ist kein Ausfall.** Endet der Helfer mit einem Befund-Exitcode
+(z. B. `rc=2` „Repo nicht erreichbar"), steht der Datenblock trotzdem in dieser
+Ausgabe. Die API übernimmt ihn dann: Timer, letzter Lauf und Check-Ergebnis sind
+host-lokal gemessen und bleiben gültig, der Grund steht als
+`Messung mit Befund: …` daneben. Ohne Block bleibt es bei `failed` ohne Werte —
+und ein grüner Check entsteht aus einem Befund nie.
 
 ### Ausrollen und zurücknehmen
 

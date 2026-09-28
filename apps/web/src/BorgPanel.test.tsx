@@ -99,6 +99,7 @@ describe("BorgPanel", () => {
     expect(lastRun.textContent).toContain("journalctl -u borgmatic + systemctl show borgmatic.service");
 
     const check = screen.getByTestId("borg-check");
+    expect(check.textContent).toContain("Repository check (check)");
     expect(check.textContent).toContain("failed");
     expect(check.textContent).toContain("rc 2");
     expect(check.textContent).toContain("2026-09-21 05:12:44+02:00");
@@ -152,11 +153,24 @@ describe("BorgPanel", () => {
   });
 
   it("nennt den Grund, wenn eine Messung scheitert, und bleibt bei unknown", async () => {
-    stubFetch([{ ...emptyView, state: "failed", note: "sudo: /usr/local/sbin/cockpit-borg-action: command not found" }]);
+    stubFetch([{ ...emptyView, state: "failed", note: "sudo: [pfad] command not found" }]);
 
     render(<BorgPanel />);
 
     const unavailable = await screen.findByTestId("borg-unavailable");
-    expect(unavailable.textContent).toContain("cockpit-borg-action");
+    expect(unavailable.textContent).toContain("command not found");
+    expect(unavailable.textContent).not.toContain("/usr/local/sbin");
+  });
+
+  it("zeigt bei einer Messung mit Befund die Werte und daneben den Grund", async () => {
+    // Der Helfer endete mit rc≠0 (z. B. Repo nicht erreichbar), hat aber Werte
+    // geschrieben: die Anzeige zeigt sie und behauptet trotzdem nichts.
+    stubFetch([{ ...measured, state: "fresh", note: "Messung mit Befund: CRITICAL [pfad] Connection refused" }]);
+
+    render(<BorgPanel />);
+
+    const lastRun = await screen.findByTestId("borg-last-run");
+    expect(lastRun.textContent).toContain("exit 0");
+    expect(screen.getByText(/Messung mit Befund:/).textContent).toBeTruthy();
   });
 });

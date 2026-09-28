@@ -1394,7 +1394,7 @@ describe("control API", () => {
       expect(JSON.stringify(view)).not.toContain("passphrase");
     });
 
-    it("sagt ohne Helfer ehrlich failed, statt Werte zu erfinden", async () => {
+    it("sagt ohne Helfer ehrlich failed, statt Werte zu erfinden — und ohne Pfad in der Anzeige", async () => {
       const app = await createTestApp(openApps, {}, {
         borgStatusReader: async () => { throw new Error("sudo: /usr/local/sbin/cockpit-borg-action: command not found"); },
       });
@@ -1404,7 +1404,8 @@ describe("control API", () => {
       expect(response.statusCode).toBe(200);
       expect(response.json().state).toBe("failed");
       expect(response.json().borg).toBeNull();
-      expect(response.json().note).toContain("cockpit-borg-action");
+      expect(response.json().note).toContain("command not found");
+      expect(response.json().note).not.toContain("/usr/local/sbin");
     });
 
     it("stösst beim GET eine veraltete Messung an und antwortet sofort", async () => {
