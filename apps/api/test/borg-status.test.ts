@@ -224,6 +224,16 @@ describe("sanitizeReason", () => {
     expect(reason).toContain("[adresse]");
     expect(reason).toContain("Connection refused");
   });
+
+  it("entfernt auch IPv6-Adressen, lässt aber eine Uhrzeit stehen", () => {
+    const reason = sanitizeReason(
+      "connect to fe80::1 and 2001:db8:0:0:1:2:3:4 and [2001:db8::5]:22 refused at 02:56:06",
+    );
+    expect(reason).not.toContain("fe80");
+    expect(reason).not.toContain("2001");
+    expect(reason).toContain("[adresse]");
+    expect(reason).toContain("02:56:06");
+  });
 });
 
 describe("createBorgStatusService", () => {

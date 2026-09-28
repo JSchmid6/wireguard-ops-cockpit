@@ -247,9 +247,10 @@ für alle drei Werte einzeln, solange keine Quelle vorliegt.
 
 **Der Grund wird geschwärzt.** Auf dem Fehlerpfad reicht der Executor-Broker die
 rohe Helfer-Ausgabe durch (`error: [stderr, stdout].join("\n")`); darin stehen
-Pfade, URLs und Adressen (`ssh://borg@…/media/…`, `/usr/local/sbin/…`). Bevor
-etwas davon in die Anzeige kommt, ersetzt `sanitizeReason` jedes Token mit einem
-Pfadtrenner, jede URL und jede IPv4-Adresse — geprüft in
+Pfade, URLs und Adressen (`ssh://borg@…/media/…`, `/usr/local/sbin/…`,
+`fe80::1`). Bevor etwas davon in die Anzeige kommt, ersetzt `sanitizeReason`
+jedes Token mit einem Pfadtrenner, jede URL und jede Adresse (IPv4 und IPv6) —
+eine Uhrzeit wie `02:56:06` bleibt dabei lesbar. Geprüft in
 `apps/api/test/borg-status.test.ts`.
 
 **Ein Befund ist kein Ausfall.** Endet der Helfer mit einem Befund-Exitcode

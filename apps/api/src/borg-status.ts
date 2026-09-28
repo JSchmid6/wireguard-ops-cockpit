@@ -242,6 +242,10 @@ export function sanitizeReason(text: string): string {
     .replace(/\b[a-z][a-z0-9+.-]*:\/\/\S+/gi, "[pfad]")
     .replace(/\S*\/\S*/g, "[pfad]")
     .replace(/\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b/g, "[adresse]")
+    // IPv6: verlangt mindestens einen Hex-Buchstaben bzw. die ::-Kurzform —
+    // eine Uhrzeit (02:56:06) ist keine Adresse und bleibt lesbar.
+    .replace(/\b(?=[0-9a-f:]*[a-f])[0-9a-f]{1,4}(?::[0-9a-f]{1,4}){2,}\b/gi, "[adresse]")
+    .replace(/\b(?:[0-9a-f]{1,4}:)*[0-9a-f]{0,4}::(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*)?/gi, "[adresse]")
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 200);
