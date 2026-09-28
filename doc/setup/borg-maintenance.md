@@ -132,7 +132,12 @@ lassen sich nicht mehr wiederherstellen. Der Weg:
 2. Befund lesen — und entscheiden, ob die betroffenen Archivzeitpunkte entbehrlich
    sind. `status` zeigt danach die Unit und nach `check` den Befund im Journal.
 3. Erst dann `repair` bestellen. Die API erzwingt dafür die Freigabe des Operators
-   (`borg.repair` ⇒ `blocked_user_approval`).
+   (`borg.repair` ⇒ `blocked_user_approval`): die Plan-Policy liest die
+   typisierte Zeile mit demselben Parser wie die Ausführung (`requestsBorgRepair`
+   über `typedPlanScript`) — aber über den **ganzen** Plan, also auch in einem
+   zweiten Code-Block oder einem anderen Fence, und unabhängig davon, ob der Plan
+   ein Capability-Manifest mitbringt. Den zweiten Riegel hält der Executor: er
+   führt einen `repair` nur aus, wenn die Freigabe an genau diesen Job gebunden ist.
 4. Nach dem Lauf `status`: Fortschritt und Ergebnis stehen im Journal der Unit;
    das nächste nächtliche `create` schreibt den neuen Stand. Die übrigen Archive
    bleiben unangetastet.
