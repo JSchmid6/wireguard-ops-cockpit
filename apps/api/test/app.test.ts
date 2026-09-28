@@ -1343,6 +1343,10 @@ describe("control API", () => {
       "maintenance_source=unit-journal",
       "scheduled_check=skipped",
       "scheduled_check_at=2026-09-28T02:56:05+02:00",
+      // Die Ausgabe des Helfers kann Zugangsdaten enthalten (borgmatic schreibt
+      // z. B. eine Passphrase mit). Die Anzeige darf nur die weißgelisteten
+      // Felder übernehmen — deshalb steht der Wert hier im Bericht.
+      "passphrase=hunter2",
       "",
     ].join("\n");
 
@@ -1391,7 +1395,10 @@ describe("control API", () => {
       // Der übersprungene Nachtcheck steht getrennt: er sieht grün aus, ist
       // aber kein Check.
       expect(view.borg.scheduledCheck.state).toBe("skipped");
-      expect(JSON.stringify(view)).not.toContain("passphrase");
+      // Die Passphrase aus dem Bericht darf nicht mitkommen. Eine Zusicherung
+      // gegen das Wort "passphrase" konnte hier nie scheitern — die Vorlage
+      // enthielt vorher keine. Jetzt steht der Wert im Bericht und muss fallen.
+      expect(JSON.stringify(view)).not.toContain("hunter2");
     });
 
     it("sagt ohne Helfer ehrlich failed, statt Werte zu erfinden — und ohne Pfad in der Anzeige", async () => {

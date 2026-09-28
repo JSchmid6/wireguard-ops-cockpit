@@ -182,8 +182,32 @@ describe("BorgPanel", () => {
       expect(screen.getByTestId("borg-unavailable").textContent).toContain("command not found"),
     );
 
+    // Der Grund steht so da, wie der Dienst ihn geliefert hat — samt Platzhalter
+    // "[pfad]". Geschwärzt wird serverseitig (`sanitizeReason` in
+    // apps/api/src/borg-status.ts), und dort wird es auch geprüft:
+    // apps/api/test/borg-status.test.ts ("meldet einen gescheiterten Lauf als
+    // Zustand samt Grund — ohne Pfade") und apps/api/test/app.test.ts ("sagt ohne
+    // Helfer ehrlich failed, statt Werte zu erfinden — und ohne Pfad in der
+    // Anzeige"), jew. gegen Pfade, ssh://, IPs und Zugangsdaten. Eine Zusicherung
+    // gegen einen Pfad konnte an dieser Stelle nie scheitern: die Vorlage enthält
+    // den Platzhalter bereits, und diese Anzeige gibt sie nur aus. Geprüft wird
+    // hier darum, was die Anzeige selbst schuldet — den Grund vollständig zeigen
+    // und keine Werte erfinden.
     const unavailable = screen.getByTestId("borg-unavailable");
-    expect(unavailable.textContent).not.toContain("/usr/local/sbin");
+    expect(unavailable.textContent).toContain("No measurement yet.");
+    expect(unavailable.textContent).toContain("sudo: [pfad] command not found");
+
+    // Eine gescheiterte Messung liefert keine Werte — dann darf hier auch keiner
+    // stehen.
+    expect(screen.queryByTestId("borg-last-run")).toBeNull();
+    expect(screen.queryByTestId("borg-check")).toBeNull();
+    expect(screen.queryByTestId("borg-scheduled-check")).toBeNull();
+    expect(screen.queryByTestId("borg-timer")).toBeNull();
+
+    // Und der Zustand bleibt der gemeldete: keine erfundene Messzeit.
+    const freshness = screen.getByTestId("borg-freshness");
+    expect(freshness.textContent).toContain("state failed");
+    expect(freshness.textContent).toContain("not measured yet");
   });
 
   it("zeigt bei einer Messung mit Befund die Werte und daneben den Grund", async () => {
