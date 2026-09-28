@@ -1,7 +1,17 @@
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, configure, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import BorgPanel from "./BorgPanel";
+
+// Der RTL-Standard von 1000 ms fuer asynchrone Zusicherungen reicht auf dieser
+// Maschine unter Last nicht: in der Wiederholungsserie lief `findByRole` nach
+// 1000 ms in den Timeout, waehrend nur noch die Antwort ausstand (Test 1204 ms).
+// Die Sonden messen zusaetzlich: der erste Render braucht 527-1011 ms, danach
+// dauert es noch 100-407 ms, bis der Zustand sichtbar ist. 5 s liegen ueber
+// dieser Streuung und bleiben unter dem `testTimeout` von 20 s aus
+// vite.config.ts. Die Zusicherungen selbst bleiben unveraendert — eine echte
+// Haengung faellt weiter auf, nur spaeter.
+configure({ asyncUtilTimeout: 5000 });
 
 // Der gemessene Stand, wie ihn /api/borg/status liefert.
 const measured = {
@@ -81,7 +91,13 @@ describe("BorgPanel", () => {
 
     render(<BorgPanel />);
 
-    const unavailable = await screen.findByTestId("borg-unavailable");
+    // Auf den verarbeiteten Zustand warten: der Knopf ist erst wieder bedienbar,
+    // wenn die Antwort durch ist. Sonst gelten die Zusicherungen schon fuer den
+    // Startzustand, und der Test bliebe auch dann gruen, wenn die Antwort nie
+    // ankaeme.
+    await screen.findByRole("button", { name: "Measure now" });
+
+    const unavailable = screen.getByTestId("borg-unavailable");
     expect(unavailable.textContent).toContain("No measurement yet");
     expect(screen.queryByTestId("borg-last-run")).toBeNull();
   });
@@ -121,9 +137,11 @@ describe("BorgPanel", () => {
     const user = userEvent.setup();
 
     render(<BorgPanel />);
-    await screen.findByTestId("borg-unavailable");
+    // Erst den geladenen Startzustand abwarten: solange die erste Antwort laeuft,
+    // heisst der Knopf "Measuring…" und ist deaktiviert — der Klick ginge verloren.
+    const measure = await screen.findByRole("button", { name: "Measure now" });
 
-    await user.click(screen.getByRole("button", { name: "Measure now" }));
+    await user.click(measure);
 
     await waitFor(() => expect(screen.getByTestId("borg-last-run")).toBeTruthy());
     expect(calls).toContainEqual({ url: "/api/borg/status/refresh", method: "POST" });
@@ -157,8 +175,14 @@ describe("BorgPanel", () => {
 
     render(<BorgPanel />);
 
-    const unavailable = await screen.findByTestId("borg-unavailable");
-    expect(unavailable.textContent).toContain("command not found");
+    // "No measurement yet." steht sofort (Startzustand), der Grund erst nach der
+    // Antwort von /api/borg/status. Darum auf den Grund warten und nicht auf den
+    // ersten Render — sonst liest die Zusicherung unter Last den Startzustand.
+    await waitFor(() =>
+      expect(screen.getByTestId("borg-unavailable").textContent).toContain("command not found"),
+    );
+
+    const unavailable = screen.getByTestId("borg-unavailable");
     expect(unavailable.textContent).not.toContain("/usr/local/sbin");
   });
 
