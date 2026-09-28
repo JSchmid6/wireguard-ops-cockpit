@@ -58,7 +58,18 @@
 #     Check aussieht.
 #   * `status` fragt das Repo NICHT ab, während Backup oder Wartung läuft: dann
 #     hält borg die Sperre, `list`/`info` scheiterten und das Repo sähe "nicht
-#     erreichbar" aus. Stattdessen: `repo: belegt (…)`, rc=0.
+#     erreichbar" aus. Stattdessen: `repo: belegt (…)`, rc=0. Sonst nimmt
+#     `status` die Sperre selbst (`flock -w BORG_ACTION_LOCK_WAIT`, 60 s), EINMAL
+#     um `list` und `info`, und gibt sie gleich danach frei — so wartet ein
+#     gleichzeitig startendes nächtliches Backup (Drop-in) statt an der
+#     Repo-Sperre zu scheitern. Ist die Sperre nach der Grenze nicht frei, meldet
+#     `status` "belegt" mit rc=0 und fragt nicht ab; ist sie gar nicht nehmbar
+#     (flock fehlt oder scheitert), endet `status` mit 67 statt ohne Sperre
+#     abzufragen. Die Wartezeit läuft gegen das Zeitbudget der status-Unit
+#     (STATUS_TIMEOUT_SEC, 200 s) und bleibt deshalb gedeckelt: 60 s Warten,
+#     danach nur der kurze Belegt-Ausgang, keine langen Abfragen mehr.
+#     Umgekehrt weist `guard_no_run` einen check/repair mit rc=3 ab, solange
+#     eine status-Abfrage die Sperre hält — ein Fenster von Sekunden, gewollt.
 #   * `status` endet mit einem maschinenlesbaren Block `== DATEN
 #     (cockpit-borg-status/v1) ==` (Schlüssel=Wert, nur ISO-Zeit mit Zone, ganze
 #     Zahl, Einheitenname oder feste Aufzählung). Den liest die Cockpit-Anzeige
@@ -71,7 +82,7 @@
 #
 # Prüf-Haken (COCKPIT_BORG_ACTION_*: LOCK, STATE_DIR, CONFIG, KISTE_URL,
 # KISTE_REPO, MAX_LOG_LINES, UNIT_PREFIX, TIMER, SERVICE, MIN_HEADROOM_SEC,
-# STATUS_TIMEOUT_SEC, RUN_TIMEOUT_SEC, IN_UNIT) leiten Pfade und Grenzen für die
+# STATUS_TIMEOUT_SEC, RUN_TIMEOUT_SEC, LOCK_WAIT_SEC, IN_UNIT) leiten Pfade und Grenzen für die
 # Offline-Prüfung um (test/cockpit-borg-action.test.sh). sudo(8) setzt die
 # Umgebung zurück und der Broker gibt nur PATH mit, auf dem typisierten Weg
 # sieht der Helfer also immer die echten Pfade und Grenzen.
@@ -91,6 +102,7 @@ readonly BORG_ACTION_SERVICE="${COCKPIT_BORG_ACTION_SERVICE:-borgmatic.service}"
 readonly BORG_ACTION_MIN_HEADROOM="${COCKPIT_BORG_ACTION_MIN_HEADROOM_SEC:-28800}"      # 8 h
 readonly BORG_ACTION_STATUS_TIMEOUT="${COCKPIT_BORG_ACTION_STATUS_TIMEOUT_SEC:-200}"    # s
 readonly BORG_ACTION_RUN_TIMEOUT="${COCKPIT_BORG_ACTION_RUN_TIMEOUT_SEC:-86400}"        # 24 h
+readonly BORG_ACTION_LOCK_WAIT="${COCKPIT_BORG_ACTION_LOCK_WAIT_SEC:-60}"              # s
 
 # Die Unit startet diesen Helfer erneut (`--payload <verb>`). Der Pfad muss dafür
 # absolut sein — systemd startet die Unit mit Arbeitsverzeichnis /.
@@ -354,16 +366,42 @@ status_borgmatic() {
     printf '%s\n' "borg hält gerade die Repo-Sperre; list/info würden sie nur sehen und das Repo fälschlich als nicht erreichbar melden. Nach dem Lauf erneut fragen."
     REPO_REACHABLE="belegt (nicht abgefragt)"
   else
+    # N1: Die Abfragen nehmen dieselbe Sperre wie check/repair — einmal um beide,
+    # frei gleich nach `info`. Das nächtliche Backup wartet darauf (Drop-in),
+    # statt an der Repo-Sperre von borg zu scheitern (borg wartet nur 1 s).
+    # Die Sperre hält diese Shell; borgmatic bekommt fd 7 nicht mit (`7>&-`),
+    # damit kein überlebender Kindprozess (z. B. ein ssh-Master) sie weiterhält.
+    local lock_rc=0
+    exec 7>>"$BORG_ACTION_LOCK" || die "Sperrdatei $BORG_ACTION_LOCK ist nicht öffenbar." 67
+    flock -w "$BORG_ACTION_LOCK_WAIT" 7 || lock_rc=$?
+    case "$lock_rc" in
+      0) : ;;
+      1)
+        exec 7>&-
+        section "VPS: Repo — nicht abgefragt"
+        printf 'repo: belegt (Sperre %s nach %s s nicht frei)\n' "$BORG_ACTION_LOCK" "$BORG_ACTION_LOCK_WAIT"
+        printf '%s\n' "Ein Lauf hält die Repo-Sperre; list/info sähen nur die Sperre und das Repo sähe fälschlich nicht erreichbar aus. Nach dem Lauf erneut fragen."
+        REPO_REACHABLE="belegt (nicht abgefragt)"
+        return 0
+        ;;
+      *)
+        exec 7>&-
+        die "die Sperre $BORG_ACTION_LOCK ist nicht nehmbar (flock rc=$lock_rc) — ohne Sperre wird das Repo nicht abgefragt." 67
+        ;;
+    esac
+
     section "VPS: Archive (borgmatic list --last 5)"
     local archives
-    archives="$(borgmatic --verbosity 0 list --last 5 2>&1)"
+    archives="$(borgmatic --verbosity 0 list --last 5 2>&1 7>&-)"
     if [ $? -eq 0 ]; then REPO_REACHABLE="ja"; else REPO_REACHABLE="nein"; fi
     printf '%s\n' "$archives" | tail -n 12
 
     section "VPS: Repo-Kennzahlen (borgmatic info --last 1)"
-    borgmatic --verbosity 0 info --last 1 2>&1 \
+    borgmatic --verbosity 0 info --last 1 2>&1 7>&- \
       | grep -aE 'Archive name|Time \(start\)|Time \(end\)|Duration|Number of files|Original size|This archive:|All archives:|Deduplicated size' \
       | tail -n 12
+    flock -u 7
+    exec 7>&-
   fi
   # Ein nicht erreichbares Repo ist der Befund, nicht eine Randnotiz: rc=2.
   # "belegt" ist kein Befund — die Repo-Abfrage steht nur noch aus.

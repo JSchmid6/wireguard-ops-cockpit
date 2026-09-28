@@ -21,6 +21,13 @@
 #   * status bei unerreichbarem Repo (rc=2 durch die Unit hindurch),
 #   * status bei belegtem Repo: Backup oder Wartungs-Unit aktiv => keine
 #     list/info-Abfrage, "repo: belegt", rc=0 (Befund B4),
+#   * N1: status nimmt für list/info die Repo-Sperre selbst — einmal um beide
+#     Abfragen (der borgmatic-Stub prüft bei jeder Abfrage, dass die Sperre
+#     gehalten ist, das nächtliche Backup also warten würde); ist sie belegt,
+#     wartet status bis zur Grenze (LOCK_WAIT_SEC) und meldet "belegt", rc=0,
+#     ohne list/info; wird sie im Wartefenster frei, fragt status danach ab;
+#     ist sie nicht nehmbar (flock mit anderem rc als 0/1), endet status mit
+#     rc=67 und fragt nicht ab,
 #   * dass /etc/borgmatic/config.yaml NIE im Ausgabestrom landet,
 #   * check mit --force (Befund B2) und repair mit --repair --force + Freigabe,
 #   * check/repair als benannte Unit ohne Warten, Laufzustand über die Unit und
@@ -38,12 +45,15 @@
 # Aufruf (braucht root wegen der Rechteprüfung des Helfers):
 #   docker --context werkstatt run --rm \
 #     --mount type=bind,src=<HOST-Pfad des Klons>,dst=/w,readonly \
-#     bash:5 bash /w/test/cockpit-borg-action.test.sh
+#     ubuntu:24.04 bash /w/test/cockpit-borg-action.test.sh
 #
 # Aus dem Hermes-Container derselbe Lauf über den Austauschordner (die Werkstatt
-# sieht ihn unter /austausch), bash:5 oder ubuntu:24.04 — beide grün:
+# sieht ihn unter /austausch):
 #   docker --context werkstatt run --rm -v /austausch/<klon>:/w:ro \
-#     bash:5 bash /w/test/cockpit-borg-action.test.sh
+#     ubuntu:24.04 bash /w/test/cockpit-borg-action.test.sh
+# Das Image braucht util-linux-flock wie der Host (`flock -w`): das BusyBox-flock
+# in bash:5 kennt kein -w und endet mit rc=1, was der Helfer als
+# Zeitüberschreitung liest — die N1-Fälle wären dort rot.
 # =============================================================================
 set -uo pipefail
 
@@ -84,9 +94,12 @@ bad() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$1"
   fi
 }
 assert_rc() { if [ "$RC" -eq "$2" ]; then ok "$1 (rc=$2)"; else bad "$1 (rc=$RC, erwartet $2)"; fi; }
-assert_out() { if printf '%s' "$OUT" | grep -qF -- "$2"; then ok "$1"; else bad "$1 — Ausgabe ohne: $2"; fi; }
-assert_no_out() { if printf '%s' "$OUT" | grep -qF -- "$2"; then bad "$1 — Ausgabe enthält unerwartet: $2"; else ok "$1"; fi; }
-assert_err() { if printf '%s' "$ERR" | grep -qF -- "$2"; then ok "$1"; else bad "$1 — stderr ohne: $2"; fi; }
+# Here-Strings statt `printf | grep -q`: unter pipefail bekäme printf SIGPIPE,
+# sobald grep -q beim ersten Treffer aufhört — ein Treffer sähe dann zufällig
+# wie keiner aus (unter Last beobachtet).
+assert_out() { if grep -qF -- "$2" <<<"$OUT"; then ok "$1"; else bad "$1 — Ausgabe ohne: $2"; fi; }
+assert_no_out() { if grep -qF -- "$2" <<<"$OUT"; then bad "$1 — Ausgabe enthält unerwartet: $2"; else ok "$1"; fi; }
+assert_err() { if grep -qF -- "$2" <<<"$ERR"; then ok "$1"; else bad "$1 — stderr ohne: $2"; fi; }
 assert_file() { if [ -f "$2" ]; then ok "$1"; else bad "$1 — fehlt: $2"; fi; }
 assert_no_file() { if [ -e "$2" ]; then bad "$1 — existiert: $2"; else ok "$1"; fi; }
 
@@ -183,6 +196,19 @@ case "\$*" in
       echo "ssh: connect to host 10.0.0.5 port 22: Connection refused" >&2
       exit 2
     fi
+    ;;
+esac
+# N1: bei jeder Repo-Abfrage festhalten, ob die Sperre frei ist — frei hiesse,
+# ein gleichzeitig startendes Backup liefe an der Repo-Sperre von borg vorbei.
+case "\$*" in
+  *" list --last 5"*|*" info --last 1"*)
+    if flock -n "\${COCKPIT_BORG_ACTION_LOCK:-/run/lock/cockpit-borg.lock}" true 2>/dev/null; then
+      probe=frei
+    else
+      probe=gehalten
+    fi
+    case "\$*" in *" list "*) what=list ;; *) what=info ;; esac
+    printf '%s: %s\n' "\$what" "\$probe" >> "$WORK/lock-probe.log"
     ;;
 esac
 case "\$*" in
@@ -367,7 +393,15 @@ cat > "$WORK/bin-broken/systemd-run" <<'EOF'
 echo "systemd-run: Failed to start transient service unit" >&2
 exit 1
 EOF
-chmod 755 "$STUBS"/* "$WORK/bin-broken"/*
+# Kaputtes flock: weder genommen (0) noch Zeitüberschreitung (1) — die Sperre
+# ist nicht nehmbar, status darf dann nicht ohne sie abfragen (rc=67).
+mkdir -p "$WORK/bin-flock-broken"
+cat > "$WORK/bin-flock-broken/flock" <<'EOF'
+#!/usr/bin/env bash
+echo "flock: kaputt" >&2
+exit 3
+EOF
+chmod 755 "$STUBS"/* "$WORK/bin-broken"/* "$WORK/bin-flock-broken"/*
 
 export PATH="$STUBS:$PATH"
 export COCKPIT_BORG_ACTION_LOCK="$WORK/borg.lock"
@@ -457,6 +491,72 @@ else
   ok "status überspringt list/info während des Backups"
 fi
 rm -f "$WORK/borgmatic-busy"
+
+echo "== N1: status hält die Repo-Sperre während list/info =="
+: > "$WORK/borgmatic.log"; : > "$WORK/lock-probe.log"
+run_helper status
+assert_rc "status bei freier Sperre läuft durch" 0
+assert_out "Repo erreichbar" "repo_erreichbar: ja"
+if grep -q "^list: gehalten$" "$WORK/lock-probe.log" && grep -q "^info: gehalten$" "$WORK/lock-probe.log" \
+   && ! grep -q "frei" "$WORK/lock-probe.log"; then
+  ok "list und info laufen unter der Sperre (das Backup würde warten)"
+else
+  bad "Sperre während der Abfrage nicht gehalten: $(tr '\n' ' ' < "$WORK/lock-probe.log")"
+fi
+if flock -n "$WORK/borg.lock" true; then
+  ok "Sperre nach status wieder frei"
+else
+  bad "status hat die Sperre nicht freigegeben"
+fi
+
+echo "== N1: status bei belegter Sperre =="
+: > "$WORK/borgmatic.log"
+exec 9>>"$WORK/borg.lock"
+flock -n 9 && ok "Sperre im Harness gehalten" || bad "Sperre nicht haltbar"
+T0="$(date +%s)"
+run_helper_env COCKPIT_BORG_ACTION_LOCK_WAIT_SEC=1 -- status
+T1="$(date +%s)"
+assert_rc "status bleibt rc=0 bei belegter Sperre" 0
+assert_out "Repo als belegt gemeldet (Sperre)" "repo: belegt (Sperre $WORK/borg.lock nach 1 s nicht frei)"
+assert_out "Zusammenfassung nennt belegt" "repo_erreichbar: belegt (nicht abgefragt)"
+assert_no_out "kein falsches nicht erreichbar" "repo_erreichbar: nein"
+if [ $(( T1 - T0 )) -ge 1 ]; then ok "status hat bis zur Grenze gewartet"; else bad "status hat nicht gewartet ($(( T1 - T0 )) s)"; fi
+if grep -qE "list --last 5|info --last 1" "$WORK/borgmatic.log"; then
+  bad "status hat das Repo trotz belegter Sperre abgefragt: $(cat "$WORK/borgmatic.log")"
+else
+  ok "status überspringt list/info bei belegter Sperre"
+fi
+flock -u 9; exec 9>&-
+
+echo "== N1: Sperre wird im Wartefenster frei =="
+: > "$WORK/borgmatic.log"; : > "$WORK/lock-probe.log"; rm -f "$WORK/lock-taken"
+flock "$WORK/borg.lock" sh -c ": > '$WORK/lock-taken'; sleep 2" &
+HOLDER=$!
+wait_for_file "$WORK/lock-taken" || bad "Hintergrundprozess hat die Sperre nicht genommen"
+run_helper_env COCKPIT_BORG_ACTION_LOCK_WAIT_SEC=10 -- status
+wait "$HOLDER" 2>/dev/null
+assert_rc "status wartet und fragt danach ab" 0
+assert_out "Repo erreichbar nach dem Warten" "repo_erreichbar: ja"
+if grep -q "list --last 5" "$WORK/borgmatic.log" && grep -q "info --last 1" "$WORK/borgmatic.log"; then
+  ok "list/info nach freigewordener Sperre abgefragt"
+else
+  bad "list/info fehlen nach dem Warten: $(cat "$WORK/borgmatic.log")"
+fi
+if grep -q "frei" "$WORK/lock-probe.log"; then bad "Abfrage lief ohne Sperre"; else ok "auch nach dem Warten unter der Sperre abgefragt"; fi
+
+echo "== N1: Sperre nicht nehmbar =="
+: > "$WORK/borgmatic.log"
+OUT="$(PATH="$WORK/bin-flock-broken:$STUBS:$PATH" "$BASH_BIN" "$HELPER" status 2>"$WORK/stderr")"; RC=$?
+ERR="$(cat "$WORK/stderr")"
+assert_rc "nicht nehmbare Sperre => rc=67" 67
+assert_err "Grund genannt (flock rc)" "nicht nehmbar (flock rc=3)"
+assert_no_out "keine falsche Belegt-Meldung" "repo: belegt"
+assert_no_out "keine Belegt-Zusammenfassung" "repo_erreichbar: belegt"
+if grep -qE "list --last 5|info --last 1" "$WORK/borgmatic.log"; then
+  bad "status hat ohne Sperre abgefragt: $(cat "$WORK/borgmatic.log")"
+else
+  ok "ohne Sperre keine list/info-Abfrage"
+fi
 
 echo "== B1: check/repair als benannte Unit ohne Warten =="
 run_helper check
