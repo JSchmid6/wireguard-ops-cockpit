@@ -960,7 +960,9 @@ describe("App", () => {
 
     expect(await screen.findByText("Borg backup")).toBeTruthy();
 
-    const lastRun = screen.getByTestId("borg-last-run");
+    // Der Zustand kommt asynchron über /api/borg/status — auf den ersten Wert
+    // warten, statt die (sofort gerenderte) Überschrift als Beleg zu nehmen.
+    const lastRun = await screen.findByTestId("borg-last-run");
     expect(lastRun.textContent).toContain("2026-09-28 02:56:06+02:00");
     expect(lastRun.textContent).toContain("success");
     expect(lastRun.textContent).toContain("exit 0");
