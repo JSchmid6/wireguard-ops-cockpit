@@ -839,8 +839,12 @@ describe("App", () => {
 
     render(<App />);
 
-    expect(await screen.findByText("Local admin login stays separate from WireGuard reachability.")).toBeTruthy();
-    expect(screen.getByText("authentication required")).toBeTruthy();
+    // Der statische Satz steht schon im ersten Render, der Fehlerhinweis erst nach
+    // der abgelehnten /api/me-Antwort. Deshalb auf den Fehlerhinweis warten und den
+    // Satz danach synchron pruefen (mit 3 s Latenz je /api-Antwort war die alte
+    // Reihenfolge rot).
+    expect(await screen.findByText("authentication required")).toBeTruthy();
+    expect(screen.getByText("Local admin login stays separate from WireGuard reachability.")).toBeTruthy();
 
     await user.click(screen.getByRole("button", { name: "Sign in" }));
 
