@@ -57,10 +57,12 @@ import {
   parseTypedSelfUpdates,
   createExecutionEnvelope,
   hashCanonical,
+  manifestPlanCapabilities,
   normalizeAllowedCapabilities,
   normalizeEvidence,
   parseTypedBorgActions,
   requestsBorgRepair,
+  requestsBorgRepairInSteps,
   typedPlanScript,
   verifyExecutionEnvelopeSignature,
   type CapabilityId,
@@ -254,15 +256,19 @@ export function evaluatePlanPolicy(plan: string, safetyVerdict: string): PlanPol
   if (safetyVerdict === "approval_required") zone = "yellow";
   // G1: a borg repair can delete corrupt archives, so it is never an autonomous
   // action — the operator decides, a read-only check stays the autonomous way.
-  // The criterion is the typed line, not the plan's free text: the gate asks the
-  // same parser the execution uses (parseTypedBorgActions) about the same verb.
-  // It reads the whole plan instead of only the ```bash fence the executor runs,
-  // and it holds whatever else the plan carries (a capability manifest included):
-  // the runner receives the whole plan text, so a repair line in a second code
-  // block or in another fence language must stop here as well. The gate is
-  // therefore never narrower than what can execute, and for a manifest stand it
-  // is the only gate left.
-  if (requestsBorgRepair(plan)) {
+  // The criterion is the typed action, not the plan's free text, and it is read
+  // from both forms a plan can carry it in: the shell line (whole plan text, so a
+  // second fence counts too) and the argv of a capability step. The plan form
+  // therefore never decides whether the gate holds — the 28.09.2026 live case ran
+  // a repair as `steps[0].argv = ["/usr/local/sbin/cockpit-borg-action","repair"]`,
+  // passed both thresholds and was stopped only by the sandbox's "executable is
+  // unavailable", i.e. by the missing rollout.
+  // The manifest is read here with the same reader the route uses
+  // (parseCapabilityManifest), so no caller can switch the gate off by not
+  // handing the manifest in. An unparseable manifest throws exactly as it does in
+  // the route, which parses it before this policy.
+  const manifestSteps = parseCapabilityManifest(plan)?.steps;
+  if (requestsBorgRepair(plan) || requestsBorgRepairInSteps(manifestSteps)) {
     return {
       zone: "red", allowed: false, status: "blocked_user_approval",
       reason: "A borg repository repair can delete corrupt archives; it needs the operator's explicit decision.",
@@ -2671,7 +2677,9 @@ Follow these rules:
           (step.argv[0] === "/usr/local/sbin/cockpit-nextcloud-app-action" && nextcloudMutationModes.has(step.argv[1] || ""))
           || (step.argv[0] === "/usr/local/sbin/cockpit-nextcloud-context-action" && contextMutationModes.has(step.argv[1] || ""))
         ) ?? false;
-        const capabilities: CapabilityId[] = manifest ? [manifest.writablePaths.length > 0 || semanticMutation ? "filesystem.write" : "read.host"] : classifyCapabilities(planText);
+        const capabilities: CapabilityId[] = manifest
+          ? manifestPlanCapabilities(manifest.steps, manifest.writablePaths.length > 0 || semanticMutation)
+          : classifyCapabilities(planText);
         const capabilityEscalation = capabilities.filter((capability) => !allowedCapabilities.includes(capability));
         if (!manifest && policy.allowed && capabilityEscalation.length > 0) {
           policy = {
@@ -2710,10 +2718,12 @@ Follow these rules:
           };
         }
         // Der borg-Repair-Riegel sitzt in evaluatePlanPolicy: er greift für
-        // jeden Plan — mit oder ohne Capability-Manifest — und liest genau das
-        // Skript, das der Executor ausführt (typedPlanScript/requestsBorgRepair).
-        // Den zweiten Riegel hält executeTypedCapabilities: kein Repair ohne die
-        // Freigabe des Operators für genau diesen Job.
+        // jeden Plan — Skript oder Capability-Manifest — und liest die typisierte
+        // Aktion aus beiden Formen (Shell-Zeile oder Schritt-argv). Den zweiten
+        // Riegel hält je Ausführungspfad der Vollstrecker: executeTypedCapabilities
+        // keinen Repair ohne die Freigabe des Operators für genau diesen Job, der
+        // Capability-Sandkasten keinen Repair-Schritt im Manifest ohne dieselbe
+        // Freigabe (ops/cockpit-capability-action.mjs, stepNeedsApproval).
         if (manifest && policy.allowed && capabilityNeedsOperatorApproval(manifest)) {
           policy = {
             ...policy, zone: "red", allowed: false, status: "blocked_user_approval",

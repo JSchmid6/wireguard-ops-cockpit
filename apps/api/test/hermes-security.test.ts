@@ -10,6 +10,9 @@ import {
   parseTypedDiskActions,
   parseTypedSelfUpdates,
   requestsBorgRepair,
+  requestsBorgRepairInSteps,
+  helperArgvCapabilities,
+  manifestPlanCapabilities,
   typedPlanScript,
   validateExecutionEnvelope,
 } from "../src/hermes-security.js";
@@ -265,5 +268,45 @@ describe("typed borg maintenance (borg.manage)", () => {
 
   it("accepts borg.manage as an authorizable capability", () => {
     expect(normalizeAllowedCapabilities(["borg.manage", "become.root"])).toEqual(["borg.manage"]);
+  });
+
+  // Der Live-Fall vom 28.09.2026 (Job 4282c4ac): der Planer schrieb den Repair
+  // nicht als Shell-Zeile, sondern als Capability-Schritt. Beide Formen tragen
+  // dieselbe Aktion, also muss dieselbe Regel sie lesen.
+  const step = (argv: string[]) => ({ argv });
+
+  it("reads a repair from a capability step, not only from a shell line", () => {
+    expect(requestsBorgRepairInSteps([step(["/usr/local/sbin/cockpit-borg-action", "repair"])])).toBe(true);
+    expect(requestsBorgRepairInSteps([step(["/usr/local/sbin/cockpit-borg-action", "check"])])).toBe(false);
+    expect(requestsBorgRepairInSteps([step(["/usr/local/sbin/cockpit-borg-action", "status"])])).toBe(false);
+    // Ein Zusatzargument bleibt die Entscheidung des Operators: nur der Helfer
+    // selbst kennt seine Grammatik, der Riegel raet nicht.
+    expect(requestsBorgRepairInSteps([step(["/usr/local/sbin/cockpit-borg-action", "repair", "--force"])])).toBe(true);
+    expect(requestsBorgRepairInSteps([step(["/usr/local/sbin/cockpit-borg-action"])])).toBe(true);
+    // Ein anderer Helfer, ein anderer Pfad oder Prosa sind keine Borg-Aktion.
+    expect(requestsBorgRepairInSteps([step(["/usr/local/sbin/cockpit-disk-action", "repair"])])).toBe(false);
+    expect(requestsBorgRepairInSteps([step(["/tmp/cockpit-borg-action", "repair"])])).toBe(false);
+    expect(requestsBorgRepairInSteps([step(["/bin/true"])])).toBe(false);
+    expect(requestsBorgRepairInSteps([{}])).toBe(false);
+    expect(requestsBorgRepairInSteps([])).toBe(false);
+    expect(requestsBorgRepairInSteps(undefined)).toBe(false);
+  });
+
+  it("names the capability a directly invoked helper needs — the same mapping as the typed lines", () => {
+    expect(helperArgvCapabilities(["/usr/local/sbin/cockpit-borg-action", "status"])).toEqual(["borg.manage"]);
+    expect(helperArgvCapabilities(["/usr/local/sbin/cockpit-disk-action", "status"])).toEqual(["disk.manage"]);
+    expect(helperArgvCapabilities(["/usr/local/sbin/cockpit-self-update-action", "a".repeat(40)])).toEqual(["self.update"]);
+    expect(helperArgvCapabilities(["/usr/local/sbin/cockpit-dienste-update-action", "a".repeat(40)])).toEqual(["dienste.update"]);
+    expect(helperArgvCapabilities(["/usr/bin/tee", "/tmp/x"])).toEqual([]);
+    expect(helperArgvCapabilities(undefined)).toEqual([]);
+  });
+
+  it("does not let a manifest plan hide a mutating step behind read.host", () => {
+    const repairManifest = [step(["/usr/local/sbin/cockpit-borg-action", "repair"])];
+    expect(manifestPlanCapabilities(repairManifest, false)).toEqual(["read.host", "borg.manage"]);
+    expect(manifestPlanCapabilities(repairManifest, true)).toEqual(["filesystem.write", "borg.manage"]);
+    expect(manifestPlanCapabilities([step(["/bin/true"])], false)).toEqual(["read.host"]);
+    expect(manifestPlanCapabilities([], false)).toEqual(["read.host"]);
+    expect(manifestPlanCapabilities(undefined, false)).toEqual(["read.host"]);
   });
 });

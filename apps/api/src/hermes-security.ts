@@ -47,6 +47,10 @@ const BORG_HELPER_STATUS_LINE = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-borg-a
 const BORG_HELPER_CHECK_LINE = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-borg-action\s+check$/;
 const BORG_HELPER_REPAIR_LINE = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-borg-action\s+repair$/;
 const BORG_HELPER_INVOCATION = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-borg-action\b/;
+// Derselbe Pfad als Konstante, fuer die Manifest-Form: dort steht der Helfer als
+// argv[0], nicht als Shell-Zeile. Nur die beiden lesenden Verben laufen autonom.
+const BORG_HELPER = "/usr/local/sbin/cockpit-borg-action";
+const BORG_AUTONOMOUS_VERBS = new Set(["status", "check"]);
 // The installed self-update helper is the executor's face for rolling out a
 // merged cockpit stand: one full lowercase commit sha, or the read-only
 // status form. Everything else stays shell.exception.
@@ -56,6 +60,7 @@ const SELF_UPDATE_STATUS_LINE = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-self-u
 const SELF_UPDATE_INVOCATION = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-self-update-action\b/;
 // The same form for server-dienste (the root supervisor of James' Docker
 // services): one merged commit, reviewed like a self-update, or status.
+const DIENSTE_UPDATE_HELPER = "/usr/local/sbin/cockpit-dienste-update-action";
 const DIENSTE_UPDATE_COMMIT_LINE = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-dienste-update-action\s+([a-f0-9]{40})$/;
 const DIENSTE_UPDATE_STATUS_LINE = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-dienste-update-action\s+status$/;
 const DIENSTE_UPDATE_INVOCATION = /^(?:sudo\s+)?\/usr\/local\/sbin\/cockpit-dienste-update-action\b/;
@@ -149,6 +154,46 @@ export function parseTypedBorgActions(script: string): { actions: TypedBorgActio
 // corrupt, so both sides ask the same parser about the same verb.
 export function requestsBorgRepair(text: string): boolean {
   return parseTypedBorgActions(text).actions.some((action) => action.action === "borg.repair");
+}
+
+// Derselbe Helfer, aber als Schritt eines Capability-Manifests: dort steht er als
+// argv, nicht als Shell-Zeile. Die Regel ist dieselbe — nur `status` und `check`
+// laufen autonom, jeder andere argv an diesem Helfer ist die Entscheidung des
+// Operators (ein Zusatzargument eingeschlossen, denn nur der Helfer selbst kennt
+// seine Grammatik). Damit entscheidet die Planform nie, ob die Regel greift.
+export function requestsBorgRepairInSteps(steps: ReadonlyArray<{ argv?: readonly string[] }> | null | undefined): boolean {
+  return (steps ?? []).some((step) => {
+    const argv = step?.argv;
+    if (!Array.isArray(argv) || argv[0] !== BORG_HELPER) return false;
+    return argv.length !== 2 || !BORG_AUTONOMOUS_VERBS.has(argv[1]);
+  });
+}
+
+// Die Faehigkeit, die ein direkt benannter installierter Helfer braucht — dieselbe
+// Zuordnung, die classifyCapabilities fuer die typisierten Zeilen trifft. Ein
+// Manifest-Schritt nennt den Helfer selbst; ohne diese Zuordnung wuerde ein
+// mutierender Schritt als `read.host` verbucht und verdeckte seine eigene Wirkung.
+export function helperArgvCapabilities(argv: readonly string[] | null | undefined): CapabilityId[] {
+  const executable = argv?.[0] ?? "";
+  if (executable === BORG_HELPER) return ["borg.manage"];
+  if (executable === DISK_HELPER) return ["disk.manage"];
+  if (executable === SELF_UPDATE_HELPER) return ["self.update"];
+  if (executable === DIENSTE_UPDATE_HELPER) return ["dienste.update"];
+  return [];
+}
+
+// Die Faehigkeiten eines Plans, der seine Schritte als argv nennt (Manifest-Form):
+// die Basis bleibt, was der Job schon hatte — lesende Sichtbarkeit oder
+// Schreibrecht — dazu kommt, was die deklarierten Schritte wirklich brauchen.
+export function manifestPlanCapabilities(
+  steps: ReadonlyArray<{ argv?: readonly string[] }> | null | undefined,
+  writesFiles: boolean,
+): CapabilityId[] {
+  const capabilities = new Set<CapabilityId>([writesFiles ? "filesystem.write" : "read.host"]);
+  for (const step of steps ?? []) {
+    for (const capability of helperArgvCapabilities(step?.argv)) capabilities.add(capability);
+  }
+  return [...capabilities];
 }
 
 export interface TypedSelfUpdateAction { action: "self.update" | "self.status"; target: string }

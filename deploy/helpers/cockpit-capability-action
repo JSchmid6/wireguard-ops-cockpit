@@ -121,10 +121,19 @@ function readableBindProperty(item) {
   return `--property=BindReadOnlyPaths=${item === "/proc/mdstat" ? "/proc/mdstat:/run/mdstat" : item}`;
 }
 const readOnlyContainerCommands = new Set(["ps", "inspect", "version", "info"]);
+// Derselbe Riegel, den die Plan-Policy haelt (evaluatePlanPolicy /
+// requestsBorgRepairInSteps): ein Repair kann beschädigte Archive entfernen
+// (Datenverlust). Nur die beiden lesenden Verben laufen ohne Freigabe; jeder
+// andere argv an diesem Helfer — ein Zusatzargument eingeschlossen — ist die
+// Entscheidung des Operators. Ohne diesen Riegel entschiede allein, ob der
+// Helfer schon ausgerollt ist, ob ein Manifest-Repair startet.
+const borgHelper = "/usr/local/sbin/cockpit-borg-action";
+const borgAutonomousVerbs = new Set(["status", "check"]);
 function stepNeedsApproval(step) {
   const executable = step?.argv?.[0] || "";
   if (executable === "/bin/sh" && step?.argv?.[1] === emailArchiveDeployHelper) return true;
   if (executable === "/bin/sh" && step?.argv?.[1] === hermesSkillHelper && step?.argv?.[2] === "remove-empty-target") return true;
+  if (executable === borgHelper) return step?.argv?.length !== 2 || !borgAutonomousVerbs.has(step?.argv?.[1] || "");
   if (dangerousExecutable.test(executable)) return true;
   if (/\/(?:docker|podman)$/.test(executable)) return !readOnlyContainerCommands.has(step?.argv?.[1] || "");
   return false;
