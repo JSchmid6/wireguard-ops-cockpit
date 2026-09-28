@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { formatOutput, request } from "./lib";
+import BorgPanel from "./BorgPanel";
 
 interface UserSummary {
   id: string;
@@ -613,6 +614,11 @@ export default function App() {
           The GUI reviews definitions and execution state, but it does not become the privilege boundary.
         </p>
       </section>
+
+      {/* Der Backup-Zustand gehört sichtbar ins Cockpit (read-only, mit Quelle je
+          Wert): der letzte borgmatic-Lauf, sein Exit-Status und das Ergebnis des
+          Repo-Checks. */}
+      <BorgPanel />
 
       <section className="grid two-column">
         <article className="panel">

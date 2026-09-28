@@ -43,6 +43,7 @@ import {
 import { generateRunbookSafetyReview, type SafetyReviewRunner } from "./safety-review.js";
 import { runBrokerAgent } from "./agent-broker.js";
 import { runDynamicCapability, runExecutorAction, type ExecutorActionKind } from "./executor-broker.js";
+import { borgStatusRequestDigest, createBorgStatusService } from "./borg-status.js";
 import {
   capabilityManifestHash, capabilityNeedsOperatorApproval, capabilityPlannerContract,
   parseCapabilityManifest, readablePathsNeedingApproval, type CapabilityManifest,
@@ -93,6 +94,9 @@ interface AppOptions {
   // The isolated reviewer of a self-update's code (prompt in, raw answer out).
   // Defaults to the agent broker's safety role; tests inject a stub.
   updateReviewRunner?: (prompt: string) => Promise<string>;
+  // The borg helper's status report (`borg.status`, read-only). Defaults to the
+  // typed executor path; tests inject the helper's output instead of a host.
+  borgStatusReader?: () => Promise<string>;
 }
 
 interface LoginAttemptState {
@@ -120,6 +124,12 @@ const DIENSTE_UPDATE_EXECUTOR_TIMEOUT_MS = 16 * 60 * 1000;
 // durch `--wait --pipe` zurückkommen. check und repair kehren sofort zurück,
 // weil der Helper den stundenlangen Lauf als eigene Unit startet (ohne Warten).
 const BORG_EXECUTOR_TIMEOUT_MS = 4 * 60 * 1000;
+// Der Zustandsbereich der Anzeige (unten /api/borg/status) misst über dieselbe
+// typisierte Aktion `borg.status` — lesend, allowlistetes Ziel `state`, ohne
+// Freigabe. Ein gemessener Stand gilt 10 Minuten als frisch; eine Anfrage wartet
+// höchstens 25 s und bekommt sonst den letzten Stand plus "Messung läuft".
+const BORG_STATUS_TTL_MS = 10 * 60 * 1000;
+const BORG_STATUS_REQUEST_WAIT_MS = 25_000;
 
 // Keeps a validated capability manifest for reuse, only when the planner
 // declared the operation as recurring (`retain: true`); a one-off repair stays
@@ -677,6 +687,26 @@ export async function createApp(options: AppOptions = {}) {
   const agents = listAgents(config.plannerRuntime);
   const scripts = listScripts();
   const safetyReviewRunner = options.safetyReviewRunner || generateRunbookSafetyReview;
+
+  // Borg-Zustand für die Anzeige: derselbe typisierte Weg wie im Job
+  // (`sudo -n /usr/local/sbin/cockpit-borg-action status` über den Executor),
+  // aber lesend und ohne Job. Kein Modell, kein Plan, kein Audit-Eintrag —
+  // nichts wird verändert; die Herkunft jedes Werts steht in der Antwort.
+  const borgStatus = createBorgStatusService({
+    ttlMs: BORG_STATUS_TTL_MS,
+    maxWaitMs: BORG_STATUS_REQUEST_WAIT_MS,
+    readReport: options.borgStatusReader || (async () => {
+      if (!config.executorBrokerSocket || !config.executorBrokerSecret) {
+        throw new Error("executor broker is not configured");
+      }
+      const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+      const payload = { action: "borg.status" as const, target: "state", expiresAt };
+      return await runExecutorAction(config.executorBrokerSocket, config.executorBrokerSecret, {
+        ...payload,
+        envelopeDigest: borgStatusRequestDigest(payload),
+      }, BORG_EXECUTOR_TIMEOUT_MS);
+    }),
+  });
   const terminalSigningSecret = Buffer.from(config.terminalSigningSecret, "utf8");
   const loginAttempts = new Map<string, LoginAttemptState>();
   const scheduleLocks = new Set<string>();
@@ -1465,6 +1495,23 @@ export async function createApp(options: AppOptions = {}) {
         : null,
     },
   }));
+
+  // Borg-Zustand: letzter borgmatic-Lauf (Zeitstempel, Ergebnis, Exit-Status) und
+  // das Ergebnis des letzten Repo-Checks — read-only, gemessen über die
+  // typisierte Leseaktion `borg.status`. GET liefert den Stand und stösst eine
+  // veraltete Messung im Hintergrund an; POST /refresh wartet kurz auf ein
+  // frisches Ergebnis (mehr gibt der Helfer nicht her, er läuft in eigener Unit).
+  app.get("/api/borg/status", async (request, reply) => {
+    const actor = await requireActor(request, reply, database);
+    if (!actor) return;
+    return await borgStatus.measure({ waitMs: 0 });
+  });
+
+  app.post("/api/borg/status/refresh", async (request, reply) => {
+    const actor = await requireActor(request, reply, database);
+    if (!actor) return;
+    return await borgStatus.measure({ force: true, waitMs: BORG_STATUS_REQUEST_WAIT_MS });
+  });
 
   app.post("/api/research", async (request, reply) => {
     const actor = await requireActor(request, reply, database);

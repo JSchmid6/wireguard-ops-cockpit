@@ -59,6 +59,11 @@
 #   * `status` fragt das Repo NICHT ab, während Backup oder Wartung läuft: dann
 #     hält borg die Sperre, `list`/`info` scheiterten und das Repo sähe "nicht
 #     erreichbar" aus. Stattdessen: `repo: belegt (…)`, rc=0.
+#   * `status` endet mit einem maschinenlesbaren Block `== DATEN
+#     (cockpit-borg-status/v1) ==` (Schlüssel=Wert, nur ISO-Zeit mit Zone, ganze
+#     Zahl, Einheitenname oder feste Aufzählung). Den liest die Cockpit-Anzeige
+#     (apps/api/src/borg-status.ts); die Prosa darüber ist für Menschen. Der
+#     Block enthält keine Pfade und nichts aus /etc/borgmatic/config.yaml.
 #
 # Rückgabewerte: 0 ok · 2 Repo nicht erreichbar (nur status) · 3 schon in Arbeit
 # oder zu wenig Frist bis zum Timer · 64 Aufruffehler · 67 falscher Host /
@@ -366,6 +371,130 @@ status_borgmatic() {
   return 2
 }
 
+# ---------------------------------------------------------------------------
+# Werte für die Cockpit-Anzeige (maschinenlesbarer Block)
+# ---------------------------------------------------------------------------
+# Der Zustandsbereich der Cockpit-API liest ausschliesslich diesen Block
+# (apps/api/src/borg-status.ts, Prüfung apps/api/test/borg-status.test.ts): er
+# ist die einzige Schnittstelle zwischen Helfer und Anzeige, und er ist eng —
+# ein Schlüssel je Zeile, als Wert nur ISO-Zeit mit Zone, ganze Zahl,
+# Einheitenname oder feste Aufzählung. Kein Freitext, keine Pfade, nichts aus
+# /etc/borgmatic/config.yaml. Die API verwirft jede Zeile, die nicht in dieses
+# Muster passt; ohne Block bleibt die Anzeige ehrlich bei "unknown".
+#
+# Zwei Werte sind bewusst getrennt: `maintenance_*` ist der letzte Lauf, den
+# dieses Cockpit wirklich gestartet hat, `scheduled_check` das, was der
+# nächtliche borgmatic-Lauf über seine Konsistenzprüfung sagt. Der ist meist
+# "skipped" (borgmatic fährt sie nur nach seiner Frequenz) — und genau deshalb
+# wird hier nie ein grüner Check behauptet, den es nicht gab.
+data_block_iso() { # erste ISO-Zeit (mit Zone) einer journalctl-short-iso-Zeile
+  awk '{print $1}' | grep -aE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,6})?([+-][0-9]{2}:[0-9]{2}|Z)$' || true
+}
+
+data_block_value() { # nichts erfinden: leere Werte heissen "unknown"
+  case "${1:-}" in ''|unknown|null|unbekannt) printf 'unknown' ;; *) printf '%s' "$1" ;; esac
+}
+
+service_journal_lines() {
+  have journalctl || return 0
+  journalctl -u "$BORG_ACTION_SERVICE" --since '-30 days' --no-pager -o short-iso 2>/dev/null || true
+}
+
+maintenance_end_line() { # letzte 'Ende: <ISO> (rc=<n>)'-Zeile aus dem Journal der Unit
+  journalctl -u "$1" --no-pager -o cat 2>/dev/null | grep -a '^Ende: ' | tail -n 1 || true
+}
+
+data_block() {
+  local lines props unit line
+  lines="$(service_journal_lines)"
+
+  # Letzter borgmatic-Lauf: Zeiten aus dem Journal (ISO mit Zone), Ergebnis aus systemd.
+  local last_start="" last_end="" result="unknown" exit_status="unknown"
+  if [ -n "$lines" ]; then
+    last_start="$(printf '%s\n' "$lines" | grep -a 'Starting borgmatic' | tail -n 1 | data_block_iso)"
+    last_end="$(printf '%s\n' "$lines" | grep -a 'Finished borgmatic' | tail -n 1 | data_block_iso)"
+  fi
+  if have systemctl; then
+    props="$(systemctl show "$BORG_ACTION_SERVICE" --no-pager -p Result -p ExecMainStatus 2>/dev/null || true)"
+    result="$(printf '%s\n' "$props" | sed -n 's/^Result=//p' | head -n 1)"
+    exit_status="$(printf '%s\n' "$props" | sed -n 's/^ExecMainStatus=//p' | head -n 1)"
+  fi
+  if [ -n "$result" ]; then case "$result" in *[!a-z-]*) result="unknown" ;; esac; else result="unknown"; fi
+  if [ -n "$exit_status" ]; then case "$exit_status" in *[!0-9]*) exit_status="unknown" ;; esac; else exit_status="unknown"; fi
+
+  # Wartung (check/repair): läuft sie gerade, oder was hat die zuletzt gestartete
+  # ergeben? Das Ergebnis steht in ihrem Journal; die Unit selbst ist mit --collect
+  # nach dem Lauf weg, ihr Journal bleibt.
+  local m_running="no" m_unit="unknown" m_kind="unknown" m_rc="unknown" m_end="unknown" m_source="none"
+  unit="$(active_maintenance_unit)" || unit=""
+  if [ -n "$unit" ]; then
+    m_running="yes"; m_unit="$unit"; m_kind="$(unit_kind "$unit")"; m_source="running-unit"
+  else
+    unit="$(recorded_unit)" || unit=""
+    if [ -n "$unit" ]; then
+      m_unit="$unit"; m_kind="$(recorded_kind)"
+      line="$(maintenance_end_line "$unit")"
+      if [ -n "$line" ]; then
+        local rc_part iso_part
+        rc_part="$(printf '%s' "$line" | sed -n 's/.*(rc=\([0-9]\{1,5\}\)).*/\1/p')"
+        iso_part="$(printf '%s' "$line" | awk '{print $2}' | data_block_iso)"
+        if [ -n "$rc_part" ]; then m_rc="$rc_part"; m_source="unit-journal"; fi
+        if [ -n "$iso_part" ]; then m_end="$iso_part"; fi
+      fi
+    fi
+  fi
+  case "$m_kind" in check|repair) : ;; *) m_kind="unknown" ;; esac
+  case "$m_source" in unit-journal|running-unit|none) : ;; *) m_source="none" ;; esac
+
+  # Nächtlicher Lauf: was borgmatic über seine Konsistenzprüfung sagt. Die Zeilen
+  # sind INFO/CRITICAL-Zeilen mit ISO-Zeit; die jüngste entscheidet.
+  local s_state="unknown" s_at="unknown" s_line=""
+  s_line="$(printf '%s\n' "$lines" | grep -aE 'Skipping (repository|archives) check|check --glob-archives.* returned non-zero exit status|Data integrity error' | tail -n 1 || true)"
+  if [ -n "$s_line" ]; then
+    s_at="$(printf '%s' "$s_line" | data_block_iso)"
+    if [ -n "$s_at" ]; then
+      case "$s_line" in *'Skipping '*) s_state="skipped" ;; *) s_state="failed" ;; esac
+    else
+      s_at="unknown"
+    fi
+  fi
+
+  # Timer: der nächste Lauf als Zeitpunkt in UTC (die Frist selbst rechnet
+  # guard_timer_headroom weiterhin in Sekunden, nie über eine formatierte Uhr).
+  local t_active="unknown" t_next="unknown" json usec
+  if have systemctl; then
+    t_active="$(systemctl is-active "$BORG_ACTION_TIMER" 2>/dev/null || true)"
+    case "$t_active" in active|activating|inactive|deactivating|failed) : ;; *) t_active="unknown" ;; esac
+    json="$(systemctl list-timers --output=json --no-pager "$BORG_ACTION_TIMER" 2>/dev/null || true)"
+    if usec="$(timer_next_usec "$json")"; then
+      t_next="$(date -u -d "@$(( 10#$usec / 1000000 ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
+      if [ -z "$t_next" ]; then t_next="unknown"; fi
+    fi
+  fi
+
+  section "DATEN (cockpit-borg-status/v1)"
+  printf 'schema=cockpit-borg-status/v1\n'
+  printf 'measured_at=%s\n' "$(now_iso)"
+  printf 'host=%s\n' "$(hostname -f 2>/dev/null || hostname)"
+  printf 'role=%s\n' "$(borgmatic_here && printf vps || printf kiste)"
+  printf 'timer_unit=%s\n' "$BORG_ACTION_TIMER"
+  printf 'timer_active=%s\n' "$t_active"
+  printf 'timer_next=%s\n' "$t_next"
+  printf 'last_run_start=%s\n' "$(data_block_value "$last_start")"
+  printf 'last_run_end=%s\n' "$(data_block_value "$last_end")"
+  printf 'last_run_result=%s\n' "$result"
+  printf 'last_run_exit=%s\n' "$exit_status"
+  printf 'maintenance_running=%s\n' "$m_running"
+  printf 'maintenance_unit=%s\n' "$m_unit"
+  printf 'maintenance_kind=%s\n' "$m_kind"
+  printf 'maintenance_rc=%s\n' "$m_rc"
+  printf 'maintenance_end=%s\n' "$m_end"
+  printf 'maintenance_source=%s\n' "$m_source"
+  printf 'scheduled_check=%s\n' "$s_state"
+  printf 'scheduled_check_at=%s\n' "$s_at"
+  return 0
+}
+
 run_status() {
   printf 'cockpit-borg-action status — %s\n' "$(now_iso)"
   printf 'Host: %s\n' "$(hostname -f 2>/dev/null || hostname)"
@@ -386,6 +515,10 @@ run_status() {
   printf 'borgmatic_busy: %s\n' "$(borgmatic_busy && printf ja || printf nein)"
   printf 'wartung_laeuft: %s\n' "$running"
   printf 'wartung_unit: %s\n' "$unit"
+  # Der maschinenlesbare Block steht immer am Ende: die Cockpit-Anzeige liest nur
+  # ihn (siehe data_block). Auch bei rc=2 (Repo nicht erreichbar) kommt er — der
+  # Befund „Repo nicht erreichbar" ist ein Wert, keine fehlende Antwort.
+  data_block
   return "$rc"
 }
 
