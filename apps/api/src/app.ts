@@ -60,6 +60,7 @@ import {
   normalizeEvidence,
   parseTypedBorgActions,
   requestsBorgRepair,
+  typedPlanScript,
   verifyExecutionEnvelopeSignature,
   type CapabilityId,
   type ExecutionEnvelope,
@@ -179,7 +180,7 @@ export function evaluatePlanPolicy(plan: string, safetyVerdict: string): PlanPol
       : "green";
   const rollback = sectionValue(plan, "Rollback");
   const rollbackAvailable = Boolean(rollback && !/^none\.?$/i.test(rollback));
-  const executableScript = plan.match(/```(?:bash|sh)\s*\n([\s\S]*?)```/i)?.[1] || "";
+  const executableScript = typedPlanScript(plan);
 
   // These are intentionally few hard boundaries. Contextual classification
   // remains the Safety LLM's job.
@@ -241,6 +242,25 @@ export function evaluatePlanPolicy(plan: string, safetyVerdict: string): PlanPol
     };
   }
   if (safetyVerdict === "approval_required") zone = "yellow";
+  // G1: a borg repair can delete corrupt archives, so it is never an autonomous
+  // action — the operator decides, a read-only check stays the autonomous way.
+  // The criterion is the typed line, not the plan's free text: the gate asks the
+  // same parser the execution uses (parseTypedBorgActions) about the same verb.
+  // It reads the whole plan instead of only the ```bash fence the executor runs,
+  // and it holds whatever else the plan carries (a capability manifest included):
+  // the runner receives the whole plan text, so a repair line in a second code
+  // block or in another fence language must stop here as well. The gate is
+  // therefore never narrower than what can execute, and for a manifest stand it
+  // is the only gate left.
+  if (requestsBorgRepair(plan)) {
+    return {
+      zone: "red", allowed: false, status: "blocked_user_approval",
+      reason: "A borg repository repair can delete corrupt archives; it needs the operator's explicit decision.",
+      evidence: ["typed action: borg.repair"],
+      neededToContinue: ["Confirm this borg repair, or run a read-only check first."],
+      rollbackAvailable,
+    };
+  }
   return {
     zone, allowed: true, status: "ready",
     reason: zone === "green" ? "Read-only or low-impact plan passed review." : "Reversible scoped change passed review.",
@@ -1706,7 +1726,7 @@ export async function createApp(options: AppOptions = {}) {
     if (!config.executorBrokerSocket || !config.executorBrokerSecret) {
       throw new Error("typed executor broker is not configured");
     }
-    const script = planText.match(/```(?:bash|sh)\s*\n([\s\S]*?)```/i)?.[1] || "";
+    const script = typedPlanScript(planText);
     const actions: Array<{ action: ExecutorActionKind; target: string }> = [];
     if (wantsService) {
       for (const line of script.split("\n")) {
@@ -1732,6 +1752,14 @@ export async function createApp(options: AppOptions = {}) {
     if (wantsBorg) {
       const borg = parseTypedBorgActions(script);
       if (borg.unsupported.length > 0) throw new Error(`borg.manage plan contains an unsupported form: ${borg.unsupported[0]}`);
+      // Second bolt behind the plan gate (evaluatePlanPolicy): a repair removes
+      // the archives borg judges corrupt, so it may only run in the job the
+      // operator approved for exactly that repair. Both sides read the same
+      // script (typedPlanScript) with the same parser, so the gate and this
+      // check can never disagree about what was approved.
+      if (borg.actions.some((action) => action.action === "borg.repair") && !envelope.operatorApproved) {
+        throw new Error("borg.repair runs only with the operator's approval bound to this job");
+      }
       actions.push(...borg.actions);
     }
     if (actions.length === 0) throw new Error("typed capability plan contains no typed action");
@@ -2634,20 +2662,11 @@ Follow these rules:
             neededToContinue: ["Install and review a narrow typed helper; do not fall back to agent shell execution."],
           };
         }
-        // Ein borg-Repair kann beschädigte Archive ENTFERNEN (Datenverlust) und
-        // läuft Stunden: er startet nie autonom, egal wie der Plan seine
-        // Risikozone nennt. Der Operator entscheidet; ein lesender Check bleibt
-        // der autonome Weg. Die Bindung an die typisierte Zeile ist das
-        // Kriterium, nicht der Freitext des Plans.
-        const borgScript = manifest ? "" : planText.match(/```(?:bash|sh)\s*\n([\s\S]*?)```/i)?.[1] || "";
-        if (!manifest && policy.allowed && borgScript && requestsBorgRepair(borgScript)) {
-          policy = {
-            ...policy, zone: "red", allowed: false, status: "blocked_user_approval",
-            reason: "A borg repository repair can delete corrupt archives; it needs the operator's explicit decision.",
-            evidence: [...policy.evidence, "typed action: borg.repair"],
-            neededToContinue: ["Confirm this borg repair, or run a read-only check first."],
-          };
-        }
+        // Der borg-Repair-Riegel sitzt in evaluatePlanPolicy: er greift für
+        // jeden Plan — mit oder ohne Capability-Manifest — und liest genau das
+        // Skript, das der Executor ausführt (typedPlanScript/requestsBorgRepair).
+        // Den zweiten Riegel hält executeTypedCapabilities: kein Repair ohne die
+        // Freigabe des Operators für genau diesen Job.
         if (manifest && policy.allowed && capabilityNeedsOperatorApproval(manifest)) {
           policy = {
             ...policy, zone: "red", allowed: false, status: "blocked_user_approval",

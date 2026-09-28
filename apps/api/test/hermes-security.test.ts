@@ -10,6 +10,7 @@ import {
   parseTypedDiskActions,
   parseTypedSelfUpdates,
   requestsBorgRepair,
+  typedPlanScript,
   validateExecutionEnvelope,
 } from "../src/hermes-security.js";
 
@@ -236,6 +237,30 @@ describe("typed borg maintenance (borg.manage)", () => {
     expect(requestsBorgRepair("/usr/local/sbin/cockpit-borg-action check")).toBe(false);
     expect(requestsBorgRepair("/usr/local/sbin/cockpit-borg-action status")).toBe(false);
     expect(requestsBorgRepair("borg delete ::archive")).toBe(false);
+  });
+
+  it("reads the typed script from the first bash or sh fence — the one reader every gate uses", () => {
+    expect(typedPlanScript("```bash\n/usr/bin/true\n```")).toBe("/usr/bin/true\n");
+    expect(typedPlanScript("prose\n```sh\n/usr/bin/true\n```")).toBe("/usr/bin/true\n");
+    // Later blocks are not the typed script: the executor runs the first fence only.
+    expect(typedPlanScript("```bash\n/usr/bin/true\n```\n```bash\nrm -rf /\n```")).toBe("/usr/bin/true\n");
+    // Another fence language is not the typed script either, and prose is nothing.
+    expect(typedPlanScript("```shell\n/usr/bin/true\n```")).toBe("");
+    expect(typedPlanScript("no fence here")).toBe("");
+    expect(classifyCapabilities("```shell\n/usr/bin/true\n```")).toEqual(["read.host", "shell.exception"]);
+  });
+
+  it("reads a plan for a repair request in any fence language and in a later block", () => {
+    const repair = "/usr/local/sbin/cockpit-borg-action repair";
+    const harmless = ["```bash", "/usr/bin/true", "```"].join("\n");
+    // The typed script of these plans is harmless; the plan-wide read is what sees the repair line.
+    expect(typedPlanScript([harmless, "```shell", repair, "```"].join("\n"))).toBe("/usr/bin/true\n");
+    expect(requestsBorgRepair([harmless, "```shell", repair, "```"].join("\n"))).toBe(true);
+    expect(requestsBorgRepair([harmless, "```bash", repair, "```"].join("\n"))).toBe(true);
+    expect(requestsBorgRepair(["```shell", repair, "```"].join("\n"))).toBe(true);
+    // Only the exact invocation on a line of its own counts, never prose.
+    expect(requestsBorgRepair("The plan discusses a borg repair in prose.")).toBe(false);
+    expect(requestsBorgRepair([harmless].join("\n"))).toBe(false);
   });
 
   it("accepts borg.manage as an authorizable capability", () => {

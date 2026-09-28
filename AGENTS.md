@@ -101,7 +101,10 @@ Bare-metal Ubuntu VPS (161.97.86.86) running:
 - Config `/etc/borgmatic/config.yaml` holds live credentials — never read it into a job,
   never cat it in a plan; only borgmatic itself may use it.
 - Typed path (`borg.manage`): `cockpit-borg-action status|check|repair`, see
-  `doc/setup/borg-maintenance.md`. `repair` always needs the operator's approval.
+  `doc/setup/borg-maintenance.md`. `repair` always needs the operator's approval:
+  the plan policy stops any plan that names it — a capability manifest or another
+  code fence changes nothing — and the executor refuses a repair without the
+  approval bound to exactly that job.
 - Every verb runs in its own transient systemd unit (`status` with
   `--wait --pipe --collect`, `check`/`repair` as `cockpit-borg-<verb>-<stamp>`
   without waiting): the executor's sandbox has no network, no writable

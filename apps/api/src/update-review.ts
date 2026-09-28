@@ -4,6 +4,7 @@ import {
   hashCanonical,
   parseTypedDiensteUpdates,
   parseTypedSelfUpdates,
+  typedPlanScript,
   type ExecutionEnvelope,
   type UntrustedEvidence,
 } from "./hermes-security.js";
@@ -183,7 +184,7 @@ export function selfUpdateTargets(plan: string): string[] {
 
 // Every reviewed install a plan would run, in plan order, deduplicated.
 export function updateTargets(plan: string): UpdateTarget[] {
-  const script = plan.match(/```(?:bash|sh)\s*\n([\s\S]*?)```/i)?.[1] || "";
+  const script = typedPlanScript(plan);
   const found: UpdateTarget[] = [
     ...parseTypedSelfUpdates(script).actions.filter((action) => action.action === "self.update").map((action) => ({ kind: "self" as const, sha: action.target })),
     ...parseTypedDiensteUpdates(script).actions.filter((action) => action.action === "dienste.update").map((action) => ({ kind: "dienste" as const, sha: action.target })),
@@ -266,6 +267,34 @@ export function focusFiles(diff: UpdateDiff): Set<string> {
   return new Set(diff.focusAreas.flatMap((area) => area.files));
 }
 
+// Material that runs as root on the host: the deploy tree holds the installer,
+// the root helpers, the systemd units and the sudoers sources. It comes first in
+// the excerpt and is named when it does not fit. The runner orders its sections
+// by file class, which puts a file it classes as `other` behind tests and docs —
+// that is how deploy/vps/vps-cockpit-deploy.sh fell out of the material of the
+// 28.09.2026 rollout review although it installs everything as root.
+const DEPLOY_MATERIAL = /^deploy\//;
+
+// The diff sections in review order: deploy material first, everything else in
+// the runner's order (stable, so a focus area still precedes tests and docs).
+export function materialOrder(sections: UpdateDiffSection[]): UpdateDiffSection[] {
+  return [
+    ...sections.filter((section) => DEPLOY_MATERIAL.test(section.path)),
+    ...sections.filter((section) => !DEPLOY_MATERIAL.test(section.path)),
+  ];
+}
+
+// Deploy material the excerpt does not cover completely and that is not already
+// named as cut. It is reported as left out even when the runner emitted no
+// section for it at all. A name is not a stop: the reviewer sees what is missing
+// and can flag it, while only a focus area that stays incomplete stops the
+// update by itself.
+function namedDeployGaps(diff: UpdateDiff, complete: Set<string>, cut: string[]): string[] {
+  return diff.files
+    .map((file) => file.path)
+    .filter((path) => DEPLOY_MATERIAL.test(path) && !complete.has(path) && !cut.includes(path));
+}
+
 function bytes(text: string): number {
   return Buffer.byteLength(text, "utf8");
 }
@@ -316,9 +345,10 @@ function describeUpdate(diff: UpdateDiff, index: number, total: number): string 
 
 // The complete reviewer prompt. The instruction block comes first, then the
 // material inside nonce-marked data markers, then a short reminder. Sections of
-// the diff are taken in the runner's order (focus areas first) while they fit
-// the budget; focus-area files that do not fit completely are reported as
-// incomplete coverage.
+// the diff are taken in review order — the deploy material first, then the
+// runner's order (focus areas first) — while they fit the budget; focus-area
+// files that do not fit completely are reported as incomplete coverage, deploy
+// material that does not fit is named as left out.
 export function buildUpdateReviewPrompt(diffs: UpdateDiff[], options: { nonce?: string; limit?: number } = {}): { prompt: string; coverage: UpdateReviewCoverage[] } {
   const nonce = options.nonce || randomBytes(8).toString("hex");
   const limit = options.limit ?? UPDATE_REVIEW_PROMPT_LIMIT;
@@ -338,7 +368,7 @@ export function buildUpdateReviewPrompt(diffs: UpdateDiff[], options: { nonce?: 
     const omitted: string[] = [...diff.omittedFiles];
     const complete = new Set<string>();
     const shown = new Set<string>();
-    for (const section of diff.excerpt) {
+    for (const section of materialOrder(diff.excerpt)) {
       const text = redactSecrets(section.text.endsWith("\n") ? section.text : `${section.text}\n`);
       const size = bytes(text);
       if (cut.length || omitted.length > diff.omittedFiles.length) {
@@ -361,7 +391,7 @@ export function buildUpdateReviewPrompt(diffs: UpdateDiff[], options: { nonce?: 
     const incomplete = [...focusFiles(diff)].filter((file) => !complete.has(file)).sort();
     // cut: partially in the prompt (by the runner or here); omitted: not at all.
     const cutFiles = [...new Set([...diff.partialFiles.filter((file) => shown.has(file)), ...cut])];
-    const omittedFiles = [...new Set(omitted)];
+    const omittedFiles = [...new Set([...omitted, ...namedDeployGaps(diff, complete, cutFiles)])];
     coverage.push({ sha: diff.sha, incomplete, cut: cutFiles, omitted: omittedFiles });
     const excerpt = included.join("");
     const state = cutFiles.length || omittedFiles.length

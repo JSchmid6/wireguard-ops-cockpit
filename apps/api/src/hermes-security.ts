@@ -141,8 +141,14 @@ export function parseTypedBorgActions(script: string): { actions: TypedBorgActio
   return { actions, unsupported };
 }
 
-export function requestsBorgRepair(script: string): boolean {
-  return parseTypedBorgActions(script).actions.some((action) => action.action === "borg.repair");
+// True when the text asks for a repair. The parser only sees the helper
+// invocation on a line of its own, so the caller may pass the typed script or
+// the whole plan: the plan policy passes the plan (a repair line in a later code
+// block or in another fence language stops the plan too), the executor passes
+// the script it is about to run. A repair removes the archives borg judges
+// corrupt, so both sides ask the same parser about the same verb.
+export function requestsBorgRepair(text: string): boolean {
+  return parseTypedBorgActions(text).actions.some((action) => action.action === "borg.repair");
 }
 
 export interface TypedSelfUpdateAction { action: "self.update" | "self.status"; target: string }
@@ -284,8 +290,19 @@ export function buildAgentTask(intent: string, evidence: UntrustedEvidence[]): s
   ].join("\n");
 }
 
+// The text a plan's typed capabilities are read from: the first ```bash/```sh
+// fence. Every reader asks this one function — the typed executor
+// (executeTypedCapabilities), the plan policy (evaluatePlanPolicy), the
+// capability classifier below and the update review (updateTargets) — so no gate
+// can ever be evaluated on a different text than the one that is executed.
+// (G1 finding of the 28.09.2026 borg rollout: the repair gate kept its own copy
+// of this regex and was switched off as soon as the plan carried a manifest.)
+export function typedPlanScript(planText: string): string {
+  return planText.match(/```(?:bash|sh)\s*\n([\s\S]*?)```/i)?.[1] || "";
+}
+
 export function classifyCapabilities(plan: string): CapabilityId[] {
-  const script = plan.match(/```(?:bash|sh)\s*\n([\s\S]*?)```/i)?.[1] || "";
+  const script = typedPlanScript(plan);
   const capabilities = new Set<CapabilityId>();
   if (/\b(systemctl|service)\s+(restart|start|stop|reload|enable|disable)\b/i.test(script)) capabilities.add("service.manage");
   if (script.split("\n").some((line) => isTypedDiskLine(line))) capabilities.add("disk.manage");
