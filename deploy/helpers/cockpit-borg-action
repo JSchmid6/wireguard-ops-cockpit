@@ -34,10 +34,21 @@
 #     mitgeben — der typisierte Weg kann diese Verben also nicht aufrufen.
 #   * check/repair starten nur, wenn der nächste borgmatic.timer-Lauf mehr als
 #     BORG_ACTION_MIN_HEADROOM (8 h) entfernt ist. Die Zeit kommt aus
-#     `systemctl show … NextElapseUSecRealtime` und wird in Epochensekunden
-#     gerechnet (zeitzonen- und sommerzeitfest). Ein Check über ~3,5 TB läuft
+#     `systemctl list-timers <timer> --output=json`: dort steht `next` in
+#     Mikrosekunden seit der Epoche. Damit rechnet der Helfer gar nicht erst mit
+#     einer formatierten Wanduhr („Tue 2026-09-29 01:53:08 CEST“) und kann weder
+#     Zeitzone noch Sommerzeit falsch auflösen. Ein Check über ~3,5 TB läuft
 #     Stunden; ein Start kurz vor dem Timer liesse das nächtliche Backup in die
 #     Repo-Sperre laufen (genau das passierte am 22.09.2026).
+#   * Auch der zweite Riegel gegen die Kollision sitzt ausserhalb dieses Helfers:
+#     ein Drop-in für borgmatic.service
+#     (`/etc/systemd/system/borgmatic.service.d/cockpit-borg-lock.conf`) lässt das
+#     nächtliche Backup auf die Repo-Sperre WARTEN, statt an ihr zu scheitern —
+#     installiert von deploy/vps/vps-cockpit-deploy.sh, fremde Drop-ins bleiben
+#     unangetastet.
+#   * check/repair laufen mit `Nice=10` und `IOSchedulingClass=idle`: sie dürfen
+#     Stunden dauern und sollen Nextcloud und GitLab dabei nicht ausbremsen.
+#     `status` ist eine kurze Abfrage und bleibt davon unberührt.
 #   * Kein zweiter Lauf gleichzeitig: eine aktive borg-Wartungs-Unit, ein
 #     laufendes borgmatic.service und die Sperrdatei werden vorher geprüft; der
 #     Lauf hält die Sperre selbst, solange er dauert.
@@ -193,50 +204,38 @@ borgmatic_busy() {
 }
 
 # ---------------------------------------------------------------------------
-# Frist bis zum nächsten Timer-Lauf (zeitzonenfest in Epochensekunden)
+# Frist bis zum nächsten Timer-Lauf — die Zeit kommt als Zahl von systemd
 # ---------------------------------------------------------------------------
-parse_next_elapse() { # parse_next_elapse <systemctl-Wert> -> Epoche auf stdout
-  local raw="$1" number stamp
-  raw="${raw##*=}"                                   # "Property=Wert" -> "Wert"
-  raw="${raw#"${raw%%[![:space:]]*}"}"               # führende Leerzeichen weg
-  raw="${raw%"${raw##*[![:space:]]}"}"               # Schlussleerzeichen weg
-  [ -n "$raw" ] || return 1
-  case "$raw" in
-    n/a|N/A|none|unknown|0) return 1 ;;
+timer_next_usec() { # <systemctl list-timers --output=json> -> Mikrosekunden
+  # systemd gibt für `list-timers --output=json` je Timer ein Objekt aus: `next`
+  # (und `left`/`last`/`passed`) in Mikrosekunden seit der Epoche, `null`, wenn
+  # kein nächster Lauf feststeht. Eine formatierte Wanduhr gibt es hier nicht —
+  # also nichts zu zonen und nichts zu rechnen.
+  local flat field value
+  flat="$(printf '%s' "$1" | tr -d '[:space:]' || true)"          # kompakt wie json-pretty
+  field="$(printf '%s' "$flat" | grep -o '"next":[^,}]*' | head -n 1 || true)"
+  value="${field#*:}"
+  case "$value" in
+    ''|null) return 1 ;;                                          # [] oder kein nächster Lauf
   esac
-  number="${raw%% *}"                                # erstes Feld
-  if [[ "$number" =~ ^[0-9]+$ ]]; then
-    # systemctl --timestamp=us+utc liefert "<us> @ <Wanduhr UTC>"; `unix` liefert
-    # Sekunden, `us` Mikrosekunden. Beides ohne Zeitzone — reine Zahl ist gut.
-    if [ "${#number}" -ge 14 ]; then printf '%s\n' "$(( number / 1000000 ))"; return 0; fi
-    if [ "${#number}" -ge 9 ]; then printf '%s\n' "$number"; return 0; fi
-    return 1
-  fi
-  # Wanduhr, wie systemctl sie ausgibt: "Tue 2026-09-29 01:53:08 CEST". Wochentag
-  # und Zonenkürzel fallen weg, die Wanduhr wird in der LOKALEN Zone ausgewertet —
-  # genau die Zone, mit der systemctl formatiert hat. Gerechnet wird die Differenz
-  # in Epochensekunden, damit Zeitzone und Sommerzeit keine Rolle spielen.
-  stamp="$(printf '%s' "$raw" | sed -E 's/^[A-Za-z]{3}[[:space:]]+//; s/[[:space:]]+[A-Za-z]{2,6}$//')"
-  case "$stamp" in
-    *[0-9][0-9][0-9][0-9]*) ;;                         # nur mit Jahreszahl rechnen
-    *) return 1 ;;
-  esac
-  if date -u -d "$stamp" +%s 2>/dev/null; then return 0; fi
-  if date -u -d "$raw" +%s 2>/dev/null; then return 0; fi
-  return 1
+  [[ "$value" =~ ^[0-9]{1,18}$ ]] || return 1                    # nur eine Zahl ist eine Zeit
+  printf '%s\n' "$value"
 }
 
 guard_timer_headroom() {
-  local raw next now delta
+  local json usec next now delta
   have systemctl || die "systemctl fehlt — der nächste $BORG_ACTION_TIMER-Lauf ist nicht prüfbar." 67
   if ! systemctl is-active --quiet "$BORG_ACTION_TIMER" 2>/dev/null; then
     printf 'Frist: %s ist nicht aktiv — kein anstehender Backup-Lauf, der kollidieren könnte.\n' "$BORG_ACTION_TIMER"
     return 0
   fi
-  raw="$(systemctl show --property=NextElapseUSecRealtime --value "$BORG_ACTION_TIMER" 2>/dev/null || true)"
-  if ! next="$(parse_next_elapse "$raw")" || [ -z "$next" ]; then
-    die "der nächste $BORG_ACTION_TIMER-Lauf ist nicht ermittelbar (NextElapseUSecRealtime='${raw}') — ohne Fristprüfung startet hier kein stundenlanger Lauf." 3
+  # Genau der Timer als Muster; sollte daraus je eine Liste werden, ist die erste
+  # (systemd sortiert nach dem nächsten Lauf) die vorsichtigste Annahme.
+  json="$(systemctl list-timers --output=json --no-pager "$BORG_ACTION_TIMER" 2>/dev/null || true)"
+  if ! usec="$(timer_next_usec "$json")"; then
+    die "der nächste $BORG_ACTION_TIMER-Lauf ist nicht ermittelbar (systemctl list-timers --output=json: '${json:-<leer>}') — ohne Fristprüfung startet hier kein stundenlanger Lauf." 3
   fi
+  next=$(( 10#$usec / 1000000 ))
   now="$(date -u +%s)"
   delta=$(( next - now ))
   if [ "$delta" -lt "$BORG_ACTION_MIN_HEADROOM" ]; then
@@ -473,10 +472,13 @@ start_maintenance() { # verb (check|repair)
 
   # Ohne --wait: die Unit läuft weiter, wenn dieser Aufruf (und der Executor
   # dahinter) längst fertig ist. Type=exec sorgt dafür, dass ein Startfehler
-  # hier noch auffällt statt in der Unit zu verpuffen.
+  # hier noch auffällt statt in der Unit zu verpuffen. Nice=10 und
+  # IOSchedulingClass=idle halten den stundenlangen Lauf aus dem Weg von
+  # Nextcloud und GitLab: er bekommt CPU und Platte nur, wenn sonst niemand will.
   systemd-run --quiet --collect --unit="$unit" \
     --description="Cockpit borg $verb" \
     --property=Type=exec --property=RuntimeMaxSec="$BORG_ACTION_RUN_TIMEOUT" \
+    --property=Nice=10 --property=IOSchedulingClass=idle \
     --setenv="COCKPIT_BORG_ACTION_IN_UNIT=$unit" \
     -- "$BORG_ACTION_SELF" --payload "$verb" || rc=$?
   [ "$rc" -eq 0 ] || die "die Unit $unit konnte nicht starten (systemd-run rc=$rc) — es läuft nichts, es wurde nichts verändert." 69

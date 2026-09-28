@@ -44,7 +44,12 @@ transiente Unit — ausserhalb der Sandbox, im eigenen cgroup, mit eigenem Journ
   `--wait`. Der Aufruf kehrt nach dem Start zurück (der Executor ist eine
   Anfrage/Antwort-Strecke und darf nicht Stunden warten), die Unit läuft weiter.
   `Type=exec` lässt einen Startfehler noch im Aufruf auffallen (rc=69),
-  `RuntimeMaxSec=86400` beendet einen hängenden Lauf nach 24 h.
+  `RuntimeMaxSec=86400` beendet einen hängenden Lauf nach 24 h,
+  `Nice=10` und `IOSchedulingClass=idle` halten den stundenlangen Lauf aus dem Weg
+  von Nextcloud und GitLab: er bekommt CPU und Platte nur, wenn sonst niemand
+  will. `status` bekommt das **nicht** — es ist eine kurze Abfrage. (Beides wirkt
+  auf diesem Host; die Platte der Kiste wird vom entfernten `borg`-Prozess
+  belastet und sieht davon nichts.)
 
 Der Laufzustand ist damit systemd-Zustand, nicht eine PID-Datei:
 `systemctl is-active <unit>`, `systemctl status <unit>`, `journalctl -u <unit>`.
@@ -59,14 +64,17 @@ gestartete Unit; `--collect` räumt jede Unit nach ihrem Ende ab.
    selbst, solange er dauert; systemd räumt sie mit der Unit ab.
 2. **Frist bis zum Timer (rc=3).** `check`/`repair` starten nicht, wenn der nächste
    `borgmatic.timer`-Lauf in weniger als 8 h ansteht. Die Zeit kommt aus
-   `systemctl show borgmatic.timer -p NextElapseUSecRealtime`; gerechnet wird in
-   Epochensekunden (`date -u`), also zeitzonen- und sommerzeitfest — der Host
-   läuft in CEST, der Timer mit `OnCalendar=daily` und `RandomizedDelaySec=3h`.
-   Grund: ein Check über ~3,5 TB läuft Stunden; ein Start kurz vor dem Timer
-   liesse das nächtliche Backup in die Repo-Sperre laufen (genau das passierte am
-   22.09.2026). Ist der Timer nicht aktiv, gibt es nichts zu kollidieren (der
-   Helfer sagt es im Klartext); ist sein Wert nicht lesbar, wird **nicht**
-   gestartet (fail closed).
+   `systemctl list-timers borgmatic.timer --output=json`: dort steht `next` in
+   Mikrosekunden **seit der Epoche** — keine Wanduhr, also auch keine Zeitzonen-
+   oder Sommerzeitrechnung im Helfer. (`systemctl show … NextElapseUSecRealtime`
+   formatiert in Ortszeit; wer das als UTC liest, liegt im Sommer zwei und im
+   Winter eine Stunde daneben.) Der Host läuft in CEST, der Timer mit
+   `OnCalendar=daily` und `RandomizedDelaySec=3h`. Grund: ein Check über ~3,5 TB
+   läuft Stunden; ein Start kurz vor dem Timer liesse das nächtliche Backup in die
+   Repo-Sperre laufen (genau das passierte am 22.09.2026). Ist der Timer nicht
+   aktiv, gibt es nichts zu kollidieren (der Helfer sagt es im Klartext); steht
+   kein nächster Lauf fest (`next` ist `null`, leere Liste), ist die Ausgabe
+   unbrauchbar oder fehlt `systemctl`, wird **nicht** gestartet (fail closed).
 3. **`--force`.** borgmatic überspringt Checks, die innerhalb der konfigurierten
    Frequenz liegen („Skipping archives check due to configured frequency“) — ohne
    `--force` wäre `check` ein No-op, der wie ein grüner Check aussieht. `check`
@@ -74,6 +82,43 @@ gestartete Unit; `--collect` räumt jede Unit nach ihrem Ende ab.
 
 `repair` setzt zusätzlich `BORG_CHECK_I_KNOW_WHAT_I_AM_DOING=YES` (borg fragt sonst
 interaktiv „Type 'YES'…“ und der Lauf stirbt headless).
+
+## Das nächtliche Backup wartet auf die Sperre
+
+Die 8-h-Frist (Riegel 2) ist nur so gut wie die Schätzung, wie lange ein Check
+über ~4,7 TB dauert. Gemessen ist das nicht. Darum gibt es einen zweiten,
+unabhängigen Riegel **auf der Seite des Backups**:
+
+`/etc/systemd/system/borgmatic.service.d/cockpit-borg-lock.conf`
+
+```
+[Service]
+ExecStartPre=/usr/bin/flock /run/lock/cockpit-borg.lock /bin/true
+```
+
+`flock` ohne `-n` blockiert, bis die Repo-Sperre frei ist, und läuft danach
+`/bin/true` (rc=0). Ein `check`/`repair`, das die Frist passiert hat und dann
+länger dauert als gedacht, lässt das nächtliche `create` also **warten** statt
+scheitern. `borgmatic.service` ist `Type=oneshot` und hat damit keinen
+Start-Timeout — Warten kostet hier nichts; die Unit steht solange auf
+`activating`, und `status` zeigt den Wartenden als belegtes Repo.
+
+Eigenschaften des Riegels:
+
+* Er beschleunigt nichts und ändert nichts an borgmatic — er hält nur den Start
+  auf. Die Sperre selbst hält weiterhin der Wartungslauf, solange er dauert.
+* Er ist **kein** Ersatz für die Frist: der wartende Backup-Lauf hält die Sperre
+  selbst noch nicht, ein überlanger Check kann das Backup also weit in den Morgen
+  schieben.
+* Er setzt `/usr/bin/flock` voraus (util-linux) — ohne `flock` scheitert der Start
+  des Backups. systemd selbst hängt an util-linux, und der Helfer braucht `flock`
+  ohnehin für dieselbe Sperre.
+* Fremde Drop-ins in demselben Verzeichnis (z. B. `nach-gitlab-backup.conf`)
+  bleiben unangetastet; `ExecStartPre`-Einträge mehrerer Drop-ins gelten
+  nebeneinander.
+* Installiert wird die Datei von `deploy/vps/vps-cockpit-deploy.sh` (Tabelle) —
+  wie der Helfer, also auch über den Selbst-Update-Weg. Der Rückfall des Skripts
+  nimmt genau diese Datei wieder weg (bzw. stellt den vorherigen Stand her).
 
 ## repair: erst nach einem Befund
 
@@ -111,10 +156,12 @@ erreichbar“) heisst weiterhin genau das.
 | `/etc/sudoers.d/cockpit-executor` | `deploy/sudoers/cockpit-executor` | Zeile `cockpit-executor ALL=(root) NOPASSWD: /usr/local/sbin/cockpit-borg-action *` |
 | `/var/lib/wireguard-ops-cockpit/borg/last.unit`, `last.kind` | Laufzeit | zuletzt gestartete Wartungs-Unit und ihre Art, 0750 root — nur für die Anzeige; **der Laufzustand kommt aus systemd** (`systemctl is-active <unit>`) |
 | `/run/lock/cockpit-borg.lock` | Laufzeit | Sperre gegen zwei gleichzeitige Läufe auf demselben Repo |
+| `/etc/systemd/system/borgmatic.service.d/cockpit-borg-lock.conf` | `deploy/systemd/borgmatic-cockpit-borg-lock.conf` | Drop-in: das nächtliche Backup wartet auf die Sperre, statt an ihr zu scheitern |
 | Journal der Unit | systemd | Fortschritt und Ergebnis jedes Laufs (`journalctl -u cockpit-borg-<verb>-<stamp>`); ein eigenes Logverzeichnis gibt es nicht mehr |
 
-Installiert wird der Helfer von `deploy/vps/vps-cockpit-deploy.sh` (Tabelle) — also
-auch über den Selbst-Update-Weg des Cockpits, ohne Handgriff am Terminal.
+Installiert werden Helfer und Drop-in von `deploy/vps/vps-cockpit-deploy.sh`
+(Tabelle) — also auch über den Selbst-Update-Weg des Cockpits, ohne Handgriff am
+Terminal.
 
 ## Rückgabewerte
 

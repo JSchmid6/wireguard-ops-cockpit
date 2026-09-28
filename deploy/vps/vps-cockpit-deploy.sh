@@ -16,9 +16,11 @@
 #     trigger list would silently miss build inputs), and installs EVERY file of
 #     the table below — the complete set of root helpers the executor and the
 #     capability sandbox dispatch to, the sudoers file (visudo-checked), the four
-#     service units, the web unit, the self-update unit template, self-update.env
-#     and this script. Besides the table it writes only state.json, the web image,
-#     the web unit's enable link and a backup directory that it removes on success.
+#     service units, the web unit, the self-update unit template, self-update.env,
+#     the two drop-ins (API brokers, and the borg lock barrier in the package's
+#     borgmatic.service.d), and this script. Besides the table it writes only
+#     state.json, the web image, the web unit's enable link and a backup directory
+#     that it removes on success.
 #   * It never switches the running web container: the web unit does that when it
 #     is restarted, which the runner does together with the four services at the
 #     activation (defer), or this script does at the end (mode now).
@@ -78,6 +80,10 @@ readonly TABLE=(
   "deploy/sudoers/cockpit-executor|$SUDOERS|440"
   "deploy/systemd/wireguard-ops-cockpit-api.service|$UNITS/wireguard-ops-cockpit-api.service|644"
   "deploy/systemd/wireguard-ops-cockpit-api-brokers.conf|$UNITS/wireguard-ops-cockpit-api.service.d/brokers.conf|644"
+  # Drop-in in einem FREMDEN Verzeichnis: borgmatic.service gehört dem Paket. Der
+  # Einzige, der hier etwas anfasst, ist diese Datei — andere Drop-ins
+  # (nach-gitlab-backup.conf) bleiben liegen, und der Rückfall entfernt nur sie.
+  "deploy/systemd/borgmatic-cockpit-borg-lock.conf|$UNITS/borgmatic.service.d/cockpit-borg-lock.conf|644"
   "deploy/systemd/wireguard-ops-cockpit-agent.service|$UNITS/wireguard-ops-cockpit-agent.service|644"
   "deploy/systemd/wireguard-ops-cockpit-executor.service|$UNITS/wireguard-ops-cockpit-executor.service|644"
   "deploy/systemd/wireguard-ops-cockpit-ttyd.service|$UNITS/wireguard-ops-cockpit-ttyd.service|644"

@@ -108,8 +108,17 @@ Bare-metal Ubuntu VPS (161.97.86.86) running:
   `/root/.cache`, and a job started there dies with the service's cgroup. Run
   state is the unit (`systemctl is-active`, `journalctl -u`), never a pid file.
   `check`/`repair` refuse (rc=3) while another run holds the repo, and while the
-  next `borgmatic.timer` run is less than 8 h away; `check` always passes `--force`
+  next `borgmatic.timer` run is less than 8 h away — that time is read as
+  microseconds since the epoch from `systemctl list-timers <timer> --output=json`
+  (`next`), never as a formatted local-time string; `check` always passes `--force`
   (borgmatic otherwise skips checks inside its configured frequency).
+- The nightly run is hardened against the remaining risk that a check takes longer
+  than its headroom: the drop-in
+  `/etc/systemd/system/borgmatic.service.d/cockpit-borg-lock.conf`
+  (`deploy/systemd/borgmatic-cockpit-borg-lock.conf`) makes it wait on
+  `/run/lock/cockpit-borg.lock` via `ExecStartPre` instead of failing.
+- `check`/`repair` units run with `Nice=10` and `IOSchedulingClass=idle` so a
+  multi-hour run never crowds out Nextcloud or GitLab; `status` does not.
 
 ### Cockpit Runbooks
 - All host operations go through Cockpit Runbooks API

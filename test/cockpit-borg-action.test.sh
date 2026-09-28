@@ -27,9 +27,12 @@
 #     ihr Journal statt PID-Datei (Befund B1),
 #   * Ablehnung während borgmatic läuft, bei laufender Wartungs-Unit und bei
 #     belegter Sperre (rc=3),
-#   * die Fristprüfung gegen den nächsten borgmatic.timer-Lauf: 8 h in
-#     Epochensekunden, wanduhr- und mikrosekundenweise, fail-closed bei
-#     unlesbarem Wert, ohne Timer aktiv ohne Frist (Befund B3),
+#   * die Fristprüfung gegen den nächsten borgmatic.timer-Lauf (Befund B3, R1):
+#     die Zeit kommt als Zahl aus `systemctl list-timers --output=json`, dazu das
+#     CEST-Beispiel aus dem Review mit festgelegtem „jetzt", fail closed bei
+#     `null`, leerer Liste und unlesbarem Wert, inaktiver Timer ohne Frist,
+#   * Nice=10 und IOSchedulingClass=idle auf den check/repair-Units (R3) — und
+#     nicht auf der kurzen status-Abfrage,
 #   * check/repair ohne borgmatic (Kiste) => rc=67, Startfehler => rc=69.
 #
 # Aufruf (braucht root wegen der Rechteprüfung des Helfers):
@@ -102,6 +105,14 @@ run_helper_env() { # run_helper_env VAR=WERT [VAR=WERT …] -- <Argumente…>
   ERR="$(cat "$WORK/stderr")"
 }
 
+run_helper_clock() { # wie run_helper_env, aber mit festgelegtem „jetzt“ (R1)
+  local envs=()
+  while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
+  [ "$1" = "--" ] && shift
+  OUT="$(PATH="$WORK/clock:$STUBS:$PATH" env "${envs[@]}" "$BASH_BIN" "$HELPER" "$@" 2>"$WORK/stderr")"; RC=$?
+  ERR="$(cat "$WORK/stderr")"
+}
+
 wait_for_file() { # wait_for_file <pfad> [sekunden]
   local i limit="${2:-60}"
   for _ in $(seq 1 "$limit"); do [ -e "$1" ] && return 0; sleep 0.1; done
@@ -128,11 +139,36 @@ md126 : active raid10 sda[4] sdb[2] sdc[1] sdd[0]
       5860528128 blocks super external:/md127/0 64K chunks 2 near-copies [4/4] [UUUU]
 DF: /dev/md126      5,5T    4,7T  787G   86% /media/RAID
 EOF
-# Frist bis zum nächsten Timer-Lauf (systemctl show-Stub liest die Datei).
-next_elapse_human() { date -d "@$1" '+%a %F %T %Z'; }
-next_elapse_us() { printf '%s\n' "$(( $1 * 1000000 ))"; }
+# Frist bis zum nächsten Timer-Lauf: der Helfer liest `systemctl list-timers
+# --output=json`. Dort steht `next` in Mikrosekunden seit der Epoche (systemd
+# 255), `null`, wenn kein nächster Lauf feststeht. Der Stub gibt genau diese Form
+# aus — die alten Wanduhr-Formen „Tue 2026-09-29 01:53:08 CEST“ gibt es hier
+# bewusst nicht mehr.
 NOW="$(date -u +%s)"
-next_elapse_human "$(( NOW + 16 * 3600 ))" > "$WORK/next-elapse"
+timer_json() { # timer_json <next-Wert>: Mikrosekunden, null, [] oder Unsinn
+  printf '[{"next":%s,"left":%s,"last":1780017744000000,"passed":1780017744000000,"unit":"borgmatic.timer","activates":"borgmatic.service"}]\n' \
+    "$1" "$1" > "$WORK/list-timers.json"
+}
+timer_usec() { printf '%s\n' "$(( $1 * 1000000 ))"; }
+timer_json "$(timer_usec "$(( NOW + 16 * 3600 ))")"
+
+# Uhr des Helfers: nur `date -u +%s` wird auf $WORK/fake-now festgelegt, alles
+# andere geht an das echte date. Die CEST-Probe (R1) ist ein fester Zeitpunkt und
+# braucht ein festes „jetzt"; die übrigen Proben rechnen relativ zu NOW.
+REAL_DATE="$(command -v date)"
+mkdir -p "$WORK/clock"
+cat > "$WORK/clock/date" <<CLOCK
+#!/bin/sh
+[ "\$*" = "-u +%s" ] && [ -f "$WORK/fake-now" ] && { cat "$WORK/fake-now"; exit 0; }
+exec "$REAL_DATE" "\$@"
+CLOCK
+chmod 755 "$WORK/clock/date"
+# Das Beispiel aus dem Review als Epoche: „Tue 2026-09-29 01:53:08 CEST“ ist
+# 2026-09-28 23:53:08 UTC = 1790639588 s.
+CEST_NEXT=1790639588
+fake_now() { # fake_now <Epoche> — „jetzt“ für den Helfer festlegen
+  printf '%s\n' "$1" > "$WORK/fake-now"
+}
 
 cat > "$STUBS/borgmatic" <<EOF
 #!/usr/bin/env bash
@@ -221,8 +257,17 @@ case "\$cmd" in
     esac
     [ "\$quiet" -eq 1 ] || echo "\$state"
     exit "\$rc" ;;
-  show)
-    cat "$WORK/next-elapse" 2>/dev/null || true
+  list-timers)
+    # Der Weg der Fristprüfung (R1) ist `--output=json`; der Aufruf wird
+    # protokolliert, damit die Prüfung ihn belegen kann. Ohne --output=json bleibt
+    # die menschliche Tabelle für `status`.
+    case " \$* " in
+      *" --output=json "*)
+        printf '%s\n' "list-timers \$*" >> "$WORK/list-timers.log"
+        cat "$WORK/list-timers.json" 2>/dev/null || true
+        exit 0 ;;
+    esac
+    printf '%s\n' "NEXT                         LEFT     LAST                         PASSED UNIT            ACTIVATES" "Mon 2026-09-28 02:26:08 CEST 3h 10min Sun 2026-09-27 02:39:04 CEST 20h ago borgmatic.timer borgmatic.service"
     exit 0 ;;
   list-units)
     # Nur noch nicht abgeräumte (aktive) borg-Unit-*.service zeigen — genau das,
@@ -237,9 +282,6 @@ case "\$cmd" in
       [ -f "\$UNITDIR/\$n.rc" ] && continue
       printf '%s %s %s %s %s\n' "\$n.service" loaded active running "stub"
     done
-    exit 0 ;;
-  list-timers)
-    printf '%s\n' "NEXT                         LEFT     LAST                         PASSED UNIT            ACTIVATES" "Mon 2026-09-28 02:26:08 CEST 3h 10min Sun 2026-09-27 02:39:04 CEST 20h ago borgmatic.timer borgmatic.service"
     exit 0 ;;
 esac
 exit 0
@@ -459,6 +501,25 @@ fi
 wait_for_rc_file "$REPAIR_UNIT" 100
 if [ "$(cat "$WORK/state/last.kind")" = "repair" ]; then ok "last.kind = repair"; else bad "last.kind falsch: $(cat "$WORK/state/last.kind")"; fi
 
+echo "== R3: Wartungs-Units laufen mit Nice=10 und IOSchedulingClass=idle =="
+# Ein Repo-Check über Stunden darf Nextcloud und GitLab nicht ausbremsen: die
+# Wartungs-Units bekommen CPU und Platte nur, wenn sonst niemand will. `status`
+# ist eine kurze Abfrage und bleibt davon unberührt.
+for probe in "$CHECK_UNIT" "$HOLD_UNIT" "$REPAIR_UNIT"; do
+  line="$(grep -F -- "--unit=$probe" "$WORK/systemd-run.log" | head -n 1)"
+  if [ -n "$line" ] && [[ "$line" == *"--property=Nice=10"* && "$line" == *"--property=IOSchedulingClass=idle"* ]]; then
+    ok "R3: $probe läuft mit Nice=10 und IOSchedulingClass=idle"
+  else
+    bad "R3: $probe ohne Nice/IOSchedulingClass: $line"
+  fi
+done
+STATUS_CALL="$(grep -F -- "--unit=$PREFIX-status-" "$WORK/systemd-run.log" | head -n 1)"
+if [ -n "$STATUS_CALL" ] && [[ "$STATUS_CALL" != *"Nice="* ]]; then
+  ok "R3: status bleibt ohne Nice (kurze Abfrage)"
+else
+  bad "R3: status-Aufruf unerwartet: $STATUS_CALL"
+fi
+
 echo "== Ablehnungen (rc=3) =="
 : > "$WORK/borgmatic-busy"
 run_helper check
@@ -473,37 +534,95 @@ assert_rc "check bei belegter Sperre wird abgewiesen" 3
 assert_err "Grund genannt (Sperre)" "$WORK/borg.lock ist belegt"
 flock -u 9; exec 9>&-
 
-echo "== B3: Frist bis zum nächsten borgmatic.timer-Lauf =="
-next_elapse_human "$(( NOW + 2 * 3600 ))" > "$WORK/next-elapse"
+echo "== R1/B3: Frist bis zum nächsten borgmatic.timer-Lauf =="
+# R1: der Helfer holt die Zeit als Zahl aus `systemctl list-timers --output=json`.
+# Eine formatierte Wanduhr — und damit jede Zeitzonen- oder Sommerzeitrechnung —
+# kommt im Helfer nicht mehr vor.
+if grep -qE "NextElapseUSecRealtime|parse_next_elapse" "$HELPER"; then
+  bad "R1: Helfer parst noch eine formatierte Timerzeit"
+else
+  ok "R1: Helfer kennt keine formatierte Timerzeit mehr"
+fi
+
+timer_json "$(timer_usec "$(( NOW + 2 * 3600 ))")"
 RUNS_BEFORE="$(wc -l < "$WORK/systemd-run.log")"
 run_helper check
 assert_rc "weniger als 8 h bis zum Timer => rc=3" 3
 assert_err "Abstand genannt" "zu wenig Abstand"
+if grep -qF "list-timers --output=json --no-pager borgmatic.timer" "$WORK/list-timers.log"; then
+  ok "R1: Frist kommt aus systemctl list-timers --output=json"
+else
+  bad "R1: Aufruf ohne --output=json: $(tr '\n' ' ' < "$WORK/list-timers.log")"
+fi
 RUNS_AFTER="$(wc -l < "$WORK/systemd-run.log")"
 if [ "$RUNS_BEFORE" = "$RUNS_AFTER" ]; then ok "trotz Fristverletzung keine Unit gestartet"; else bad "trotz Fristverletzung gestartet"; fi
 
-next_elapse_human "$(( NOW + 2 * 3600 ))" > "$WORK/next-elapse"
+timer_json "$(timer_usec "$(( NOW + 2 * 3600 ))")"
 run_helper repair
 assert_rc "repair mit weniger als 8 h => rc=3" 3
 
-next_elapse_us "$(( NOW + 16 * 3600 ))" > "$WORK/next-elapse"
+timer_json "$(timer_usec "$(( NOW + 16 * 3600 ))")"
 run_helper check
 assert_rc "Mikrosekundenform mit Abstand => rc=0" 0
 assert_out "Frist in Ordnung" "in Ordnung"
 SHORT_UNIT="$(sed -n 's/^Unit: //p' <<<"$OUT" | head -n 1)"
 wait_for_rc_file "$SHORT_UNIT" 100
 
-next_elapse_us "$(( NOW + 3600 ))" > "$WORK/next-elapse"
+timer_json "$(timer_usec "$(( NOW + 3600 ))")"
 run_helper check
 assert_rc "Mikrosekundenform mit 1 h => rc=3" 3
 
-printf '%s\n' "kaputt" > "$WORK/next-elapse"
+# `null` ist systemds „kein nächster Lauf steht fest" (`next` ist dann nicht
+# gesetzt), `[]` ein leeres Ergebnis. Beides heisst: keine Frist — also fail closed
+# wie bei einem unlesbaren Wert, nicht „kein Grund zur Vorsicht".
+timer_json null
+run_helper check
+assert_rc "next=null => rc=3 (fail closed)" 3
+printf '[]\n' > "$WORK/list-timers.json"
+run_helper check
+assert_rc "leere Timerliste => rc=3 (fail closed)" 3
+
+printf '%s\n' "kaputt" > "$WORK/list-timers.json"
 RUNS_BEFORE="$(wc -l < "$WORK/systemd-run.log")"
 run_helper check
 assert_rc "unlesbarer Timerwert => rc=3 (fail closed)" 3
-assert_err "Wert wird zitiert" "NextElapseUSecRealtime='kaputt'"
+assert_err "Wert wird zitiert" "list-timers --output=json: 'kaputt'"
 RUNS_AFTER="$(wc -l < "$WORK/systemd-run.log")"
 if [ "$RUNS_BEFORE" = "$RUNS_AFTER" ]; then ok "bei unlesbarem Wert keine Unit gestartet"; else bad "trotz unlesbarem Wert gestartet"; fi
+
+echo "== R1: das CEST-Beispiel aus dem Review =="
+# Auf dem Host lieferte `systemctl show -p NextElapseUSecRealtime` die Wanduhr
+# „Tue 2026-09-29 01:53:08 CEST". Der alte Weg entfernte das Zonenkürzel und las
+# die Wanduhr als UTC (03:53:08 UTC) — zwei Stunden zu viel Frist; im Winter eine.
+# Hier steht dieselbe Zeit als das, was systemd im JSON ausgibt, und das „jetzt"
+# wird festgelegt, damit die Zahl selbst geprüft wird.
+# Der feste Wert wird gegen die Datumsrechnung des Prüf-Images geprüft: mit tzdata
+# als „Tue 2026-09-29 01:53:08 CEST", ohne tzdata (bash:5, ubuntu:24.04) als
+# derselbe Zeitpunkt in UTC — Sommerzeit heisst hier +2 h.
+if [ "$(TZ=Europe/Berlin date -d "@$CEST_NEXT" '+%a %F %T %Z' 2>/dev/null)" = "Tue 2026-09-29 01:53:08 CEST" ]; then
+  ok "CEST-Beispiel: $CEST_NEXT s = Tue 2026-09-29 01:53:08 CEST"
+elif [ "$(TZ=UTC date -u -d "@$CEST_NEXT" '+%a %F %T UTC' 2>/dev/null)" = "Mon 2026-09-28 23:53:08 UTC" ]; then
+  ok "CEST-Beispiel: $CEST_NEXT s = 2026-09-28 23:53:08 UTC (= 01:53:08 CEST beim Prüf-Image ohne tzdata)"
+else
+  bad "CEST-Beispiel: $CEST_NEXT s passt nicht (Image: $(TZ=UTC date -u -d "@$CEST_NEXT" 2>&1))"
+fi
+timer_json "$(timer_usec "$CEST_NEXT")"
+
+fake_now "$(( CEST_NEXT - 6 * 3600 ))"
+RUNS_BEFORE="$(wc -l < "$WORK/systemd-run.log")"
+run_helper_clock -- check
+assert_rc "CEST: 6 h bis zum Termin => rc=3" 3
+assert_err "CEST: Abstand mit 6 h gerechnet (alt: 8 h => Start)" "in 6 h 0 min"
+RUNS_AFTER="$(wc -l < "$WORK/systemd-run.log")"
+if [ "$RUNS_BEFORE" = "$RUNS_AFTER" ]; then ok "CEST: keine Unit gestartet"; else bad "CEST: trotz Fristverletzung gestartet"; fi
+
+fake_now "$(( CEST_NEXT - 10 * 3600 ))"
+run_helper_clock -- check
+assert_rc "CEST: 10 h bis zum Termin => rc=0" 0
+assert_out "CEST: Frist mit 10 h gerechnet (alt: 12 h)" "in 10 h 0 min"
+CEST_UNIT="$(sed -n 's/^Unit: //p' <<<"$OUT" | head -n 1)"
+wait_for_rc_file "$CEST_UNIT" 100
+rm -f "$WORK/fake-now"
 
 : > "$WORK/timer-off"
 run_helper check
@@ -512,7 +631,7 @@ assert_out "Hinweis zum inaktiven Timer" "ist nicht aktiv"
 OFF_UNIT="$(sed -n 's/^Unit: //p' <<<"$OUT" | head -n 1)"
 wait_for_rc_file "$OFF_UNIT" 100
 rm -f "$WORK/timer-off"
-next_elapse_human "$(( NOW + 16 * 3600 ))" > "$WORK/next-elapse"
+timer_json "$(timer_usec "$(( NOW + 16 * 3600 ))")"
 
 echo "== Startfehler und falscher Host =="
 OUT="$(PATH="$WORK/bin-broken:$STUBS:$PATH" COCKPIT_BORG_ACTION_LOCK="$WORK/borg.lock" \

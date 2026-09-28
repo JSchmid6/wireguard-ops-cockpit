@@ -9,12 +9,17 @@
 # told to fail. Checks: a clean install, the byte-exact rollback when the install
 # fails half-way, the web image tag rollback when the web build fails, a build
 # failure before anything is installed, an unmerged commit, the deferred restart,
-# the web unit start (only when inactive, before the new image exists), and that
-# the data directory's mode survives every run.
+# the web unit start (only when inactive, before the new image exists), that the
+# data directory's mode survives every run, and that the borgmatic.service drop-in
+# lands next to a foreign drop-in that stays untouched in both directions (R2).
 #
 # Everything lives below one fresh mktemp directory under /tmp; the harness
 # refuses to run otherwise. Call as root (install -o root):
 #   sudo bash test/vps-cockpit-deploy.test.sh
+# In a container the image needs git and python3 (the script edits state.json with
+# python3), e.g.:
+#   docker --context werkstatt run --rm -v /austausch/<klon>:/w:ro ubuntu:24.04 \
+#     bash -c 'apt-get update -qq && apt-get install -y git python3 && bash /w/test/vps-cockpit-deploy.test.sh'
 # ============================================================================
 set -eu
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -77,6 +82,12 @@ targets() { grep -oE '^  "[^"|]+\|[^"|]+\|' "$SCRIPT" | cut -d'|' -f2 | sed -E \
 fresh_host() { # host root: half the targets with old bytes, the other half absent; repo at A
   rm -rf "$FIX/root" "$FIX/repo" "$FIX/calls.log" "$FIX/fail-visudo" "$FIX/fail-build" "$FIX/fail-webbuild" "$FIX/web-active"
   mkdir -p "$FIX/root/var/lib/wireguard-ops-cockpit"; chmod 750 "$FIX/root/var/lib/wireguard-ops-cockpit"
+  # Fremdes Drop-in in dem Verzeichnis, in das unser neues Drop-in kommt (der
+  # Host hat dort z. B. nach-gitlab-backup.conf): es gehört nicht zu diesem
+  # Repository und darf weder beim Installieren noch beim Rückfall angefasst
+  # werden.
+  mkdir -p "$FIX/root/etc/systemd/system/borgmatic.service.d"
+  printf '%s\n' "FREMD nach-gitlab-backup.conf" > "$FIX/root/etc/systemd/system/borgmatic.service.d/nach-gitlab-backup.conf"
   g clone -q "$FIX/origin.git" "$FIX/repo" 2>/dev/null; git -C "$FIX/repo" checkout -q -B main "$A"
   local i=0 target
   while IFS= read -r target; do
@@ -110,6 +121,12 @@ check "Erfolg: inaktive Web-Unit vor dem Web-Bau gestartet" 'start_before_build'
 check "Erfolg: Neustart inkl. Web-Unit" 'grep -q "^systemctl restart .*wireguard-ops-cockpit-web" "$FIX/calls.log"'
 check "Erfolg: Sicherungsordner entfernt" '[ -z "$(ls -d "$FIX"/root/var/lib/wireguard-ops-cockpit/self-update/deploy-backup.* 2>/dev/null)" ]'
 check "Erfolg: Datenordner des Dienstes bleibt 750" '[ "$(parent_mode)" = 750 ]'
+# R2: das Drop-in für borgmatic.service. Das Verzeichnis gehört dem Paket, nicht
+# uns: hier wird nur die eigene Datei geschrieben.
+check "R2: Drop-in borgmatic.service.d/cockpit-borg-lock.conf installiert" '[ "$(cat "$FIX/root/etc/systemd/system/borgmatic.service.d/cockpit-borg-lock.conf")" = "B deploy/systemd/borgmatic-cockpit-borg-lock.conf" ]'
+check "R2: fremdes Drop-in unberührt" '[ "$(cat "$FIX/root/etc/systemd/system/borgmatic.service.d/nach-gitlab-backup.conf")" = "FREMD nach-gitlab-backup.conf" ]'
+check "R2: Drop-in lässt das Backup auf die Sperre warten" 'grep -qx "ExecStartPre=/usr/bin/flock /run/lock/cockpit-borg.lock /bin/true" "$HERE/../deploy/systemd/borgmatic-cockpit-borg-lock.conf"'
+check "R2: Drop-in hat keine andere aktive Zeile (ändert nichts an borgmatic.service)" '[ "$(grep -vE "^[[:space:]]*(#|$)" "$HERE/../deploy/systemd/borgmatic-cockpit-borg-lock.conf" | tr "\n" "|")" = "[Service]|ExecStartPre=/usr/bin/flock /run/lock/cockpit-borg.lock /bin/true|" ]'
 
 # 2: install fails half-way (sudoers check after install) -> byte-exact rollback
 fresh_host; : > "$FIX/fail-visudo"; code=0; deploy "$B" now || code=$?
@@ -119,6 +136,8 @@ check "Rückfall: Checkout wieder auf A" '[ "$(git -C "$FIX/repo" rev-parse HEAD
 check "Rückfall: vollständig gemeldet, kein Neustart" 'grep -q "rollback complete" "$FIX/out.log" && ! grep -q "^systemctl restart" "$FIX/calls.log"'
 check "Rückfall: kein state.json geschrieben" '[ ! -e "$FIX/root/var/lib/wireguard-ops-cockpit/self-update/state.json" ]'
 check "Rückfall: Datenordner des Dienstes bleibt 750" '[ "$(parent_mode)" = 750 ]'
+check "Rückfall: Drop-in wieder weg (lag vorher nicht da)" '[ ! -e "$FIX/root/etc/systemd/system/borgmatic.service.d/cockpit-borg-lock.conf" ]'
+check "Rückfall: fremdes Drop-in unberührt" '[ "$(cat "$FIX/root/etc/systemd/system/borgmatic.service.d/nach-gitlab-backup.conf")" = "FREMD nach-gitlab-backup.conf" ]'
 
 # 3: the web build fails after the install -> files restored, web tag back on the old image
 fresh_host; : > "$FIX/fail-webbuild"; code=0; deploy "$B" now || code=$?
