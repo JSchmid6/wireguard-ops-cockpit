@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
@@ -515,6 +515,17 @@ function makeServer(initiallyAuthenticated: boolean) {
         createdAt: "2026-04-19T12:00:00.000Z"
       }
     ],
+    // Angehaltene Change-Jobs kommen als eigener Teil der Freigabe-Antwort und
+    // sind in diesem Server standardmäßig leer (im Betrieb füllt sie die API).
+    changeApprovals: [] as Array<{
+      jobId: string;
+      title: string;
+      planSummary: string;
+      reason: string;
+      findings: string[];
+      expiresAt: string | null;
+    }>,
+    lastChangeDecision: null as null | { jobId: string; decision: string; reason?: string },
     audits: [
       {
         id: "audit-1",
@@ -655,7 +666,7 @@ function makeServer(initiallyAuthenticated: boolean) {
     }
 
     if (url === "/api/approvals?status=pending") {
-      return okResponse({ approvals: state.approvals });
+      return okResponse({ approvals: state.approvals, changeApprovals: state.changeApprovals });
     }
 
     if (url === "/api/audits?limit=12") {
@@ -740,6 +751,16 @@ function makeServer(initiallyAuthenticated: boolean) {
       return okResponse({ ok: true });
     }
 
+    // Freigabe eines angehaltenen Change-Jobs: die Oberfläche ruft die Route des
+    // Jobs auf — dieselbe, die der Operator von Hand benutzt.
+    if (url.startsWith("/api/hermes/jobs/") && url.endsWith("/approval") && method === "POST") {
+      const jobId = url.split("/")[4];
+      const body = JSON.parse(String(init?.body || "{}")) as { decision: string; reason?: string };
+      state.changeApprovals = state.changeApprovals.filter((entry) => entry.jobId !== jobId);
+      state.lastChangeDecision = { jobId, decision: body.decision, ...(body.reason ? { reason: body.reason } : {}) };
+      return okResponse({ job: { id: jobId, status: body.decision === "approved" ? "running" : "rejected" } });
+    }
+
     if (url.includes("/checkpoints/") && method === "POST") {
       const [, , jobId, , checkpointId] = url.split("/").slice(1);
       for (const detail of Object.values(state.sessionDetails)) {
@@ -795,7 +816,7 @@ function makeServer(initiallyAuthenticated: boolean) {
   });
 
   vi.stubGlobal("fetch", fetchMock);
-  return { fetchMock };
+  return { fetchMock, state };
 }
 
 describe("App", () => {
@@ -977,5 +998,90 @@ describe("App", () => {
     expect(screen.getByTestId("borg-scheduled-check").textContent).toContain("skipped");
     expect(screen.getByTestId("borg-timer").textContent).toContain("borgmatic.timer");
     expect(screen.getByTestId("borg-freshness").textContent).toContain("fresh");
+  });
+
+  it("zeigt angehaltene Change-Jobs und entscheidet sie über die Route des Jobs", async () => {
+    const { fetchMock, state } = makeServer(true);
+    state.changeApprovals = [
+      {
+        jobId: "job-2b24d99f",
+        title: "Update the Email Archive image",
+        planSummary: "Plan: Email-Archive-Image aktualisieren",
+        reason: "The plan needs the operator: it replaces a running container image.",
+        findings: [
+          "Safety review: no rollback for the image swap.",
+          "policy: container image replacement needs operator approval"
+        ],
+        expiresAt: "2026-09-28T14:30:00.000Z"
+      },
+      {
+        jobId: "job-overdue",
+        title: "Rotate the WireGuard peer of the laptop",
+        planSummary: "Plan: Peer-Schlüssel tauschen",
+        reason: "The plan needs the operator: it changes an identity.",
+        findings: ["Safety review: no rollback for the peer swap."],
+        expiresAt: "2020-01-01T00:00:00.000Z"
+      },
+      {
+        jobId: "job-without-expiry",
+        title: "Restart the print queue",
+        planSummary: "",
+        reason: "The plan needs the operator.",
+        findings: [],
+        expiresAt: null
+      },
+      {
+        jobId: "job-unreadable-expiry",
+        title: "Refresh the capability manifest",
+        planSummary: "Plan: Manifest neu schreiben",
+        reason: "The plan needs the operator.",
+        findings: [],
+        expiresAt: "kein-zeitstempel"
+      }
+    ];
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    const open = await screen.findByTestId("change-approval-job-2b24d99f");
+    expect(open.textContent).toContain("Update the Email Archive image");
+    expect(open.textContent).toContain("Plan: Email-Archive-Image aktualisieren");
+    expect(open.textContent).toContain("Precheck findings");
+    expect(open.textContent).toContain("Safety review: no rollback for the image swap.");
+    expect(open.textContent).toContain("policy: container image replacement needs operator approval");
+    expect(open.textContent).toContain("Expires at:");
+
+    // Abgelaufen wird als abgelaufen benannt, ein fehlender oder unlesbarer
+    // Zeitstempel als fehlend — geraten wird nichts.
+    expect(screen.getByTestId("change-approval-job-overdue").textContent).toContain("(expired)");
+    expect(screen.getByTestId("change-approval-job-without-expiry").textContent).toContain("Expires at: not recorded");
+    expect(screen.getByTestId("change-approval-job-unreadable-expiry").textContent).toContain("Expires at: not recorded");
+    // Ohne Planzeile steht keine erfundene Zeile in der Ansicht.
+    expect(screen.getByTestId("change-approval-job-without-expiry").textContent).not.toContain("Plan:");
+
+    // Ablehnen mit Begründung: sie geht an die bestehende Route des Jobs.
+    const overdue = screen.getByTestId("change-approval-job-overdue");
+    await user.type(within(overdue).getByPlaceholderText("Why this decision"), "Der Schlüssel bleibt beim alten Peer");
+    await user.click(within(overdue).getByRole("button", { name: "Reject" }));
+
+    await waitFor(() => {
+      expect(state.lastChangeDecision).toEqual({
+        jobId: "job-overdue",
+        decision: "rejected",
+        reason: "Der Schlüssel bleibt beim alten Peer"
+      });
+    });
+    await waitFor(() => expect(screen.queryByTestId("change-approval-job-overdue")).toBeNull());
+
+    // Freigeben ohne Begründung bleibt möglich — das Feld ist optional, die
+    // Entscheidung geht trotzdem nur über die Route des Jobs.
+    const stillOpen = await screen.findByTestId("change-approval-job-2b24d99f");
+    await user.click(within(stillOpen).getByRole("button", { name: "Approve" }));
+    await waitFor(() => {
+      expect(state.lastChangeDecision).toEqual({ jobId: "job-2b24d99f", decision: "approved" });
+    });
+    expect(
+      fetchMock.mock.calls.filter(([url]) => String(url) === "/api/hermes/jobs/job-2b24d99f/approval").length
+    ).toBe(1);
   });
 });

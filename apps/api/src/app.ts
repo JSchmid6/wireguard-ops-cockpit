@@ -44,6 +44,7 @@ import { generateRunbookSafetyReview, type SafetyReviewRunner } from "./safety-r
 import { runBrokerAgent } from "./agent-broker.js";
 import { runDynamicCapability, runExecutorAction, type ExecutorActionKind } from "./executor-broker.js";
 import { borgStatusRequestDigest, createBorgStatusService } from "./borg-status.js";
+import { summarizeChangeApproval } from "./change-approvals.js";
 import {
   capabilityManifestHash, capabilityNeedsOperatorApproval, capabilityPlannerContract,
   parseCapabilityManifest, readablePathsNeedingApproval, type CapabilityManifest,
@@ -2041,11 +2042,16 @@ export async function createApp(options: AppOptions = {}) {
   app.post("/api/hermes/jobs/:jobId/approval", async (request, reply) => {
     const actor = await requireActor(request, reply, database);
     if (!actor) return;
+    // G1: freigeben darf nur der Operator in der Admin-Sitzung. Der
+    // Agenten-Token kann sich nicht selbst freigeben — auch nicht für einen
+    // eigenen Job und auch dann nicht, wenn ihm die Route je als Scope
+    // zugeteilt würde.
+    if (actor.role !== "admin") {
+      return reply.code(403).send({ message: "operator approval requires an admin session" });
+    }
     const { jobId } = request.params as { jobId: string };
     const body = (request.body || {}) as { decision?: "approved" | "rejected"; reason?: string };
-    const job = actor.role === "admin"
-      ? database.getJob(jobId)
-      : database.getJobForActor(jobId, actor.id);
+    const job = database.getJob(jobId);
     if (!job) return reply.code(404).send({ message: "job not found" });
     const jobOwnerId = database.getJobOwnerId(jobId);
     if (!jobOwnerId) return reply.code(409).send({ message: "job owner is unavailable" });
@@ -3253,7 +3259,21 @@ Follow these rules:
     }
 
     const { status } = (request.query || {}) as { status?: "pending" | "approved" | "rejected" };
-    return { approvals: database.listApprovalsForActor(actor.id, status) };
+    const approvals = database.listApprovalsForActor(actor.id, status);
+
+    // Ein roter Change-Job legt keine Approval-Zeile an; er bleibt der Job
+    // selbst. Ohne diesen Teil der Antwort fehlt der Ansicht genau die
+    // Entscheidung, die Jochen treffen soll (Vorfall 28.09.2026: das Update
+    // 2b24d99f war im Web nirgends freizugeben). Nur die Admin-Sitzung sieht
+    // sie — der Agenten-Token bleibt bei 403 und bekommt hier nichts.
+    if (actor.role !== "admin" || (status && status !== "pending")) {
+      return { approvals };
+    }
+
+    return {
+      approvals,
+      changeApprovals: database.listJobsAwaitingOperatorApproval().map(summarizeChangeApproval)
+    };
   });
 
   app.post("/api/approvals/:approvalId/decision", async (request, reply) => {

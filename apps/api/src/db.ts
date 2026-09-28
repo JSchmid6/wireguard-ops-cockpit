@@ -697,6 +697,23 @@ export class CockpitDatabase {
     return rows.map((row) => this.mapJob(row));
   }
 
+  /**
+   * Change-Jobs, die beim Menschen angehalten sind. Sie stehen nicht in der
+   * Approvals-Tabelle — angehalten wird der Job selbst —, deshalb holt die
+   * Freigabe-Ansicht sie über Status und Betreff. Neueste zuerst, damit die
+   * zuletzt gemeldete Entscheidung oben steht.
+   */
+  listJobsAwaitingOperatorApproval(): JobRecord[] {
+    const rows = this.database
+      .prepare(
+        `SELECT * FROM jobs
+         WHERE subject_id = ? AND status = ?
+         ORDER BY datetime(updated_at) DESC, rowid DESC`
+      )
+      .all("hermes-change", "blocked_user_approval") as JobRow[];
+    return rows.map((row) => this.mapJob(row));
+  }
+
   createExecutionPlan(input: {
     sessionId: string | null;
     targetType: PlanTargetType;

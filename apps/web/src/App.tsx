@@ -86,6 +86,20 @@ interface ApprovalRecord {
   createdAt: string;
 }
 
+/**
+ * Ein Change-Job, der beim Operator angehalten ist. Er steht nicht in der
+ * Approvals-Tabelle, sondern kommt als eigener Teil der Freigabe-Antwort —
+ * mit genau den Fakten, die für die Entscheidung nötig sind.
+ */
+interface ChangeApprovalRecord {
+  jobId: string;
+  title: string;
+  planSummary: string;
+  reason: string;
+  findings: string[];
+  expiresAt: string | null;
+}
+
 interface AuditRecord {
   id: string;
   action: string;
@@ -227,6 +241,24 @@ function parseCheckpointState(value: unknown): ExecutionCheckpointState[] {
   });
 }
 
+/**
+ * Die Ablaufzeit der Freigabe in Ortszeit. Ohne Zeitstempel steht hier, dass
+ * keiner vorliegt — geraten wird nichts; ein abgelaufener Zeitpunkt wird als
+ * solcher benannt, weil eine Freigabe danach neu geplant werden muss.
+ */
+function formatChangeExpiry(expiresAt: string | null): string {
+  if (!expiresAt) {
+    return "not recorded";
+  }
+
+  const parsed = Date.parse(expiresAt);
+  if (Number.isNaN(parsed)) {
+    return "not recorded";
+  }
+
+  return `${new Date(parsed).toLocaleString()}${parsed < Date.now() ? " (expired)" : ""}`;
+}
+
 export default function App() {
   const weekdayLabels = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
   const [user, setUser] = useState<UserSummary | null>(null);
@@ -236,6 +268,8 @@ export default function App() {
   const [scripts, setScripts] = useState<ScriptDefinition[]>([]);
   const [agents, setAgents] = useState<AgentManifest[]>([]);
   const [approvals, setApprovals] = useState<ApprovalRecord[]>([]);
+  const [changeApprovals, setChangeApprovals] = useState<ChangeApprovalRecord[]>([]);
+  const [changeReasons, setChangeReasons] = useState<Record<string, string>>({});
   const [audits, setAudits] = useState<AuditRecord[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState("");
   const [sessionDetail, setSessionDetail] = useState<SessionDetail | null>(null);
@@ -313,7 +347,7 @@ export default function App() {
           request<{ schedules: ScheduledRunbook[] }>("/schedules"),
           request<{ scripts: ScriptDefinition[] }>("/scripts"),
           request<{ agents: AgentManifest[] }>("/agents"),
-          request<{ approvals: ApprovalRecord[] }>("/approvals?status=pending"),
+          request<{ approvals: ApprovalRecord[]; changeApprovals?: ChangeApprovalRecord[] }>("/approvals?status=pending"),
           request<{ audits: AuditRecord[] }>("/audits?limit=12")
         ]);
 
@@ -324,6 +358,7 @@ export default function App() {
       setScripts(scriptsResponse.scripts);
       setAgents(agentsResponse.agents);
       setApprovals(approvalsResponse.approvals);
+      setChangeApprovals(approvalsResponse.changeApprovals || []);
       setAudits(auditsResponse.audits);
       setError("");
 
@@ -411,6 +446,8 @@ export default function App() {
       setSchedules([]);
       setScripts([]);
       setApprovals([]);
+      setChangeApprovals([]);
+      setChangeReasons({});
       setAudits([]);
       setSessionDetail(null);
       setSelectedSessionId("");
@@ -516,6 +553,31 @@ export default function App() {
       }
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "Unable to decide approval");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /**
+   * Die Entscheidung über einen angehaltenen Change-Job geht über die bestehende
+   * Route des Jobs. Die Begründung ist optional, steht aber im Audit — bei einer
+   * Ablehnung trägt sie den Grund, deshalb wird sie mitgeschickt.
+   */
+  async function decideChangeApproval(jobId: string, decision: "approved" | "rejected") {
+    setBusy(true);
+    try {
+      const reason = (changeReasons[jobId] || "").trim();
+      await request(`/hermes/jobs/${jobId}/approval`, {
+        method: "POST",
+        body: JSON.stringify(reason ? { decision, reason } : { decision })
+      });
+      setChangeReasons((current) => ({ ...current, [jobId]: "" }));
+      await refreshDashboard();
+      if (selectedSessionId) {
+        await refreshSession(selectedSessionId);
+      }
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "Unable to decide the change job");
     } finally {
       setBusy(false);
     }
@@ -982,6 +1044,43 @@ export default function App() {
           <h2>Approvals</h2>
           <div className="panel-scroll">
             <ul className="list">
+              {changeApprovals.map((approval) => (
+                <li key={approval.jobId} data-testid={`change-approval-${approval.jobId}`}>
+                  <strong>{approval.title}</strong>
+                  <small>
+                    change job {approval.jobId} · awaiting operator approval
+                  </small>
+                  {approval.planSummary ? <p>Plan: {approval.planSummary}</p> : null}
+                  <p>{approval.reason}</p>
+                  {approval.findings.length > 0 ? (
+                    <div className="stack">
+                      <small>Precheck findings</small>
+                      {approval.findings.map((finding, index) => (
+                        <small key={`${approval.jobId}-finding-${index}`}>{finding}</small>
+                      ))}
+                    </div>
+                  ) : null}
+                  <small>Expires at: {formatChangeExpiry(approval.expiresAt)}</small>
+                  <label className="stack">
+                    Reason
+                    <input
+                      value={changeReasons[approval.jobId] || ""}
+                      placeholder="Why this decision"
+                      onChange={(event) =>
+                        setChangeReasons((current) => ({ ...current, [approval.jobId]: event.target.value }))
+                      }
+                    />
+                  </label>
+                  <div className="actions">
+                    <button disabled={busy} onClick={() => decideChangeApproval(approval.jobId, "approved")}>
+                      Approve
+                    </button>
+                    <button disabled={busy} onClick={() => decideChangeApproval(approval.jobId, "rejected")}>
+                      Reject
+                    </button>
+                  </div>
+                </li>
+              ))}
               {approvals.map((approval) => (
                 <li key={approval.id}>
                   <strong>{approval.status}</strong>
@@ -996,7 +1095,7 @@ export default function App() {
                   </div>
                 </li>
               ))}
-              {approvals.length === 0 ? <li>No pending approvals.</li> : null}
+              {approvals.length === 0 && changeApprovals.length === 0 ? <li>No pending approvals.</li> : null}
             </ul>
           </div>
         </article>

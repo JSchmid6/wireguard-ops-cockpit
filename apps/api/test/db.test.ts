@@ -115,6 +115,52 @@ describe("CockpitDatabase", () => {
     expect(database.listAudits(1)).toEqual([audit]);
   });
 
+  it("listet nur die beim Operator angehaltenen Change-Jobs, neueste zuerst", () => {
+    const session = database.upsertSession({
+      name: "hermes-change-queue",
+      tmuxSessionName: "cockpit-hermes-change-queue",
+      tmuxBackend: "tmux",
+      terminalUrl: null
+    });
+
+    const older = database.createJob({
+      sessionId: session.id,
+      kind: "runbook",
+      subjectId: "hermes-change",
+      status: "blocked_user_approval",
+      requiresApproval: false,
+      output: { explanation: { intent: "Älteres angehaltenes Vorhaben" } }
+    });
+    const newer = database.createJob({
+      sessionId: session.id,
+      kind: "runbook",
+      subjectId: "hermes-change",
+      status: "blocked_user_approval",
+      requiresApproval: false,
+      output: { explanation: { intent: "Neueres angehaltenes Vorhaben" } }
+    });
+    // Beides darf nicht in der Freigabe-Liste landen: ein anderer Betreff und
+    // ein bereits entschiedener Change-Job.
+    database.createJob({
+      sessionId: session.id,
+      kind: "runbook",
+      subjectId: "nextcloud-update-plan",
+      status: "blocked_user_approval",
+      requiresApproval: false,
+      output: { summary: "runbook, das nicht auf den Operator wartet" }
+    });
+    database.createJob({
+      sessionId: session.id,
+      kind: "runbook",
+      subjectId: "hermes-change",
+      status: "rejected",
+      requiresApproval: false,
+      output: { explanation: { intent: "Bereits abgelehnt" } }
+    });
+
+    expect(database.listJobsAwaitingOperatorApproval().map((job) => job.id)).toEqual([newer.id, older.id]);
+  });
+
   it("stores execution plans and updates them after dispatch", () => {
     const actor = database.authenticateUser("admin", "test-password");
     const session = database.upsertSession({
