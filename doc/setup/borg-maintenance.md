@@ -227,11 +227,14 @@ Warum nicht `sudo -n /usr/local/sbin/cockpit-borg-action status` im Katalog?
   Rechte-Regel für eine reine Anzeige. Genau das soll die Sicherheitslinie
   vermeiden („Rechte nur über die versionierte Datei, kein Runtime-Sudo“), und
   die Kennzahlen des Repos gibt es ohne Freigabe über `borg.status`.
-* Die bestehende `wgops`-Datei im Repo (`deploy/sudoers/wireguard-ops-cockpit`)
-  wird von **keinem** Mechanismus installiert — sie steht weder in der Tabelle
-  von `deploy/vps/vps-cockpit-deploy.sh` noch in einem anderen Skript. Ein
-  `sudo -n`-Eintrag wäre auf dem VPS also ein toter Knopf, bis jemand zusätzlich
-  die Installation dieser Datei baut.
+* Die bestehende `wgops`-Datei im Repo (`deploy/sudoers/wireguard-ops-cockpit`,
+  die zwei Zeilen für die Nextcloud-Runbooks) wird **nicht** von der Tabelle in
+  `deploy/vps/vps-cockpit-deploy.sh` installiert, sondern nur als Handgriff in
+  `doc/setup/vps-handover.md` genannt (`install -m 440 …`). Auf dem VPS liegt sie
+  nicht: `/etc/sudoers.d` enthält `cockpit-executor`, `cockpit-borgmatic`,
+  `backupPriv`, `wgops-temp` und `README` (Stand 28.09.2026). Ein
+  `sudo -n`-Eintrag im Katalog wäre dort also ein toter Knopf, bis die
+  Installation dieser Datei in den Deploy-Weg kommt.
 
 Wenn der Operator den Helfer trotzdem im Katalog will, sind es zwei Schritte:
 `bin/borg-status.sh` ruft `sudo -n /usr/local/sbin/cockpit-borg-action status`
