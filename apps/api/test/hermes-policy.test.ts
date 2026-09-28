@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { evaluatePlanPolicy } from "../src/app.js";
 import { parseCapabilityManifest } from "../src/capability-manifest.js";
+import { requestsBorgRepair } from "../src/hermes-security.js";
 
 function plan(zone: string, rollback: string, script = "/usr/bin/true") {
   return [
@@ -60,6 +61,45 @@ describe("Hermes plan policy", () => {
     for (const verb of ["status", "check"]) {
       expect(evaluatePlanPolicy(["```bash", `/usr/local/sbin/cockpit-borg-action ${verb}`, "```"].join("\n"), "passed"))
         .toMatchObject({ allowed: true, status: "ready" });
+    }
+  });
+
+  it("gates a repair that only the capability step carries — the live case of 28.09.2026", () => {
+    // Job 4282c4ac: die Absicht nannte die Zeile, der Planer antwortete mit einem
+    // Manifest, dessen Schritt den Helfer direkt nennt. Keine Shell-Zeile traegt
+    // den Repair — ohne den Schritt-Leser entschied allein, ob der Helfer schon
+    // ausgerollt ist. Beleg: /opt/data/out/t_0fd81c52/belege/job-repair-4282c4ac-*.json
+    const live = [
+      "```capability",
+      JSON.stringify({
+        version: "cockpit-capability/v1", name: "borg-repository-repair",
+        purpose: "Run borgmatic check --repair --force in a transient systemd unit to repair the remote Borg backup repository",
+        steps: [{ argv: ["/usr/local/sbin/cockpit-borg-action", "repair"] }],
+        readablePaths: [], writablePaths: [], network: "outbound",
+        expectedEffects: ["repository consistency repaired"], verification: ["a read-only check confirms a consistent archive list"],
+        rollback: ["home server snapshot of the repository"], risk: ["contained"],
+      }),
+      "```",
+    ].join("\n");
+    expect(parseCapabilityManifest(live)).not.toBeNull();
+    // Die Zeilenform sieht hier nichts: der Repair steht nur im Schritt.
+    expect(requestsBorgRepair(live)).toBe(false);
+    expect(evaluatePlanPolicy(live, "approval_required")).toMatchObject({
+      allowed: false, zone: "red", status: "blocked_user_approval", evidence: ["typed action: borg.repair"],
+    });
+  });
+
+  it("leaves a manifest with the read-only borg verbs to the normal policy", () => {
+    for (const verb of ["status", "check"]) {
+      const text = ["```capability", JSON.stringify({
+        version: "cockpit-capability/v1", name: `borg-${verb}`, purpose: "Read the backup state of the remote repository",
+        steps: [{ argv: ["/usr/local/sbin/cockpit-borg-action", verb] }],
+        readablePaths: [], writablePaths: [], network: "none",
+        expectedEffects: ["the backup state is reported"],
+        verification: ["the reported state matches `borgmatic list --last 1`"],
+        rollback: ["nothing is written, there is nothing to undo"], risk: ["contained"],
+      }), "```"].join("\n");
+      expect(evaluatePlanPolicy(text, "passed")).toMatchObject({ allowed: true, status: "ready" });
     }
   });
 

@@ -14,11 +14,18 @@ typisierte Aktion mit Audit und Freigabe.
 
 Alles andere (`restore`, `delete`, zusätzliche Argumente, ein Pfad ausserhalb
 `/usr/local/sbin/`) ist kein `borg.manage`, sondern `shell.exception` — es läuft
-durch keinen automatischen Job.
+durch keinen automatischen Job. Dasselbe gilt für die Manifest-Form: ein Schritt,
+der den Helfer direkt nennt, fällt nicht in den Riegel der Aktionsregel, sondern
+bleibt an der Zeilenform — und der Sandkasten verweigert ihn ohne Freigabe
+(`stepNeedsApproval`, alles ausser `status` und `check`).
 
 Die Fähigkeit heisst `borg.manage` und liegt in der Allowlist des Aufrufers: ein
-Change-Job muss `allowedCapabilities: ["borg.manage"]` mitbringen, sonst endet der
-Plan als `blocked_user_approval` (Capability-Eskalation).
+Skript-Plan muss `allowedCapabilities: ["borg.manage"]` mitbringen, sonst endet der
+Plan als `blocked_user_approval` (Capability-Eskalation). Bei einem Manifest-Plan
+werden die Fähigkeiten aus den Schritten gelesen (derselbe Helfer ⇒ `borg.manage`),
+die Eskalationsprüfung greift dort aber **nicht** — eine offene Entscheidung, siehe
+„Offene Punkte“ unten. Der Repair hängt nicht daran: für ihn greift die
+Aktionsregel in beiden Formen.
 
 ## Warum jedes Verb in einer eigenen systemd-Unit läuft
 
@@ -132,12 +139,18 @@ lassen sich nicht mehr wiederherstellen. Der Weg:
 2. Befund lesen — und entscheiden, ob die betroffenen Archivzeitpunkte entbehrlich
    sind. `status` zeigt danach die Unit und nach `check` den Befund im Journal.
 3. Erst dann `repair` bestellen. Die API erzwingt dafür die Freigabe des Operators
-   (`borg.repair` ⇒ `blocked_user_approval`): die Plan-Policy liest die
-   typisierte Zeile mit demselben Parser wie die Ausführung (`requestsBorgRepair`
-   über `typedPlanScript`) — aber über den **ganzen** Plan, also auch in einem
-   zweiten Code-Block oder einem anderen Fence, und unabhängig davon, ob der Plan
-   ein Capability-Manifest mitbringt. Den zweiten Riegel hält der Executor: er
-   führt einen `repair` nur aus, wenn die Freigabe an genau diesen Job gebunden ist.
+   (`borg.repair` ⇒ `blocked_user_approval`): die Plan-Policy liest die typisierte
+   Aktion mit demselben Parser wie die Ausführung (`requestsBorgRepair`) — über den
+   **ganzen** Plan, also auch in einem zweiten Code-Block oder einem anderen Fence —
+   und ebenso aus den `argv` eines **Capability-Manifests**
+   (`requestsBorgRepairInSteps`; der Planer hat genau dort schon einmal einen Repair
+   untergebracht, Job `4282c4ac` am 28.09.2026). Die Planform entscheidet also nicht
+   mehr, ob der Riegel greift. Den zweiten Riegel hält der Vollstrecker: der
+   typisierte Executor führt einen `repair` nur aus, wenn die Freigabe an genau
+   diesen Job gebunden ist, und der Capability-Sandkasten verlangt für einen
+   Helfer-Schritt die Freigabe, sobald er nicht `status` oder `check` ist
+   (`stepNeedsApproval` in `deploy/helpers/cockpit-capability-action` bzw.
+   `ops/cockpit-capability-action.mjs`).
 4. Nach dem Lauf `status`: Fortschritt und Ergebnis stehen im Journal der Unit;
    das nächste nächtliche `create` schreibt den neuen Stand. Die übrigen Archive
    bleiben unangetastet.
@@ -152,6 +165,17 @@ scheiterten dann und das Repo sähe „nicht erreichbar“ aus (rc=2), obwohl es
 belegt ist. `status` fragt darum **gar nicht** ab, sondern meldet
 `repo: belegt (Backup|check|repair läuft)` mit rc=0. `rc=2` („Repo nicht
 erreichbar“) heisst weiterhin genau das.
+
+## Offene Punkte (Stand 28.09.2026)
+
+* **Capability-Eskalation für Manifest-Pläne.** Sie läuft nur für Skript-Pläne
+  (`apps/api/src/app.ts`, `if (!manifest && …)`). Für Manifest-Pläne werden die
+  Fähigkeiten seit dem Fix des Repair-Riegels aus den Schritten gelesen und im Job
+  wahrheitsgemäss ausgewiesen (`manifestPlanCapabilities`), aber nicht mehr gegen
+  `allowedCapabilities` geprüft. Eine Ausweitung wäre eine Verhaltensänderung für
+  bestehende Manifest-Aufrufer (z. B. `cockpit-disk-action status`, das als
+  Manifest-Schritt läuft) und deshalb eine eigene Entscheidung — die Aktionsregeln
+  (Repair) hängen nicht daran.
 
 ## Dateien
 

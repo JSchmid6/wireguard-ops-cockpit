@@ -144,7 +144,39 @@ const check = (name, ok, detail = "") => {
   check("a forbidden root cannot be a scope", r.status === 77, `status=${r.status}`);
 }
 
-// ── 8: vps-Helfer — löschen und zurückrollen bleiben freigabepflichtig ────
+// ── 8: ein borg-Repair-Schritt im Manifest bleibt freigabepflichtig ───────
+// Dieselbe Regel wie in der Plan-Policy (evaluatePlanPolicy): nur `status` und
+// `check` laufen autonom. Ohne Freigabe muss der Lauf VOR jeder Ausführung
+// enden — vorher entschied allein, ob der Helfer schon ausgerollt ist.
+const borgHelper = "/usr/local/sbin/cockpit-borg-action";
+for (const argv of [[borgHelper, "repair"], [borgHelper, "repair", "--force"], [borgHelper], [borgHelper, "restore"]]) {
+  const r = run({
+    version: "cockpit-capability/v1", name: "borg-step", network: "outbound", risk: ["contained"],
+    readablePaths: [], writablePaths: [], steps: [{ argv, timeoutSeconds: 60 }],
+  });
+  check(`borg: ${argv.slice(1).join(" ") || "(no verb)"} needs operator approval`,
+    r.status === 77 && /approval/.test(r.stderr) && !r.out,
+    `status=${r.status} stderr=${r.stderr.slice(0, 120)}`);
+}
+// Die lesenden Verben laufen nicht in den Riegel. Der Helfer ist hier (noch) nicht
+// ausgerollt, deshalb endet der Lauf danach an der Existenzprüfung — genau das
+// beweist, dass die Freigabe-Schwelle für sie nicht greift. Ist er ausgerollt,
+// wird übersprungen: `check --force` ist ein echter Borg-Lauf und kein Test.
+if (existsSync(borgHelper)) {
+  console.log("SKIP  borg: status/check stay autonomous (the helper is installed; a real check is not a test)");
+} else {
+  for (const verb of ["status", "check"]) {
+    const r = run({
+      version: "cockpit-capability/v1", name: `borg-${verb}`, network: "outbound", risk: ["contained"],
+      readablePaths: [], writablePaths: [], steps: [{ argv: [borgHelper, verb], timeoutSeconds: 60 }],
+    });
+    check(`borg: ${verb} stays autonomous (no approval threshold)`,
+      r.status !== 77 && /executable is unavailable/.test(r.stderr),
+      `status=${r.status} stderr=${r.stderr.slice(0, 120)}`);
+  }
+}
+
+// ── 9: vps-Helfer — löschen und zurückrollen bleiben freigabepflichtig ────
 const vpsHelper = "/usr/local/lib/wireguard-ops-cockpit/cockpit-vps-snapshot";
 const vpsCredentials = existsSync("/etc/wireguard-ops-cockpit/contabo.env");
 for (const action of ["revert", "delete"]) {
@@ -156,7 +188,7 @@ for (const action of ["revert", "delete"]) {
   check(`vps: ${action} needs operator approval`, r.status === 77 && /approval/.test(r.stderr), `status=${r.status} ${r.stderr.slice(0, 120)}`);
 }
 
-// ── 9: vps-Helfer nur mit ausgehendem Netz, nur mit bekannten Aktionen ────
+// ── 10: vps-Helfer nur mit ausgehendem Netz, nur mit bekannten Aktionen ────
 {
   const r = run({
     version: "cockpit-capability/v1", name: "vps-nonet", network: "none", risk: ["contained"],
@@ -172,7 +204,7 @@ for (const action of ["revert", "delete"]) {
   check("vps: an unknown action is rejected before anything runs", u.status === 77, `status=${u.status} ${u.stderr.slice(0, 120)}`);
 }
 
-// ── 10: vps status läuft im Sandkasten — der Helfer findet seine Datei oder
+// ── 11: vps status läuft im Sandkasten — der Helfer findet seine Datei oder
 //        sagt, dass sie fehlt. Beides beweist, dass der Bind stimmt. ────────
 {
   const r = run({
@@ -191,7 +223,7 @@ for (const action of ["revert", "delete"]) {
   }
 }
 
-// ── 11: v2 vps-Scope ohne Zugang: der Snapshot scheitert VOR dem ersten
+// ── 12: v2 vps-Scope ohne Zugang: der Snapshot scheitert VOR dem ersten
 //        Schritt, und nichts wird ausgeführt ────────────────────────────────
 if (vpsCredentials) {
   console.log("SKIP  vps: scope without credentials (credentials are deposited; a real snapshot is not a test)");
@@ -209,7 +241,7 @@ if (vpsCredentials) {
   rmSync(root, { recursive: true, force: true });
 }
 
-// ── 12: vps-Scope nimmt keine Parameter, und nur einen gibt es ────────────
+// ── 13: vps-Scope nimmt keine Parameter, und nur einen gibt es ────────────
 {
   const p = run({
     version: "cockpit-capability/v2", name: "vps-param", network: "none", risk: ["contained"],
@@ -225,7 +257,7 @@ if (vpsCredentials) {
   check("vps scope: only one is allowed", d.status === 77, `status=${d.status}`);
 }
 
-// ── 13: der vps-Helfer lädt als Modul, und sein Taktgeber hält sauber an ──
+// ── 14: der vps-Helfer lädt als Modul, und sein Taktgeber hält sauber an ──
 //        (12.09.2026: ein Feld namens _stop verdeckte Thread._stop; die erste
 //        echte Messung starb erst beim Anhalten — kein Test hatte create je
 //        ausgeführt. Dieser hier braucht keinen Zugang.)
