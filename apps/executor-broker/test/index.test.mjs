@@ -54,6 +54,32 @@ test("executor broker rejects disk targets and actions outside the allowlist", (
   }
 });
 
+const borgBase = { expiresAt: "2030-01-01T00:00:00.000Z", envelopeDigest: "f".repeat(64) };
+
+test("executor broker admits the typed borg actions on allowlisted targets", () => {
+  for (const [action, target] of [["borg.status", "state"], ["borg.check", "repo"], ["borg.repair", "repo"]]) {
+    const payload = { ...borgBase, action, target };
+    assert.deepEqual(validateRequest({ payload, signature: sign(payload) }, validAt), payload);
+  }
+});
+
+test("executor broker rejects borg targets and actions outside the allowlist", () => {
+  const rejected = [
+    { action: "borg.status", target: "repo" },
+    { action: "borg.check", target: "state" },
+    { action: "borg.repair", target: "md127" },
+    { action: "borg.restore", target: "repo" },
+    { action: "borg.repair", target: "repo " },
+    { action: "borg.check", target: "/media/RAID/backup_VServer/borg" },
+  ];
+  for (const partial of rejected) {
+    const payload = { ...borgBase, ...partial };
+    let threw = false;
+    try { validateRequest({ payload, signature: sign(payload) }, validAt); } catch { threw = true; }
+    assert.equal(threw, true, `expected rejection: ${JSON.stringify(partial)}`);
+  }
+});
+
 const selfBase = { expiresAt: "2030-01-01T00:00:00.000Z", envelopeDigest: "d".repeat(64) };
 const selfSha = "0123456789abcdef0123456789abcdef01234567";
 

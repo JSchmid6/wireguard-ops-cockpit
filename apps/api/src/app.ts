@@ -58,6 +58,8 @@ import {
   hashCanonical,
   normalizeAllowedCapabilities,
   normalizeEvidence,
+  parseTypedBorgActions,
+  requestsBorgRepair,
   verifyExecutionEnvelopeSignature,
   type CapabilityId,
   type ExecutionEnvelope,
@@ -111,6 +113,12 @@ const SELF_DIFF_EXECUTOR_TIMEOUT_MS = 8 * 60 * 1000;
 // dienste.update: fetch, tests of the new stand as nobody, fast-forward and the
 // supervisor's health check run in one transient unit (RuntimeMaxSec=900).
 const DIENSTE_UPDATE_EXECUTOR_TIMEOUT_MS = 16 * 60 * 1000;
+// borg status sammelt zwei Sichten (Archive/Repo über SSH, Journal, Statusdatei
+// der Kiste) und braucht mehr als den 60s-Default — sie laufen in der
+// transienten status-Unit (RuntimeMaxSec=200), deren Ausgabe und Rückgabecode
+// durch `--wait --pipe` zurückkommen. check und repair kehren sofort zurück,
+// weil der Helper den stundenlangen Lauf als eigene Unit startet (ohne Warten).
+const BORG_EXECUTOR_TIMEOUT_MS = 4 * 60 * 1000;
 
 // Keeps a validated capability manifest for reuse, only when the planner
 // declared the operation as recurring (`retain: true`); a one-off repair stays
@@ -1693,7 +1701,8 @@ export async function createApp(options: AppOptions = {}) {
     const wantsDisk = envelope.capabilities.includes("disk.manage");
     const wantsSelfUpdate = envelope.capabilities.includes("self.update");
     const wantsDiensteUpdate = envelope.capabilities.includes("dienste.update");
-    if (!wantsService && !wantsDisk && !wantsSelfUpdate && !wantsDiensteUpdate) return null;
+    const wantsBorg = envelope.capabilities.includes("borg.manage");
+    if (!wantsService && !wantsDisk && !wantsSelfUpdate && !wantsDiensteUpdate && !wantsBorg) return null;
     if (!config.executorBrokerSocket || !config.executorBrokerSecret) {
       throw new Error("typed executor broker is not configured");
     }
@@ -1720,6 +1729,11 @@ export async function createApp(options: AppOptions = {}) {
       if (diensteUpdate.unsupported.length > 0) throw new Error(`dienste.update plan contains an unsupported form: ${diensteUpdate.unsupported[0]}`);
       actions.push(...diensteUpdate.actions);
     }
+    if (wantsBorg) {
+      const borg = parseTypedBorgActions(script);
+      if (borg.unsupported.length > 0) throw new Error(`borg.manage plan contains an unsupported form: ${borg.unsupported[0]}`);
+      actions.push(...borg.actions);
+    }
     if (actions.length === 0) throw new Error("typed capability plan contains no typed action");
     const outputs: string[] = [];
     for (const action of actions) {
@@ -1740,7 +1754,7 @@ export async function createApp(options: AppOptions = {}) {
       }
       outputs.push(await runExecutorAction(config.executorBrokerSocket, config.executorBrokerSecret, {
         ...action, ...(diffSha256 ? { diffSha256 } : {}), expiresAt: envelope.expiresAt, envelopeDigest: envelope.digest,
-      }, kind === "self" ? SELF_UPDATE_EXECUTOR_TIMEOUT_MS : kind === "dienste" ? DIENSTE_UPDATE_EXECUTOR_TIMEOUT_MS : undefined));
+      }, kind === "self" ? SELF_UPDATE_EXECUTOR_TIMEOUT_MS : kind === "dienste" ? DIENSTE_UPDATE_EXECUTOR_TIMEOUT_MS : action.action.startsWith("borg.") ? BORG_EXECUTOR_TIMEOUT_MS : undefined));
     }
     const ran = actions.map((action) => `${action.action} ${action.target}`).join(", ");
     return `## EXECUTION RESULT\nSTATUS: success\nEXIT_CODE: 0\nWHAT_RAN: typed executor actions: ${ran}\nOUTPUT: ${outputs.join("\n").slice(-10000)}\nNOTES: executed by isolated capability broker`;
@@ -2608,7 +2622,7 @@ Follow these rules:
         }
         const unsupportedAutonomousCapabilities = capabilities.filter((capability) =>
           capability !== "read.host" && capability !== "service.manage" && capability !== "disk.manage" && capability !== "self.update"
-          && capability !== "dienste.update" && capability !== "shell.exception"
+          && capability !== "dienste.update" && capability !== "borg.manage" && capability !== "shell.exception"
         );
         if (!manifest && policy.allowed && unsupportedAutonomousCapabilities.length > 0) {
           policy = {
@@ -2618,6 +2632,20 @@ Follow these rules:
             reason: "The requested capability does not yet have a typed executor helper.",
             evidence: unsupportedAutonomousCapabilities.map((capability) => `missing typed helper: ${capability}`),
             neededToContinue: ["Install and review a narrow typed helper; do not fall back to agent shell execution."],
+          };
+        }
+        // Ein borg-Repair kann beschädigte Archive ENTFERNEN (Datenverlust) und
+        // läuft Stunden: er startet nie autonom, egal wie der Plan seine
+        // Risikozone nennt. Der Operator entscheidet; ein lesender Check bleibt
+        // der autonome Weg. Die Bindung an die typisierte Zeile ist das
+        // Kriterium, nicht der Freitext des Plans.
+        const borgScript = manifest ? "" : planText.match(/```(?:bash|sh)\s*\n([\s\S]*?)```/i)?.[1] || "";
+        if (!manifest && policy.allowed && borgScript && requestsBorgRepair(borgScript)) {
+          policy = {
+            ...policy, zone: "red", allowed: false, status: "blocked_user_approval",
+            reason: "A borg repository repair can delete corrupt archives; it needs the operator's explicit decision.",
+            evidence: [...policy.evidence, "typed action: borg.repair"],
+            neededToContinue: ["Confirm this borg repair, or run a read-only check first."],
           };
         }
         if (manifest && policy.allowed && capabilityNeedsOperatorApproval(manifest)) {
