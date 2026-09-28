@@ -97,6 +97,9 @@ interface AppOptions {
   // The borg helper's status report (`borg.status`, read-only). Defaults to the
   // typed executor path; tests inject the helper's output instead of a host.
   borgStatusReader?: () => Promise<string>;
+  // Senke für die Zeile je gestarteter Borg-Messung. Vorgabe ist stdout (das
+  // Journal der API); Tests fangen die Zeile damit ab.
+  borgStatusLog?: (line: string) => void;
 }
 
 interface LoginAttemptState {
@@ -130,6 +133,10 @@ const BORG_EXECUTOR_TIMEOUT_MS = 4 * 60 * 1000;
 // höchstens 25 s und bekommt sonst den letzten Stand plus "Messung läuft".
 const BORG_STATUS_TTL_MS = 10 * 60 * 1000;
 const BORG_STATUS_REQUEST_WAIT_MS = 25_000;
+// Höchstens eine Messung je 60 s, auch über `refresh` (force): die Anzeige darf
+// den root-Helfer und das Repo nicht in einer Schleife beschäftigen — jede
+// Messung ist eine eigene Unit mit SSH-Abfragen und nimmt die Repo-Sperre.
+const BORG_STATUS_MIN_INTERVAL_MS = 60_000;
 
 // Keeps a validated capability manifest for reuse, only when the planner
 // declared the operation as recurring (`retain: true`); a one-off repair stays
@@ -695,6 +702,8 @@ export async function createApp(options: AppOptions = {}) {
   const borgStatus = createBorgStatusService({
     ttlMs: BORG_STATUS_TTL_MS,
     maxWaitMs: BORG_STATUS_REQUEST_WAIT_MS,
+    minIntervalMs: BORG_STATUS_MIN_INTERVAL_MS,
+    log: options.borgStatusLog ?? ((line) => console.log(line)),
     readReport: options.borgStatusReader || (async () => {
       if (!config.executorBrokerSocket || !config.executorBrokerSecret) {
         throw new Error("executor broker is not configured");
