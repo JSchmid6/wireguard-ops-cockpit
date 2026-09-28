@@ -8,9 +8,9 @@ typisierte Aktion mit Audit und Freigabe.
 
 | Aktion | Form im Plan | Wirkung | Freigabe |
 | --- | --- | --- | --- |
-| `borg.status` | `/usr/local/sbin/cockpit-borg-action status` | lesend: borgmatic-Timer, letzte Läufe (Journal), jüngste Archive, Repo-Kennzahlen, Statusdatei der Kiste | autonom (keine) |
-| `borg.check` | `/usr/local/sbin/cockpit-borg-action check` | startet `borgmatic check` (lesend) abgesetzt und kehrt sofort zurück | autonom (keine) |
-| `borg.repair` | `/usr/local/sbin/cockpit-borg-action repair` | startet `borgmatic check --repair --force` abgesetzt; kann beschädigte Archive entfernen | **Operator** (`blocked_user_approval`) |
+| `borg.status` | `/usr/local/sbin/cockpit-borg-action status` | lesend: borgmatic-Timer, letzte Läufe (Journal), laufende Wartungs-Unit, jüngste Archive, Repo-Kennzahlen, Statusdatei der Kiste. Läuft in einer eigenen transienten Unit (`--wait --pipe --collect`) | autonom (keine) |
+| `borg.check` | `/usr/local/sbin/cockpit-borg-action check` | startet `borgmatic --verbosity 1 check --force` in der Unit `cockpit-borg-check-<stamp>` und kehrt sofort zurück | autonom (keine) |
+| `borg.repair` | `/usr/local/sbin/cockpit-borg-action repair` | startet `borgmatic --verbosity 1 check --repair --force` in der Unit `cockpit-borg-repair-<stamp>`; kann beschädigte Archive entfernen (siehe unten) | **Operator** (`blocked_user_approval`) |
 
 Alles andere (`restore`, `delete`, zusätzliche Argumente, ein Pfad ausserhalb
 `/usr/local/sbin/`) ist kein `borg.manage`, sondern `shell.exception` — es läuft
@@ -20,35 +20,108 @@ Die Fähigkeit heisst `borg.manage` und liegt in der Allowlist des Aufrufers: ei
 Change-Job muss `allowedCapabilities: ["borg.manage"]` mitbringen, sonst endet der
 Plan als `blocked_user_approval` (Capability-Eskalation).
 
+## Warum jedes Verb in einer eigenen systemd-Unit läuft
+
+Der Executor (`wireguard-ops-cockpit-executor.service`), über den die typisierten
+Aktionen laufen, ist absichtlich streng sandboxed (`RestrictAddressFamilies=AF_UNIX`,
+`ProtectHome=read-only`, `PrivateTmp=yes`, `ProtectSystem=…`). In dieser Sandbox
+geht der Borg-Betrieb nicht:
+
+* kein SSH zur Kiste — `borgmatic list/info/check` scheitern am Socket,
+* kein Schreibzugriff auf `/root/.cache/borg` und `/root/.config/borg` — borg kann
+  seinen Cache nicht führen,
+* und ein dort „abgesetzter“ Lauf (`setsid`) bliebe im cgroup des Executors: ein
+  Neustart des Dienstes (z. B. beim Selbst-Update) beendet einen stundenlangen
+  Check mitten im Lauf.
+
+Darum startet der Helfer jedes der drei Verben über `systemd-run` als eigene
+transiente Unit — ausserhalb der Sandbox, im eigenen cgroup, mit eigenem Journal:
+
+* `status`: `systemd-run --wait --pipe --collect`. Die Ausgabe kommt durch
+  `--pipe` durch, der Rückgabecode des Laufs durch `--wait` — `rc=2` („Repo nicht
+  erreichbar“) bleibt also erhalten.
+* `check`/`repair`: `systemd-run --collect --unit=cockpit-borg-<verb>-<stamp>` **ohne**
+  `--wait`. Der Aufruf kehrt nach dem Start zurück (der Executor ist eine
+  Anfrage/Antwort-Strecke und darf nicht Stunden warten), die Unit läuft weiter.
+  `Type=exec` lässt einen Startfehler noch im Aufruf auffallen (rc=69),
+  `RuntimeMaxSec=86400` beendet einen hängenden Lauf nach 24 h.
+
+Der Laufzustand ist damit systemd-Zustand, nicht eine PID-Datei:
+`systemctl is-active <unit>`, `systemctl status <unit>`, `journalctl -u <unit>`.
+`status` zeigt die laufende Unit mit ihrem Journal und nach dem Lauf die zuletzt
+gestartete Unit; `--collect` räumt jede Unit nach ihrem Ende ab.
+
+## check und repair: drei Riegel
+
+1. **Kein zweiter Lauf (rc=3).** Abgelehnt wird, wenn eine borg-Wartungs-Unit aktiv
+   ist, `borgmatic.service` läuft (nächtliches Backup) oder die Sperrdatei
+   `/run/lock/cockpit-borg.lock` belegt ist. Der gestartete Lauf hält die Sperre
+   selbst, solange er dauert; systemd räumt sie mit der Unit ab.
+2. **Frist bis zum Timer (rc=3).** `check`/`repair` starten nicht, wenn der nächste
+   `borgmatic.timer`-Lauf in weniger als 8 h ansteht. Die Zeit kommt aus
+   `systemctl show borgmatic.timer -p NextElapseUSecRealtime`; gerechnet wird in
+   Epochensekunden (`date -u`), also zeitzonen- und sommerzeitfest — der Host
+   läuft in CEST, der Timer mit `OnCalendar=daily` und `RandomizedDelaySec=3h`.
+   Grund: ein Check über ~3,5 TB läuft Stunden; ein Start kurz vor dem Timer
+   liesse das nächtliche Backup in die Repo-Sperre laufen (genau das passierte am
+   22.09.2026). Ist der Timer nicht aktiv, gibt es nichts zu kollidieren (der
+   Helfer sagt es im Klartext); ist sein Wert nicht lesbar, wird **nicht**
+   gestartet (fail closed).
+3. **`--force`.** borgmatic überspringt Checks, die innerhalb der konfigurierten
+   Frequenz liegen („Skipping archives check due to configured frequency“) — ohne
+   `--force` wäre `check` ein No-op, der wie ein grüner Check aussieht. `check`
+   läuft darum mit `--force`.
+
+`repair` setzt zusätzlich `BORG_CHECK_I_KNOW_WHAT_I_AM_DOING=YES` (borg fragt sonst
+interaktiv „Type 'YES'…“ und der Lauf stirbt headless).
+
+## repair: erst nach einem Befund
+
+`repair` ist **kein** Routinewerkzeug und keine Vorsichtsmassnahme. Mit `--repair`
+entfernt borg Archive bzw. Segmente, die es nicht mehr lesen kann — die
+betroffenen Archivzeitpunkte sind danach aus dem Repository **weg**, ihre Dateien
+lassen sich nicht mehr wiederherstellen. Der Weg:
+
+1. `check` bestellen (autonom). Das Journal nennt das auffällige Archiv:
+   `journalctl -u cockpit-borg-check-<stamp>`.
+2. Befund lesen — und entscheiden, ob die betroffenen Archivzeitpunkte entbehrlich
+   sind. `status` zeigt danach die Unit und nach `check` den Befund im Journal.
+3. Erst dann `repair` bestellen. Die API erzwingt dafür die Freigabe des Operators
+   (`borg.repair` ⇒ `blocked_user_approval`).
+4. Nach dem Lauf `status`: Fortschritt und Ergebnis stehen im Journal der Unit;
+   das nächste nächtliche `create` schreibt den neuen Stand. Die übrigen Archive
+   bleiben unangetastet.
+
+Was `repair` **nicht** tut: den Repo-Schlüssel anfassen, Konfiguration ändern, den
+Timer abschalten oder Backups löschen, die noch lesbar sind.
+
+## status: bei belegtem Repo wird nicht abgefragt
+
+Während Backup oder Wartung hält borg die Repo-Sperre. `borgmatic list/info`
+scheiterten dann und das Repo sähe „nicht erreichbar“ aus (rc=2), obwohl es nur
+belegt ist. `status` fragt darum **gar nicht** ab, sondern meldet
+`repo: belegt (Backup|check|repair läuft)` mit rc=0. `rc=2` („Repo nicht
+erreichbar“) heisst weiterhin genau das.
+
 ## Dateien
 
 | Pfad (Host) | Quelle | Zweck |
 | --- | --- | --- |
 | `/usr/local/sbin/cockpit-borg-action` | `deploy/helpers/cockpit-borg-action` | der einzige sudo-exponierte Einstieg; gepinnte Grammatik `status\|check\|repair` |
 | `/etc/sudoers.d/cockpit-executor` | `deploy/sudoers/cockpit-executor` | Zeile `cockpit-executor ALL=(root) NOPASSWD: /usr/local/sbin/cockpit-borg-action *` |
-| `/var/lib/wireguard-ops-cockpit/borg/` | Laufzeit | `last.pid`, `last.kind`, `last.log` (Symlink auf das jüngste Log), 0750 root |
-| `/var/log/wireguard-ops-cockpit-borg/<verb>-<stamp>.log` | Laufzeit | ein Log je abgesetztem Lauf, 0750 root |
+| `/var/lib/wireguard-ops-cockpit/borg/last.unit`, `last.kind` | Laufzeit | zuletzt gestartete Wartungs-Unit und ihre Art, 0750 root — nur für die Anzeige; **der Laufzustand kommt aus systemd** (`systemctl is-active <unit>`) |
 | `/run/lock/cockpit-borg.lock` | Laufzeit | Sperre gegen zwei gleichzeitige Läufe auf demselben Repo |
+| Journal der Unit | systemd | Fortschritt und Ergebnis jedes Laufs (`journalctl -u cockpit-borg-<verb>-<stamp>`); ein eigenes Logverzeichnis gibt es nicht mehr |
 
 Installiert wird der Helfer von `deploy/vps/vps-cockpit-deploy.sh` (Tabelle) — also
 auch über den Selbst-Update-Weg des Cockpits, ohne Handgriff am Terminal.
 
-## Warum `check`/`repair` abgesetzt laufen
+## Rückgabewerte
 
-Ein Repo-Check über ~3,5 TB läuft Stunden. Der typisierte Executor ist eine
-Anfrage/Antwort-Strecke (der Broker wartet auf den Kindprozess), ein Helper, der
-zwei Stunden im Slot hängt, wäre ein kaputter Executor. `check`/`repair` starten
-darum über `setsid` eine eigene Sitzung, die die Sperre für die gesamte Dauer
-hält, und kehren sofort mit PID und Logpfad zurück. Der Fortschritt ist über
-`status` sichtbar (Sperrzustand, PID, Logschwanz).
-
-`repair` setzt `BORG_CHECK_I_KNOW_WHAT_I_AM_DOING=YES` (borg fragt sonst
-interaktiv „Type 'YES'…" und der Lauf stirbt headless).
-
-Beide Verben brechen mit rc=3 ab, wenn `borgmatic.service` gerade läuft oder die
-Sperre belegt ist. Grund: borgmatic benutzt denselben Repo-Lock; ein zweiter Lauf
-beendet den nächtlichen Timer-Lauf mit „Failed to create/acquire the lock" (genau
-das passierte am 22.09.2026).
+`0` ok · `2` Repo nicht erreichbar (nur `status`) · `3` es läuft schon eine Wartung
+oder zu wenig Frist bis zum Timer · `64` Aufruffehler · `67` falscher Host
+(`check`/`repair` auf einer Maschine ohne borgmatic) oder fehlende Umgebung ·
+`69` die Unit konnte nicht starten.
 
 ## Grenzen (bewusst)
 
@@ -57,16 +130,18 @@ das passierte am 22.09.2026).
   (mysqldump, borg). Es laufen nur borgmatic-Kommandos, die den Schlüssel selbst
   benutzen und nur ihre Zusammenfassung ausgeben.
 * Keine freien Argumente, keine Pfade, kein `borg`-Rohkommando, kein `--repair`
-  ohne vorherige Freigabe.
+  ohne vorherige Freigabe. Die internen Payload-Verben (`--payload <verb>`) laufen
+  nur aus der eigenen Unit: sie verlangen `COCKPIT_BORG_ACTION_IN_UNIT`, das die
+  Unit selbst setzt — und `sudo` lässt ohne SETENV keine Umgebung durch.
 * Kein Runtime-Sudo: die Zeile steht in der versionierten, vom Deploy geprüften
   sudoers-Datei; die API kann sich keine Rechte bauen.
 * Kein tmux-Runbook für borg: Runbook-Sitzungen laufen als `wgops`, der
   Repo-Schlüssel gehört root. Der lesende Weg ist die typisierte Aktion, nicht
   eine Shell-Sitzung.
 
-## Zustand der Kiste (Baustein „Sichtbarkeit")
+## Zustand der Kiste (Baustein „Sichtbarkeit“)
 
-`status` beantwortet auch „was macht die Kiste?" ohne SSH:
+`status` beantwortet auch „was macht die Kiste?“ ohne SSH:
 
 * auf dem VPS: Array-Zustand und freier Platz aus der Statusdatei
   `http://10.0.0.5:8088/status.txt` (`MDSTAT`, `DF /media/RAID`), die der
@@ -75,4 +150,4 @@ das passierte am 22.09.2026).
   kein Schlüssel): Mount, Platz und das Repo-Verzeichnis — Existenz, mtime,
   Grösse, Anzahl Datensegmente und das jüngste Segment. Ein nicht erreichbares
   Repo meldet `status` mit rc=2 und `repo_erreichbar: nein`, damit der Job als
-  Befund endet und nicht als „alles gut".
+  Befund endet und nicht als „alles gut“.

@@ -14,8 +14,9 @@ const capabilityNode = "/opt/node-v20.19.1-linux-x64/bin/node";
 const services = new Set(["apache2", "wireguard-ops-cockpit-ttyd"]);
 const diskActions = new Set(["disk.status", "disk.remove", "disk.add", "disk.smart", "disk.smarttest"]);
 const diskDevice = /^sd[a-z]$/;
-// Borg-Betrieb: status ist lesend, check/repair starten einen abgesetzten Lauf
-// (der Helper hält die Repo-Sperre) und kehren sofort zurück.
+// Borg-Betrieb: status ist lesend und läuft in einer eigenen transienten Unit
+// (--wait --pipe --collect); check/repair starten eine benannte Unit ohne Warten
+// (der Lauf hält dort die Repo-Sperre selbst) und kehren sofort zurück.
 const borgHelper = "/usr/local/sbin/cockpit-borg-action";
 const borgActions = new Set(["borg.status", "borg.check", "borg.repair"]);
 const selfUpdateActions = new Set(["self.update", "self.status", "self.diff"]);

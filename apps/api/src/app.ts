@@ -114,8 +114,10 @@ const SELF_DIFF_EXECUTOR_TIMEOUT_MS = 8 * 60 * 1000;
 // supervisor's health check run in one transient unit (RuntimeMaxSec=900).
 const DIENSTE_UPDATE_EXECUTOR_TIMEOUT_MS = 16 * 60 * 1000;
 // borg status sammelt zwei Sichten (Archive/Repo über SSH, Journal, Statusdatei
-// der Kiste) und braucht mehr als den 60s-Default; check und repair kehren
-// sofort zurück, weil der Helper den stundenlangen Lauf abgesetzt startet.
+// der Kiste) und braucht mehr als den 60s-Default — sie laufen in der
+// transienten status-Unit (RuntimeMaxSec=200), deren Ausgabe und Rückgabecode
+// durch `--wait --pipe` zurückkommen. check und repair kehren sofort zurück,
+// weil der Helper den stundenlangen Lauf als eigene Unit startet (ohne Warten).
 const BORG_EXECUTOR_TIMEOUT_MS = 4 * 60 * 1000;
 
 // Keeps a validated capability manifest for reuse, only when the planner
