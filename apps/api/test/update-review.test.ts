@@ -121,7 +121,7 @@ describe("self-update pre-install review", () => {
     expect(prompt).toContain("[... apps/api/src/hermes-security.ts truncated for the review budget ...]");
     const policy = applyUpdateReviewPolicy(readyPolicy, outcome({ coverage, answer: parseUpdateReviewAnswer("VERDICT: approve") }));
     expect(policy).toMatchObject({ allowed: false, status: "blocked_user_approval", zone: "red" });
-    expect(policy.reason).toContain("1 focus-area file(s) were not fully visible to the reviewer");
+    expect(policy.reason).toContain("1 focus-area or deploy file(s) were not fully visible to the reviewer");
     expect(policy.evidence).toContain(`not fully reviewed (${SHA.slice(0, 12)}): apps/api/src/hermes-security.ts`);
   });
 
@@ -189,11 +189,26 @@ describe("self-update pre-install review", () => {
     expect(coverage[0].omitted).toContain("doc/setup/borg-maintenance.md");
     expect(prompt).toContain("Cut: apps/api/test/app.test.ts");
     expect(prompt).toContain("Left out: doc/setup/borg-maintenance.md");
-    // Deploy material is not a focus area: naming it never stops the update by itself.
+    // The deploy script is complete, so only the cut test and the left-out doc
+    // are named — neither is a stop.
     expect(coverage[0].incomplete).toEqual([]);
+    const policy = applyUpdateReviewPolicy(readyPolicy, outcome({ coverage, answer: parseUpdateReviewAnswer("VERDICT: approve") }));
+    expect(policy).toMatchObject({ allowed: true, status: "ready" });
   });
 
-  it("names deploy material the runner never excerpted", () => {
+  it("stops when deploy material is cut by the budget", () => {
+    const deploy = section("deploy/vps/vps-cockpit-deploy.sh", ["@@ -1,300 +1,300 @@", ...Array.from({ length: 300 }, (_, index) => `+install -m 0755 helper${index} /usr/local/sbin/ ${"x".repeat(40)}`)]);
+    const { coverage } = buildUpdateReviewPrompt([diff({
+      files: [{ status: "M", path: "deploy/vps/vps-cockpit-deploy.sh", added: 300, deleted: 300, class: "other" }, ...diff().files],
+      filesTotal: 3, focusAreas: [], excerpt: [...diff().excerpt, deploy],
+    })], { nonce: NONCE, limit: 15_000 });
+    expect(coverage[0].cut).toEqual(["deploy/vps/vps-cockpit-deploy.sh"]);
+    expect(coverage[0].incomplete).toEqual(["deploy/vps/vps-cockpit-deploy.sh"]);
+    const policy = applyUpdateReviewPolicy(readyPolicy, outcome({ coverage, answer: parseUpdateReviewAnswer("VERDICT: approve") }));
+    expect(policy).toMatchObject({ allowed: false, zone: "red", status: "blocked_user_approval" });
+  });
+
+  it("names deploy material the runner never excerpted and stops for the operator", () => {
     const { prompt, coverage } = buildUpdateReviewPrompt([diff({
       files: [
         { status: "M", path: "deploy/vps/vps-cockpit-deploy.sh", added: 10, deleted: 3, class: "other" },
@@ -202,10 +217,13 @@ describe("self-update pre-install review", () => {
       filesTotal: 3,
     })], { nonce: NONCE });
     expect(coverage[0].omitted).toContain("deploy/vps/vps-cockpit-deploy.sh");
-    expect(coverage[0].incomplete).toEqual([]);
+    expect(coverage[0].incomplete).toEqual(["deploy/vps/vps-cockpit-deploy.sh"]);
     expect(prompt).toContain("Left out: deploy/vps/vps-cockpit-deploy.sh");
+    // Even an approving reviewer cannot turn a missing root installer green.
     const policy = applyUpdateReviewPolicy(readyPolicy, outcome({ coverage, answer: parseUpdateReviewAnswer("VERDICT: approve") }));
-    expect(policy).toMatchObject({ allowed: true, status: "ready" });
+    expect(policy).toMatchObject({ allowed: false, zone: "red", status: "blocked_user_approval" });
+    expect(policy.reason).toContain("1 focus-area or deploy file(s) were not fully visible to the reviewer");
+    expect(policy.evidence.join("\n")).toContain("not fully reviewed (0123456789ab): deploy/vps/vps-cockpit-deploy.sh");
   });
 
   it("parses approve, flag and garbage deterministically", () => {
