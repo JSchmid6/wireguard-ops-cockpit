@@ -6,7 +6,7 @@ Production uses three Unix identities and two non-network Unix sockets.
 
 - `wgops`: Control API; supplementary member of both client groups
 - `cockpit-agent`: primary group `cockpit-agent-client`; no sudo
-- `cockpit-executor`: primary group `cockpit-executor-client`; only the static service and disk helpers and the signed capability sandbox launcher in sudoers
+- `cockpit-executor`: primary group `cockpit-executor-client`; only the static service and disk helpers, the signed capability sandbox launcher and the signed host-run launcher (`start`, `status <job>`) in sudoers
 
 Never add `cockpit-agent` to `cockpit-executor-client` or grant it access to Control storage.
 
@@ -30,6 +30,7 @@ The Hermes token file is `hermes:hermes` mode `0600` because Hermes must present
 - `deploy/helpers/cockpit-service-action`
 - `deploy/helpers/cockpit-disk-action` (typed IMSM maintenance on the fixed `/dev/md127` container: `status`, `remove`/`add` for whole `sd[a-z]` disks only; refuses to remove an active member of an already degraded volume and refuses to add a disk that carries a filesystem, foreign metadata, or lands while a rebuild is running; verifies through `/proc/mdstat`; `smart` reads one disk's SMART JSON read-only and `smarttest` starts its short self-test without touching data. The capability sandbox refuses `remove`/`add`/`smart`/`smarttest` before execution — it has no block devices and no raw-IO capabilities, so mutations and direct device access run only through the typed executor path)
 - `deploy/helpers/cockpit-capability-action` (installed root-owned as `/usr/local/lib/wireguard-ops-cockpit/cockpit-capability-action.mjs` and pinned to the production Node 20 runtime; disk-helper steps get a read-only `/proc/mdstat` view at `/run/mdstat`, and `remove`/`add`/`smart`/`smarttest` are refused — mutations and direct device access run only through the typed executor)
+- `deploy/helpers/cockpit-host-run` (installed root-owned as `/usr/local/lib/wireguard-ops-cockpit/cockpit-host-run.mjs`; the general host door: verifies the signed envelope itself, then runs the reviewed shell steps as root in a transient unit after a borg-age check and a machine snapshot — see `setup/host-run.md`) plus `deploy/systemd/wireguard-ops-cockpit-host-run-resume.service` (continues runs after a reboot step)
 - `deploy/helpers/cockpit-exact-file-replace` (generic exact-content replacement constrained to the signed manifest's matching writable file)
 - `deploy/helpers/cockpit-nextcloud-context-action` and `deploy/helpers/nextcloud-context-test-file.php` (fixed, non-overwriting Context Chat E2E operations)
 - `deploy/helpers/cockpit-hermes-skill-action` (fixed, non-overwriting installation of the reviewed FullDialog Hermes skill)

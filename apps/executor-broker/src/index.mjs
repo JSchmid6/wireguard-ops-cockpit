@@ -11,6 +11,12 @@ const selfUpdateHelper = "/usr/local/sbin/cockpit-self-update-action";
 const diensteUpdateHelper = "/usr/local/sbin/cockpit-dienste-update-action";
 const capabilityHelper = "/usr/local/lib/wireguard-ops-cockpit/cockpit-capability-action.mjs";
 const capabilityNode = "/opt/node-v20.19.1-linux-x64/bin/node";
+// The general host door (doc/setup/host-run.md): host.run hands the signed
+// manifest to the root helper, which starts the run in its own unit and returns
+// at once; host.status reads that run's state. The helper verifies the envelope
+// itself, so this broker only checks the request's shape.
+const hostRunHelper = "/usr/local/lib/wireguard-ops-cockpit/cockpit-host-run.mjs";
+const hostRunJobId = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/;
 const services = new Set(["apache2", "wireguard-ops-cockpit-ttyd"]);
 const diskActions = new Set(["disk.status", "disk.remove", "disk.add", "disk.smart", "disk.smarttest"]);
 const diskDevice = /^sd[a-z]$/;
@@ -37,7 +43,7 @@ export function validateRequest(value, now = Date.now()) {
   const expected = signature(value.payload);
   if (!/^[a-f0-9]{64}$/.test(value.signature) || !timingSafeEqual(Buffer.from(value.signature, "hex"), Buffer.from(expected, "hex"))) throw new Error("invalid request signature");
   const { action, target, expiresAt, envelopeDigest } = value.payload;
-  if (action !== "service.restart" && action !== "service.status" && action !== "capability.execute" && !diskActions.has(action) && !selfUpdateActions.has(action) && !diensteUpdateActions.has(action) && !borgActions.has(action)) throw new Error("unsupported capability action");
+  if (action !== "service.restart" && action !== "service.status" && action !== "capability.execute" && action !== "host.run" && action !== "host.status" && !diskActions.has(action) && !selfUpdateActions.has(action) && !diensteUpdateActions.has(action) && !borgActions.has(action)) throw new Error("unsupported capability action");
   if (action.startsWith("service.") && !services.has(target)) throw new Error("service target is not allowlisted");
   if (action === "borg.status" && target !== "state") throw new Error("borg status target is not allowlisted");
   if ((action === "borg.check" || action === "borg.repair") && target !== "repo") throw new Error("borg maintenance target is not allowlisted");
@@ -52,6 +58,8 @@ export function validateRequest(value, now = Date.now()) {
   if (reviewedUpdates.has(action) && (typeof value.payload.diffSha256 !== "string" || !reviewedDiffHash.test(value.payload.diffSha256))) throw new Error(`${action} requires the reviewed diff sha256`);
   if (!reviewedUpdates.has(action) && value.payload.diffSha256 !== undefined) throw new Error("diffSha256 is only valid for self.update and dienste.update");
   if (action === "capability.execute" && (!value.payload.manifest || !value.payload.envelope)) throw new Error("dynamic capability payload is incomplete");
+  if (action === "host.run" && (!value.payload.manifest || !value.payload.envelope || value.payload.manifest.version !== "cockpit-host-run/v1")) throw new Error("host run payload is incomplete");
+  if (action === "host.status" && (typeof target !== "string" || !hostRunJobId.test(target))) throw new Error("host run job id is not valid");
   if (typeof envelopeDigest !== "string" || !/^[a-f0-9]{64}$/.test(envelopeDigest)) throw new Error("invalid envelope digest");
   if (typeof expiresAt !== "string" || now > Date.parse(expiresAt)) throw new Error("execution request expired");
   return value.payload;
@@ -59,8 +67,8 @@ export function validateRequest(value, now = Date.now()) {
 
 export function execute(payload) {
   return new Promise((resolve) => {
-    if (payload.action === "capability.execute") {
-      const child = spawn("sudo", ["-n", capabilityNode, capabilityHelper], { env: { PATH: "/usr/sbin:/usr/bin:/sbin:/bin" }, stdio: ["pipe", "pipe", "pipe"] });
+    if (payload.action === "capability.execute" || payload.action === "host.run") {
+      const child = spawn("sudo", ["-n", capabilityNode, ...(payload.action === "host.run" ? [hostRunHelper, "start"] : [capabilityHelper])], { env: { PATH: "/usr/sbin:/usr/bin:/sbin:/bin" }, stdio: ["pipe", "pipe", "pipe"] });
       let output = ""; let error = "";
       child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
       child.stdout.on("data", (chunk) => { output += chunk; }); child.stderr.on("data", (chunk) => { error += chunk; });
@@ -72,6 +80,15 @@ export function execute(payload) {
         error: code === 0 ? null : [error, output].filter(Boolean).join("\n").slice(-50000),
       }));
       child.stdin.end(JSON.stringify({ manifest: payload.manifest, envelope: payload.envelope }));
+      return;
+    }
+    if (payload.action === "host.status") {
+      const child = spawn("sudo", ["-n", capabilityNode, hostRunHelper, "status", payload.target], { env: { PATH: "/usr/sbin:/usr/bin:/sbin:/bin" }, stdio: ["ignore", "pipe", "pipe"] });
+      let hostOutput = ""; let hostError = "";
+      child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => { hostOutput += chunk; }); child.stderr.on("data", (chunk) => { hostError += chunk; });
+      child.on("error", (reason) => resolve({ ok: false, error: reason.message }));
+      child.on("close", (code) => resolve({ ok: code === 0, exitCode: code, output: hostOutput.slice(-200000), error: code === 0 ? null : [hostError, hostOutput].filter(Boolean).join("\n").slice(-4000) }));
       return;
     }
     if (selfUpdateActions.has(payload.action) || diensteUpdateActions.has(payload.action)) {

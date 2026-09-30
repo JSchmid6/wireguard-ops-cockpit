@@ -168,3 +168,31 @@ test("executor broker admits the typed dienste-update actions with the same stri
     assert.equal(threw, true, `expected rejection: ${JSON.stringify(partial)}`);
   }
 });
+
+const hostBase = { expiresAt: "2030-01-01T00:00:00.000Z", envelopeDigest: "e".repeat(64) };
+
+test("executor broker admits the general host door with a host-run manifest and a valid job id", () => {
+  const run = { ...hostBase, action: "host.run", manifest: { version: "cockpit-host-run/v1", steps: [{ name: "x", run: "true" }] }, envelope: { digest: "e".repeat(64) } };
+  assert.deepEqual(validateRequest({ payload: run, signature: sign(run) }, validAt), run);
+  const status = { ...hostBase, action: "host.status", target: "0b9c1d2e-job_1.a" };
+  assert.deepEqual(validateRequest({ payload: status, signature: sign(status) }, validAt), status);
+});
+
+test("executor broker rejects incomplete host runs and invalid job ids", () => {
+  const rejected = [
+    { action: "host.run", manifest: { version: "cockpit-capability/v1", steps: [] }, envelope: { digest: "e" } },
+    { action: "host.run", manifest: { version: "cockpit-host-run/v1" } },
+    { action: "host.run", envelope: { digest: "e" } },
+    { action: "host.status", target: "../runs" },
+    { action: "host.status", target: ".." },
+    { action: "host.status", target: "." },
+    { action: "host.status", target: "job 1" },
+    { action: "host.status", target: "" },
+    { action: "host.status" },
+    { action: "host.resume", target: "job-1" },
+  ];
+  for (const partial of rejected) {
+    const payload = { ...hostBase, ...partial };
+    assert.throws(() => validateRequest({ payload, signature: sign(payload) }, validAt), undefined, JSON.stringify(partial));
+  }
+});

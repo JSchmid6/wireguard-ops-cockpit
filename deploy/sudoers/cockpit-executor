@@ -4,3 +4,7 @@ cockpit-executor ALL=(root) NOPASSWD: /usr/local/sbin/cockpit-borg-action *
 cockpit-executor ALL=(root) NOPASSWD: /usr/local/sbin/cockpit-self-update-action *
 cockpit-executor ALL=(root) NOPASSWD: /usr/local/sbin/cockpit-dienste-update-action *
 cockpit-executor ALL=(root) NOPASSWD: /opt/node-v20.19.1-linux-x64/bin/node /usr/local/lib/wireguard-ops-cockpit/cockpit-capability-action.mjs
+# The general host door (doc/setup/host-run.md): exactly two argument forms; the
+# helper verifies the signed envelope itself and refuses everything else.
+cockpit-executor ALL=(root) NOPASSWD: /opt/node-v20.19.1-linux-x64/bin/node /usr/local/lib/wireguard-ops-cockpit/cockpit-host-run.mjs start
+cockpit-executor ALL=(root) NOPASSWD: /opt/node-v20.19.1-linux-x64/bin/node /usr/local/lib/wireguard-ops-cockpit/cockpit-host-run.mjs status *

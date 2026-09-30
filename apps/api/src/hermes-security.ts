@@ -12,6 +12,7 @@ export type CapabilityId =
   | "borg.manage"
   | "self.update"
   | "dienste.update"
+  | "host.run"
   | "package.manage"
   | "filesystem.write"
   | "network.manage"
@@ -20,7 +21,7 @@ export type CapabilityId =
   | "shell.exception";
 
 const CAPABILITIES = new Set<CapabilityId>([
-  "read.host", "service.manage", "disk.manage", "borg.manage", "self.update", "dienste.update", "package.manage", "filesystem.write", "network.manage",
+  "read.host", "service.manage", "disk.manage", "borg.manage", "self.update", "dienste.update", "host.run", "package.manage", "filesystem.write", "network.manage",
   "identity.manage", "database.direct", "shell.exception",
 ]);
 
@@ -225,6 +226,9 @@ export interface ExecutionEnvelope {
   policyHash: string;
   capabilities: CapabilityId[];
   manifestHash?: string;
+  // Host runs only: the doorkeeper passed this exact plan. The host-run helper
+  // opens for gatePassed or operatorApproved, never for a blocked job's envelope.
+  gatePassed?: boolean;
   operatorApproved?: boolean;
   issuedAt: string;
   expiresAt: string;
@@ -351,6 +355,7 @@ export function createExecutionEnvelope(input: {
   policy: unknown;
   capabilities: CapabilityId[];
   manifestHash?: string;
+  gatePassed?: boolean;
   operatorApproved?: boolean;
   ttlMinutes: number;
   signingSecret: string;
@@ -369,6 +374,7 @@ export function createExecutionEnvelope(input: {
     policyHash: hashCanonical(input.policy),
     capabilities: [...input.capabilities].sort(),
     ...(input.manifestHash ? { manifestHash: input.manifestHash } : {}),
+    ...(input.gatePassed ? { gatePassed: true } : {}),
     ...(input.operatorApproved ? { operatorApproved: true } : {}),
     issuedAt: issued.toISOString(),
     expiresAt: new Date(issued.getTime() + input.ttlMinutes * 60_000).toISOString(),
@@ -388,6 +394,7 @@ export function validateExecutionEnvelope(envelope: ExecutionEnvelope, expected:
   if (JSON.stringify(envelope.capabilities) !== JSON.stringify([...expected.capabilities].sort())) errors.push("capability drift");
   if (envelope.manifestHash !== expected.manifestHash) errors.push("capability manifest drift");
   if (Boolean(envelope.operatorApproved) !== Boolean(expected.operatorApproved)) errors.push("operator approval drift");
+  if (Boolean(envelope.gatePassed) !== Boolean(expected.gatePassed)) errors.push("doorkeeper gate drift");
   const evidence = expected.evidence.map((item) => ({ source: item.source, digest: hashCanonical(item.content), length: item.content.length }));
   if (JSON.stringify(envelope.evidence) !== JSON.stringify(evidence)) errors.push("evidence drift");
   return errors;

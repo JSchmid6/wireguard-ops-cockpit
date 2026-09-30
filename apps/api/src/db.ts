@@ -690,6 +690,15 @@ export class CockpitDatabase {
     return row?.owner_id || null;
   }
 
+  // Jobs of one subject that are still running — after a restart the API
+  // picks up host runs it was watching (a reboot takes the API down too).
+  listRunningJobs(subjectId: string): JobRecord[] {
+    const rows = this.database
+      .prepare("SELECT * FROM jobs WHERE subject_id = ? AND status = 'running' ORDER BY datetime(created_at) ASC")
+      .all(subjectId) as JobRow[];
+    return rows.map((row) => this.mapJob(row));
+  }
+
   listJobsForSession(sessionId: string): JobRecord[] {
     const rows = this.database
       .prepare("SELECT * FROM jobs WHERE session_id = ? ORDER BY datetime(created_at) DESC")

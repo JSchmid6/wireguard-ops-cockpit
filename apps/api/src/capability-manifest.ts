@@ -96,7 +96,7 @@ export function capabilityManifestHash(manifest: CapabilityManifest): string {
 // both helper copies carry the same rules, and a bound path exposes its whole
 // subtree. Keep the lists in step with deploy/helpers/cockpit-capability-action
 // and ops/cockpit-capability-action.mjs.
-const READABLE_PROTECTED_PATH = /(?:^|\/)(?:\.ssh|sudoers(?:\.d)?|shadow|gshadow|passwd|group|ssh|wireguard|secrets?|credentials?|private|keys?|backups?)(?:[._~-]|\/|$)|(?:\.(?:key|pem|p12|env|db|sqlite3?|bak|backup|old|orig|save|swp|dpkg-[a-z]+|rpmnew|rpmsave)|~)$|^\/(?:opt\/nextcloud|opt\/gitlab|var\/www\/nextcloud\/config|var\/lib\/wireguard-ops-cockpit)(?:\/|$)/i;
+export const READABLE_PROTECTED_PATH = /(?:^|\/)(?:\.ssh|sudoers(?:\.d)?|shadow|gshadow|passwd|group|ssh|wireguard|secrets?|credentials?|private|keys?|backups?)(?:[._~-]|\/|$)|(?:\.(?:key|pem|p12|env|db|sqlite3?|bak|backup|old|orig|save|swp|dpkg-[a-z]+|rpmnew|rpmsave)|~)$|^\/(?:opt\/nextcloud|opt\/gitlab|var\/www\/nextcloud\/config|var\/lib\/wireguard-ops-cockpit)(?:\/|$)/i;
 const READABLE_APPROVAL_TREES = /^\/(?:dev|proc|sys|root)(?:\/|$)|^\/var\/lib\/(?:docker|containerd)(?:\/|$)/;
 const READABLE_FIXED_PATHS = new Set(["/proc/mdstat"]);
 // Fixed boundaries (as in the executor's protectedPath): a tree that contains
@@ -123,7 +123,8 @@ export function capabilityNeedsOperatorApproval(manifest: CapabilityManifest): b
 
 export function capabilityPlannerContract(): string {
   return [
-    "For a change, include exactly one fenced `capability` JSON manifest using version cockpit-capability/v1.",
+    "TYPED HELPERS (the existing special doors; use them when one of them covers the task exactly, otherwise use the general host door above):",
+    "For a change through a typed helper or an exact-file replacement, include exactly one fenced `capability` JSON manifest using version cockpit-capability/v1.",
     "Exception — reviewed installs: to install a merged commit of the Cockpit itself or of server-dienste, never write a capability manifest and never ask for a diff hash. Emit a ```bash fence whose only line is exactly `/usr/local/sbin/cockpit-self-update-action <sha>` (Cockpit) or `/usr/local/sbin/cockpit-dienste-update-action <sha>` (server-dienste), with the full 40-hex sha. The API fetches the diff, has it reviewed and binds its hash itself; these helpers do not run inside the capability sandbox (the repositories are not visible there).",
     "Render the complete manifest JSON on one physical line between the opening and closing fence. Do not pretty-print it: the unattended OpenCode console can omit brace-only and array-only display lines.",
     "Describe tools with direct absolute argv arrays, not shell syntax; discover current tool help/version before relying on unstable flags. Omit cwd unless host-directory visibility is essential.",
