@@ -16,7 +16,7 @@
 #     trigger list would silently miss build inputs), and installs EVERY file of
 #     the table below — the complete set of root helpers the executor and the
 #     capability sandbox dispatch to, the sudoers file (visudo-checked), the four
-#     service units, the web unit, the self-update unit template, self-update.env,
+#     service units, the web unit, the host-run resume unit, the self-update unit template, self-update.env,
 #     the two drop-ins (API brokers, and the borg lock barrier in the package's
 #     borgmatic.service.d), and this script. Besides the table it writes only
 #     state.json, the web image, the web unit's enable link and a backup directory
@@ -91,6 +91,10 @@ readonly TABLE=(
   "deploy/systemd/email-archive-auto-deploy.service|$UNITS/email-archive-auto-deploy.service|644"
   "deploy/systemd/email-archive-auto-deploy.timer|$UNITS/email-archive-auto-deploy.timer|644"
   "deploy/vps/wireguard-ops-cockpit-web.service|$UNITS/wireguard-ops-cockpit-web.service|644"
+  # The general host door (doc/setup/host-run.md): its root helper and the
+  # boot-time continuation of runs that asked for a reboot.
+  "deploy/helpers/cockpit-host-run|$LIB/cockpit-host-run.mjs|755"
+  "deploy/systemd/wireguard-ops-cockpit-host-run-resume.service|$UNITS/wireguard-ops-cockpit-host-run-resume.service|644"
 )
 
 log() { echo "[vps-cockpit-deploy $(date -u +%H:%M:%S)] $*"; }
@@ -145,6 +149,8 @@ install_table() {
   "$VISUDO" -c >/dev/null
   "$SYSTEMCTL" daemon-reload
   "$SYSTEMCTL" enable --quiet wireguard-ops-cockpit-web.service
+  # Runs once per boot: continues host runs that stopped for a reboot step.
+  "$SYSTEMCTL" enable --quiet wireguard-ops-cockpit-host-run-resume.service
   # The runner requires the unit to be active. Start it only when it is not: that is the
   # first install (or a boot where it failed) and happens BEFORE the new web image exists,
   # so it (re)creates the container from the image that is running now.
@@ -182,6 +188,9 @@ rollback() {
     "$VISUDO" -c >/dev/null 2>&1 || { log "rollback: sudoers check FAILED after restore"; step_failed=1; }
     if [ ! -e "$UNITS/wireguard-ops-cockpit-web.service" ]; then
       rm -f -- "$UNITS/multi-user.target.wants/wireguard-ops-cockpit-web.service" || step_failed=1
+    fi
+    if [ ! -e "$UNITS/wireguard-ops-cockpit-host-run-resume.service" ]; then
+      rm -f -- "$UNITS/multi-user.target.wants/wireguard-ops-cockpit-host-run-resume.service" || step_failed=1
     fi
     "$SYSTEMCTL" daemon-reload || { log "rollback: daemon-reload FAILED"; step_failed=1; }
   fi

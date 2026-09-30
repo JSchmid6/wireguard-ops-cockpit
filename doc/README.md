@@ -9,6 +9,7 @@ This repository uses `/doc` as the implementation planning hub.
 - `setup/dev-environment.md` - Codespaces/devcontainer role and how it complements cloud-agent setup
 - `setup/agent-stack.md` - project-specific agents, skills, MCP strategy, and model guidance
 - `setup/vps-handover.md` - VPS-local bring-up instructions, deployment files, and Copilot handover prompt
+- `setup/host-run.md` - the general host door: shell steps as root behind lock (signed envelope), doorkeeper (isolated reviewer) and safety net (borg + machine snapshot)
 
 ## Services
 

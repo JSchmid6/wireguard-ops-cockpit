@@ -26,7 +26,8 @@ describe("registries", () => {
   it("uses the dynamic manifest contract for agent-centric change jobs", () => {
     const planner = findAgent("planner-agent", "opencode")!;
     const prompt = buildBrokerAgentPrompt(planner, "TRUSTED_INTENT: probe\nDYNAMIC CAPABILITY CONTRACT:\nversion cockpit-capability/v1");
-    expect(prompt).toContain("exactly one fenced `capability` JSON manifest");
+    expect(prompt).toContain("exactly one manifest: a fenced `host-run` manifest for work on the host (the general door, the default)");
+    expect(prompt).toContain("a fenced `capability` manifest when one of the typed helpers in the contract covers the task");
     expect(prompt).toContain("Do not return a bash/sh code fence");
     expect(prompt).not.toContain("Produce a structured, reviewable plan and a bash script");
   });

@@ -1,0 +1,480 @@
+#!/usr/bin/node
+// cockpit-host-run — die allgemeine Tür (doc/setup/host-run.md).
+//
+// Führt die geprüften Shell-Schritte eines Plans als root auf dem Host aus: in
+// einer eigenen transienten systemd-Unit, mit Zeitlimit, die ganze Ausgabe ins
+// Protokoll, Geheimnisse geschwärzt. Kein Sandkasten — die Sicherung liegt
+// davor (Schloss und Türsteher) und darunter (Netz):
+//
+//   Schloss    Nur ein Envelope der Cockpit-API öffnet: HMAC mit dem Secret aus
+//              api.env, gebunden an genau dieses Manifest (manifestHash), mit
+//              Ablaufzeit, Capability host.run und dem Vermerk, dass der
+//              Türsteher bestanden ist (gatePassed) oder Jochen freigegeben hat
+//              (operatorApproved). Wer bestellt hat, steht als actorId im
+//              Envelope und im Protokoll.
+//   Türsteher  Sitzt in der API (apps/api/src/host-run.ts): der isolierte
+//              Safety-Reviewer liest diese Schritte, bevor der Envelope
+//              entsteht. Hier wird nichts mehr eingestuft oder abgelehnt, was
+//              er gesehen hat.
+//   Netz       Vor einem Lauf, der den Systemzustand ändert (mutates, Standard):
+//              das letzte borg-Backup muss jünger als 24 h sein, dann ein
+//              Maschinen-Snapshot beim Hoster (cockpit-vps-snapshot, rotiert den
+//              ältesten cockpit-eigenen). Scheitert eines davon, läuft kein
+//              Schritt.
+//
+// Verben (gepinnte Grammatik; sudoers erlaubt nur `start` und `status *`):
+//   start             stdin: {"manifest", "envelope"} — prüfen, Laufverzeichnis
+//                     anlegen, Lauf-Unit starten (ohne Warten), sofort zurück
+//   status <jobId>    Zustand und Protokollende eines Laufs (JSON)
+//   resume            nur aus wireguard-ops-cockpit-host-run-resume.service beim
+//                     Hochfahren: Läufe, die für einen Neustart angehalten haben,
+//                     in einer neuen Unit fortsetzen
+//   --payload <jobId> nur aus der Lauf-Unit (COCKPIT_HOST_RUN_IN_UNIT, das die
+//                     Unit selbst setzt; sudo(8) setzt die Umgebung zurück)
+//
+// Ein Neustart ist ein gewöhnlicher Schritt ({"reboot": true}): der Lauf
+// schreibt vorher, wo er weitermacht, und meldet sein Ergebnis nach dem
+// Hochfahren über `status`.
+//
+// Harness-Hooks (HOST_RUN_*) lenken Pfade und Werkzeuge für
+// test/cockpit-host-run.test.sh um. Über sudo kommen sie nie an (env_reset),
+// und die Units setzen nur COCKPIT_HOST_RUN_IN_UNIT.
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, openSync, fsyncSync, closeSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+const env = process.env;
+const STATE_ROOT = env.HOST_RUN_STATE_DIR || "/var/lib/wireguard-ops-cockpit/host-runs";
+const CONFIG_DIR = env.HOST_RUN_CONFIG_DIR || "/etc/wireguard-ops-cockpit";
+const SYSTEMD_RUN = env.HOST_RUN_SYSTEMD_RUN || "/usr/bin/systemd-run";
+const SYSTEMCTL = env.HOST_RUN_SYSTEMCTL || "/usr/bin/systemctl";
+const BORG_STATUS = env.HOST_RUN_BORG_STATUS ? [env.HOST_RUN_BORG_STATUS] : ["/usr/local/sbin/cockpit-borg-action", "status"];
+const SNAPSHOT = env.HOST_RUN_SNAPSHOT ? [env.HOST_RUN_SNAPSHOT] : ["/usr/bin/python3", "/usr/local/lib/wireguard-ops-cockpit/cockpit-vps-snapshot"];
+const BOOT_ID_FILE = env.HOST_RUN_BOOT_ID_FILE || "/proc/sys/kernel/random/boot_id";
+const SELF = fileURLToPath(import.meta.url);
+const STEP_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+const JOB_ID = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/; // nie "." oder ".."
+const MAX_STEPS = 24;
+const MAX_CHECKS = 16;
+const MAX_REBOOTS = 3;
+const MAX_SCRIPT = 16000;
+const STEP_TIMEOUT_MAX = 10800;
+const CHECK_TIMEOUT_MAX = 1800;
+const BORG_MAX_AGE_HOURS = 24;
+const ACTIVE_PHASES = new Set(["preflight", "resuming", "running", "rebooting", "checking"]);
+const REBOOT_GRACE_MS = 30 * 60 * 1000;
+// Zwischen "resuming" (gespeichert) und dem Start der Unit liegt ein kurzes
+// Fenster; eine API, die beim Hochfahren sofort fragt, darf den Lauf darin
+// nicht fuer gescheitert halten.
+const RESUME_GRACE_MS = 2 * 60 * 1000;
+// Ein privater Schluessel ist hoechstens rund hundert Zeilen lang. Ein
+// BEGIN ohne END (etwa ein abgebrochener Dump) schwaerzt nicht den ganzen Rest.
+const KEY_BLOCK_MAX_LINES = 200;
+
+function fail(message, code = 64) { process.stderr.write(`${message}\n`); process.exit(code); }
+function now() { return new Date().toISOString(); }
+function canonicalHash(value) { return createHash("sha256").update(JSON.stringify(value)).digest("hex"); }
+
+// ── Schloss ────────────────────────────────────────────────────────────────
+function envValues(file) {
+  try {
+    return readFileSync(`${CONFIG_DIR}/${file}`, "utf8").split(/\r?\n/).flatMap((line) => {
+      const match = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+      return match ? [[match[1], match[2].trim().replace(/^['"]|['"]$/g, "")]] : [];
+    });
+  } catch { return []; }
+}
+function readSecret() {
+  const found = envValues("api.env").find(([key]) => key === "COCKPIT_EXECUTION_ENVELOPE_SECRET");
+  if (!found || !found[1]) fail("execution authority is unavailable", 78);
+  return found[1];
+}
+// Signatur, Manifest-Bindung, Capability und Job. Die Ablaufzeit prüft nur der
+// Start: ein Lauf, der vor Ablauf begann, darf nach einem Neustart weitermachen.
+function verifyRequest(request, { checkExpiry }) {
+  const { manifest, envelope } = request || {};
+  if (!envelope || envelope.version !== "hermes-execution-envelope/v1" || typeof envelope.digest !== "string") fail("invalid execution envelope");
+  const { digest, ...unsigned } = envelope;
+  const expected = createHmac("sha256", readSecret()).update(JSON.stringify(unsigned)).digest("hex");
+  if (!/^[a-f0-9]{64}$/.test(digest) || !timingSafeEqual(Buffer.from(digest, "hex"), Buffer.from(expected, "hex"))) fail("execution envelope signature mismatch", 77);
+  if (checkExpiry && !(Date.now() <= Date.parse(envelope.expiresAt))) fail("execution envelope expired", 77);
+  if (envelope.manifestHash !== canonicalHash(manifest)) fail("host-run manifest drift", 77);
+  if (!Array.isArray(envelope.capabilities) || !envelope.capabilities.includes("host.run")) fail("the envelope does not grant host.run", 77);
+  // The API signs an envelope for every decision (a blocked job keeps one for
+  // the operator's approval). Only a passed doorkeeper (gatePassed) or the
+  // operator's approval of exactly this job opens the door.
+  if (envelope.gatePassed !== true && envelope.operatorApproved !== true) fail("the envelope carries neither a passed doorkeeper review nor an operator approval", 77);
+  if (!JOB_ID.test(envelope.jobId || "")) fail("invalid envelope job id");
+  validateManifest(manifest);
+  return { manifest, envelope };
+}
+
+// Dieselbe Form, die apps/api/src/host-run.ts (parseHostRunManifest) herstellt.
+// Hier nur die Struktur: was ein Schritt tut, hat der Türsteher beurteilt.
+function validateManifest(manifest) {
+  const bad = (why) => fail(`invalid host-run manifest: ${why}`);
+  if (!manifest || manifest.version !== "cockpit-host-run/v1") bad("version");
+  if (typeof manifest.name !== "string" || !manifest.name.trim() || manifest.name.length > 120) bad("name");
+  if (typeof manifest.mutates !== "boolean") bad("mutates");
+  if (!Array.isArray(manifest.steps) || manifest.steps.length < 1 || manifest.steps.length > MAX_STEPS) bad("steps");
+  let reboots = 0;
+  for (const step of manifest.steps) {
+    if (!step || typeof step.name !== "string" || !step.name.trim()) bad("step name");
+    if (step.reboot === true) { reboots += 1; continue; }
+    if (typeof step.run !== "string" || !step.run.trim() || step.run.length > MAX_SCRIPT || step.run.includes("\0")) bad(`step ${step.name}`);
+    if (!Number.isInteger(step.timeoutSeconds) || step.timeoutSeconds < 1 || step.timeoutSeconds > STEP_TIMEOUT_MAX) bad(`timeout of ${step.name}`);
+  }
+  if (reboots > MAX_REBOOTS) bad("too many reboots");
+  if (reboots > 0 && !manifest.mutates) bad("a reboot changes the system; mutates must be true");
+  if (!Array.isArray(manifest.checks) || manifest.checks.length < 1 || manifest.checks.length > MAX_CHECKS) bad("checks");
+  for (const check of manifest.checks) {
+    if (!check || typeof check.name !== "string" || typeof check.run !== "string" || !check.run.trim() || check.run.length > MAX_SCRIPT || check.run.includes("\0")) bad("check");
+    if (!Number.isInteger(check.timeoutSeconds) || check.timeoutSeconds < 1 || check.timeoutSeconds > CHECK_TIMEOUT_MAX) bad(`timeout of ${check.name}`);
+  }
+  if (!Array.isArray(manifest.rollback) || manifest.rollback.length < 1) bad("rollback");
+}
+
+// ── Schwärzen ──────────────────────────────────────────────────────────────
+// Die Muster wie redactSecrets in apps/api/src/update-review.ts, dazu jede
+// Zuweisung an einen Namen, der nach Geheimnis klingt, und die wörtlichen Werte
+// der Cockpit-eigenen Geheimnisse (api.env, executor.env, contabo.env): der
+// Lauf ist root und kann sie lesen, das Protokoll darf sie nie enthalten.
+const PATTERNS = [
+  [/sk-[a-zA-Z0-9_-]{20,}/g, "[REDACTED:API_KEY]"],
+  [/glpat-[a-zA-Z0-9_.-]{20,}/g, "[REDACTED:TOKEN]"],
+  [/gh[pousr]_[A-Za-z0-9]{30,}/g, "[REDACTED:TOKEN]"],
+  [/eyJ[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,}/g, "[REDACTED:JWT]"],
+  [/(authorization:\s*(?:bearer|basic)\s+)\S+/gi, "$1[REDACTED]"],
+  [/((?:password|passwd|passphrase|secret|token|api[_-]?key|client[_-]?secret)[A-Za-z0-9_]*["']?\s*[=:]\s*["']?)[^\s"',;]+/gi, "$1[REDACTED]"],
+];
+function knownSecrets() {
+  return ["api.env", "executor.env", "contabo.env"].flatMap((file) => envValues(file).map(([, value]) => value)).filter((value) => value.length >= 8);
+}
+function redactor() {
+  const literals = knownSecrets().sort((a, b) => b.length - a.length);
+  let keyLines = 0;
+  return (line) => {
+    if (/-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(line)) keyLines = KEY_BLOCK_MAX_LINES;
+    if (keyLines > 0) {
+      keyLines = /-----END [A-Z ]*PRIVATE KEY-----/.test(line) ? 0 : keyLines - 1;
+      return "[REDACTED:PRIVATE_KEY]";
+    }
+    let out = line;
+    for (const literal of literals) out = out.split(literal).join("[REDACTED:COCKPIT_SECRET]");
+    for (const [pattern, replacement] of PATTERNS) out = out.replace(pattern, replacement);
+    return out;
+  };
+}
+
+// ── Laufzustand ────────────────────────────────────────────────────────────
+function runDir(jobId) { return `${STATE_ROOT}/${jobId}`; }
+function unitName(jobId) { return `cockpit-host-run-${jobId}`; }
+function writeJson(path, value) {
+  const tmp = `${path}.tmp`;
+  writeFileSync(tmp, JSON.stringify(value, null, 1), { mode: 0o600 });
+  const fd = openSync(tmp, "r"); fsyncSync(fd); closeSync(fd);
+  renameSync(tmp, path);
+}
+function readJson(path) { return JSON.parse(readFileSync(path, "utf8")); }
+function readState(jobId) {
+  const state = readJson(`${runDir(jobId)}/state.json`);
+  if (state.jobId !== jobId) throw new Error(`state of ${jobId} names another job`);
+  return settleLostReboot(state);
+}
+function saveState(state) { state.updatedAt = now(); writeJson(`${runDir(state.jobId)}/state.json`, state); }
+// A reboot that was requested but never happened (same boot, long after the
+// request) would hold the door shut for good: such a run has failed.
+function settleLostReboot(state) {
+  if (state.phase !== "rebooting" || state.boots.at(-1) !== bootId()) return state;
+  if (!(Date.now() - Date.parse(state.rebootRequestedAt || state.updatedAt) > REBOOT_GRACE_MS)) return state;
+  Object.assign(state, { phase: "finished", status: "failed", error: "the requested reboot did not happen", finishedAt: now() });
+  saveState(state);
+  return state;
+}
+function bootId() { try { return readFileSync(BOOT_ID_FILE, "utf8").trim(); } catch { return "unknown"; } }
+function unitActive(unit) {
+  const out = spawnSync(SYSTEMCTL, ["is-active", unit], { encoding: "utf8", timeout: 15000 });
+  return /^(?:active|activating|deactivating|reloading)$/.test((out.stdout || "").trim());
+}
+
+let redact = (line) => line;
+let logPath = null;
+// Terminal colours and other control characters never reach the log: they
+// carry nothing a reader needs and would blow up the JSON of `status`.
+function printable(line) {
+  return line.replace(/\x1b\[[0-9;?]*[ -\/]*[@-~]/g, "").replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "");
+}
+function log(text) {
+  const lines = String(text).split("\n").map((line) => redact(printable(line))).join("\n");
+  const stamped = `${lines}\n`;
+  if (logPath) appendFileSync(logPath, stamped, { mode: 0o600 });
+  process.stdout.write(stamped);
+}
+
+function startUnit(jobId, runtimeSeconds) {
+  const started = spawnSync(SYSTEMD_RUN, [
+    `--unit=${unitName(jobId)}`, "--collect", "--quiet", "--property=Type=exec",
+    `--property=RuntimeMaxSec=${runtimeSeconds}`, "--property=KillMode=control-group",
+    `--description=Cockpit host run ${jobId}`, "--setenv=COCKPIT_HOST_RUN_IN_UNIT=1",
+    "--", process.execPath, SELF, "--payload", jobId,
+  ], { encoding: "utf8", timeout: 60000 });
+  return started.status === 0 ? null : (started.stderr || started.stdout || `systemd-run exited ${started.status}`).trim().slice(-400);
+}
+
+function runtimeBudget(manifest, fromStep = 0) {
+  const steps = manifest.steps.slice(fromStep).reduce((sum, step) => sum + (step.reboot ? 0 : step.timeoutSeconds), 0);
+  const checks = manifest.checks.reduce((sum, check) => sum + check.timeoutSeconds, 0);
+  return steps + checks + 1800; // + borg-Abfrage, Snapshot und Hochfahren
+}
+
+// ── start ──────────────────────────────────────────────────────────────────
+async function readStdin() {
+  let input = "";
+  process.stdin.setEncoding("utf8");
+  for await (const chunk of process.stdin) { input += chunk; if (input.length > 1048576) fail("host-run request too large"); }
+  try { return JSON.parse(input); } catch { return fail("invalid host-run request JSON"); }
+}
+
+// Die Sperre um Prüfen, Anlegen und Unit-Start: mkdir ist atomar. Eine Sperre,
+// die ein abgestürzter Start liegen liess, gilt nach fünf Minuten als verwaist.
+function withStartLock(action) {
+  const lock = `${STATE_ROOT}/.start.lock`;
+  try { mkdirSync(lock, { mode: 0o700 }); }
+  catch (error) {
+    if (error.code !== "EEXIST") throw error;
+    let stale = false;
+    try { stale = Date.now() - statSync(lock).mtimeMs > 300000; } catch { /* eben entfernt */ }
+    if (!stale) fail("another host run is starting", 75);
+    rmSync(lock, { recursive: true, force: true });
+    try { mkdirSync(lock, { mode: 0o700 }); } catch { fail("another host run is starting", 75); }
+  }
+  try { return action(); } finally { rmSync(lock, { recursive: true, force: true }); }
+}
+
+async function start() {
+  const request = await readStdin();
+  const { manifest, envelope } = verifyRequest(request, { checkExpiry: true });
+  mkdirSync(STATE_ROOT, { recursive: true, mode: 0o700 });
+  withStartLock(() => startLocked(manifest, envelope));
+}
+
+function startLocked(manifest, envelope) {
+  // Ein Lauf zur Zeit: zwei Root-Läufe, die gleichzeitig Pakete oder Dienste
+  // anfassen, machen beide Ergebnisse unklar.
+  for (const other of readdirSync(STATE_ROOT)) {
+    if (!JOB_ID.test(other) || other.startsWith(".")) continue;
+    let state;
+    try { state = readState(other); } catch { continue; }
+    if (other === envelope.jobId) fail(`host run ${other} exists already`, 75);
+    if (ACTIVE_PHASES.has(state.phase) && (state.phase === "rebooting" || state.phase === "resuming" || unitActive(unitName(other)))) fail(`another host run is active: ${other}`, 75);
+  }
+  const dir = runDir(envelope.jobId);
+  mkdirSync(dir, { mode: 0o700 });
+  writeJson(`${dir}/request.json`, { manifest, envelope });
+  const state = {
+    version: 1, jobId: envelope.jobId, actorId: envelope.actorId, name: manifest.name, unit: unitName(envelope.jobId),
+    mutates: manifest.mutates, phase: "preflight", status: "running", nextStep: 0, boots: [bootId()],
+    steps: manifest.steps.map((step, index) => ({ index: index + 1, name: step.name, reboot: step.reboot === true, status: "pending" })),
+    checks: manifest.checks.map((check, index) => ({ index: index + 1, name: check.name, status: "pending" })),
+    borg: null, snapshot: null, error: null, startedAt: now(), updatedAt: now(), finishedAt: null,
+  };
+  saveState(state);
+  const problem = startUnit(envelope.jobId, runtimeBudget(manifest));
+  if (problem) {
+    Object.assign(state, { phase: "finished", status: "failed", error: `the run unit did not start: ${problem}`, finishedAt: now() });
+    saveState(state);
+    fail(state.error, 70);
+  }
+  process.stdout.write(`${JSON.stringify({ status: "started", jobId: envelope.jobId, unit: state.unit })}\n`);
+}
+
+// ── status ─────────────────────────────────────────────────────────────────
+function status(jobId) {
+  if (!JOB_ID.test(jobId || "")) fail("invalid job id");
+  let state;
+  try { state = readState(jobId); } catch { fail(`no host run ${jobId}`, 66); }
+  // Eine Unit, die ohne Ergebnis endete (Zeitlimit, Absturz), ist gescheitert —
+  // ausser sie wartet gerade auf das Hochfahren oder wird eben fortgesetzt.
+  const resumingNow = state.phase === "resuming" && Date.now() - Date.parse(state.updatedAt) < RESUME_GRACE_MS;
+  if (ACTIVE_PHASES.has(state.phase) && state.phase !== "rebooting" && !resumingNow && !unitActive(state.unit)) {
+    state = { ...state, phase: "finished", status: "failed", error: state.error || "the run unit ended without a result (time limit or crash)" };
+  }
+  let logTail = "";
+  try { logTail = readFileSync(`${runDir(jobId)}/output.log`, "utf8").slice(-30000); } catch { /* noch keine Ausgabe */ }
+  process.stdout.write(`${JSON.stringify({ ok: true, state, logTail })}\n`);
+}
+
+// ── resume (beim Hochfahren) ───────────────────────────────────────────────
+function resume() {
+  if (!existsSync(STATE_ROOT)) return;
+  const current = bootId();
+  for (const jobId of readdirSync(STATE_ROOT)) {
+    if (!JOB_ID.test(jobId)) continue;
+    let state;
+    try { state = readState(jobId); } catch { continue; }
+    if (state.phase !== "rebooting" || state.boots.includes(current)) continue;
+    logPath = `${runDir(jobId)}/output.log`;
+    redact = redactor();
+    state.boots.push(current);
+    state.phase = "resuming";
+    saveState(state);
+    log(`== ${now()} host back up (boot ${current.slice(0, 8)}); run continues at step ${state.nextStep + 1}`);
+    const request = readJson(`${runDir(jobId)}/request.json`);
+    const problem = startUnit(jobId, runtimeBudget(request.manifest, state.nextStep));
+    if (problem) {
+      Object.assign(state, { phase: "finished", status: "failed", error: `the run could not continue after the reboot: ${problem}`, finishedAt: now() });
+      saveState(state);
+      log(`== ${state.error}`);
+    }
+  }
+}
+
+// ── payload (in der Lauf-Unit) ─────────────────────────────────────────────
+function runScript(script, timeoutSeconds) {
+  return new Promise((resolve) => {
+    const child = spawn("/bin/bash", ["--noprofile", "--norc", "-eo", "pipefail", "-c", script], {
+      cwd: "/", detached: true, stdio: ["ignore", "pipe", "pipe"],
+      env: { PATH: STEP_PATH, LANG: "C.UTF-8", HOME: "/root", DEBIAN_FRONTEND: "noninteractive", NEEDRESTART_MODE: "a" },
+    });
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; try { process.kill(-child.pid, "SIGKILL"); } catch { /* schon weg */ } }, timeoutSeconds * 1000);
+    for (const [stream, prefix] of [[child.stdout, ""], [child.stderr, "! "]]) {
+      let pending = "";
+      stream.setEncoding("utf8");
+      stream.on("data", (chunk) => {
+        pending += chunk;
+        const lines = pending.split("\n");
+        pending = lines.pop();
+        if (lines.length) log(lines.map((line) => `${prefix}${line}`).join("\n"));
+      });
+      stream.on("end", () => { if (pending) log(`${prefix}${pending}`); });
+    }
+    child.on("error", (error) => { clearTimeout(timer); resolve({ code: 127, timedOut, error: error.message }); });
+    child.on("close", (code, signal) => { clearTimeout(timer); resolve({ code: code ?? 128, signal, timedOut }); });
+  });
+}
+
+function finish(state, status, error = null) {
+  Object.assign(state, { phase: "finished", status, error, finishedAt: now() });
+  saveState(state);
+  log(`== ${now()} run finished: ${status}${error ? ` — ${error}` : ""}`);
+  if (state.snapshot?.snapshotId && status !== "success") {
+    log(`== return path: machine snapshot ${state.snapshot.snapshotId} (revert only with operator approval)`);
+  }
+}
+
+// last_run_end is the newest "Finished borgmatic…" line: systemd writes it
+// only when the oneshot backup unit completed successfully. last_run_result
+// (systemd's Result) must also be success, so a later failed run blocks too.
+function borgFresh() {
+  const out = spawnSync(BORG_STATUS[0], BORG_STATUS.slice(1), { encoding: "utf8", timeout: 300000, maxBuffer: 4 * 1024 * 1024 });
+  if (out.status !== 0) return { ok: false, why: `borg status failed (exit ${out.status})` };
+  const value = (key) => (out.stdout.match(new RegExp(`^${key}=(.*)$`, "m"))?.[1] || "").trim();
+  const end = value("last_run_end");
+  const result = value("last_run_result");
+  const ended = Date.parse(end);
+  if (!Number.isFinite(ended)) return { ok: false, why: "no finished borg backup is known" };
+  const ageHours = (Date.now() - ended) / 3600000;
+  const record = { lastRunEnd: end, lastRunResult: result, ageHours: Math.round(ageHours * 10) / 10 };
+  if (result !== "success") return { ok: false, why: `the last borg backup did not succeed (${result || "unknown"})`, record };
+  if (ageHours > BORG_MAX_AGE_HOURS) return { ok: false, why: `the last borg backup is ${record.ageHours} h old (limit ${BORG_MAX_AGE_HOURS} h)`, record };
+  return { ok: true, record };
+}
+
+function takeSnapshot(jobId) {
+  const name = `cockpit-run-${jobId}`.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 60);
+  const made = spawnSync(SNAPSHOT[0], [...SNAPSHOT.slice(1), "create", name, "--wait", "900"], {
+    encoding: "utf8", timeout: 1000000, maxBuffer: 1024 * 1024, env: { PATH: STEP_PATH, LANG: "C.UTF-8" },
+  });
+  if (made.status !== 0) return { ok: false, why: `machine snapshot failed: ${(made.stderr || "").trim().slice(-400)}` };
+  let result;
+  try { result = JSON.parse(made.stdout); } catch { return { ok: false, why: "machine snapshot returned no result" }; }
+  if (!result?.snapshot?.snapshotId) return { ok: false, why: "machine snapshot returned no id" };
+  return { ok: true, record: { snapshotId: result.snapshot.snapshotId, name: result.snapshot.name, rotated: result.rotated || null, seconds: result.seconds ?? null } };
+}
+
+async function payload(jobId) {
+  if (env.COCKPIT_HOST_RUN_IN_UNIT !== "1") fail("the payload runs only inside its own unit", 64);
+  if (!JOB_ID.test(jobId || "")) fail("invalid job id");
+  const { manifest } = verifyRequest(readJson(`${runDir(jobId)}/request.json`), { checkExpiry: false });
+  const state = readState(jobId);
+  if (state.phase === "finished") fail(`host run ${jobId} is finished`, 75);
+  logPath = `${runDir(jobId)}/output.log`;
+  redact = redactor();
+
+  if (state.phase === "preflight") {
+    log(`== ${now()} host run ${jobId}: ${manifest.name} (ordered by ${state.actorId}, unit ${state.unit})`);
+    if (manifest.mutates) {
+      const borg = borgFresh();
+      state.borg = borg.record || null;
+      saveState(state);
+      if (!borg.ok) return finish(state, "preflight_failed", `${borg.why}; nothing was executed`);
+      log(`== borg: last backup ${borg.record.lastRunEnd} (${borg.record.ageHours} h ago)`);
+      const snap = takeSnapshot(jobId);
+      if (!snap.ok) return finish(state, "preflight_failed", `${snap.why}; nothing was executed`);
+      state.snapshot = snap.record;
+      log(`== machine snapshot ${snap.record.snapshotId}${snap.record.rotated ? ` (rotated ${snap.record.rotated.snapshotId})` : ""}`);
+    } else {
+      log("== declared read-only (mutates false): no snapshot, no backup check");
+    }
+    state.phase = "running";
+    saveState(state);
+  } else if (state.phase === "resuming") {
+    // Nach dem Hochfahren: erst weiter, wenn der Start des Systems durch ist.
+    state.phase = "running";
+    saveState(state);
+    spawnSync(SYSTEMCTL, ["is-system-running", "--wait"], { encoding: "utf8", timeout: 600000 });
+  }
+
+  for (let index = state.nextStep; index < manifest.steps.length; index += 1) {
+    const step = manifest.steps[index];
+    const record = state.steps[index];
+    if (step.reboot === true) {
+      Object.assign(record, { status: "rebooting", startedAt: now() });
+      Object.assign(state, { phase: "rebooting", nextStep: index + 1, rebootRequestedAt: now() });
+      saveState(state);
+      log(`== ${now()} step ${index + 1}/${manifest.steps.length}: ${step.name} — reboot requested`);
+      const out = spawnSync(SYSTEMCTL, ["reboot"], { encoding: "utf8", timeout: 60000 });
+      if (out.status !== 0) {
+        Object.assign(record, { status: "failed", endedAt: now(), exitCode: out.status });
+        return finish(state, "failed", `reboot request failed: ${(out.stderr || "").trim().slice(-300)}`);
+      }
+      return; // systemd beendet diese Unit; resume setzt nach dem Hochfahren fort
+    }
+    Object.assign(record, { status: "running", startedAt: now() });
+    saveState(state);
+    log(`== ${now()} step ${index + 1}/${manifest.steps.length}: ${step.name} (limit ${step.timeoutSeconds} s)`);
+    const result = await runScript(step.run, step.timeoutSeconds);
+    // A step that hit its limit failed, even if bash itself exited 0 (a
+    // background child kept the output open until the kill).
+    const ok = result.code === 0 && !result.timedOut;
+    Object.assign(record, { status: ok ? "success" : "failed", exitCode: result.code, timedOut: result.timedOut, endedAt: now() });
+    state.nextStep = index + 1;
+    saveState(state);
+    if (!ok) {
+      return finish(state, "failed", `step ${index + 1} (${step.name}) ${result.timedOut ? "hit its time limit" : `exited ${result.code}`}; later steps did not run`);
+    }
+  }
+
+  state.phase = "checking";
+  saveState(state);
+  let failed = 0;
+  for (const [index, check] of manifest.checks.entries()) {
+    log(`== ${now()} check ${index + 1}/${manifest.checks.length}: ${check.name}`);
+    const result = await runScript(check.run, check.timeoutSeconds);
+    const ok = result.code === 0 && !result.timedOut;
+    Object.assign(state.checks[index], { status: ok ? "passed" : "failed", exitCode: result.code, timedOut: result.timedOut, endedAt: now() });
+    saveState(state);
+    if (!ok) failed += 1;
+  }
+  finish(state, failed === 0 ? "success" : "check_failed", failed === 0 ? null : `${failed} check(s) failed`);
+}
+
+const [verb, argument] = process.argv.slice(2);
+if (verb === "start" && process.argv.length === 3) await start();
+else if (verb === "status" && process.argv.length === 4) status(argument);
+else if (verb === "resume" && process.argv.length === 3) resume();
+else if (verb === "--payload" && process.argv.length === 4) await payload(argument);
+else fail("usage: cockpit-host-run start | status <jobId> | resume");

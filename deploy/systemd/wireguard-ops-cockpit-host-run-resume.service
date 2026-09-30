@@ -1,0 +1,15 @@
+[Unit]
+Description=WireGuard Ops Cockpit: continue host runs after a reboot step
+# The general host door (doc/setup/host-run.md). A run that asked for a reboot
+# recorded where it continues; this oneshot starts that continuation in a new
+# transient unit and exits. It runs nothing that was not signed and reviewed:
+# the helper re-verifies the stored envelope before it continues.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/node-v20.19.1-linux-x64/bin/node /usr/local/lib/wireguard-ops-cockpit/cockpit-host-run.mjs resume
+
+[Install]
+WantedBy=multi-user.target

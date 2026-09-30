@@ -3,11 +3,15 @@ import { createHmac } from "node:crypto";
 
 import type { CapabilityManifest } from "./capability-manifest.js";
 import type { ExecutionEnvelope } from "./hermes-security.js";
+import type { HostRunManifest } from "./host-run.js";
 
-export type ExecutorActionKind = "service.restart" | "service.status" | "disk.status" | "disk.remove" | "disk.add" | "disk.smart" | "disk.smarttest" | "self.update" | "self.status" | "self.diff" | "dienste.update" | "dienste.status" | "dienste.diff" | "borg.status" | "borg.check" | "borg.repair";
+export type ExecutorActionKind = "host.status" | "service.restart" | "service.status" | "disk.status" | "disk.remove" | "disk.add" | "disk.smart" | "disk.smarttest" | "self.update" | "self.status" | "self.diff" | "dienste.update" | "dienste.status" | "dienste.diff" | "borg.status" | "borg.check" | "borg.repair";
 // diffSha256: only on self.update and dienste.update — the hash of the diff the pre-install review covered.
 export interface ExecutorAction { action: ExecutorActionKind; target: string; diffSha256?: string; expiresAt: string; envelopeDigest: string }
 export interface DynamicExecutorAction { action: "capability.execute"; manifest: CapabilityManifest; envelope: ExecutionEnvelope; expiresAt: string; envelopeDigest: string }
+// The general host door: starts the signed run and returns at once; the run
+// itself lives in its own unit and is followed with host.status <jobId>.
+export interface HostRunExecutorAction { action: "host.run"; manifest: HostRunManifest; envelope: ExecutionEnvelope; expiresAt: string; envelopeDigest: string }
 export async function runExecutorAction(socketPath: string, secret: string, payload: ExecutorAction, timeoutMs = 60_000): Promise<string> {
   const signature = createHmac("sha256", secret).update(JSON.stringify(payload)).digest("hex");
   return await new Promise((resolve, reject) => {
@@ -22,7 +26,7 @@ export async function runExecutorAction(socketPath: string, secret: string, payl
   });
 }
 
-export async function runDynamicCapability(socketPath: string, secret: string, payload: DynamicExecutorAction): Promise<string> {
+export async function runDynamicCapability(socketPath: string, secret: string, payload: DynamicExecutorAction | HostRunExecutorAction): Promise<string> {
   const signature = createHmac("sha256", secret).update(JSON.stringify(payload)).digest("hex");
   return await new Promise((resolve, reject) => {
     const connection = net.createConnection(socketPath); let response = "";

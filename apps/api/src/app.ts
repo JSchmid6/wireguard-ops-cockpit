@@ -86,6 +86,20 @@ import {
   type UpdateReviewOutcome,
   type UpdateTarget,
 } from "./update-review.js";
+import {
+  buildHostRunReviewPrompt,
+  hostRunManifestHash,
+  hostRunPlannerContract,
+  hostRunPolicy,
+  hostRunResultText,
+  hostRunSafetyRecord,
+  parseHostRunManifest,
+  parseHostRunReviewAnswer,
+  parseHostRunStatus,
+  verifyHostRunFindings,
+  type HostRunManifest,
+  type HostRunReviewOutcome,
+} from "./host-run.js";
 
 interface AppOptions {
   config?: AppConfig;
@@ -94,6 +108,11 @@ interface AppOptions {
   // The isolated reviewer of a self-update's code (prompt in, raw answer out).
   // Defaults to the agent broker's safety role; tests inject a stub.
   updateReviewRunner?: (prompt: string) => Promise<string>;
+  // The doorkeeper of the general host door (prompt in, raw answer out).
+  // Defaults to the agent broker's safety role; tests inject a stub.
+  hostRunReviewRunner?: (prompt: string) => Promise<string>;
+  // Interval of host.status polls while a host run is going (tests shorten it).
+  hostRunPollMs?: number;
   // The borg helper's status report (`borg.status`, read-only). Defaults to the
   // typed executor path; tests inject the helper's output instead of a host.
   borgStatusReader?: () => Promise<string>;
@@ -137,6 +156,11 @@ const BORG_STATUS_REQUEST_WAIT_MS = 25_000;
 // den root-Helfer und das Repo nicht in einer Schleife beschäftigen — jede
 // Messung ist eine eigene Unit mit SSH-Abfragen und nimmt die Repo-Sperre.
 const BORG_STATUS_MIN_INTERVAL_MS = 60_000;
+// A host run lives in its own unit; the API follows it with host.status. The
+// deadline is the run's own time budget plus room for reboots; a poll that
+// fails (executor restarting, host rebooting) is retried until then.
+const HOST_RUN_POLL_MS = 15_000;
+const HOST_RUN_REBOOT_ALLOWANCE_MS = 60 * 60 * 1000;
 
 // Keeps a validated capability manifest for reuse, only when the planner
 // declared the operation as recurring (`retain: true`); a one-off repair stays
@@ -676,6 +700,7 @@ export async function createApp(options: AppOptions = {}) {
     plannerModel: config.opencodeModel,
     safetyModel: config.safetyOpencodeModel,
     capabilityContract: hashCanonical(capabilityPlannerContract()),
+    hostRunContract: hashCanonical(hostRunPlannerContract()),
     brokerRoleContract: "ephemeral-role-workspace-v7",
     executorBoundaryContract: "dynamic-capability-v16-daemonless-kaniko",
   });
@@ -1610,7 +1635,7 @@ export async function createApp(options: AppOptions = {}) {
       .join("\n");
     // Planner output: preserve a dynamic capability fence even when it precedes legacy markdown sections.
     const capabilityStart = noTimestamps.search(
-      /(?:^|\n)```(?:capability|json)?\s*\n(?=\s*\{[\s\S]{0,1000}?"version"\s*:\s*"cockpit-capability\/v1")/i
+      /(?:^|\n)```(?:capability|host-run|json)?\s*\n(?=\s*\{[\s\S]{0,1000}?"version"\s*:\s*"cockpit-(?:capability|host-run)\/v1")/i
     );
     const modelStart = noTimestamps.search(/(?:^|\n)## /);
     const contentStart = capabilityStart >= 0 ? capabilityStart + (noTimestamps[capabilityStart] === "\n" ? 1 : 0)
@@ -1765,7 +1790,8 @@ export async function createApp(options: AppOptions = {}) {
     ].join("\n");
   }
 
-  async function executeTypedCapabilities(planText: string, envelope: ExecutionEnvelope, manifest?: CapabilityManifest | null, reviewedUpdates: UpdateBinding[] = []): Promise<string | null> {
+  async function executeTypedCapabilities(planText: string, envelope: ExecutionEnvelope, manifest?: CapabilityManifest | null, reviewedUpdates: UpdateBinding[] = [], hostRun?: HostRunManifest | null): Promise<string | null> {
+    if (hostRun) return await runHostRun(envelope, hostRun);
     if (manifest) {
       if (!config.executorBrokerSocket || !config.executorBrokerSecret) throw new Error("sandbox executor broker is not configured");
       const output = await runDynamicCapability(config.executorBrokerSocket, config.executorBrokerSecret, {
@@ -1851,6 +1877,80 @@ export async function createApp(options: AppOptions = {}) {
     if (!config.agentBrokerSocket) throw new Error("the isolated reviewer needs the agent broker");
     return await runBrokerAgent(config.agentBrokerSocket, "safety", prompt);
   });
+
+  // The doorkeeper of the general host door: the same isolated safety role,
+  // its own instructions (host-run.ts). Without the agent broker there is no
+  // isolated reviewer, and the review is incomplete.
+  const hostRunReviewRunner = options.hostRunReviewRunner || (async (prompt: string) => {
+    if (!config.agentBrokerSocket) throw new Error("the isolated reviewer needs the agent broker");
+    return await runBrokerAgent(config.agentBrokerSocket, "safety", prompt);
+  });
+  const hostRunPollMs = options.hostRunPollMs ?? HOST_RUN_POLL_MS;
+
+  // The reviewer prompt is kept next to the proposal (<jobId>-host-run-review.md,
+  // 0600): exactly what the doorkeeper read.
+  async function reviewHostRun(jobId: string, manifest: HostRunManifest, proposalDir: string): Promise<HostRunReviewOutcome> {
+    const material = buildHostRunReviewPrompt(manifest);
+    const outcome: HostRunReviewOutcome = { manifestHash: hostRunManifestHash(manifest), complete: material.complete, missing: material.missing, focus: material.focus };
+    if (!material.complete) return outcome;
+    outcome.reviewPath = path.join(proposalDir, `${jobId}-host-run-review.md`);
+    await writeFile(outcome.reviewPath, material.prompt, { encoding: "utf-8", mode: 0o600 });
+    try {
+      outcome.answer = verifyHostRunFindings(parseHostRunReviewAnswer(redactSecrets(await hostRunReviewRunner(material.prompt))), manifest);
+    } catch (error) {
+      outcome.reviewerError = error instanceof Error ? error.message : "reviewer failed";
+    }
+    return outcome;
+  }
+
+  function hostRunDeadline(manifest: HostRunManifest, startedAt: number): number {
+    const seconds = manifest.steps.reduce((sum, step) => sum + (step.timeoutSeconds || 0), 0) + manifest.checks.reduce((sum, check) => sum + check.timeoutSeconds, 0);
+    const reboots = manifest.steps.filter((step) => step.reboot).length;
+    return startedAt + (seconds + 1800) * 1000 + (reboots + 1) * HOST_RUN_REBOOT_ALLOWANCE_MS;
+  }
+
+  async function hostRunStatus(jobId: string): Promise<ReturnType<typeof parseHostRunStatus>> {
+    if (!config.executorBrokerSocket || !config.executorBrokerSecret) throw new Error("executor broker is not configured");
+    const expiresAt = new Date(Date.now() + 5 * 60_000).toISOString();
+    return parseHostRunStatus(await runExecutorAction(config.executorBrokerSocket, config.executorBrokerSecret, {
+      action: "host.status", target: jobId, expiresAt, envelopeDigest: hashCanonical({ jobId, purpose: "host-run-status", expiresAt }),
+    }));
+  }
+
+  // Follows a started run until it reports a result. Poll failures are
+  // expected while the host reboots; only the deadline ends the wait.
+  async function awaitHostRun(jobId: string, manifest: HostRunManifest, startedAt: number): Promise<string> {
+    const deadline = hostRunDeadline(manifest, startedAt);
+    let lastError = "";
+    while (Date.now() < deadline) {
+      try {
+        const current = await hostRunStatus(jobId);
+        if (current.finished) return hostRunResultText(manifest, current);
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error);
+      }
+      await new Promise((resolve) => setTimeout(resolve, hostRunPollMs));
+    }
+    throw new Error(`host run ${jobId} reported no result before its deadline${lastError ? ` (last status error: ${lastError})` : ""}`);
+  }
+
+  async function runHostRun(envelope: ExecutionEnvelope, manifest: HostRunManifest): Promise<string> {
+    if (!config.executorBrokerSocket || !config.executorBrokerSecret) throw new Error("executor broker is not configured");
+    // Marked before the start: an API that dies between the helper's answer
+    // and the record below still follows the run after its restart.
+    const requested = database.getJob(envelope.jobId);
+    if (requested) database.updateJob(envelope.jobId, { status: requested.status, output: { ...requested.output, hostRunRequestedAt: new Date().toISOString() } });
+    const started = await runDynamicCapability(config.executorBrokerSocket, config.executorBrokerSecret, {
+      action: "host.run", manifest, envelope, expiresAt: envelope.expiresAt, envelopeDigest: envelope.digest,
+    });
+    const startedAt = Date.now();
+    // Recorded on the job, so an API restart (a reboot step restarts it too)
+    // can pick the run up again: resumeHostRuns below.
+    const current = database.getJob(envelope.jobId);
+    if (current) database.updateJob(envelope.jobId, { status: current.status, output: { ...current.output, hostRunStartedAt: new Date(startedAt).toISOString(), hostRunStart: filterSensitiveContent(started).slice(0, 2000) } });
+    database.createAudit({ actorId: envelope.actorId, action: "hermes.host_run.started", targetType: "job", targetId: envelope.jobId, details: { manifestHash: envelope.manifestHash, name: manifest.name, mutates: manifest.mutates } });
+    return await awaitHostRun(envelope.jobId, manifest, startedAt);
+  }
 
   // Pre-install review of the commits a plan would install (see
   // update-review.ts). The reviewer prompt is written next to the proposal
@@ -2074,6 +2174,7 @@ export async function createApp(options: AppOptions = {}) {
       const policy = job.output?.policy;
       const capabilities = job.output?.capabilities;
       const manifest = job.output?.manifest as CapabilityManifest | null | undefined;
+      const hostRun = job.output?.hostRun as HostRunManifest | null | undefined;
       const envelopeErrors: string[] = [];
       if (!envelope || typeof envelope !== "object") {
         envelopeErrors.push("execution envelope missing");
@@ -2086,7 +2187,7 @@ export async function createApp(options: AppOptions = {}) {
         if (envelope.safetyHash !== hashCanonical(safety)) envelopeErrors.push("safety review drift");
         if (envelope.policyHash !== hashCanonical(policy)) envelopeErrors.push("policy decision drift");
         if (JSON.stringify(envelope.capabilities) !== JSON.stringify(capabilities)) envelopeErrors.push("capability drift");
-        if (envelope.manifestHash !== (manifest ? capabilityManifestHash(manifest) : undefined)) envelopeErrors.push("capability manifest drift");
+        if (envelope.manifestHash !== (manifest ? capabilityManifestHash(manifest) : hostRun ? hostRunManifestHash(hostRun) : undefined)) envelopeErrors.push("capability manifest drift");
       }
       if (envelopeErrors.length > 0) {
         const blocked = updateHermesJob(job.id, "blocked_policy", explanation({
@@ -2132,6 +2233,11 @@ export async function createApp(options: AppOptions = {}) {
     } catch {
       return reply.code(409).send({ message: "stored proposal is no longer available" });
     }
+    // Two approvals of the same job may both pass the check above while this
+    // request awaited the file; only the first one starts the run.
+    if (database.getJob(job.id)?.status !== "blocked_user_approval") {
+      return reply.code(409).send({ message: "job is not awaiting operator approval" });
+    }
 
     const running = updateHermesJob(job.id, "running", explanation({
       phase: "executing", intent, reason: "Operator approval recorded; the reviewed proposal is executing with the service account's bounded permissions.",
@@ -2150,7 +2256,8 @@ export async function createApp(options: AppOptions = {}) {
         const envelope = running.output?.envelope as ExecutionEnvelope;
         const manifest = running.output?.manifest as CapabilityManifest | null | undefined;
         const reviewedUpdates = normalizeUpdateBindings((running.output?.updateReview as Record<string, unknown> | undefined)?.bindings);
-        const typedResult = await executeTypedCapabilities(reviewedPlan, envelope, manifest, reviewedUpdates);
+        const hostRun = running.output?.hostRun as HostRunManifest | null | undefined;
+        const typedResult = await executeTypedCapabilities(reviewedPlan, envelope, manifest, reviewedUpdates, hostRun);
         const raw = typedResult || await runIsolatedAgent(actor, session, planner, "runner", isolatedRunnerPrompt(proposalPath, reviewedPlan), "-runner", 10 * 60_000);
         const result = typedResult || filterSensitiveContent(extractRunnerHandoff(raw));
         const runnerSuccess = /STATUS:\s*success/i.test(result);
@@ -2604,7 +2711,7 @@ Follow these rules:
     const intent = requestedIntent;
     const untrustedEvidence = normalizeEvidence(body.evidence);
     const allowedCapabilities = normalizeAllowedCapabilities(body.allowedCapabilities);
-    const agentTask = `${buildAgentTask(intent, untrustedEvidence)}\n\nDYNAMIC CAPABILITY CONTRACT:\n${capabilityPlannerContract()}`;
+    const agentTask = `${buildAgentTask(intent, untrustedEvidence)}\n\nDYNAMIC CAPABILITY CONTRACT:\n${hostRunPlannerContract()}\n\n${capabilityPlannerContract()}`;
     const job = database.createJob({
       sessionId: session.id, kind: "runbook", subjectId: "hermes-change",
       status: "running", requiresApproval: false,
@@ -2652,7 +2759,9 @@ Follow these rules:
         };
 
         const manifest = parseCapabilityManifest(planText);
-        const updateTargets = manifest ? [] : reviewedUpdateTargets(planText);
+        const hostRun = parseHostRunManifest(planText);
+        if (manifest && hostRun) throw new Error("the plan carries a capability manifest and a host-run manifest; one door per job");
+        const updateTargets = manifest || hostRun ? [] : reviewedUpdateTargets(planText);
         let updateReview: Awaited<ReturnType<typeof reviewSelfUpdates>> | null = null;
         if (updateTargets.length > 0) {
           updateHermesJob(job.id, "running", explanation({
@@ -2662,27 +2771,40 @@ Follow these rules:
           updateReview = await reviewSelfUpdates(job.id, updateTargets, proposalDir);
         }
         const reviewRecord = updateReview ? { updateReview: summarizeUpdateReview(updateReview.diffs, updateReview.outcome, updateReview.reviewPath) } : {};
-        const reviewedSteps = ["Planner proposal", ...(updateReview ? ["Pre-install code review"] : []), "Safety review", "Policy evaluation"];
+        const reviewedSteps = ["Planner proposal", ...(updateReview ? ["Pre-install code review"] : []), hostRun ? "Doorkeeper review" : "Safety review", "Policy evaluation"];
 
         updateHermesJob(job.id, "running", explanation({
           phase: "reviewing", intent, reason: "Independent safety review and hard-boundary policy are evaluating the proposal.",
           completed: ["Structured planner proposal", ...(updateReview ? ["Pre-install code review"] : [])], evidence: [proposalPath],
         }), { plan: planText, proposalPath, ...reviewRecord });
-        const review = await safetyReviewRunner({
-          runbook: proposal, runbookVersionHash: computeRunbookVersionHash(proposal), riskClass: "moderate",
-          sessionId: session.id, trigger: "manual", scheduleId: null,
-        }, { ...config, opencodeModel: config.safetyOpencodeModel });
-        let policy = evaluatePlanPolicy(planText, review.verdict);
-        const manifestHash = manifest ? capabilityManifestHash(manifest) : undefined;
+        // The general host door has its own doorkeeper (host-run.ts): the
+        // deterministic hits are its focus, and only its evidenced findings —
+        // or an incomplete review — keep the run from starting. The other doors
+        // keep the plan safety review and the plan policy.
+        let review: ExecutionReview;
+        let policy: PlanPolicyResult;
+        if (hostRun) {
+          const hostRunReview = await reviewHostRun(job.id, hostRun, proposalDir);
+          policy = hostRunPolicy(hostRun, hostRunReview);
+          review = hostRunSafetyRecord(hostRun, hostRunReview, policy);
+        } else {
+          review = await safetyReviewRunner({
+            runbook: proposal, runbookVersionHash: computeRunbookVersionHash(proposal), riskClass: "moderate",
+            sessionId: session.id, trigger: "manual", scheduleId: null,
+          }, { ...config, opencodeModel: config.safetyOpencodeModel });
+          policy = evaluatePlanPolicy(planText, review.verdict);
+        }
+        const manifestHash = manifest ? capabilityManifestHash(manifest) : hostRun ? hostRunManifestHash(hostRun) : undefined;
         const nextcloudMutationModes = new Set(["php-install", "php-enable", "exapp-catalog-refresh", "exapp-register", "exapp-reinitialize", "exapp-restart-reinitialize"]);
         const contextMutationModes = new Set(["create-test", "search-test", "prompt-test"]);
         const semanticMutation = manifest?.steps.some((step) =>
           (step.argv[0] === "/usr/local/sbin/cockpit-nextcloud-app-action" && nextcloudMutationModes.has(step.argv[1] || ""))
           || (step.argv[0] === "/usr/local/sbin/cockpit-nextcloud-context-action" && contextMutationModes.has(step.argv[1] || ""))
         ) ?? false;
-        const capabilities: CapabilityId[] = manifest ? [manifest.writablePaths.length > 0 || semanticMutation ? "filesystem.write" : "read.host"] : classifyCapabilities(planText);
+        const capabilities: CapabilityId[] = hostRun ? ["host.run"]
+          : manifest ? [manifest.writablePaths.length > 0 || semanticMutation ? "filesystem.write" : "read.host"] : classifyCapabilities(planText);
         const capabilityEscalation = capabilities.filter((capability) => !allowedCapabilities.includes(capability));
-        if (!manifest && policy.allowed && capabilityEscalation.length > 0) {
+        if (!manifest && !hostRun && policy.allowed && capabilityEscalation.length > 0) {
           policy = {
             ...policy,
             zone: "red",
@@ -2693,7 +2815,7 @@ Follow these rules:
             neededToContinue: ["Authorize the exact capability from trusted operator intent or narrow the plan."],
           };
         }
-        if (!manifest && policy.allowed && capabilities.includes("shell.exception")) {
+        if (!manifest && !hostRun && policy.allowed && capabilities.includes("shell.exception")) {
           policy = {
             ...policy,
             zone: "red",
@@ -2708,7 +2830,7 @@ Follow these rules:
           capability !== "read.host" && capability !== "service.manage" && capability !== "disk.manage" && capability !== "self.update"
           && capability !== "dienste.update" && capability !== "borg.manage" && capability !== "shell.exception"
         );
-        if (!manifest && policy.allowed && unsupportedAutonomousCapabilities.length > 0) {
+        if (!manifest && !hostRun && policy.allowed && unsupportedAutonomousCapabilities.length > 0) {
           policy = {
             ...policy,
             allowed: false,
@@ -2743,7 +2865,8 @@ Follow these rules:
           jobId: job.id, actorId: actor.id, sessionId: session.id, intent,
           evidence: [...untrustedEvidence, ...updateReviewEvidence(updateReview?.outcome.bindings ?? [])],
           plan: planText, safety: review, policy, capabilities,
-          manifestHash, ttlMinutes: config.approvalTtlMinutes, signingSecret: config.executionEnvelopeSecret,
+          manifestHash, gatePassed: Boolean(hostRun && policy.allowed),
+          ttlMinutes: config.approvalTtlMinutes, signingSecret: config.executionEnvelopeSecret,
         });
         const provenance = {
           trustedIntentHash: hashCanonical(intent),
@@ -2758,7 +2881,7 @@ Follow these rules:
             evidence: [review.summary, ...policy.evidence], neededToContinue: policy.neededToContinue,
             recommendedAction: policy.status === "blocked_user_approval" ? "Ask the operator to approve or narrow the plan." : "Revise the plan as indicated.",
             rollbackAvailable: policy.rollbackAvailable,
-          }), { plan: planText, safety: review, policy, capabilities, manifest, envelope, provenance, proposalPath, ...reviewRecord });
+          }), { plan: planText, safety: review, policy, capabilities, manifest, hostRun, envelope, provenance, proposalPath, ...reviewRecord });
           return;
         }
         if (!shouldExecute) {
@@ -2767,7 +2890,7 @@ Follow these rules:
             completed: reviewedSteps,
             evidence: [review.summary, ...policy.evidence], recommendedAction: "Submit an execution request if this plan should run.",
             rollbackAvailable: policy.rollbackAvailable,
-          }), { plan: planText, safety: review, policy, capabilities, manifest, envelope, provenance, proposalPath, ...reviewRecord, result: "" });
+          }), { plan: planText, safety: review, policy, capabilities, manifest, hostRun, envelope, provenance, proposalPath, ...reviewRecord, result: "" });
           return;
         }
 
@@ -2775,8 +2898,8 @@ Follow these rules:
           phase: "executing", intent, reason: policy.reason,
           completed: reviewedSteps,
           evidence: [review.summary, ...policy.evidence], rollbackAvailable: policy.rollbackAvailable,
-        }), { plan: planText, safety: review, policy, capabilities, manifest, envelope, provenance, proposalPath, ...reviewRecord });
-        const typedResult = await executeTypedCapabilities(planText, envelope, manifest, updateReview?.outcome.bindings ?? []);
+        }), { plan: planText, safety: review, policy, capabilities, manifest, hostRun, envelope, provenance, proposalPath, ...reviewRecord });
+        const typedResult = await executeTypedCapabilities(planText, envelope, manifest, updateReview?.outcome.bindings ?? [], hostRun);
         const runnerRaw = typedResult || await runIsolatedAgent(actor, session, planner, "runner", isolatedRunnerPrompt(proposalPath, planText), "-runner", 10 * 60_000);
         const result = typedResult || filterSensitiveContent(extractRunnerHandoff(runnerRaw));
         if (!result) throw new Error("runner produced no structured execution result");
@@ -2800,7 +2923,7 @@ Follow these rules:
           neededToContinue: success ? [] : ["Inspect the structured runner result and complete the failed verification."],
           recommendedAction: success ? "No further action is required." : "Correct the reported issue or perform rollback.",
           rollbackAvailable: policy.rollbackAvailable,
-        }), { plan: planText, safety: review, policy, capabilities, manifest, envelope, provenance, proposalPath, ...reviewRecord, retainedCapability, result, verification, elapsedMs: Date.now() - startedAt });
+        }), { plan: planText, safety: review, policy, capabilities, manifest, hostRun, envelope, provenance, proposalPath, ...reviewRecord, retainedCapability, result, verification, elapsedMs: Date.now() - startedAt });
       } catch (error) {
         const preservedOutput = database.getJobForActor(job.id, actor.id)?.output || {};
         updateHermesJob(job.id, "failed_execution", explanation({
@@ -3732,6 +3855,50 @@ Follow these rules:
       audits: database.listAuditsForActor(actor.id, 20)
     };
   });
+
+  // A reboot step (and any restart of the API) ends the promise that was
+  // following a host run. The run itself goes on in its own unit and reports
+  // through host.status; these watchers take over from the job record and
+  // finish the job the same way the original request would have.
+  async function resumeHostRun(job: JobRecord): Promise<void> {
+    const output = job.output || {};
+    const hostRun = output.hostRun as HostRunManifest | undefined;
+    const intent = String((output.explanation as Record<string, unknown> | undefined)?.intent || "Hermes host run");
+    const planText = typeof output.plan === "string" ? output.plan : "";
+    const policy = output.policy as Record<string, unknown> | undefined;
+    const completed = ["Planner proposal", "Doorkeeper review", "Policy evaluation", ...(output.approval ? ["Operator approval"] : []), "Host run"];
+    try {
+      if (!hostRun) throw new Error("the job has no host-run manifest to follow");
+      const result = await awaitHostRun(job.id, hostRun, Date.parse(String(output.hostRunStartedAt ?? output.hostRunRequestedAt)) || Date.now());
+      const ownerId = database.getJobOwnerId(job.id);
+      const actor = ownerId ? database.getUserById(ownerId) : null;
+      const session = job.sessionId && ownerId ? database.getSessionRuntimeTargetForActor(job.sessionId, ownerId) : null;
+      const planner = findAgent("planner-agent", "opencode");
+      const runnerSuccess = /STATUS:\s*success/i.test(result);
+      const verification = runnerSuccess && actor && session && planner
+        ? await runIndependentVerification(actor, session, planner, intent, planText, result)
+        : `VERIFICATION_STATUS: failed\nREASON: ${runnerSuccess ? "the verifier runtime is unavailable after the restart" : "the host run did not report success"}`;
+      const success = runnerSuccess && /VERIFICATION_STATUS:\s*passed/i.test(verification);
+      updateHermesJob(job.id, success ? "completed" : "failed_verification", explanation({
+        phase: "finished", intent,
+        reason: success ? "Host run and verification completed (followed across a restart)." : "The host run finished without a verified success (followed across a restart).",
+        completed: [...completed, "Independent verification", "Result collection"],
+        neededToContinue: success ? [] : ["Inspect the host-run result and its log; use the plan's rollback or the machine snapshot named there."],
+        recommendedAction: success ? "No further action is required." : "Correct the reported issue or perform rollback.",
+        rollbackAvailable: Boolean(policy?.rollbackAvailable),
+      }), { ...output, result, verification, resumedAfterRestart: true });
+    } catch (error) {
+      updateHermesJob(job.id, "failed_execution", explanation({
+        phase: "finished", intent, reason: error instanceof Error ? error.message : "Following the host run failed.",
+        completed, neededToContinue: ["Read the run with host.status (or its log under /var/lib/wireguard-ops-cockpit/host-runs) before retrying."],
+        recommendedAction: "Check the host run's state before submitting it again.",
+      }), { ...output, resumedAfterRestart: true });
+    }
+  }
+
+  for (const job of database.listRunningJobs("hermes-change")) {
+    if (typeof job.output?.hostRunStartedAt === "string" || typeof job.output?.hostRunRequestedAt === "string") void resumeHostRun(job);
+  }
 
   return app;
 }
