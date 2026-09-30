@@ -25,8 +25,8 @@ import {
 // hash right before the deploy script and refuses a mismatch.
 //
 // Deterministic stops (operator approval): the review input is unavailable or
-// incomplete inside a focus area, the reviewer failed, its answer does not
-// parse, or it answered VERDICT flag. Touching a focus area is never a stop by
+// incomplete inside a focus area or the deploy material, the reviewer failed,
+// its answer does not parse, or it answered VERDICT flag. Touching a focus area is never a stop by
 // itself.
 //
 // The same review guards a second repository: `dienste.update <sha>` installs a
@@ -126,7 +126,8 @@ export interface UpdateBinding {
 
 export interface UpdateReviewCoverage {
   sha: string;
-  // Focus-area files the reviewer could not see completely: a deterministic stop.
+  // Focus-area and deploy files the reviewer could not see completely: a
+  // deterministic stop.
   incomplete: string[];
   // Files cut or left out of the prompt (focus or not), for the record.
   cut: string[];
@@ -269,7 +270,7 @@ export function focusFiles(diff: UpdateDiff): Set<string> {
 
 // Material that runs as root on the host: the deploy tree holds the installer,
 // the root helpers, the systemd units and the sudoers sources. It comes first in
-// the excerpt and is named when it does not fit. The runner orders its sections
+// the excerpt; when it does not fit it is named and stops the update. The runner orders its sections
 // by file class, which puts a file it classes as `other` behind tests and docs —
 // that is how deploy/vps/vps-cockpit-deploy.sh fell out of the material of the
 // 28.09.2026 rollout review although it installs everything as root.
@@ -284,15 +285,27 @@ export function materialOrder(sections: UpdateDiffSection[]): UpdateDiffSection[
   ];
 }
 
-// Deploy material the excerpt does not cover completely and that is not already
-// named as cut. It is reported as left out even when the runner emitted no
-// section for it at all. A name is not a stop: the reviewer sees what is missing
-// and can flag it, while only a focus area that stays incomplete stops the
-// update by itself.
-function namedDeployGaps(diff: UpdateDiff, complete: Set<string>, cut: string[]): string[] {
-  return diff.files
-    .map((file) => file.path)
-    .filter((path) => DEPLOY_MATERIAL.test(path) && !complete.has(path) && !cut.includes(path));
+// Deploy material the excerpt does not cover completely, whether cut, left out,
+// or never emitted as a section by the runner. Each such file is a
+// deterministic stop (like an incomplete focus area): a root installer the
+// reviewer could not read is never approved silently. The runner caps its file
+// list, so its omitted and partial lists are read too.
+function deployGaps(diff: UpdateDiff, complete: Set<string>): string[] {
+  const paths = [...diff.files.map((file) => file.path), ...diff.omittedFiles, ...diff.partialFiles];
+  return [...new Set(paths)].filter((path) => DEPLOY_MATERIAL.test(path) && !complete.has(path));
+}
+
+// When the runner listed fewer files than changed, deploy material may hide in
+// the unlisted rest: that is a stop as well (fail closed), named as one entry.
+function unlistedDeployGap(diff: UpdateDiff): string[] {
+  const unlisted = diff.filesTotal - diff.files.length;
+  return unlisted > 0 ? [`(${unlisted} changed file(s) not listed by the runner; deploy material not determinable)`] : [];
+}
+
+// The gaps that are neither cut nor shown: reported as left out, so the reviewer
+// sees them in the state line instead of assuming a complete material.
+function namedDeployGaps(diff: UpdateDiff, complete: Set<string>, cut: string[], shown: Set<string>): string[] {
+  return deployGaps(diff, complete).filter((path) => !cut.includes(path) && !shown.has(path));
 }
 
 function bytes(text: string): number {
@@ -346,9 +359,9 @@ function describeUpdate(diff: UpdateDiff, index: number, total: number): string 
 // The complete reviewer prompt. The instruction block comes first, then the
 // material inside nonce-marked data markers, then a short reminder. Sections of
 // the diff are taken in review order — the deploy material first, then the
-// runner's order (focus areas first) — while they fit the budget; focus-area
-// files that do not fit completely are reported as incomplete coverage, deploy
-// material that does not fit is named as left out.
+// runner's order (focus areas first) — while they fit the budget; focus-area and
+// deploy files that do not fit completely are reported as incomplete coverage
+// (a stop), deploy material without any section is also named as left out.
 export function buildUpdateReviewPrompt(diffs: UpdateDiff[], options: { nonce?: string; limit?: number } = {}): { prompt: string; coverage: UpdateReviewCoverage[] } {
   const nonce = options.nonce || randomBytes(8).toString("hex");
   const limit = options.limit ?? UPDATE_REVIEW_PROMPT_LIMIT;
@@ -388,10 +401,10 @@ export function buildUpdateReviewPrompt(diffs: UpdateDiff[], options: { nonce?: 
         omitted.push(section.path);
       }
     }
-    const incomplete = [...focusFiles(diff)].filter((file) => !complete.has(file)).sort();
+    const incomplete = [...new Set([...[...focusFiles(diff)].filter((file) => !complete.has(file)), ...deployGaps(diff, complete), ...unlistedDeployGap(diff)])].sort();
     // cut: partially in the prompt (by the runner or here); omitted: not at all.
     const cutFiles = [...new Set([...diff.partialFiles.filter((file) => shown.has(file)), ...cut])];
-    const omittedFiles = [...new Set([...omitted, ...namedDeployGaps(diff, complete, cutFiles)])];
+    const omittedFiles = [...new Set([...omitted, ...namedDeployGaps(diff, complete, cutFiles, shown)])];
     coverage.push({ sha: diff.sha, incomplete, cut: cutFiles, omitted: omittedFiles });
     const excerpt = included.join("");
     const state = cutFiles.length || omittedFiles.length
@@ -512,7 +525,7 @@ export function updateReviewFindings(outcome: UpdateReviewOutcome): { reasons: s
   const incomplete = outcome.coverage.filter((item) => item.incomplete.length > 0);
   if (incomplete.length > 0) {
     const count = incomplete.reduce((sum, item) => sum + item.incomplete.length, 0);
-    reasons.push(`the review input is incomplete: ${count} focus-area file(s) were not fully visible to the reviewer`);
+    reasons.push(`the review input is incomplete: ${count} focus-area or deploy file(s) were not fully visible to the reviewer`);
     for (const item of incomplete) {
       evidence.push(`not fully reviewed (${item.sha.slice(0, 12)}): ${item.incomplete.slice(0, 30).join(", ")}${item.incomplete.length > 30 ? ", ..." : ""}`);
     }
