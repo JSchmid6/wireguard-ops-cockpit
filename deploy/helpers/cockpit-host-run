@@ -16,6 +16,10 @@
 //              Safety-Reviewer liest diese Schritte, bevor der Envelope
 //              entsteht. Hier wird nichts mehr eingestuft oder abgelehnt, was
 //              er gesehen hat.
+//   Riegel     Ein Lauf, der Backups löscht oder ihre Aufbewahrung verkürzt,
+//              öffnet nur mit operatorApproved, auch bei bestandenem Türsteher
+//              (cockpit-backup-guard.mjs, dieselbe Erkennung wie in der API;
+//              installiert neben diesem Helfer).
 //   Netz       Vor einem Lauf, der den Systemzustand ändert (mutates, Standard):
 //              das letzte borg-Backup muss jünger als 24 h sein, dann ein
 //              Maschinen-Snapshot beim Hoster (cockpit-vps-snapshot, rotiert den
@@ -43,6 +47,8 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, openSync, fsyncSync, closeSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+
+import { backupGuardHits } from "./cockpit-backup-guard.mjs";
 
 const env = process.env;
 const STATE_ROOT = env.HOST_RUN_STATE_DIR || "/var/lib/wireguard-ops-cockpit/host-runs";
@@ -108,6 +114,12 @@ function verifyRequest(request, { checkExpiry }) {
   if (envelope.gatePassed !== true && envelope.operatorApproved !== true) fail("the envelope carries neither a passed doorkeeper review nor an operator approval", 77);
   if (!JOB_ID.test(envelope.jobId || "")) fail("invalid envelope job id");
   validateManifest(manifest);
+  // Backups löschen nur mit Jochens Freigabe: ein bestandener Türsteher reicht
+  // hier nie, auch nicht bei der Fortsetzung nach einem Neustart.
+  const backup = backupGuardHits(manifest);
+  if (backup.length > 0 && envelope.operatorApproved !== true) {
+    fail(`the run touches the backups and needs the operator's approval: ${backup.slice(0, 3).map((hit) => `${hit.where} ${hit.reason}`).join("; ")}`, 77);
+  }
   return { manifest, envelope };
 }
 

@@ -94,6 +94,8 @@ readonly TABLE=(
   # The general host door (doc/setup/host-run.md): its root helper and the
   # boot-time continuation of runs that asked for a reboot.
   "deploy/helpers/cockpit-host-run|$LIB/cockpit-host-run.mjs|755"
+  # Backups löschen nur mit Freigabe: die eine Erkennung, die der Helfer importiert.
+  "deploy/helpers/cockpit-backup-guard.mjs|$LIB/cockpit-backup-guard.mjs|644"
   "deploy/systemd/wireguard-ops-cockpit-host-run-resume.service|$UNITS/wireguard-ops-cockpit-host-run-resume.service|644"
 )
 

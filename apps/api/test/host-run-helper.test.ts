@@ -15,6 +15,7 @@ import { hostRunManifestHash, parseHostRunManifest } from "../src/host-run.js";
 // payload synchronously, so `start` returns when the run is over.
 
 const HELPER = fileURLToPath(new URL("../../../deploy/helpers/cockpit-host-run", import.meta.url));
+const GUARD = fileURLToPath(new URL("../../../deploy/helpers/cockpit-backup-guard.mjs", import.meta.url));
 const SECRET = "test-envelope-secret-0123456789";
 const HOSTER_SECRET = "hoster-client-secret-abcdef";
 
@@ -84,6 +85,7 @@ beforeEach(() => {
   dir = mkdtempSync(path.join(tmpdir(), "host-run-"));
   helper = path.join(dir, "cockpit-host-run.mjs");
   copyFileSync(HELPER, helper);
+  copyFileSync(GUARD, path.join(dir, "cockpit-backup-guard.mjs"));
   mkdirSync(path.join(dir, "etc"));
   write(path.join(dir, "etc", "api.env"), `COCKPIT_EXECUTION_ENVELOPE_SECRET=${SECRET}\n`, 0o600);
   write(path.join(dir, "etc", "contabo.env"), `CONTABO_CLIENT_SECRET=${HOSTER_SECRET}\n`, 0o600);
@@ -175,6 +177,39 @@ describe("cockpit-host-run: lock", () => {
   it("opens for the operator's approval of a job the doorkeeper stopped", () => {
     expect(run(["start"], request(manifest(), { gatePassed: undefined, operatorApproved: true })).code).toBe(0);
     expect(status().state.status).toBe("success");
+  });
+
+  // The steps really run here: they only write marker files whose names the
+  // backup bolt recognizes, never a real borg or systemctl command.
+  it("keeps a run that touches the backups shut without the operator's approval, even with a passed doorkeeper", () => {
+    const prune = manifest({ steps: [{ name: "prune", run: `echo prune > ${dir}/borgmatic-prune.txt`, timeoutSeconds: 30 }] });
+    const out = run(["start"], request(prune));
+    expect(out.code).toBe(77);
+    expect(out.stderr).toContain("touches the backups");
+    expect(existsSync(path.join(dir, "runs", "job-1"))).toBe(false);
+    expect(existsSync(path.join(dir, "units.log"))).toBe(false);
+  });
+
+  it("opens a run that touches the backups for the operator's approval", () => {
+    const prune = manifest({ steps: [{ name: "status", run: `echo keep_daily: 1 > ${dir}/borgmatic-retention.txt`, timeoutSeconds: 30 }],
+      checks: [{ name: "written", run: `test -f ${dir}/borgmatic-retention.txt`, timeoutSeconds: 30 }] });
+    expect(run(["start"], request(prune, { gatePassed: undefined, operatorApproved: true })).code).toBe(0);
+    expect(status().state.status).toBe("success");
+  });
+
+  it("asks the backup bolt again when a run continues after the boot", () => {
+    // A request.json that lost its approval (or was forged) does not continue.
+    const prune = manifest({ steps: [{ name: "reboot", reboot: true }, { name: "delete", run: `echo delete > ${dir}/borg-delete.txt`, timeoutSeconds: 30 }] });
+    expect(run(["start"], request(prune, { gatePassed: undefined, operatorApproved: true })).code).toBe(0);
+    expect(status().state.phase).toBe("rebooting");
+    const file = path.join(dir, "runs", "job-1", "request.json");
+    const stored = JSON.parse(readFileSync(file, "utf8"));
+    const { digest: _digest, ...unsigned } = { ...stored.envelope, operatorApproved: undefined, gatePassed: true };
+    stored.envelope = { ...unsigned, digest: createHmac("sha256", SECRET).update(JSON.stringify(unsigned)).digest("hex") };
+    writeFileSync(file, JSON.stringify(stored));
+    writeFileSync(path.join(dir, "boot_id"), "boot-b\n");
+    run(["resume"]);
+    expect(status().state.status).not.toBe("success");
   });
 
   it("refuses a manifest changed after signing", () => {

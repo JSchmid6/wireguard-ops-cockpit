@@ -53,19 +53,21 @@ function config(dir: string, overrides: Partial<AppConfig>): AppConfig {
   };
 }
 
-// The 30.09. case (/etc/apt with *.save and ~ files) plus a borg repair line:
-// both used to stop by rule; here only the doorkeeper decides.
+// The 30.09. case (/etc/apt with *.save and ~ files): it used to stop by rule;
+// here only the doorkeeper decides.
 const hostRun = {
   version: "cockpit-host-run/v1", name: "apt maintenance", purpose: "update packages from the configured sources", mutates: true,
   steps: [
     { name: "sources", run: "ls -l /etc/apt/sources.list.save /etc/apt/trusted.gpg~" },
     { name: "upgrade", run: "apt-get update && apt-get -y upgrade" },
-    { name: "repair", run: "/usr/local/sbin/cockpit-borg-action repair" },
   ],
   checks: [{ name: "nothing pending", run: "test -z \"$(apt list --upgradable 2>/dev/null | tail -n +2)\"" }],
   rollback: ["downgrade the upgraded packages to the versions in /var/log/apt/history.log"],
   risk: ["contained"],
 };
+// Plus a borg repair: a repair can delete archives, so the backup bolt sends
+// it to the operator whatever the doorkeeper says.
+const hostRunWithRepair = { ...hostRun, steps: [...hostRun.steps, { name: "repair", run: "/usr/local/sbin/cockpit-borg-action repair" }] };
 const planWith = (...manifests: Array<{ version: string }>) => [
   ...manifests.map((manifest) => "```" + (manifest.version.startsWith("cockpit-capability") ? "capability" : "host-run") + "\n" + JSON.stringify(manifest) + "\n```"),
   "## Intent", "Keep the host's packages current.",
@@ -135,7 +137,7 @@ describe("host door through the API", () => {
   });
 
   it("sends an evidenced finding to the operator, and runs exactly that plan after approval", async () => {
-    const flow = await setup({ plan: planWith(hostRun), doorkeeper: [
+    const flow = await setup({ plan: planWith(hostRunWithRepair), doorkeeper: [
       "VERDICT: flag",
       "FINDING: borg repair without the operator",
       "CLASS: X4",
@@ -159,6 +161,30 @@ describe("host door through the API", () => {
     expect(start.payload.envelope.gatePassed).toBeUndefined();
     expect(start.payload.envelope).toMatchObject({ operatorApproved: true, manifestHash: (job.output?.envelope as Record<string, unknown>).manifestHash });
     expect(start.payload.manifest).toEqual(job.output?.hostRun);
+  });
+
+  it("keeps a run that deletes backups for the operator although the doorkeeper passed it", async () => {
+    const prune = { ...hostRun, name: "free space", purpose: "free space on Lab0", steps: [
+      { name: "space", run: "df -h /" },
+      { name: "delete", run: "borg delete --glob-archives 'vmd61162-2025-*' ssh://borg@10.0.0.5/media/RAID/backup_VServer/borg" },
+    ] };
+    const flow = await setup({ plan: planWith(prune), doorkeeper: "VERDICT: pass\nNOTES: the operator asked for it" });
+    const job = await flow.submit();
+
+    expect(job.status).toBe("blocked_user_approval");
+    const policy = job.output?.policy as { reason: string; evidence: string[] };
+    expect(policy.reason).toContain("touches the backups");
+    expect(policy.evidence.join("\n")).toContain("BACKUP [backup] S2:L1");
+    expect((job.output?.envelope as Record<string, unknown>).gatePassed).toBeUndefined();
+    expect(flow.doorkeeperPrompts[0]).toContain("[backup-approval:backup]");
+    expect(flow.executorCalls.some((call) => call.payload.action === "host.run")).toBe(false);
+
+    const approved = await flow.app.inject({ method: "POST", url: `/api/hermes/jobs/${job.id}/approval`, headers: { cookie: flow.cookie }, payload: { decision: "approved" } });
+    expect(approved.statusCode).toBe(202);
+    expect((await flow.settled(job.id)).status).toBe("completed");
+    const start = flow.executorCalls.find((call) => call.payload.action === "host.run")!;
+    expect(start.payload.envelope).toMatchObject({ operatorApproved: true });
+    expect(start.payload.envelope.gatePassed).toBeUndefined();
   });
 
   it("stops without an approval offer when the doorkeeper flags without evidence", async () => {
