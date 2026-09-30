@@ -288,17 +288,24 @@ export function materialOrder(sections: UpdateDiffSection[]): UpdateDiffSection[
 // Deploy material the excerpt does not cover completely, whether cut, left out,
 // or never emitted as a section by the runner. Each such file is a
 // deterministic stop (like an incomplete focus area): a root installer the
-// reviewer could not read is never approved silently.
+// reviewer could not read is never approved silently. The runner caps its file
+// list, so its omitted and partial lists are read too.
 function deployGaps(diff: UpdateDiff, complete: Set<string>): string[] {
-  return diff.files
-    .map((file) => file.path)
-    .filter((path) => DEPLOY_MATERIAL.test(path) && !complete.has(path));
+  const paths = [...diff.files.map((file) => file.path), ...diff.omittedFiles, ...diff.partialFiles];
+  return [...new Set(paths)].filter((path) => DEPLOY_MATERIAL.test(path) && !complete.has(path));
 }
 
-// The gaps that are not already named as cut: reported as left out, so the
-// reviewer sees them in the state line instead of assuming a complete material.
-function namedDeployGaps(diff: UpdateDiff, complete: Set<string>, cut: string[]): string[] {
-  return deployGaps(diff, complete).filter((path) => !cut.includes(path));
+// When the runner listed fewer files than changed, deploy material may hide in
+// the unlisted rest: that is a stop as well (fail closed), named as one entry.
+function unlistedDeployGap(diff: UpdateDiff): string[] {
+  const unlisted = diff.filesTotal - diff.files.length;
+  return unlisted > 0 ? [`(${unlisted} changed file(s) not listed by the runner; deploy material not determinable)`] : [];
+}
+
+// The gaps that are neither cut nor shown: reported as left out, so the reviewer
+// sees them in the state line instead of assuming a complete material.
+function namedDeployGaps(diff: UpdateDiff, complete: Set<string>, cut: string[], shown: Set<string>): string[] {
+  return deployGaps(diff, complete).filter((path) => !cut.includes(path) && !shown.has(path));
 }
 
 function bytes(text: string): number {
@@ -394,10 +401,10 @@ export function buildUpdateReviewPrompt(diffs: UpdateDiff[], options: { nonce?: 
         omitted.push(section.path);
       }
     }
-    const incomplete = [...new Set([...[...focusFiles(diff)].filter((file) => !complete.has(file)), ...deployGaps(diff, complete)])].sort();
+    const incomplete = [...new Set([...[...focusFiles(diff)].filter((file) => !complete.has(file)), ...deployGaps(diff, complete), ...unlistedDeployGap(diff)])].sort();
     // cut: partially in the prompt (by the runner or here); omitted: not at all.
     const cutFiles = [...new Set([...diff.partialFiles.filter((file) => shown.has(file)), ...cut])];
-    const omittedFiles = [...new Set([...omitted, ...namedDeployGaps(diff, complete, cutFiles)])];
+    const omittedFiles = [...new Set([...omitted, ...namedDeployGaps(diff, complete, cutFiles, shown)])];
     coverage.push({ sha: diff.sha, incomplete, cut: cutFiles, omitted: omittedFiles });
     const excerpt = included.join("");
     const state = cutFiles.length || omittedFiles.length

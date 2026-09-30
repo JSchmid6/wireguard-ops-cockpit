@@ -226,6 +226,19 @@ describe("self-update pre-install review", () => {
     expect(policy.evidence.join("\n")).toContain("not fully reviewed (0123456789ab): deploy/vps/vps-cockpit-deploy.sh");
   });
 
+  it("stops when the runner's capped file list hides deploy material", () => {
+    // Only in the runner's omitted list, not in its (capped) file list.
+    const omittedOnly = buildUpdateReviewPrompt([diff({ omittedFiles: ["deploy/vps/vps-cockpit-deploy.sh"] })], { nonce: NONCE });
+    expect(omittedOnly.coverage[0].incomplete).toEqual(["deploy/vps/vps-cockpit-deploy.sh"]);
+    // Not named anywhere: more files changed than listed, so deploy material cannot be ruled out.
+    const unlisted = buildUpdateReviewPrompt([diff({ filesTotal: 2003 })], { nonce: NONCE });
+    expect(unlisted.coverage[0].incomplete).toEqual(["(2001 changed file(s) not listed by the runner; deploy material not determinable)"]);
+    for (const { coverage } of [omittedOnly, unlisted]) {
+      const policy = applyUpdateReviewPolicy(readyPolicy, outcome({ coverage, answer: parseUpdateReviewAnswer("VERDICT: approve") }));
+      expect(policy).toMatchObject({ allowed: false, zone: "red", status: "blocked_user_approval" });
+    }
+  });
+
   it("parses approve, flag and garbage deterministically", () => {
     expect(parseUpdateReviewAnswer("Some preamble\nVERDICT: approve\nNOTES: fine refactor")).toEqual({ verdict: "approve", findings: [], notes: "fine refactor", problem: null });
     const flagged = parseUpdateReviewAnswer([
