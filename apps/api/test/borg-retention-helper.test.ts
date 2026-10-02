@@ -4,12 +4,16 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Harness für den Aufräum-Dienst (deploy/helpers/cockpit-borg-retention.mjs).
 // Der Helfer läuft echt (gleiches Node); borg und systemctl sind Stubs, die ihre
 // Aufrufe mitschreiben. Der borg-Stub hält das Repo als JSON-Datei: Archive mit
 // id, Name und Zeit; prune behält die jüngsten keep_daily Archive.
+
+// Jeder Fall startet den Helfer mehrmals als eigenen Node-Prozess (je ~0,5 s,
+// unter Coverage mehr); die 5 s Vorgabe reichen dafür nicht.
+vi.setConfig({ testTimeout: 60_000 });
 
 const HELPER = fileURLToPath(new URL("../../../deploy/helpers/cockpit-borg-retention.mjs", import.meta.url));
 
@@ -214,6 +218,11 @@ describe("cockpit-borg-retention: the service run", () => {
     expect(out.code, out.stderr).toBe(0);
     expect(lastRun()).toMatchObject({ result: "ok", compacted: false });
     expect(lastRun().compactSkipped).toMatch(/repository busy right before compact/);
+    // Zweimal in Folge ist ein Fehler, kein grüner Lauf.
+    const again = serviceRun();
+    expect(again.code).toBe(1);
+    expect(lastRun()).toMatchObject({ result: "fehler", compacted: false });
+    expect(lastRun().note).toMatch(/two runs in a row/);
   });
 
   it("halts and says so when an archive vanished while compacting", () => {

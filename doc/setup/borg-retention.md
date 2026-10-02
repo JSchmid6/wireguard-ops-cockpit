@@ -35,7 +35,8 @@ list und prune warten bis zu einer Stunde auf die Repo-Sperre (`--lock-wait 3600
 das Backup noch, wartet der Dienst, statt zu scheitern. `compact` wartet nicht: hält jemand
 die Sperre zwischen der letzten Prüfung und compact (etwa ein Löschversuch vom VPS), wird an
 diesem Tag nicht kompaktiert (`compactSkipped`), statt nach dem Warten eine ungeprüfte
-Löschung endgültig zu machen. Der Lauf hat `Nice=10` und
+Löschung endgültig zu machen. Passiert das zwei Läufe in Folge (etwa eine verwaiste Sperre),
+endet der Lauf als Fehler. Der Lauf hat `Nice=10` und
 `IOSchedulingClass=idle`.
 
 Die Passphrase liest der Dienst aus `/etc/cockpit-borg-retention/passphrase` (root, 0600).
@@ -116,7 +117,8 @@ frei sind nur `/usr/local/sbin/cockpit-borg-retention status|run`, `set D W M HH
 der Grenzen und `systemctl start cockpit-borg-retention.service`. Alles andere, was den Dienst
 oder seine Dateien berührt, ist ein Treffer und wartet auf Jochen — auch Drop-ins, die systemd
 ohne „borg“ im Namen auf seine Units anwendet (`cockpit-.service.d`, `cockpit-.timer.d`,
-`service.d`, `timer.d` in `/etc`, `/run` und `/usr/lib/systemd/system`). Der Helfer über
+`service.d`, `timer.d` in `/etc`, `/run` und `/usr/lib/systemd/system`), systemd-Generatoren
+(`system-generators`, `/run/systemd/generator*`) und `system.attached`. Der Helfer über
 `node …mjs` statt über seinen sbin-Namen ist ebenfalls ein Treffer.
 
 Die Prüf-Haken des Helfers (`BORG_RETENTION_*`, nur für die Tests) wirken nur außerhalb des

@@ -412,6 +412,12 @@ export function runService() {
       } catch (error) {
         if (!/lock/i.test(error.message)) throw error;
         record.compactSkipped = clip(`repository busy right before compact, not compacted today: ${error.message}`);
+        // Einmal ist Zufall; zweimal in Folge (etwa eine verwaiste Sperre) ist ein
+        // Fehler, sonst füllt sich das RAID unter grünen Läufen.
+        const previous = readLines(RUNS_FILE, 1)[0];
+        if (typeof previous?.compactSkipped === "string" && previous.compactSkipped.startsWith("repository busy")) {
+          throw new Stop(1, "compact skipped on two runs in a row: the repository lock does not come free (stale lock?)");
+        }
       }
       // Und hinterher noch einmal nachsehen: fehlt jetzt etwas, ist es zu spät
       // für dieses Archiv — der Dienst hält trotzdem an und sagt es.

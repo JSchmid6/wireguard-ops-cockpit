@@ -138,6 +138,8 @@ const needsApproval: Array<[string, string]> = [
   ["prefix drop-in switches the timer off", "mkdir -p /etc/systemd/system/cockpit-.timer.d\nprintf '[Unit]\\nConditionPathExists=/nie\\n' > /etc/systemd/system/cockpit-.timer.d/aus.conf\nsystemctl daemon-reload"],
   ["prefix drop-in changes the service", "cat > /etc/systemd/system/cockpit-.service.d/z.conf <<'EOF'\n[Service]\nExecStart=\nExecStart=/bin/true\nEOF"],
   ["global drop-in in /run", "tee /run/systemd/system/timer.d/x.conf <<'EOF'\n[Timer]\nOnCalendar=\nEOF"],
+  ["generator writes a prefix drop-in", "cat > /usr/local/lib/systemd/system-generators/x <<'EOF'\n#!/bin/sh\nmkdir -p \"$1/cockpit-.timer.d\"\nEOF\nchmod +x /usr/local/lib/systemd/system-generators/x\nsystemctl daemon-reload"],
+  ["portable unit attached", "cp /tmp/x.conf /etc/systemd/system.attached/x.conf"],
   ["unit overridden in /run", "cp /tmp/x.timer /run/systemd/system/cockpit-borg-retention.timer"],
 ];
 

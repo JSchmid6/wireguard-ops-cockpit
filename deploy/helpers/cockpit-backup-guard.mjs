@@ -63,6 +63,12 @@ const PROTECTED = [
   // in jedem Unit-Verzeichnis. Darüber ließe sich der Dienst sonst still abschalten.
   ...["/etc/systemd/system", "/etc/systemd/system.control", "/run/systemd/system", "/run/systemd/system.control", "/run/systemd/transient", "/usr/local/lib/systemd/system", "/usr/lib/systemd/system", "/lib/systemd/system"]
     .flatMap((dir) => ["cockpit-.service.d", "cockpit-.timer.d", "service.d", "timer.d"].map((name) => `${dir}/${name}`)),
+  // Generatoren schreiben solche Drop-ins beim daemon-reload selbst; portable
+  // Units hängen sich über system.attached ein.
+  "/etc/systemd/system-generators", "/usr/local/lib/systemd/system-generators", "/usr/lib/systemd/system-generators",
+  "/lib/systemd/system-generators", "/run/systemd/system-generators",
+  "/run/systemd/generator", "/run/systemd/generator.early", "/run/systemd/generator.late",
+  "/etc/systemd/system.attached", "/run/systemd/system.attached",
 ];
 const UNITS = ["borgmatic.timer", "borgmatic.service", "timers.target", "cockpit-borg-retention.timer", "cockpit-borg-retention.service"];
 const ANCESTORS = [...new Set(PROTECTED.flatMap((item) => {
