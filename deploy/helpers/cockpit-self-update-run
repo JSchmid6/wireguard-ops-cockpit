@@ -14,7 +14,7 @@
 #           merged checks as deploy; base = the deployed commit (state.json,
 #           else HEAD). Emits one JSON object: base, sha, files, stat,
 #           diffSha256 (sha256 of the full `git diff base sha` bytes),
-#           focusAreas (where the new code touches the guarantees G1-G8; they
+#           focusAreas (where the new code touches the guarantees G1-G10; they
 #           steer the independent reviewer and never stop a job themselves)
 #           and a bounded excerpt (per-file diff sections, focus areas
 #           first; `truncated`, partial/omitted files named). The
@@ -85,7 +85,7 @@ SHA_RE = re.compile(r"^[a-f0-9]{40}$")
 REVIEWED_TARGET_RE = re.compile(r"^([a-f0-9]{40})-([a-f0-9]{64})$")
 
 # Pre-install review classification (see cmd_diff). The running (old) code
-# marks where the new code touches the host's guarantees (G1-G8 of the review
+# marks where the new code touches the host's guarantees (G1-G10 of the review
 # prompt, apps/api/src/update-review-prompt.ts). Focus areas only steer the
 # independent reviewer; they never stop a job by themselves.
 UPDATE_MECHANISM_FILES = (
@@ -107,6 +107,15 @@ SIGNING_FUNCTIONS = {
 AUTH_PATH_RE = re.compile(r"auth|token|secret|credential|password", re.I)
 CI_PATH_RE = re.compile(r"^(?:\.github/|\.gitlab/|\.gitlab-ci\.yml$)")
 TEST_PATH_RE = re.compile(r"(?:^|/)tests?/|\.(?:test|spec)\.[A-Za-z0-9]+$")
+# The general door (doc/setup/host-run.md): lock check in the root helper,
+# doorkeeper, backup bolt and its bounds, safety net, resume after a reboot.
+HOST_DOOR_FILES = (
+    "apps/api/src/host-run.ts",
+    "deploy/helpers/cockpit-host-run",
+    "deploy/helpers/cockpit-backup-guard.mjs",
+    "deploy/helpers/cockpit-borg-retention-rules.mjs",
+    "deploy/systemd/wireguard-ops-cockpit-host-run-resume.service",
+)
 # File-level focus: (kind, guarantees, reason, matcher).
 FILE_AREAS = (
     ("approval-and-auth", ("G1", "G6"), "sign-in, bearer-token scopes, the approval route, configuration and secrets",
@@ -116,6 +125,8 @@ FILE_AREAS = (
      lambda path: path.startswith(("apps/executor-broker/", "apps/agent-broker/")) or path in (
          "apps/api/src/executor-broker.ts", "apps/api/src/agent-broker.ts", "apps/api/src/hermes-security.ts",
          "apps/api/src/safety-review.ts")),
+    ("host-door", ("G2", "G5", "G6", "G9", "G10"), "the general door host.run: lock check, doorkeeper, backup bolt, safety net, log redaction",
+     lambda path: path in HOST_DOOR_FILES),
     ("capability-sandbox", ("G5",), "dynamic capability sandbox and protected paths",
      lambda path: path in ("deploy/helpers/cockpit-capability-action", "apps/api/src/capability-manifest.ts")),
     ("root-helpers", ("G4", "G5"), "root helpers, systemd units and sudoers sources",
