@@ -32,6 +32,11 @@ const free: Array<[string, string]> = [
   ["kernel headers", "kernel=$(uname -r)\napt-get install -y linux-headers-$kernel"],
   ["output in quotes", "printf '\\033[1;32mgreen\\033[0m done\\n'\nfor i in $(seq 1 5); do echo line-$i; done"],
   ["own script", "cat > /usr/local/bin/x.sh <<'EOF'\n#!/bin/bash\nsystemctl restart apache2\nEOF\nchmod +x /usr/local/bin/x.sh\n/usr/local/bin/x.sh"],
+  // Der Aufräum-Dienst auf Lab0 (doc/setup/borg-retention.md): seine Routine ist frei.
+  ["retention service status and run", "/usr/local/sbin/cockpit-borg-retention status\n/usr/local/sbin/cockpit-borg-retention run\nsystemctl start cockpit-borg-retention.service"],
+  ["retention set inside the bounds", "/usr/local/sbin/cockpit-borg-retention set 7 4 6 06:30"],
+  ["retention set at the bounds", "cockpit-borg-retention set 3 2 0 04:00\ncockpit-borg-retention set 30 12 24 22:00"],
+  ["retention service read", "systemctl status cockpit-borg-retention.timer\njournalctl -u cockpit-borg-retention.service -n 50\ncat /var/lib/cockpit-borg-retention/laeufe.jsonl"],
 ];
 
 // Jede Form aus dem Auftrag, und Umwege, die der Text verdeckt.
@@ -113,6 +118,29 @@ const needsApproval: Array<[string, string]> = [
   ["PATH", "export PATH=/tmp/evil:$PATH; ls"],
   ["find -delete", "find /etc -name 'b*' -delete"],
   ["write target from a substitution", "printf 'keep_daily: 0\\n' > $(echo /etc/borg)matic/config.yaml"],
+  // Aufräum-Dienst: alles jenseits seiner Routine wartet auf Jochen.
+  ["retention below the minimum", "/usr/local/sbin/cockpit-borg-retention set 2 2 0 06:00"],
+  ["retention below the minimum with the approval flag", "cockpit-borg-retention set 1 0 0 06:00 --freigabe"],
+  ["retention above the upper limit", "cockpit-borg-retention set 31 2 0 06:00"],
+  ["retention time outside the window", "cockpit-borg-retention set 3 2 0 01:00"],
+  ["resume after an anomaly", "cockpit-borg-retention freigeben 0123456789abcdef"],
+  ["service run outside its unit", "cockpit-borg-retention --im-dienst"],
+  ["retention helper through node", "/opt/node-v20.19.1-linux-x64/bin/node /usr/local/lib/wireguard-ops-cockpit/cockpit-borg-retention.mjs set 7 4 6 06:00"],
+  ["retention timer stopped", "systemctl stop cockpit-borg-retention.timer"],
+  ["retention timer disabled", "systemctl disable --now cockpit-borg-retention.timer"],
+  ["retention service masked", "systemctl mask cockpit-borg-retention.service"],
+  ["retention timer drop-in", "cat > /etc/systemd/system/cockpit-borg-retention.timer.d/x.conf <<'EOF'\n[Timer]\nOnCalendar=\nEOF"],
+  ["retention settings edited", "echo '{\"keepDaily\":1}' > /etc/cockpit-borg-retention/aufbewahrung.json"],
+  ["retention baseline removed", "rm -f /var/lib/cockpit-borg-retention/zustand.json"],
+  ["retention rules replaced", "cp /tmp/rules.mjs /usr/local/lib/wireguard-ops-cockpit/cockpit-borg-retention-rules.mjs"],
+  ["prune as the repo owner", "sudo -u borg borg prune --keep-daily 3 --keep-weekly 2 /media/RAID/backup_VServer/borg"],
+  ["compact by hand", "runuser -u borg -- borg compact /media/RAID/backup_VServer/borg"],
+  ["prefix drop-in switches the timer off", "mkdir -p /etc/systemd/system/cockpit-.timer.d\nprintf '[Unit]\\nConditionPathExists=/nie\\n' > /etc/systemd/system/cockpit-.timer.d/aus.conf\nsystemctl daemon-reload"],
+  ["prefix drop-in changes the service", "cat > /etc/systemd/system/cockpit-.service.d/z.conf <<'EOF'\n[Service]\nExecStart=\nExecStart=/bin/true\nEOF"],
+  ["global drop-in in /run", "tee /run/systemd/system/timer.d/x.conf <<'EOF'\n[Timer]\nOnCalendar=\nEOF"],
+  ["generator writes a prefix drop-in", "cat > /usr/local/lib/systemd/system-generators/x <<'EOF'\n#!/bin/sh\nmkdir -p \"$1/cockpit-.timer.d\"\nEOF\nchmod +x /usr/local/lib/systemd/system-generators/x\nsystemctl daemon-reload"],
+  ["portable unit attached", "cp /tmp/x.conf /etc/systemd/system.attached/x.conf"],
+  ["unit overridden in /run", "cp /tmp/x.timer /run/systemd/system/cockpit-borg-retention.timer"],
 ];
 
 describe("backup bolt: the routine and ordinary host work stay free", () => {

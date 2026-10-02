@@ -196,3 +196,31 @@ test("executor broker rejects incomplete host runs and invalid job ids", () => {
     assert.throws(() => validateRequest({ payload, signature: sign(payload) }, validAt), undefined, JSON.stringify(partial));
   }
 });
+
+test("executor broker admits the five pinned borg retention forms", () => {
+  for (const [action, target] of [
+    ["borg.retention.status", "state"], ["borg.retention.run", "state"],
+    ["borg.retention.set", "7-4-6-06:00"], ["borg.retention.set-approved", "1-0-0-22:00"],
+    ["borg.retention.resume", "0123456789abcdef"],
+  ]) {
+    const payload = { ...borgBase, action, target };
+    assert.deepEqual(validateRequest({ payload, signature: sign(payload) }, validAt), payload);
+  }
+});
+
+test("executor broker rejects borg retention forms outside the pins", () => {
+  for (const partial of [
+    { action: "borg.retention.status", target: "repo" },
+    { action: "borg.retention.run", target: "--im-dienst" },
+    { action: "borg.retention.set", target: "7 4 6 06:00" },
+    { action: "borg.retention.set", target: "7-4-6-06:00 --freigabe" },
+    { action: "borg.retention.set", target: "7-4-6-24:00" },
+    { action: "borg.retention.set-approved", target: "-1-0-0-06:00" },
+    { action: "borg.retention.resume", target: "0123456789ABCDEF" },
+    { action: "borg.retention.resume", target: "0123456789abcdef0" },
+    { action: "borg.retention.prune", target: "state" },
+  ]) {
+    const payload = { ...borgBase, ...partial };
+    assert.throws(() => validateRequest({ payload, signature: sign(payload) }, validAt), undefined, JSON.stringify(partial));
+  }
+});

@@ -171,6 +171,16 @@ Helfers) und jedes `cd`-Ziel aufgelöst.
 `grep`, `test`, und `curl` ohne Upload an die Statusdatei auf Lab0. Werte aus `date`, `uname`,
 `seq`, `mktemp` und gewöhnliche Paketpflege lösen nichts aus.
 
+**Aufräum-Dienst auf Lab0** (`doc/setup/borg-retention.md`): frei ist seine Routine —
+`/usr/local/sbin/cockpit-borg-retention status|run`, `set <d> <w> <m> <HH:MM>` innerhalb der festen
+Grenzen (`deploy/helpers/cockpit-borg-retention-rules.mjs`, dieselbe Datei wie in API und Helfer)
+und `systemctl start cockpit-borg-retention.service`. Freigabe braucht: `set` unter der Untergrenze
+oder mit `--freigabe`, `freigeben` (Fortsetzen nach einer Anomalie), jede andere Form des Helfers,
+`systemctl stop|disable|mask|edit` an seinem Timer oder seiner Unit, und jedes Schreiben in
+`/etc/cockpit-borg-retention`, `/var/lib/cockpit-borg-retention`, seine Units samt `.d`-Verzeichnissen,
+die Drop-ins, die systemd ohne „borg“ im Namen auf sie anwendet (`cockpit-.service.d`,
+`cockpit-.timer.d`, `service.d`, `timer.d` in `/etc`, `/run`, `/usr/lib/systemd/system`), und seinen Code. Der Riegel heißt seitdem `cockpit-backup-guard/v2`.
+
 Ehrliche Grenze: Programme, die schon auf dem Host liegen und über ihren Namen oder aus den
 System-Verzeichnissen (`/usr`, `/opt/gitlab`) aufgerufen werden, nimmt der Riegel für das, was ihr
 Name sagt; ihren Inhalt sieht er nicht. Ein Interpreter-Programm ohne die genannten Primitive

@@ -286,3 +286,55 @@ small {
   color: #94a3b8;
   font-size: 0.85rem;
 }
+
+/* Backup-Aufbewahrung (RetentionPanel.tsx). */
+.retention-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 0.75rem;
+}
+
+.retention-form label {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.retention-form input[type="number"] {
+  width: 5rem;
+}
+
+.retention-approval {
+  display: grid;
+  gap: 0.5rem;
+  width: 100%;
+}
+
+.retention-status-ok {
+  color: #6ee7b7;
+}
+
+.retention-status-angehalten {
+  color: #fda4af;
+}
+
+.retention-status-neu,
+.retention-status-unknown {
+  color: #fcd34d;
+}
+
+.retention-archives {
+  font-size: 0.85rem;
+  max-height: 12rem;
+  overflow: auto;
+}
+
+.retention-runs {
+  width: 100%;
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.retention-runs th {
+  text-align: left;
+}

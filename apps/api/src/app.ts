@@ -44,6 +44,7 @@ import { generateRunbookSafetyReview, type SafetyReviewRunner } from "./safety-r
 import { runBrokerAgent } from "./agent-broker.js";
 import { runDynamicCapability, runExecutorAction, type ExecutorActionKind } from "./executor-broker.js";
 import { borgStatusRequestDigest, createBorgStatusService } from "./borg-status.js";
+import { createRetentionService, decideRetentionChange, readApproval, retentionRequestDigest, retentionTarget } from "./borg-retention.js";
 import {
   capabilityManifestHash, capabilityNeedsOperatorApproval, capabilityPlannerContract,
   parseCapabilityManifest, readablePathsNeedingApproval, type CapabilityManifest,
@@ -120,6 +121,9 @@ interface AppOptions {
   // Senke für die Zeile je gestarteter Borg-Messung. Vorgabe ist stdout (das
   // Journal der API); Tests fangen die Zeile damit ab.
   borgStatusLog?: (line: string) => void;
+  // Der Aufräum-Dienst auf Lab0 (`borg.retention.*`, doc/setup/borg-retention.md).
+  // Vorgabe ist der typisierte Executor-Weg; Tests geben die Helfer-Ausgabe vor.
+  borgRetentionRunner?: (action: string, target: string) => Promise<string>;
 }
 
 interface LoginAttemptState {
@@ -740,6 +744,21 @@ export async function createApp(options: AppOptions = {}) {
         ...payload,
         envelopeDigest: borgStatusRequestDigest(payload),
       }, BORG_EXECUTOR_TIMEOUT_MS);
+    }),
+  });
+  // Backup-Aufbewahrung (Aufräum-Dienst auf Lab0): Zustand lesen und Einstellung
+  // ändern, beides über den Executor. Die Grenzen prüfen API und Helfer.
+  const borgRetention = createRetentionService({
+    run: options.borgRetentionRunner || (async (action, target) => {
+      if (!config.executorBrokerSocket || !config.executorBrokerSecret) {
+        throw new Error("executor broker is not configured");
+      }
+      const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+      const payload = { action: action as ExecutorActionKind, target, expiresAt };
+      return await runExecutorAction(config.executorBrokerSocket, config.executorBrokerSecret, {
+        ...payload,
+        envelopeDigest: retentionRequestDigest(payload),
+      });
     }),
   });
   const terminalSigningSecret = Buffer.from(config.terminalSigningSecret, "utf8");
@@ -1546,6 +1565,86 @@ export async function createApp(options: AppOptions = {}) {
     const actor = await requireActor(request, reply, database);
     if (!actor) return;
     return await borgStatus.measure({ force: true, waitMs: BORG_STATUS_REQUEST_WAIT_MS });
+  });
+
+  // Backup-Aufbewahrung (doc/setup/borg-retention.md). Lesen und der Dienstlauf
+  // sind frei; eine Einstellung innerhalb der Grenzen auch (mit Audit). Unter der
+  // Untergrenze und das Fortsetzen nach einer Anomalie nur mit Jochens Freigabe:
+  // Admin-Sitzung, ausdrücklich bestätigt, mit Grund.
+  app.get("/api/borg/retention", async (request, reply) => {
+    const actor = await requireActor(request, reply, database);
+    if (!actor) return;
+    return await borgRetention.view();
+  });
+
+  app.put("/api/borg/retention", async (request, reply) => {
+    const actor = await requireActor(request, reply, database);
+    if (!actor) return;
+    const body = (request.body || {}) as Record<string, unknown>;
+    const approval = readApproval(actor.role, body);
+    if (approval.problem) {
+      database.createAudit({ actorId: actor.id, action: "borg.retention.approval_refused", targetType: "borg-retention", targetId: "lab0", details: { requested: body, problem: approval.problem } });
+      return reply.code(403).send({ message: approval.problem });
+    }
+    const decision = decideRetentionChange(body, approval);
+    if (decision.kind === "refused") {
+      return reply.code(400).send({ message: `retention outside the fixed bounds: ${decision.errors.join("; ")}`, errors: decision.errors });
+    }
+    if (decision.kind === "needs-approval") {
+      database.createAudit({ actorId: actor.id, action: "borg.retention.approval_needed", targetType: "borg-retention", targetId: "lab0", details: { requested: body, reasons: decision.reasons } });
+      return reply.code(409).send({ message: `below the minimum, needs Jochen's approval: ${decision.reasons.join("; ")}`, needsApproval: true, reasons: decision.reasons });
+    }
+    let output: string;
+    try {
+      output = await borgRetention.change(decision.approved ? "borg.retention.set-approved" : "borg.retention.set", retentionTarget(decision.settings));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      database.createAudit({ actorId: actor.id, action: "borg.retention.change_failed", targetType: "borg-retention", targetId: "lab0", details: { requested: decision.settings, error: message.slice(0, 500) } });
+      return reply.code(502).send({ message: `the retention helper refused or failed: ${message.slice(0, 300)}` });
+    }
+    let previous: unknown = null;
+    try { previous = (JSON.parse(output.trim().split("\n").pop() || "{}") as { vorher?: unknown }).vorher ?? null; } catch { previous = null; }
+    database.createAudit({
+      actorId: actor.id,
+      action: decision.approved ? "borg.retention.changed_with_approval" : "borg.retention.changed",
+      targetType: "borg-retention",
+      targetId: "lab0",
+      details: { previous, next: decision.settings, ...(decision.approved ? { belowMinimum: decision.belowMinimum, approvalReason: approval.reason } : {}) },
+    });
+    return await borgRetention.view(true);
+  });
+
+  app.post("/api/borg/retention/run", async (request, reply) => {
+    const actor = await requireActor(request, reply, database);
+    if (!actor) return;
+    try {
+      await borgRetention.change("borg.retention.run", "state");
+    } catch (error) {
+      return reply.code(502).send({ message: `the service could not be started: ${(error instanceof Error ? error.message : String(error)).slice(0, 300)}` });
+    }
+    database.createAudit({ actorId: actor.id, action: "borg.retention.run_requested", targetType: "borg-retention", targetId: "lab0", details: {} });
+    return await borgRetention.view(true);
+  });
+
+  app.post("/api/borg/retention/resume", async (request, reply) => {
+    const actor = await requireActor(request, reply, database);
+    if (!actor) return;
+    const body = (request.body || {}) as { anomalyId?: unknown };
+    const approval = readApproval(actor.role, body);
+    if (!approval.valid) {
+      database.createAudit({ actorId: actor.id, action: "borg.retention.approval_refused", targetType: "borg-retention", targetId: "lab0", details: { resume: body.anomalyId ?? null, problem: approval.problem || "approval missing" } });
+      return reply.code(actor.role === "admin" ? 400 : 403).send({ message: approval.problem || "resuming after an anomaly needs Jochen's approval (confirmed, with a reason)" });
+    }
+    if (typeof body.anomalyId !== "string" || !/^[a-f0-9]{16}$/.test(body.anomalyId)) {
+      return reply.code(400).send({ message: "anomalyId must name the anomaly shown in the cockpit" });
+    }
+    try {
+      await borgRetention.change("borg.retention.resume", body.anomalyId);
+    } catch (error) {
+      return reply.code(409).send({ message: `the helper did not resume: ${(error instanceof Error ? error.message : String(error)).slice(0, 300)}` });
+    }
+    database.createAudit({ actorId: actor.id, action: "borg.retention.resumed", targetType: "borg-retention", targetId: "lab0", details: { anomalyId: body.anomalyId, approvalReason: approval.reason } });
+    return await borgRetention.view(true);
   });
 
   app.post("/api/research", async (request, reply) => {

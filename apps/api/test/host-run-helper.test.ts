@@ -16,6 +16,8 @@ import { hostRunManifestHash, parseHostRunManifest } from "../src/host-run.js";
 
 const HELPER = fileURLToPath(new URL("../../../deploy/helpers/cockpit-host-run", import.meta.url));
 const GUARD = fileURLToPath(new URL("../../../deploy/helpers/cockpit-backup-guard.mjs", import.meta.url));
+// Der Riegel importiert die Grenzen des Aufräum-Diensts; installiert liegen beide nebeneinander.
+const RETENTION_RULES = fileURLToPath(new URL("../../../deploy/helpers/cockpit-borg-retention-rules.mjs", import.meta.url));
 const SECRET = "test-envelope-secret-0123456789";
 const HOSTER_SECRET = "hoster-client-secret-abcdef";
 
@@ -86,6 +88,7 @@ beforeEach(() => {
   helper = path.join(dir, "cockpit-host-run.mjs");
   copyFileSync(HELPER, helper);
   copyFileSync(GUARD, path.join(dir, "cockpit-backup-guard.mjs"));
+  copyFileSync(RETENTION_RULES, path.join(dir, "cockpit-borg-retention-rules.mjs"));
   mkdirSync(path.join(dir, "etc"));
   write(path.join(dir, "etc", "api.env"), `COCKPIT_EXECUTION_ENVELOPE_SECRET=${SECRET}\n`, 0o600);
   write(path.join(dir, "etc", "contabo.env"), `CONTABO_CLIENT_SECRET=${HOSTER_SECRET}\n`, 0o600);

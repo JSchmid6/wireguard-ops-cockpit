@@ -1,0 +1,31 @@
+# Aufräum-Dienst des borg-Repos auf Lab0 (doc/setup/borg-retention.md):
+# prune nach der im Cockpit eingestellten Aufbewahrung, danach compact — lokal
+# auf dem Repo-Pfad, nie über borg serve. Fehlen Archive, die er nicht selbst
+# entfernt hat, kompaktiert er nicht und endet mit 3 (Status "angehalten").
+[Unit]
+Description=Borg-Aufbewahrung (Cockpit): prune und compact auf dem Lab0-Repo
+RequiresMountsFor=/media/RAID/backup_VServer/borg
+
+[Service]
+Type=oneshot
+# Das Repo gehört borg:borg (0700); neue Segmente müssen ihm gehören, sonst
+# schreibt das Backup des VPS nicht mehr hinein. Der Helfer prüft das noch einmal.
+User=borg
+Group=borg
+# Die Passphrase liest systemd als root aus der root-only-Datei und reicht sie
+# nur dieser Unit herein ($CREDENTIALS_DIRECTORY/passphrase). Fehlt sie, startet
+# der Lauf nicht.
+LoadCredential=passphrase:/etc/cockpit-borg-retention/passphrase
+Environment=COCKPIT_BORG_RETENTION_IN_UNIT=1
+StateDirectory=cockpit-borg-retention
+StateDirectoryMode=0750
+ExecStart=/opt/node-v20.19.1-linux-x64/bin/node /usr/local/lib/wireguard-ops-cockpit/cockpit-borg-retention.mjs --im-dienst
+# 3 = angehalten (Anomalie): die Unit steht dann auf failed, sichtbar für
+# systemctl --failed und das Cockpit.
+TimeoutStartSec=8h
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full

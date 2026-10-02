@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { formatOutput, request } from "./lib";
 import BorgPanel from "./BorgPanel";
+import RetentionPanel from "./RetentionPanel";
 
 interface UserSummary {
   id: string;
@@ -619,6 +620,10 @@ export default function App() {
           Wert): der letzte borgmatic-Lauf, sein Exit-Status und das Ergebnis des
           Repo-Checks. */}
       <BorgPanel />
+
+      {/* Backup-Aufbewahrung: der Aufräum-Dienst auf Lab0, in festen Grenzen
+          einstellbar (doc/setup/borg-retention.md). */}
+      <RetentionPanel />
 
       <section className="grid two-column">
         <article className="panel">

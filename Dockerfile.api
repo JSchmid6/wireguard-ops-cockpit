@@ -17,7 +17,7 @@ RUN npm ci
 COPY packages/domain/src packages/domain/src
 COPY packages/tmux-adapter/src packages/tmux-adapter/src
 COPY apps/api/src apps/api/src
-COPY deploy/helpers/cockpit-backup-guard.mjs deploy/helpers/cockpit-backup-guard.d.mts deploy/helpers/
+COPY deploy/helpers/cockpit-backup-guard.mjs deploy/helpers/cockpit-backup-guard.d.mts deploy/helpers/cockpit-borg-retention-rules.mjs deploy/helpers/cockpit-borg-retention-rules.d.mts deploy/helpers/
 
 RUN npm run build -w @wireguard-ops-cockpit/domain \
  && npm run build -w @wireguard-ops-cockpit/tmux-adapter \
@@ -37,6 +37,7 @@ COPY --from=build /workspace/packages/tmux-adapter/dist ./packages/tmux-adapter/
 COPY --from=build /workspace/apps/api/package.json ./apps/api/package.json
 COPY --from=build /workspace/apps/api/dist ./apps/api/dist
 COPY --from=build /workspace/deploy/helpers/cockpit-backup-guard.mjs ./deploy/helpers/cockpit-backup-guard.mjs
+COPY --from=build /workspace/deploy/helpers/cockpit-borg-retention-rules.mjs ./deploy/helpers/cockpit-borg-retention-rules.mjs
 
 RUN mkdir -p /data
 

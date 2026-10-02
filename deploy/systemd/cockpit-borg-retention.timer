@@ -1,0 +1,13 @@
+# Täglich nach dem nächtlichen Backup des VPS. Die Uhrzeit stellt das Cockpit
+# ein (Drop-in cockpit-borg-retention.timer.d/uhrzeit.conf, geschrieben von
+# cockpit-borg-retention set); ohne Drop-in gilt die Vorgabe 06:00.
+[Unit]
+Description=Borg-Aufbewahrung (Cockpit): täglicher Lauf
+
+[Timer]
+OnCalendar=*-*-* 06:00:00
+Persistent=true
+RandomizedDelaySec=0
+
+[Install]
+WantedBy=timers.target

@@ -5,7 +5,7 @@ import type { CapabilityManifest } from "./capability-manifest.js";
 import type { ExecutionEnvelope } from "./hermes-security.js";
 import type { HostRunManifest } from "./host-run.js";
 
-export type ExecutorActionKind = "host.status" | "service.restart" | "service.status" | "disk.status" | "disk.remove" | "disk.add" | "disk.smart" | "disk.smarttest" | "self.update" | "self.status" | "self.diff" | "dienste.update" | "dienste.status" | "dienste.diff" | "borg.status" | "borg.check" | "borg.repair";
+export type ExecutorActionKind = "host.status" | "service.restart" | "service.status" | "disk.status" | "disk.remove" | "disk.add" | "disk.smart" | "disk.smarttest" | "self.update" | "self.status" | "self.diff" | "dienste.update" | "dienste.status" | "dienste.diff" | "borg.status" | "borg.check" | "borg.repair" | "borg.retention.status" | "borg.retention.run" | "borg.retention.set" | "borg.retention.set-approved" | "borg.retention.resume";
 // diffSha256: only on self.update and dienste.update — the hash of the diff the pre-install review covered.
 export interface ExecutorAction { action: ExecutorActionKind; target: string; diffSha256?: string; expiresAt: string; envelopeDigest: string }
 export interface DynamicExecutorAction { action: "capability.execute"; manifest: CapabilityManifest; envelope: ExecutionEnvelope; expiresAt: string; envelopeDigest: string }
