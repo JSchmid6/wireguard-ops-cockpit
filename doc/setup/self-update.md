@@ -73,13 +73,27 @@ runner only.
 3. The deploy script prepares files and writes the new `state.json` (including
    `web_url`). The runner verifies the host before activation: the four cockpit
    services are active, the socket files exist, `api_health` answers, and —
-   when the WireGuard address is present — `web_url` answers. It then schedules
+   when the WireGuard address is present — `web_url` answers. Where the deploy
+   script records the built web image (`state.json` `web_image`: name, id,
+   container; the VPS), the image tag must still be that id and the web
+   container must run, else 68. It then schedules
    the activation as a one-shot timer (`systemd-run --on-active=600`) and
    writes `activation.status=scheduled`.
-4. The activation restarts the four cockpit services, verifies them again, and
-   writes `activation.status=ok` (or `failed` with the reason). It refuses only
-   when `state.json` names a different deployed commit than its own (the stand
-   moved on; the older activation is superseded).
+4. The activation waits for the run lock (a running deployment or review diff;
+   up to `COCKPIT_SELF_UPDATE_ACTIVATION_LOCK_WAIT`, default 1900 s, then exit
+   66 and `failed-busy` in the history — never a silent success). It skips when
+   `state.json` names a different deployed commit than its own (the stand moved
+   on; the older activation is superseded). Before restarting anything it checks
+   that the web image tag is still the built `web_image.id` (a rebuild or
+   retag since the deploy fails the activation with 68, nothing restarted).
+   Then it restarts the services, verifies them again — including that the web
+   container now runs exactly `web_image.id` — and writes
+   `activation.status=ok` (or `failed` with the reason).
+
+   Note: until the timer fires, `systemctl show -p Result` of the scheduled
+   `…-activate-…` service already says `success` (the default of a unit that
+   never ran). Whether it ran shows `ActiveEnterTimestamp`/`ExecMainStartTimestamp`,
+   the `activation` field of `state.json` and `history.jsonl`.
 
 Rollback is plain forward motion: run the job again with the `previous_commit`
 sha from `state.json` (it is an ancestor of `origin/main`, so it deploys like
@@ -286,11 +300,16 @@ and is not installed here.
 **Web:** the image is always built (the Docker cache makes an unchanged build
 cheap; a list of build inputs would miss some). The running container is never
 switched by the deploy: `wireguard-ops-cockpit-web.service` (oneshot,
-`docker compose up -d --no-build web`) does that when restarted, and
+`docker compose up -d --no-build --force-recreate web`, so every restart swaps
+the container instead of trusting compose's change detection) does that when
+restarted, and
 `self-update.env` puts it into `COCKPIT_SELF_UPDATE_SERVICES`, so the runner
 switches web together with the four services at the activation, after its
 pre-activation checks. The unit is started by the deploy only when it is not
 active (first install), before the new image exists — so nothing switches early.
+The deploy records the built image id and the container name in `state.json`
+(`web_image`); the runner compares them before and after the activation, and
+mode `now` checks the running container right after its restart (68 otherwise).
 
 **Rollback:** every target is saved (or recorded as absent) before the install.
 Any failure until `state.json` is written restores exactly those bytes, removes

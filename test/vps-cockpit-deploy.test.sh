@@ -9,6 +9,8 @@
 # told to fail. Checks: a clean install, the byte-exact rollback when the install
 # fails half-way, the web image tag rollback when the web build fails, a build
 # failure before anything is installed, an unmerged commit, the deferred restart,
+# the built web image recorded in state.json and checked after a restart (68 when
+# the web container still runs the old image),
 # the web unit start (only when inactive, before the new image exists), that the
 # data directory's mode survives every run, and that the borgmatic.service drop-in
 # lands next to a foreign drop-in that stays untouched in both directions (R2).
@@ -55,6 +57,11 @@ cat > "$FIX/stub/systemctl" <<EOF
 #!/bin/bash
 echo "systemctl \$*" >> "$FIX/calls.log"
 if [ "\$1" = "is-active" ]; then [ -e "$FIX/web-active" ] && exit 0; exit 3; fi
+# a restart of the web unit swaps the container onto the tagged image — unless the
+# test simulates a web unit that leaves the old container running (web-stale)
+if [ "\$1" = "restart" ] && [[ " \$* " == *" wireguard-ops-cockpit-web "* ]] && [ ! -e "$FIX/web-stale" ]; then
+  : > "$FIX/web-swapped"
+fi
 exit 0
 EOF
 cat > "$FIX/stub/docker" <<EOF
@@ -62,8 +69,11 @@ cat > "$FIX/stub/docker" <<EOF
 echo "docker \$*" >> "$FIX/calls.log"
 case "\$*" in
   *"config --images web"*) echo "wireguard-ops-cockpit-web" ;;
-  "image inspect --format {{.Id}} wireguard-ops-cockpit-web") echo "sha256:alt" ;;
-  *"compose"*"build web"*) [ -e "$FIX/fail-webbuild" ] && exit 1 ;;
+  "image inspect --format {{.Id}} wireguard-ops-cockpit-web") [ -e "$FIX/web-built" ] && echo "sha256:neu" || echo "sha256:alt" ;;
+  *"compose"*"build web"*) [ -e "$FIX/fail-webbuild" ] && exit 1; : > "$FIX/web-built" ;;
+  *"compose"*"ps -a -q web"*) echo "c0ffee" ;;
+  "inspect --format {{.Name}} c0ffee") echo "/wireguard-ops-cockpit-web-1" ;;
+  "inspect --format {{.Image}} wireguard-ops-cockpit-web-1") [ -e "$FIX/web-swapped" ] && echo "sha256:neu" || echo "sha256:alt" ;;
 esac
 exit 0
 EOF
@@ -80,7 +90,8 @@ targets() { grep -oE '^  "[^"|]+\|[^"|]+\|' "$SCRIPT" | cut -d'|' -f2 | sed -E \
   -e 's#\$LIB#/usr/local/lib/wireguard-ops-cockpit#' -e 's#\$SBIN#/usr/local/sbin#' \
   -e 's#\$UNITS#/etc/systemd/system#' -e 's#\$SUDOERS#/etc/sudoers.d/cockpit-executor#'; }
 fresh_host() { # host root: half the targets with old bytes, the other half absent; repo at A
-  rm -rf "$FIX/root" "$FIX/repo" "$FIX/calls.log" "$FIX/fail-visudo" "$FIX/fail-build" "$FIX/fail-webbuild" "$FIX/web-active"
+  rm -rf "$FIX/root" "$FIX/repo" "$FIX/calls.log" "$FIX/fail-visudo" "$FIX/fail-build" "$FIX/fail-webbuild" "$FIX/web-active" \
+    "$FIX/web-built" "$FIX/web-swapped" "$FIX/web-stale"
   mkdir -p "$FIX/root/var/lib/wireguard-ops-cockpit"; chmod 750 "$FIX/root/var/lib/wireguard-ops-cockpit"
   # Fremdes Drop-in in dem Verzeichnis, in das unser neues Drop-in kommt (der
   # Host hat dort z. B. nach-gitlab-backup.conf): es gehört nicht zu diesem
@@ -119,6 +130,8 @@ check "Erfolg: state.json verbucht B" 'grep -q "\"deployed_commit\": \"$B\"" "$F
 check "Erfolg: Web-Abbild gebaut, nicht per up umgeschaltet" 'grep -q "^docker compose .* build web" "$FIX/calls.log" && ! grep -q "^docker compose .* up" "$FIX/calls.log"'
 check "Erfolg: inaktive Web-Unit vor dem Web-Bau gestartet" 'start_before_build'
 check "Erfolg: Neustart inkl. Web-Unit" 'grep -q "^systemctl restart .*wireguard-ops-cockpit-web" "$FIX/calls.log"'
+check "Erfolg: state.json verbucht das gebaute Web-Abbild und den Container" '[ "$(python3 -c "import json,sys; w=json.load(open(sys.argv[1]))[\"web_image\"]; print(w[\"name\"], w[\"id\"], w[\"container\"])" "$FIX/root/var/lib/wireguard-ops-cockpit/self-update/state.json")" = "wireguard-ops-cockpit-web sha256:neu wireguard-ops-cockpit-web-1" ]'
+check "Erfolg: nach dem Neustart läuft das gebaute Abbild (geprüft)" 'grep -q "web runs sha256:neu" "$FIX/out.log"'
 check "Erfolg: Sicherungsordner entfernt" '[ -z "$(ls -d "$FIX"/root/var/lib/wireguard-ops-cockpit/self-update/deploy-backup.* 2>/dev/null)" ]'
 check "Erfolg: Datenordner des Dienstes bleibt 750" '[ "$(parent_mode)" = 750 ]'
 check "Erfolg: Wiederaufnahme der Host-Läufe beim Hochfahren aktiviert" 'grep -q "^systemctl enable --quiet wireguard-ops-cockpit-host-run-resume.service" "$FIX/calls.log"'
@@ -158,6 +171,11 @@ check "Nicht gemergt: Exit 65, nichts angefasst" '[ "$code" = 65 ] && [ "$(after
 fresh_host; : > "$FIX/web-active"; code=0; deploy "$B" defer || code=$?
 check "Defer: Exit 0, installiert, kein Neustart" '[ "$code" = 0 ] && [ "$(count_B)" -gt 20 ] && ! grep -q "^systemctl restart" "$FIX/calls.log"'
 check "Defer: aktive Web-Unit nicht erneut gestartet (nichts schaltet vor der Aktivierung)" '! grep -q "^systemctl start" "$FIX/calls.log"'
+check "Defer: state.json verbucht das gebaute Web-Abbild für die Aktivierung" 'grep -q "\"id\": \"sha256:neu\"" "$FIX/root/var/lib/wireguard-ops-cockpit/self-update/state.json"'
+
+# 7: restart now, but the web unit leaves the old container running -> exit 68, said so
+fresh_host; : > "$FIX/web-active"; : > "$FIX/web-stale"; code=0; deploy "$B" now || code=$?
+check "Web nicht umgeschaltet: Exit 68 mit Grund" '[ "$code" = 68 ] && grep -q "runs sha256:alt, not the built sha256:neu" "$FIX/out.log"'
 
 echo
 [ "$fails" = 0 ] && echo "alles grün" || { echo "$fails rot"; exit 1; }

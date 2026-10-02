@@ -215,6 +215,9 @@ case "\${1:-}" in
     ;;
   restart)
     echo "restart: \$*" >> "$FIX/record.log"
+    # S16: the restart swaps the web container onto the tagged image, unless
+    # the test simulates a web unit that leaves the old container running.
+    if [ -e "$FIX/docker-tag" ] && [ ! -e "$FIX/web-stale" ]; then cp "$FIX/docker-tag" "$FIX/docker-running"; fi
     exit "\${FIX_RESTART_RC:-0}"
     ;;
   is-active) exit "\${FIX_ISACTIVE_RC:-0}" ;;
@@ -264,6 +267,17 @@ printf '%s' "$body"
 EOF
 chmod 755 "$FIX/bin/curl"
 
+cat > "$FIX/bin/docker" <<EOF
+#!/bin/bash
+# fixture stub (S16): the web image tag and the running web container.
+case "\$*" in
+  "image inspect --format {{.Id}} fixture-web") cat "$FIX/docker-tag" 2>/dev/null || exit 1 ;;
+  "inspect --format {{.State.Running}} {{.Image}} fixture-web-1") echo "true \$(cat "$FIX/docker-running")" ;;
+  *) echo "unexpected docker call: \$*" >&2; exit 1 ;;
+esac
+EOF
+chmod 755 "$FIX/bin/docker"
+
 cat > "$FIX/bin/ip" <<'EOF'
 #!/bin/bash
 # fixture stub: reports a WireGuard address unless the test hides it.
@@ -295,6 +309,8 @@ state = {
     "updated_at": "2026-09-25T18:00:00Z", "updated_by": "self-update",
     "web_url": "https://10.0.0.5:18181", "activation": {"status": "pending"},
 }
+if os.path.exists(os.path.join(fix, "web-image-on")):  # S16: a deploy script that builds a web image
+    state["web_image"] = {"name": "fixture-web", "id": "sha256:neu", "container": "fixture-web-1"}
 tmp = path + ".tmp"
 with open(tmp, "w", encoding="utf-8") as handle:
     json.dump(state, handle, sort_keys=True)
@@ -367,6 +383,7 @@ export COCKPIT_SELF_UPDATE_SYSTEMCTL="$FIX/bin/systemctl"
 export COCKPIT_SELF_UPDATE_SYSTEMD_RUN="$FIX/bin/systemd-run"
 export COCKPIT_SELF_UPDATE_CURL="$FIX/bin/curl"
 export COCKPIT_SELF_UPDATE_IP="$FIX/bin/ip"
+export COCKPIT_SELF_UPDATE_DOCKER="$FIX/bin/docker"
 export COCKPIT_SELF_UPDATE_ALLOWED_REMOTE="$ORIGIN"
 export COCKPIT_SELF_UPDATE_ACTIVATION_DELAY="1"
 export COCKPIT_SELF_UPDATE_VERIFY_RETRIES="2"
@@ -752,6 +769,75 @@ echo "--- S15: status with review"
 "$HELPER" status > "$FIX/s15.out" 2> "$FIX/s15.err"; rc=$?
 check "S15 status rc=0" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "rc=$rc"
 expect_json "S15 last attempt review hash" "$FIX/s15.out" "last_attempt.review.diff_sha256" "$H6B"
+
+# --------------------------------------------------------------------------
+# S16: the web container against the built image. The deploy records the built
+# image (state.json web_image); before the activation the tag must still be it,
+# after the activation the running container must carry it — otherwise 68.
+# The activation waits for the run lock instead of skipping silently.
+# --------------------------------------------------------------------------
+echo "--- S16: web image before and after the activation"
+add_commit() { # add_commit <file> -> prints the new merged sha
+  echo "$1" > "$WORK/$1.txt"
+  git -C "$WORK" add "$1.txt" && git -C "$WORK" commit -qm "$1" && git -C "$WORK" push -q origin main
+  git -C "$WORK" rev-parse main
+}
+C7="$(add_commit c7)"
+: > "$FIX/web-image-on"
+echo "sha256:alt" > "$FIX/docker-running"
+echo "sha256:neu" > "$FIX/docker-tag"
+H7="$(review_hash "$C7" "$FIX/s16-diff.out")"
+: > "$FIX/record.log"
+"$HELPER" "$C7" "$H7" > "$FIX/s16a.out" 2> "$FIX/s16a.err"; rc=$?
+check "S16 deploy with a built web image rc=0" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "rc=$rc $(head -c 300 "$FIX/s16a.err")"
+expect_json "S16 pre-activation: built image tagged, switch pending" "$FIX/state/last-result.json" "verification.web_image" "pending-activation"
+check "S16 pre-activation: web container not touched" "$(grep -q "restart:" "$FIX/record.log" && echo 1 || echo 0)" ""
+
+"$RUNNER" activate "$C7" > "$FIX/s16b.out" 2>&1; rc=$?
+check "S16 activate rc=0" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "rc=$rc $(head -c 300 "$FIX/s16b.out")"
+expect_json "S16 activation: container runs the built image" "$FIX/state/last-result.json" "activation.checks.web_image" "ok"
+expect_json "S16 activation ok" "$FIX/state/state.json" "activation.status" "ok"
+
+echo "sha256:alt" > "$FIX/docker-running"
+: > "$FIX/web-stale"
+"$RUNNER" activate "$C7" > "$FIX/s16c.out" 2>&1; rc=$?
+check "S16 restart leaves the old container -> 68" "$([ "$rc" -eq 68 ] && echo 0 || echo 1)" "rc=$rc $(head -c 300 "$FIX/s16c.out")"
+expect_json "S16 stale container: activation failed" "$FIX/state/state.json" "activation.status" "failed"
+check "S16 stale container: reason names both images" \
+  "$(grep -q "still runs image sha256:alt, not the built sha256:neu" "$FIX/state/last-result.json" && echo 0 || echo 1)" "$(head -c 400 "$FIX/state/last-result.json")"
+rm -f "$FIX/web-stale"
+
+echo "sha256:fremd" > "$FIX/docker-tag"
+: > "$FIX/record.log"
+"$RUNNER" activate "$C7" > "$FIX/s16d.out" 2>&1; rc=$?
+check "S16 tag moved since the deploy -> 68" "$([ "$rc" -eq 68 ] && echo 0 || echo 1)" "rc=$rc $(head -c 300 "$FIX/s16d.out")"
+check "S16 tag moved: nothing restarted" "$(grep -q "restart:" "$FIX/record.log" && echo 1 || echo 0)" "$(cat "$FIX/record.log")"
+check "S16 tag moved: reason given" \
+  "$(grep -q "rebuilt or retagged since" "$FIX/state/last-result.json" && echo 0 || echo 1)" "$(head -c 400 "$FIX/state/last-result.json")"
+echo "sha256:neu" > "$FIX/docker-tag"
+
+flock -x "$FIX/state/run.lock" -c 'sleep 3' &
+LOCKER=$!
+sleep 0.5
+COCKPIT_SELF_UPDATE_ACTIVATION_LOCK_WAIT=20 "$RUNNER" activate "$C7" > "$FIX/s16e.out" 2>&1; rc=$?
+wait "$LOCKER"
+check "S16 activation waits for a held run lock, then activates" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "rc=$rc $(head -c 300 "$FIX/s16e.out")"
+expect_json "S16 after the wait: activation ok" "$FIX/state/state.json" "activation.status" "ok"
+flock -x "$FIX/state/run.lock" -c 'sleep 4' &
+LOCKER=$!
+sleep 0.5
+COCKPIT_SELF_UPDATE_ACTIVATION_LOCK_WAIT=1 "$RUNNER" activate "$C7" > "$FIX/s16f.out" 2>&1; rc=$?
+wait "$LOCKER"
+check "S16 run lock held past the wait -> 66, not a silent success" "$([ "$rc" -eq 66 ] && echo 0 || echo 1)" "rc=$rc"
+check "S16 busy activation noted as failed-busy" "$(tail -n 1 "$FIX/state/history.jsonl" | grep -q '"failed-busy"' && echo 0 || echo 1)" "$(tail -n 1 "$FIX/state/history.jsonl")"
+
+C8="$(add_commit c8)"
+echo "sha256:fremd" > "$FIX/docker-tag"
+H8="$(review_hash "$C8" "$FIX/s16-diff8.out")"
+: > "$FIX/record.log"
+"$HELPER" "$C8" "$H8" > /dev/null 2> "$FIX/s16g.err"; rc=$?
+check "S16 deploy whose built image is not tagged -> 68" "$([ "$rc" -eq 68 ] && echo 0 || echo 1)" "rc=$rc $(head -c 300 "$FIX/s16g.err")"
+check "S16 untagged build: no activation scheduled" "$(grep -q "systemd-run:.*activate" "$FIX/record.log" && echo 1 || echo 0)" ""
 
 echo
 echo "Gerüst: $FIX (wird beim Beenden entfernt)"

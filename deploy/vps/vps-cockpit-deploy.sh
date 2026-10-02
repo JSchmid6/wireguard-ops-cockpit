@@ -19,7 +19,7 @@
 #     service units, the web unit, the host-run resume unit, the self-update unit template, self-update.env,
 #     the two drop-ins (API brokers, and the borg lock barrier in the package's
 #     borgmatic.service.d), and this script. Besides the table it writes only
-#     state.json, the web image, the web unit's enable link and a backup directory
+#     state.json (with the built web image id), the web image, the web unit's enable link and a backup directory
 #     that it removes on success.
 #   * It never switches the running web container: the web unit does that when it
 #     is restarted, which the runner does together with the four services at the
@@ -54,6 +54,8 @@ readonly SERVICES=(wireguard-ops-cockpit-api wireguard-ops-cockpit-agent wiregua
 readonly COMPOSE=("$DOCKER" compose --env-file .env -f docker-compose.vps.yml)
 WEB_IMAGE=""      # the compose image name of the web service
 WEB_BEFORE=""     # its image id before this deploy (the rollback target)
+WEB_BUILT=""      # its image id after the build (recorded in state.json as web_image)
+WEB_CONTAINER=""  # the web container's name; the activation swaps it, the name stays
 
 # source (repo) | target (host) | mode — the whole footprint of this script.
 readonly TABLE=(
@@ -163,10 +165,21 @@ install_table() {
 }
 
 build_web() { # new image under the compose tag; the old id is kept for the rollback
+  local id
   WEB_IMAGE="$("${COMPOSE[@]}" config --images web | head -n 1)"
   [ -n "$WEB_IMAGE" ]
   WEB_BEFORE="$("$DOCKER" image inspect --format '{{.Id}}' "$WEB_IMAGE" 2>/dev/null || true)"
   "${COMPOSE[@]}" build web
+  # Recorded so the runner can prove before and after the activation that the web
+  # container carries exactly this image (cockpit-self-update-run web_image_check).
+  WEB_BUILT="$("$DOCKER" image inspect --format '{{.Id}}' "$WEB_IMAGE")"
+  [ -n "$WEB_BUILT" ]
+  id="$("${COMPOSE[@]}" ps -a -q web | head -n 1)"
+  [ -n "$id" ]
+  WEB_CONTAINER="$("$DOCKER" inspect --format '{{.Name}}' "$id")"
+  WEB_CONTAINER="${WEB_CONTAINER#/}"
+  [ -n "$WEB_CONTAINER" ]
+  log "web image $WEB_IMAGE built as $WEB_BUILT (was ${WEB_BEFORE:-none}), container $WEB_CONTAINER"
 }
 
 restore_targets() { # exactly the saved bytes back; files that did not exist go away
@@ -223,9 +236,10 @@ INSTALLED=1
 install_table
 build_web
 
-python3 - "$STATE_DIR/state.json" "$REPO_COMMIT" "$OLD" "$WEB_URL" "${COCKPIT_SELF_UPDATE_SOURCE:-manual}" <<'PY'
+python3 - "$STATE_DIR/state.json" "$REPO_COMMIT" "$OLD" "$WEB_URL" "${COCKPIT_SELF_UPDATE_SOURCE:-manual}" \
+  "$WEB_IMAGE" "$WEB_BUILT" "$WEB_CONTAINER" <<'PY'
 import json, os, sys, datetime
-path, sha, old, web, source = sys.argv[1:6]
+path, sha, old, web, source, web_name, web_id, web_container = sys.argv[1:9]
 os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
 try:
     with open(path, encoding="utf-8") as handle:
@@ -233,7 +247,8 @@ try:
 except (FileNotFoundError, ValueError):
     state = {}
 state.update({"version": 1, "deployed_commit": sha, "previous_commit": old if old != sha else state.get("previous_commit"),
-              "web_url": web, "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+              "web_url": web, "web_image": {"name": web_name, "id": web_id, "container": web_container},
+              "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
               "updated_by": source})
 tmp = path + ".tmp"
 with open(tmp, "w", encoding="utf-8") as handle:
@@ -248,6 +263,11 @@ if [ "${COCKPIT_RESTART_MODE:-now}" = "defer" ]; then
   log "services and web not restarted (defer): the runner verifies, then restarts ${SERVICES[*]}"
 else
   "$SYSTEMCTL" restart "${SERVICES[@]}"
-  log "services and web restarted"
+  running="$("$DOCKER" inspect --format '{{.Image}}' "$WEB_CONTAINER" 2>/dev/null || true)"
+  if [ "$running" != "$WEB_BUILT" ]; then
+    log "FAILED: web container $WEB_CONTAINER runs ${running:-nothing}, not the built $WEB_BUILT"
+    exit 68
+  fi
+  log "services and web restarted (web runs $WEB_BUILT)"
 fi
 log "done: $REPO_COMMIT"

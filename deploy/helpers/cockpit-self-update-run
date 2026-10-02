@@ -34,9 +34,13 @@
 #           /var/lib/wireguard-ops-cockpit/self-update -> schedule the
 #           activation unit.
 #
-# activate: skip when superseded or when a deployment is running -> restart
-#           the four cockpit services -> post-restart verification -> merge
-#           the activation outcome into state + result. The restart of
+# activate: wait for the run lock (a running deployment or review diff) ->
+#           skip when superseded -> check that the web image tag is still the
+#           image the deploy built -> restart the cockpit services (and the web
+#           unit, where the deploy script lists it) -> post-restart
+#           verification, including that the running web container carries
+#           exactly the built image -> merge the activation outcome into
+#           state + result. The restart of
 #           api/executor cannot happen inside the typed executor path itself
 #           (it would cut the running job and audit connection), so it is
 #           this separate, scheduled step: the deploy job completes cleanly
@@ -64,8 +68,8 @@
 #
 # Simulation harness hooks (all optional, production defaults first):
 #   COCKPIT_SELF_UPDATE_REPO_DIR, _DEPLOY_SH, _STATE_DIR, _LOG_DIR, _GIT,
-#   _SYSTEMCTL, _SYSTEMD_RUN, _CURL, _IP, _ALLOWED_REMOTE, _ACTIVATION_DELAY,
-#   _SERVICES, _SOCKETS, _RUN_PATH, _WG_IP, _API_HEALTH_URL, _TTYD_URL.
+#   _SYSTEMCTL, _SYSTEMD_RUN, _CURL, _IP, _DOCKER, _ALLOWED_REMOTE, _ACTIVATION_DELAY,
+#   _ACTIVATION_LOCK_WAIT, _SERVICES, _SOCKETS, _RUN_PATH, _WG_IP, _API_HEALTH_URL, _TTYD_URL.
 #   Hooks exist for the offline fixture test and the throwaway-container E2E;
 #   in production the module is started by the systemd units, which pass a
 #   fixed environment, and the typed executor path resets the environment
@@ -191,8 +195,12 @@ SYSTEMCTL = env("COCKPIT_SELF_UPDATE_SYSTEMCTL", "/usr/bin/systemctl")
 SYSTEMD_RUN = env("COCKPIT_SELF_UPDATE_SYSTEMD_RUN", "/usr/bin/systemd-run")
 CURL = env("COCKPIT_SELF_UPDATE_CURL", "/usr/bin/curl")
 IP = env("COCKPIT_SELF_UPDATE_IP", "/usr/sbin/ip")
+DOCKER = env("COCKPIT_SELF_UPDATE_DOCKER", "/usr/bin/docker")
 ALLOWED_REMOTE = env("COCKPIT_SELF_UPDATE_ALLOWED_REMOTE", "https://github.com/JSchmid6/wireguard-ops-cockpit.git")
 ACTIVATION_DELAY = int(env("COCKPIT_SELF_UPDATE_ACTIVATION_DELAY", "600"))
+# How long the activation waits for the run lock (a deployment holds it up to its
+# TimeoutStartSec=1800, a review diff up to 420 s) before it gives up loudly.
+ACTIVATION_LOCK_WAIT = int(env("COCKPIT_SELF_UPDATE_ACTIVATION_LOCK_WAIT", "1900"))
 VERIFY_RETRIES = int(env("COCKPIT_SELF_UPDATE_VERIFY_RETRIES", "12"))
 VERIFY_DELAY = int(env("COCKPIT_SELF_UPDATE_VERIFY_DELAY", "5"))
 SERVICES = env("COCKPIT_SELF_UPDATE_SERVICES", "wireguard-ops-cockpit-api wireguard-ops-cockpit-agent wireguard-ops-cockpit-executor wireguard-ops-cockpit-ttyd").split()
@@ -804,7 +812,35 @@ def state_web_url():
     return ""
 
 
-def verify_phase(retries, delay, include_web):
+def web_image_check(after_activation):
+    """The web container against the image the deploy script built and recorded in
+    state.json (web_image: name, id, container). Hosts whose deploy script records
+    no web image (Lab0) skip it. Before the activation the image tag must still
+    point to the built image (nothing rebuilt or retagged it since) and the
+    container must run; after it the container must carry exactly that image."""
+    state = read_json(STATE_FILE)
+    built = state.get("web_image") if isinstance(state, dict) else None
+    if built is None:
+        return "skipped"
+    if not isinstance(built, dict) or not all(built.get(key) for key in ("name", "id", "container")):
+        raise Failure(68, "verify", "state.json web_image is incomplete: %s" % json.dumps(built)[:200])
+    tag = run([DOCKER, "image", "inspect", "--format", "{{.Id}}", built["name"]], timeout=30)
+    if tag.returncode != 0 or tag.stdout.strip() != built["id"]:
+        raise Failure(68, "verify", "web image %s is %s, but the deploy built %s (rebuilt or retagged since)"
+                      % (built["name"], tag.stdout.strip() or "missing", built["id"]))
+    running = run([DOCKER, "inspect", "--format", "{{.State.Running}} {{.Image}}", built["container"]], timeout=30)
+    parts = running.stdout.split()
+    if running.returncode != 0 or len(parts) != 2 or parts[0] != "true":
+        raise Failure(68, "verify", "web container %s is not running" % built["container"])
+    if parts[1] == built["id"]:
+        return "ok"
+    if after_activation:
+        raise Failure(68, "verify", "web container %s still runs image %s, not the built %s"
+                      % (built["container"], parts[1], built["id"]))
+    return "pending-activation"
+
+
+def verify_phase(retries, delay, include_web, after_activation):
     """Runs the verification checks; raises Failure(68, ...) with the first breach."""
     checks = {}
     revision = git("rev-parse", "HEAD", timeout=30)
@@ -864,17 +900,22 @@ def verify_phase(retries, delay, include_web):
         checks["web"] = "ok"
     else:
         checks["web"] = "skipped"
+    checks["web_image"] = web_image_check(after_activation)
     return checks
 
 
-def acquire_run_lock():
+def acquire_run_lock(wait=0):
     fd = os.open(RUN_LOCK, os.O_RDWR | os.O_CREAT, 0o640)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        os.close(fd)
-        return None
-    return fd
+    deadline = time.time() + wait
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except OSError:
+            if time.time() >= deadline:
+                os.close(fd)
+                return None
+            time.sleep(min(5, max(deadline - time.time(), 0.1)))
 
 
 def open_log(prefix, sha):
@@ -960,7 +1001,7 @@ def cmd_deploy(sha, reviewed_sha256):
             raise Failure(69, "deploy", "deploy script exited %s — see %s" % (proc.returncode, logfile))
         result["deploy"]["result"] = "ok"
         log("deploy script finished ok; verifying the host before activation")
-        checks = verify_phase(retries=VERIFY_RETRIES, delay=VERIFY_DELAY, include_web=True)
+        checks = verify_phase(retries=VERIFY_RETRIES, delay=VERIFY_DELAY, include_web=True, after_activation=False)
         result["verification"] = checks
         log("pre-activation verification ok: %s" % json.dumps(checks, sort_keys=True))
         # The deploy script records the deployed commit (and web_url) itself;
@@ -1007,11 +1048,15 @@ def cmd_activate(sha):
     started = utcnow()
     ensure_dir(STATE_DIR)
     ensure_dir(LOG_DIR)
-    if acquire_run_lock() is None:
+    # The run lock is also held by a review diff, which schedules no activation of
+    # its own: skipping here would leave the deployed code inactive with a unit that
+    # still ends "success". So wait; a deployment that finishes meanwhile moved
+    # deployed_commit on, and the superseded check below skips this activation.
+    if acquire_run_lock(wait=ACTIVATION_LOCK_WAIT) is None:
         logfile = open_log("activate", sha)
-        log("a self-update deployment is running; activation for %s skipped (the running deployment schedules its own activation)" % sha[:12])
-        note_history({"ts": utcnow(), "sha": sha, "phase": "activate", "result": "skipped-busy", "log": logfile})
-        return
+        log("the run lock stayed held for %ss; activation for %s NOT done" % (ACTIVATION_LOCK_WAIT, sha[:12]))
+        note_history({"ts": utcnow(), "sha": sha, "phase": "activate", "result": "failed-busy", "log": logfile})
+        sys.exit(66)
     logfile = open_log("activate", sha)
     log("self-update activation %s (log %s)" % (sha, logfile))
     state = read_json(STATE_FILE)
@@ -1025,15 +1070,25 @@ def cmd_activate(sha):
     if not isinstance(result, dict) or result.get("sha") != sha:
         result = base_result(sha, started, "awaiting-activation", True)
         result["previous_commit"] = state.get("previous_commit")
-    log("restarting the four cockpit services to activate commit %s" % sha[:12])
-    restart = run([SYSTEMCTL, "restart"] + SERVICES, timeout=300)
-    restart_detail = restart.stderr.strip()[-300:]
     checks = None
     error = None
     try:
-        checks = verify_phase(retries=VERIFY_RETRIES * 2, delay=VERIFY_DELAY, include_web=True)
+        # Before anything restarts: the web tag must still be the image the deploy built.
+        web_image_check(after_activation=False)
     except Failure as exc:
         error = exc.message
+    if error:
+        log("not activating: %s" % error)
+        restart = subprocess.CompletedProcess([], 0, "", "")
+    else:
+        log("restarting %s to activate commit %s" % (" ".join(SERVICES), sha[:12]))
+        restart = run([SYSTEMCTL, "restart"] + SERVICES, timeout=300)
+    restart_detail = restart.stderr.strip()[-300:]
+    if not error:
+        try:
+            checks = verify_phase(retries=VERIFY_RETRIES * 2, delay=VERIFY_DELAY, include_web=True, after_activation=True)
+        except Failure as exc:
+            error = exc.message
     service_timestamps = {}
     for name in SERVICES:
         stamp = run([SYSTEMCTL, "show", "-p", "ActiveEnterTimestamp", "--value", name], timeout=15)
