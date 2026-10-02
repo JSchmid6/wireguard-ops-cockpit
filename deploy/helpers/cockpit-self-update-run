@@ -114,7 +114,11 @@ HOST_DOOR_FILES = (
     "deploy/helpers/cockpit-host-run",
     "deploy/helpers/cockpit-backup-guard.mjs",
     "deploy/helpers/cockpit-borg-retention-rules.mjs",
+    "deploy/helpers/cockpit-host-run-net.mjs",
     "deploy/systemd/wireguard-ops-cockpit-host-run-resume.service",
+    "deploy/systemd/cockpit-systemsicherung.service",
+    "deploy/systemd/cockpit-systemsicherung.timer",
+    "deploy/lab0/cockpit-systemsicherung-NOTFALL.txt",
 )
 # File-level focus: (kind, guarantees, reason, matcher).
 FILE_AREAS = (

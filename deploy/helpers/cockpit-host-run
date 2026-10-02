@@ -20,11 +20,19 @@
 //              öffnet nur mit operatorApproved, auch bei bestandenem Türsteher
 //              (cockpit-backup-guard.mjs, dieselbe Erkennung wie in der API;
 //              installiert neben diesem Helfer).
-//   Netz       Vor einem Lauf, der den Systemzustand ändert (mutates, Standard):
-//              das letzte borg-Backup muss jünger als 24 h sein, dann ein
-//              Maschinen-Snapshot beim Hoster (cockpit-vps-snapshot, rotiert den
-//              ältesten cockpit-eigenen). Scheitert eines davon, läuft kein
-//              Schritt.
+//   Netz       Vor einem Lauf, der den Systemzustand ändert (mutates, Standard),
+//              je Kiste eingestellt in /etc/wireguard-ops-cockpit/host-run-net.json
+//              (cockpit-host-run-net.mjs, installiert neben diesem Helfer):
+//              VPS (hoster-snapshot, auch ohne Datei): das letzte borg-Backup
+//              jünger als 24 h, dann ein Maschinen-Snapshot beim Hoster
+//              (cockpit-vps-snapshot, rotiert den ältesten cockpit-eigenen).
+//              Lab0 (system-backup): RAID gesund, Sicherungsplatte eingehängt
+//              mit Platz, Aufräum-Dienst ohne Anomalie, dann ein borg-Archiv
+//              von / im eigenen Repo auf dem RAID (unverschlüsselt, daneben
+//              Standalone-borg und NOTFALL.txt für das Rescue-System).
+//              Scheitert etwas davon, läuft kein Schritt. Vor einem Neustart
+//              prüft er, dass die eingestellten Units (WireGuard, SSH) beim
+//              Hochfahren starten.
 //
 // Verben (gepinnte Grammatik; sudoers erlaubt nur `start` und `status *`):
 //   start             stdin: {"manifest", "envelope"} — prüfen, Laufverzeichnis
@@ -35,6 +43,9 @@
 //                     in einer neuen Unit fortsetzen
 //   --payload <jobId> nur aus der Lauf-Unit (COCKPIT_HOST_RUN_IN_UNIT, das die
 //                     Unit selbst setzt; sudo(8) setzt die Umgebung zurück)
+//   weekly-backup     nur aus cockpit-systemsicherung.service (Timer, wöchentlich;
+//                     COCKPIT_SYSTEM_BACKUP_IN_UNIT): dieselbe Systemsicherung
+//                     mit denselben Prüfungen, eigene Reihe und Aufbewahrung
 //
 // Ein Neustart ist ein gewöhnlicher Schritt ({"reboot": true}): der Lauf
 // schreibt vorher, wo er weitermacht, und meldet sein Ergebnis nach dem
@@ -44,11 +55,13 @@
 // test/cockpit-host-run.test.sh um. Über sudo kommen sie nie an (env_reset),
 // und die Units setzen nur COCKPIT_HOST_RUN_IN_UNIT.
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, openSync, fsyncSync, closeSync } from "node:fs";
+import { appendFileSync, chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, statfsSync, writeFileSync, openSync, fsyncSync, closeSync } from "node:fs";
+import { basename, dirname } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { backupGuardHits } from "./cockpit-backup-guard.mjs";
+import { HOST_RUN_NET_FILE, SYSTEM_BACKUP_UPKEEP_SECONDS, defaultHostRunNet, parseHostRunNet } from "./cockpit-host-run-net.mjs";
 
 const env = process.env;
 const STATE_ROOT = env.HOST_RUN_STATE_DIR || "/var/lib/wireguard-ops-cockpit/host-runs";
@@ -58,7 +71,17 @@ const SYSTEMCTL = env.HOST_RUN_SYSTEMCTL || "/usr/bin/systemctl";
 const BORG_STATUS = env.HOST_RUN_BORG_STATUS ? [env.HOST_RUN_BORG_STATUS] : ["/usr/local/sbin/cockpit-borg-action", "status"];
 const SNAPSHOT = env.HOST_RUN_SNAPSHOT ? [env.HOST_RUN_SNAPSHOT] : ["/usr/bin/python3", "/usr/local/lib/wireguard-ops-cockpit/cockpit-vps-snapshot"];
 const BOOT_ID_FILE = env.HOST_RUN_BOOT_ID_FILE || "/proc/sys/kernel/random/boot_id";
+// Die Standalone-borg-Binary (1.4.x), von Hand installiert (doc/setup/host-run.md,
+// 4): mit ihr sichert der Helfer, und eine Kopie liegt neben dem Repo, damit
+// das Rescue-System genau diese Version hat.
+const BORG = env.HOST_RUN_BORG || "/usr/local/lib/wireguard-ops-cockpit/borg-standalone";
+const LSBLK = env.HOST_RUN_LSBLK || "/usr/bin/lsblk";
+const MDSTAT = env.HOST_RUN_MDSTAT || "/proc/mdstat";
+const MOUNTINFO = env.HOST_RUN_MOUNTINFO || "/proc/self/mountinfo";
+const RETENTION_STATUS = env.HOST_RUN_RETENTION_STATUS ? [env.HOST_RUN_RETENTION_STATUS] : ["/usr/local/sbin/cockpit-borg-retention", "status"];
 const SELF = fileURLToPath(import.meta.url);
+// Vorlage der Notfall-Anleitung, installiert neben diesem Helfer.
+const NOTFALL_TEMPLATE = `${dirname(SELF)}/cockpit-systemsicherung-NOTFALL.txt`;
 const STEP_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 const JOB_ID = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/; // nie "." oder ".."
@@ -69,6 +92,13 @@ const MAX_SCRIPT = 16000;
 const STEP_TIMEOUT_MAX = 10800;
 const CHECK_TIMEOUT_MAX = 1800;
 const BORG_MAX_AGE_HOURS = 24;
+// Die beiden eigenen Archiv-Reihen im eigenen Repo. Geprunt wird je Reihe
+// nur nach genau diesem Präfix; ein fremdes Archiv bleibt immer liegen.
+const ARCHIVE_SERIES = Object.freeze({ preRun: "vorlauf-", weekly: "woche-" });
+// Kennzeichen des Sicherungsordners: nur einen Ordner, den der Helfer selbst
+// angelegt hat, beschreibt und prunt er.
+const BACKUP_MARK = ".cockpit-systemsicherung";
+const WEEKLY_UNIT = "cockpit-systemsicherung.service";
 const ACTIVE_PHASES = new Set(["preflight", "resuming", "running", "rebooting", "checking"]);
 const REBOOT_GRACE_MS = 30 * 60 * 1000;
 // Zwischen "resuming" (gespeichert) und dem Start der Unit liegt ein kurzes
@@ -146,6 +176,25 @@ function validateManifest(manifest) {
     if (!Number.isInteger(check.timeoutSeconds) || check.timeoutSeconds < 1 || check.timeoutSeconds > CHECK_TIMEOUT_MAX) bad(`timeout of ${check.name}`);
   }
   if (!Array.isArray(manifest.rollback) || manifest.rollback.length < 1) bad("rollback");
+}
+
+// ── Netz-Einstellung ───────────────────────────────────────────────────────
+// Eine root-eigene Datei je Kiste, keine Umgebung (sudo setzt sie zurück).
+// Fehlt sie, gilt das Netz des VPS. Gehört sie nicht dem Nutzer des Helfers
+// (root) oder ist sie für andere schreibbar, gilt sie als ungültig: dann läuft
+// kein verändernder Lauf.
+function loadNet() {
+  const file = `${CONFIG_DIR}/${HOST_RUN_NET_FILE}`;
+  let info;
+  try { info = lstatSync(file); } catch (error) {
+    if (error.code === "ENOENT") return { ok: true, net: defaultHostRunNet(), source: "default" };
+    return { ok: false, why: `net configuration ${file} is unreadable (${error.code})` };
+  }
+  if (!info.isFile() || info.uid !== process.getuid() || (info.mode & 0o022) !== 0) {
+    return { ok: false, why: `net configuration ${file} must be a regular file owned by root and not writable by group or others` };
+  }
+  try { return { ok: true, net: parseHostRunNet(JSON.parse(readFileSync(file, "utf8"))), source: file }; }
+  catch (error) { return { ok: false, why: `net configuration ${file} is invalid: ${String(error.message).slice(0, 300)}` }; }
 }
 
 // ── Schwärzen ──────────────────────────────────────────────────────────────
@@ -238,7 +287,10 @@ function startUnit(jobId, runtimeSeconds) {
 function runtimeBudget(manifest, fromStep = 0) {
   const steps = manifest.steps.slice(fromStep).reduce((sum, step) => sum + (step.reboot ? 0 : step.timeoutSeconds), 0);
   const checks = manifest.checks.reduce((sum, check) => sum + check.timeoutSeconds, 0);
-  return steps + checks + 1800; // + borg-Abfrage, Snapshot und Hochfahren
+  // Die Systemsicherung läuft nur vor dem ersten Schritt, nie nach einem Neustart.
+  const loaded = fromStep === 0 && manifest.mutates ? loadNet() : null;
+  const backup = loaded?.ok && loaded.net.systemBackup ? loaded.net.systemBackup.timeoutSeconds + 2 * SYSTEM_BACKUP_UPKEEP_SECONDS : 0;
+  return steps + checks + backup + 1800; // + borg-Abfrage, Snapshot und Hochfahren
 }
 
 // ── start ──────────────────────────────────────────────────────────────────
@@ -262,7 +314,10 @@ function withStartLock(action) {
     rmSync(lock, { recursive: true, force: true });
     try { mkdirSync(lock, { mode: 0o700 }); } catch { fail("another host run is starting", 75); }
   }
-  try { return action(); } finally { rmSync(lock, { recursive: true, force: true }); }
+  // Auch wenn action mit fail() endet: process.exit überspringt finally.
+  const release = () => rmSync(lock, { recursive: true, force: true });
+  process.once("exit", release);
+  try { return action(); } finally { release(); process.removeListener("exit", release); }
 }
 
 async function start() {
@@ -270,6 +325,10 @@ async function start() {
   const { manifest, envelope } = verifyRequest(request, { checkExpiry: true });
   mkdirSync(STATE_ROOT, { recursive: true, mode: 0o700 });
   withStartLock(() => startLocked(manifest, envelope));
+}
+
+function runActive(jobId, state) {
+  return ACTIVE_PHASES.has(state.phase) && (state.phase === "rebooting" || state.phase === "resuming" || unitActive(unitName(jobId)));
 }
 
 function startLocked(manifest, envelope) {
@@ -280,8 +339,10 @@ function startLocked(manifest, envelope) {
     let state;
     try { state = readState(other); } catch { continue; }
     if (other === envelope.jobId) fail(`host run ${other} exists already`, 75);
-    if (ACTIVE_PHASES.has(state.phase) && (state.phase === "rebooting" || state.phase === "resuming" || unitActive(unitName(other)))) fail(`another host run is active: ${other}`, 75);
+    if (runActive(other, state)) fail(`another host run is active: ${other}`, 75);
   }
+  // Die Wochen-Sicherung läuft: der Lauf käme mitten in ihr Archiv.
+  if (unitActive(WEEKLY_UNIT)) fail("the weekly system backup is running; order the run again later", 75);
   const dir = runDir(envelope.jobId);
   mkdirSync(dir, { mode: 0o700 });
   writeJson(`${dir}/request.json`, { manifest, envelope });
@@ -290,7 +351,7 @@ function startLocked(manifest, envelope) {
     mutates: manifest.mutates, phase: "preflight", status: "running", nextStep: 0, boots: [bootId()],
     steps: manifest.steps.map((step, index) => ({ index: index + 1, name: step.name, reboot: step.reboot === true, status: "pending" })),
     checks: manifest.checks.map((check, index) => ({ index: index + 1, name: check.name, status: "pending" })),
-    borg: null, snapshot: null, error: null, startedAt: now(), updatedAt: now(), finishedAt: null,
+    borg: null, snapshot: null, systemBackup: null, net: null, error: null, startedAt: now(), updatedAt: now(), finishedAt: null,
   };
   saveState(state);
   const problem = startUnit(envelope.jobId, runtimeBudget(manifest));
@@ -345,13 +406,25 @@ function resume() {
 
 // ── payload (in der Lauf-Unit) ─────────────────────────────────────────────
 function runScript(script, timeoutSeconds) {
+  return runCommand("/bin/bash", ["--noprofile", "--norc", "-eo", "pipefail", "-c", script], timeoutSeconds);
+}
+// termFirst: erst SIGTERM, eine Minute später SIGKILL — borg gibt dann die
+// Sperre seines Repos frei, statt sie liegen zu lassen.
+function runCommand(command, args, timeoutSeconds, { extraEnv = {}, termFirst = false } = {}) {
   return new Promise((resolve) => {
-    const child = spawn("/bin/bash", ["--noprofile", "--norc", "-eo", "pipefail", "-c", script], {
+    const child = spawn(command, args, {
       cwd: "/", detached: true, stdio: ["ignore", "pipe", "pipe"],
-      env: { PATH: STEP_PATH, LANG: "C.UTF-8", HOME: "/root", DEBIAN_FRONTEND: "noninteractive", NEEDRESTART_MODE: "a" },
+      env: { PATH: STEP_PATH, LANG: "C.UTF-8", HOME: "/root", DEBIAN_FRONTEND: "noninteractive", NEEDRESTART_MODE: "a", ...extraEnv },
     });
     let timedOut = false;
-    const timer = setTimeout(() => { timedOut = true; try { process.kill(-child.pid, "SIGKILL"); } catch { /* schon weg */ } }, timeoutSeconds * 1000);
+    const kill = (signal) => { try { process.kill(-child.pid, signal); } catch { /* schon weg */ } };
+    let hard = null;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      if (!termFirst) return kill("SIGKILL");
+      kill("SIGTERM");
+      hard = setTimeout(() => kill("SIGKILL"), 60000);
+    }, timeoutSeconds * 1000);
     for (const [stream, prefix] of [[child.stdout, ""], [child.stderr, "! "]]) {
       let pending = "";
       stream.setEncoding("utf8");
@@ -363,8 +436,8 @@ function runScript(script, timeoutSeconds) {
       });
       stream.on("end", () => { if (pending) log(`${prefix}${pending}`); });
     }
-    child.on("error", (error) => { clearTimeout(timer); resolve({ code: 127, timedOut, error: error.message }); });
-    child.on("close", (code, signal) => { clearTimeout(timer); resolve({ code: code ?? 128, signal, timedOut }); });
+    child.on("error", (error) => { clearTimeout(timer); clearTimeout(hard); resolve({ code: 127, timedOut, error: error.message }); });
+    child.on("close", (code, signal) => { clearTimeout(timer); clearTimeout(hard); resolve({ code: code ?? 128, signal, timedOut }); });
   });
 }
 
@@ -374,6 +447,9 @@ function finish(state, status, error = null) {
   log(`== ${now()} run finished: ${status}${error ? ` — ${error}` : ""}`);
   if (state.snapshot?.snapshotId && status !== "success") {
     log(`== return path: machine snapshot ${state.snapshot.snapshotId} (revert only with operator approval)`);
+  }
+  if (state.systemBackup?.path && status !== "success") {
+    log(`== return path: system backup ${state.systemBackup.path} (borg archive; restore on site from a rescue system as described in NOTFALL.txt next to the repository, only with operator approval)`);
   }
 }
 
@@ -407,6 +483,245 @@ function takeSnapshot(jobId) {
   return { ok: true, record: { snapshotId: result.snapshot.snapshotId, name: result.snapshot.name, rotated: result.rotated || null, seconds: result.seconds ?? null } };
 }
 
+// ── Netz für eine physische Kiste (system-backup) ──────────────────────────
+// /proc/mdstat: das Array ist aktiv und alle Glieder sind da ([4/4] [UUUU]).
+function raidHealthy(device) {
+  let text;
+  try { text = readFileSync(MDSTAT, "utf8"); } catch { return { ok: false, why: "/proc/mdstat is unreadable" }; }
+  const lines = text.split("\n");
+  const start = lines.findIndex((line) => line.startsWith(`${device} :`));
+  if (start < 0) return { ok: false, why: `RAID ${device} is not in /proc/mdstat` };
+  if (!/^\S+ : active\b/.test(lines[start])) return { ok: false, why: `RAID ${device} is not active: ${lines[start].slice(0, 160)}` };
+  for (const line of lines.slice(start + 1)) {
+    if (!line.trim() || /^\S/.test(line)) break;
+    const members = line.match(/\[(\d+)\/(\d+)\]\s+\[([U_]+)\]/);
+    if (!members) continue;
+    const state = `[${members[1]}/${members[2]}] [${members[3]}]`;
+    if (members[1] !== members[2] || members[3].includes("_") || members[3].length !== Number(members[1])) return { ok: false, why: `RAID ${device} is degraded ${state}` };
+    return { ok: true, state };
+  }
+  return { ok: false, why: `RAID ${device}: no member status in /proc/mdstat` };
+}
+
+// Der Einhängepunkt muss eingehängt sein und auf einem anderen Dateisystem
+// liegen als / (sonst schriebe die Sicherung die Root-Platte voll).
+function mountpoints() {
+  try {
+    return readFileSync(MOUNTINFO, "utf8").split("\n").flatMap((line) => {
+      const fields = line.split(" ");
+      if (fields.length < 5) return [];
+      return [{ device: fields[2], point: fields[4].replace(/\\([0-7]{3})/g, (_, octal) => String.fromCharCode(parseInt(octal, 8))) }];
+    });
+  } catch { return null; }
+}
+
+function retentionHalted() {
+  const out = spawnSync(RETENTION_STATUS[0], RETENTION_STATUS.slice(1), { encoding: "utf8", timeout: 120000, maxBuffer: 4 * 1024 * 1024, env: { PATH: STEP_PATH, LANG: "C.UTF-8" } });
+  if (out.status !== 0) return { ok: false, why: `retention service status failed (exit ${out.status})` };
+  const lines = (out.stdout || "").split("\n");
+  const marker = lines.indexOf("== DATEN (cockpit-borg-retention/v1) ==");
+  let report;
+  try { report = JSON.parse(lines[marker + 1]); } catch { return { ok: false, why: "retention service status returned no report" }; }
+  if (marker < 0 || !report?.state) return { ok: false, why: "retention service status returned no report" };
+  if (report.state.status === "angehalten" || report.state.anomaly) {
+    return { ok: false, why: `the backup retention service is halted after an anomaly (${report.state.anomaly?.id || "no id"}); the operator decides first` };
+  }
+  return { ok: true, status: report.state.status };
+}
+
+function usedBytes(path) {
+  const info = statfsSync(path);
+  return (info.blocks - info.bfree) * info.bsize;
+}
+
+function backupStamp() { return new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z"); }
+
+// borg mit der Standalone-Binary; das Repo ist unverschlüsselt (-e none),
+// damit das Rescue-System keine Passphrase braucht. Ein verschobenes Repo
+// beantwortet borg ohne Terminal mit nein: dann scheitert die Sicherung.
+const BORG_ENV = Object.freeze({ BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK: "yes", BORG_RELOCATED_REPO_ACCESS_IS_OK: "no", BORG_EXIT_CODES: "legacy" });
+function borg(args, timeoutSeconds) {
+  return runCommand(BORG, args, timeoutSeconds, { extraEnv: BORG_ENV, termFirst: true });
+}
+// 0 fertig, 1 Warnung (etwa eine Datei, die sich beim Lesen änderte — auf
+// einem laufenden System normal), ab 2 Fehler.
+function borgFailed(result) { return result.timedOut || result.code > 1; }
+
+// borg schreibt bei --version den eigenen Dateinamen und die Version, die
+// installierte Standalone-Binary also „borg-standalone 1.4.5“, ihre Kopie
+// neben dem Repo „borg 1.4.5“. Geprüft wird die erste Zeile: Name der Datei
+// (oder borg, borg.exe) und genau 1.4.x.
+function isBorg14(name, output) {
+  const match = /^(\S+) 1\.4\.\d+$/.exec(output.split("\n")[0].trim());
+  return Boolean(match) && [name, "borg", "borg.exe"].includes(match[1]);
+}
+
+// Die Binary gehört root, ist für niemand anderen schreibbar und meldet sich
+// als borg 1.4.x.
+function borgBinary() {
+  let info;
+  try { info = lstatSync(BORG); } catch { return { ok: false, why: `the standalone borg binary ${BORG} is missing (doc/setup/host-run.md, section 4)` }; }
+  if (!info.isFile() || info.uid !== process.getuid() || (info.mode & 0o022) !== 0) return { ok: false, why: `${BORG} must be a regular file owned by root and not writable by group or others` };
+  const out = spawnSync(BORG, ["--version"], { encoding: "utf8", timeout: 120000, env: { PATH: STEP_PATH, LANG: "C.UTF-8", HOME: "/root" } });
+  const version = (out.stdout || "").trim();
+  if (out.status !== 0 || !isBorg14(basename(BORG), version)) return { ok: false, why: `${BORG} is not borg 1.4.x (${version.slice(0, 80) || `exit ${out.status}`})` };
+  return { ok: true, version: version.split("\n")[0] };
+}
+
+// Der Sicherungsordner gehört root und hat 0700 (die Sicherung enthält /etc
+// und SSH-Schlüssel) und trägt das Kennzeichen des Helfers. Einen fremden
+// Ordner (etwa die VPS-Backups daneben) übernimmt er nie: angelegt wird nur
+// ein fehlender oder leerer Ordner. create: false prüft nur.
+function prepareTarget(backup, { create }) {
+  if (!existsSync(backup.target)) {
+    if (!create) return { ok: true, target: backup.target };
+    mkdirSync(backup.target, { recursive: true, mode: 0o700 });
+  }
+  const info = lstatSync(backup.target);
+  if (!info.isDirectory() || info.uid !== process.getuid()) return { ok: false, why: `backup target ${backup.target} must be a directory owned by root` };
+  const target = realpathSync(backup.target);
+  if (!target.startsWith(`${backup.mount}/`)) return { ok: false, why: `backup target ${backup.target} resolves outside ${backup.mount}` };
+  if (!existsSync(`${target}/${BACKUP_MARK}`)) {
+    if (readdirSync(target).length) return { ok: false, why: `backup target ${target} is not empty and was not created by the host door; it is never taken over` };
+    if (create) writeFileSync(`${target}/${BACKUP_MARK}`, "cockpit-host-run system backup (doc/setup/host-run.md, section 4)\n", { mode: 0o600 });
+  }
+  if (create && (info.mode & 0o777) !== 0o700) chmodSync(target, 0o700);
+  return { ok: true, target, dev: info.dev, ino: info.ino };
+}
+// Vor jedem weiteren Schreiben und vor prune: noch derselbe Ordner (nicht
+// gegen einen Symlink oder einen anderen Ordner getauscht).
+function sameTarget(place) {
+  let info;
+  try { info = lstatSync(place.target); } catch { return false; }
+  return info.isDirectory() && info.uid === process.getuid() && info.dev === place.dev && info.ino === place.ino;
+}
+
+// Alles prüfen, was vor der Sicherung feststehen muss; nichts wird geschrieben.
+function systemBackupPreflight(net) {
+  const backup = net.systemBackup;
+  const raid = raidHealthy(backup.raidDevice);
+  if (!raid.ok) return raid;
+  const mounts = mountpoints();
+  if (!mounts) return { ok: false, why: "mountinfo is unreadable" };
+  const disk = mounts.filter((entry) => entry.point === backup.mount).at(-1);
+  if (!disk) return { ok: false, why: `the backup disk ${backup.mount} is not mounted` };
+  const root = mounts.filter((entry) => entry.point === "/").at(-1);
+  if (!root || root.device === disk.device) return { ok: false, why: `${backup.mount} is on the same filesystem as / ` };
+  for (const source of backup.sources) {
+    if (!existsSync(source)) return { ok: false, why: `backup source ${source} does not exist` };
+  }
+  const tool = borgBinary();
+  if (!tool.ok) return tool;
+  if (!existsSync(NOTFALL_TEMPLATE)) return { ok: false, why: `the emergency guide ${NOTFALL_TEMPLATE} is missing` };
+  const place = prepareTarget(backup, { create: false });
+  if (!place.ok) return place;
+  if (net.retentionService) {
+    const retention = retentionHalted();
+    if (!retention.ok) return retention;
+  }
+  // Platz: so viel, wie die Quellen belegen (eine erste, volle Sicherung ohne
+  // Kompression und Deduplizierung), und danach noch die Reserve. Eine
+  // Folgesicherung braucht meist viel weniger; gerechnet wird mit dem
+  // ungünstigen Fall, damit die Sicherung nie die VPS-Backups verdrängt.
+  let needed = 0;
+  const seen = new Set();
+  for (const source of backup.sources) {
+    const device = statSync(source).dev;
+    if (seen.has(device)) continue;
+    seen.add(device);
+    needed += usedBytes(source);
+  }
+  const space = statfsSync(backup.mount);
+  const free = space.bavail * space.bsize;
+  const reserve = backup.reserveGB * 1024 ** 3;
+  const gb = (bytes) => Math.round(bytes / 1024 ** 3);
+  if (free - needed < reserve) return { ok: false, why: `not enough space on ${backup.mount}: ${gb(free)} GB free, the backup may need ${gb(needed)} GB and ${backup.reserveGB} GB must stay free` };
+  return { ok: true, record: { raid: raid.state, freeGB: gb(free), neededGB: gb(needed), borg: tool.version } };
+}
+
+// Was das Rescue-System braucht, liegt neben dem Repo und wird bei jeder
+// Sicherung erneuert: die Binary, mit der gesichert wird, die Anleitung mit
+// den Pfaden dieser Kiste und die Aufteilung der Platten (UUIDs für fstab).
+function writeRescueKit(backup, target, repo) {
+  copyFileSync(BORG, `${target}/borg.tmp`);
+  chmodSync(`${target}/borg.tmp`, 0o700);
+  renameSync(`${target}/borg.tmp`, `${target}/borg`);
+  const guide = readFileSync(NOTFALL_TEMPLATE, "utf8")
+    .replaceAll("{{TARGET}}", target).replaceAll("{{REPO}}", repo).replaceAll("{{MOUNT}}", backup.mount)
+    .replaceAll("{{RAID}}", backup.raidDevice).replaceAll("{{SOURCES}}", backup.sources.join(" "));
+  writeFileSync(`${target}/NOTFALL.txt`, guide, { mode: 0o600 });
+  const layout = spawnSync(LSBLK, ["-o", "NAME,TYPE,FSTYPE,LABEL,UUID,PARTUUID,SIZE,MOUNTPOINT"], { encoding: "utf8", timeout: 60000 });
+  let mdstat = "";
+  try { mdstat = readFileSync(MDSTAT, "utf8"); } catch { mdstat = "(unreadable)\n"; }
+  writeFileSync(`${target}/PLATTEN.txt`, `Stand ${now()}\n\nlsblk:\n${layout.status === 0 ? layout.stdout : `(lsblk failed, exit ${layout.status})\n`}\n/proc/mdstat:\n${mdstat}`, { mode: 0o600 });
+}
+
+// Ein Archiv der Reihe series ("preRun" mit dem Job als Kennung, "weekly"),
+// danach Aufbewahrung nur dieser Reihe im eigenen Repo.
+async function takeSystemBackup(net, series, label) {
+  const backup = net.systemBackup;
+  const place = prepareTarget(backup, { create: true });
+  if (!place.ok) return place;
+  const repo = `${place.target}/repo`;
+  let created = false;
+  if (!existsSync(`${repo}/config`)) {
+    if (existsSync(repo)) return { ok: false, why: `${repo} exists but is no borg repository` };
+    log(`== new borg repository ${repo} (unencrypted)`);
+    const made = await borg(["init", "--encryption=none", repo], 600);
+    if (made.timedOut || made.code !== 0) return { ok: false, why: `system backup: borg init failed (exit ${made.code})` };
+    created = true;
+  }
+  const swapped = { ok: false, why: `backup target ${place.target} changed during the backup; nothing more is written there` };
+  if (!sameTarget(place)) return swapped;
+  writeRescueKit(backup, place.target, repo);
+  if (!sameTarget(place)) return swapped;
+  const prefix = ARCHIVE_SERIES[series];
+  const archive = `${prefix}${backupStamp()}${label ? `-${label}` : ""}`;
+  const started = Date.now();
+  log(`== system backup ${repo}::${archive} of ${backup.sources.join(" ")}; limit ${backup.timeoutSeconds} s`);
+  const result = await borg(["create", "--lock-wait", "600", "--one-file-system", "--numeric-ids", "--exclude-caches", "--compression", "zstd,3", "--stats", "--show-rc",
+    ...backup.exclude.flatMap((pattern) => ["--exclude", pattern]), `${repo}::${archive}`, ...backup.sources], backup.timeoutSeconds);
+  if (borgFailed(result)) return { ok: false, why: `system backup ${result.timedOut ? "hit its time limit" : `failed (borg exit ${result.code})`}` };
+  // Nur diese Reihe, nur nach dem eigenen Präfix, nur in diesem Repo.
+  const keep = series === "preRun" ? backup.keepPreRun : backup.keepWeekly;
+  let upkeepError = null;
+  if (!sameTarget(place)) return swapped;
+  const pruned = await borg(["prune", "--lock-wait", "600", "--list", "--glob-archives", `${prefix}*`, `--keep-last=${keep}`, repo], SYSTEM_BACKUP_UPKEEP_SECONDS);
+  if (borgFailed(pruned)) upkeepError = `borg prune failed (exit ${pruned.code})`;
+  else {
+    const compacted = await borg(["compact", "--lock-wait", "600", repo], SYSTEM_BACKUP_UPKEEP_SECONDS);
+    if (borgFailed(compacted)) upkeepError = `borg compact failed (exit ${compacted.code})`;
+  }
+  // Das neue Archiv ist fertig; ältere bleiben bis zur nächsten Sicherung liegen.
+  if (upkeepError) log(`== warning: ${upkeepError}; the new archive is complete, older ones stay until the next backup`);
+  return { ok: true, record: { path: `${repo}::${archive}`, repo, archive, series, keep, repoCreated: created, borgExit: result.code, upkeepError, seconds: Math.round((Date.now() - started) / 1000) } };
+}
+
+// Prüfen und sichern; ein Dateisystemfehler (etwa ein RAID, das read-only
+// umgehängt wurde) ist ein gescheitertes Netz mit Grund, kein Absturz.
+async function systemBackup(net, series, label) {
+  try {
+    const ready = systemBackupPreflight(net);
+    if (!ready.ok) return ready;
+    log(`== RAID ${net.systemBackup.raidDevice} ${ready.record.raid}, ${ready.record.freeGB} GB free on ${net.systemBackup.mount} (backup may need ${ready.record.neededGB} GB), ${ready.record.borg}`);
+    return await takeSystemBackup(net, series, label);
+  } catch (error) {
+    return { ok: false, why: `system backup: ${String(error.message).slice(0, 300)}` };
+  }
+}
+
+// Units, die nach einem Neustart wieder da sein müssen (WireGuard, SSH): je
+// Gruppe mindestens eine `enabled`. Ohne sie käme die Kiste vielleicht hoch,
+// wäre aber nicht erreichbar.
+function bootUnitsMissing(net) {
+  const missing = [];
+  for (const group of net.reboot.mustBeEnabled) {
+    const enabled = group.some((unit) => (spawnSync(SYSTEMCTL, ["is-enabled", unit], { encoding: "utf8", timeout: 15000 }).stdout || "").trim() === "enabled");
+    if (!enabled) missing.push(group.join(" or "));
+  }
+  return missing;
+}
+
 async function payload(jobId) {
   if (env.COCKPIT_HOST_RUN_IN_UNIT !== "1") fail("the payload runs only inside its own unit", 64);
   if (!JOB_ID.test(jobId || "")) fail("invalid job id");
@@ -419,15 +734,39 @@ async function payload(jobId) {
   if (state.phase === "preflight") {
     log(`== ${now()} host run ${jobId}: ${manifest.name} (ordered by ${state.actorId}, unit ${state.unit})`);
     if (manifest.mutates) {
-      const borg = borgFresh();
-      state.borg = borg.record || null;
+      const loaded = loadNet();
+      if (!loaded.ok) return finish(state, "preflight_failed", `${loaded.why}; nothing was executed`);
+      const { net } = loaded;
+      state.net = { net: net.net, source: loaded.source, onSite: net.reboot.onSite };
       saveState(state);
-      if (!borg.ok) return finish(state, "preflight_failed", `${borg.why}; nothing was executed`);
-      log(`== borg: last backup ${borg.record.lastRunEnd} (${borg.record.ageHours} h ago)`);
-      const snap = takeSnapshot(jobId);
-      if (!snap.ok) return finish(state, "preflight_failed", `${snap.why}; nothing was executed`);
-      state.snapshot = snap.record;
-      log(`== machine snapshot ${snap.record.snapshotId}${snap.record.rotated ? ` (rotated ${snap.record.rotated.snapshotId})` : ""}`);
+      log(`== safety net: ${net.net} (${loaded.source})`);
+      const reboots = manifest.steps.some((step) => step.reboot === true);
+      if (reboots && net.reboot.onSite) log("== physical host: if it does not come back after the reboot, only someone on site can help (no hoster console, no machine snapshot)");
+      if (reboots) {
+        const missing = bootUnitsMissing(net);
+        if (missing.length) return finish(state, "preflight_failed", `not enabled at boot, the host might come back unreachable: ${missing.join("; ")}; nothing was executed`);
+      }
+      if (net.retentionService && net.net !== "system-backup") {
+        const retention = retentionHalted();
+        if (!retention.ok) return finish(state, "preflight_failed", `${retention.why}; nothing was executed`);
+      }
+      if (net.net === "system-backup") {
+        const made = await systemBackup(net, "preRun", jobId);
+        if (!made.ok) return finish(state, "preflight_failed", `${made.why}; nothing was executed`);
+        state.systemBackup = made.record;
+        saveState(state);
+        log(`== system backup ${made.record.path} (${made.record.seconds} s, the last ${made.record.keep} pre-run archives kept)`);
+      } else {
+        const borg = borgFresh();
+        state.borg = borg.record || null;
+        saveState(state);
+        if (!borg.ok) return finish(state, "preflight_failed", `${borg.why}; nothing was executed`);
+        log(`== borg: last backup ${borg.record.lastRunEnd} (${borg.record.ageHours} h ago)`);
+        const snap = takeSnapshot(jobId);
+        if (!snap.ok) return finish(state, "preflight_failed", `${snap.why}; nothing was executed`);
+        state.snapshot = snap.record;
+        log(`== machine snapshot ${snap.record.snapshotId}${snap.record.rotated ? ` (rotated ${snap.record.rotated.snapshotId})` : ""}`);
+      }
     } else {
       log("== declared read-only (mutates false): no snapshot, no backup check");
     }
@@ -444,6 +783,16 @@ async function payload(jobId) {
     const step = manifest.steps[index];
     const record = state.steps[index];
     if (step.reboot === true) {
+      // Die Schritte davor können eine Unit abgeschaltet oder ersetzt haben
+      // (ein Release-Upgrade etwa): unmittelbar vor dem Neustart noch einmal.
+      const loaded = loadNet();
+      const missing = loaded.ok ? bootUnitsMissing(loaded.net) : [loaded.why];
+      if (missing.length) {
+        Object.assign(record, { status: "failed", startedAt: now(), endedAt: now() });
+        state.nextStep = index + 1;
+        return finish(state, "failed", `step ${index + 1} (${step.name}): the host was not rebooted, it might come back unreachable — not enabled at boot: ${missing.join("; ")}`);
+      }
+      if (loaded.net.reboot.onSite) log("== physical host: if it does not come back, only someone on site can help");
       Object.assign(record, { status: "rebooting", startedAt: now() });
       Object.assign(state, { phase: "rebooting", nextStep: index + 1, rebootRequestedAt: now() });
       saveState(state);
@@ -484,9 +833,38 @@ async function payload(jobId) {
   finish(state, failed === 0 ? "success" : "check_failed", failed === 0 ? null : `${failed} check(s) failed`);
 }
 
+// ── weekly-backup (Timer) ──────────────────────────────────────────────────
+// Damit es eine Systemsicherung gibt, auch wenn lange kein verändernder Lauf
+// kommt: dieselben Prüfungen, eigene Reihe (woche-…) und eigene Aufbewahrung.
+// Endet mit einem Code ungleich 0, wenn nicht gesichert wurde — die Unit steht
+// dann auf failed, sichtbar für systemctl --failed.
+async function weeklyBackup() {
+  if (env.COCKPIT_SYSTEM_BACKUP_IN_UNIT !== "1") fail("the weekly system backup runs only inside cockpit-systemsicherung.service", 64);
+  const loaded = loadNet();
+  if (!loaded.ok) fail(`${loaded.why}; no weekly system backup`, 78);
+  if (loaded.net.net !== "system-backup") fail(`this host's net is ${loaded.net.net}, which has no system backup; the timer belongs only on a host with net system-backup`, 78);
+  // Nicht mitten in einen verändernden Lauf hinein (ein halb aktualisiertes
+  // System); der Lauf hat seine eigene Sicherung von vorher.
+  // Unter der Start-Sperre: ein Lauf, der danach startet, sieht diese Unit
+  // aktiv und startet nicht (startLocked).
+  mkdirSync(STATE_ROOT, { recursive: true, mode: 0o700 });
+  const active = withStartLock(() => readdirSync(STATE_ROOT).find((jobId) => {
+    if (!JOB_ID.test(jobId)) return false;
+    try { return runActive(jobId, readState(jobId)); } catch { return false; }
+  }));
+  if (active) fail(`host run ${active} is active; no weekly system backup now`, 75);
+  redact = redactor();
+  log(`== ${now()} weekly system backup (${loaded.source})`);
+  const made = await systemBackup(loaded.net, "weekly", null);
+  if (!made.ok) fail(`== weekly system backup failed: ${made.why}`, 70);
+  log(`== weekly system backup ${made.record.path} (${made.record.seconds} s, the last ${made.record.keep} weekly archives kept)`);
+  if (made.record.upkeepError) process.exitCode = 1;
+}
+
 const [verb, argument] = process.argv.slice(2);
 if (verb === "start" && process.argv.length === 3) await start();
 else if (verb === "status" && process.argv.length === 4) status(argument);
 else if (verb === "resume" && process.argv.length === 3) resume();
 else if (verb === "--payload" && process.argv.length === 4) await payload(argument);
+else if (verb === "weekly-backup" && process.argv.length === 3) await weeklyBackup();
 else fail("usage: cockpit-host-run start | status <jobId> | resume");

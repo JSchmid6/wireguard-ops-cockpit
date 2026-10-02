@@ -1,0 +1,19 @@
+# Wöchentliche Systemsicherung von Lab0 aufs RAID (doc/setup/host-run.md, 4):
+# dasselbe borg-Archiv wie vor jedem verändernden Lauf der Tür, mit denselben
+# Prüfungen (RAID [UUUU], RAID eingehängt mit Platz, Aufräum-Dienst ohne
+# Anomalie), eigene Reihe woche-… und eigene Aufbewahrung (keepWeekly in
+# /etc/wireguard-ops-cockpit/host-run-net.json). Geprunt wird nur im eigenen
+# Repo und nur diese Reihe. Nur auf einer Kiste mit Netz system-backup.
+[Unit]
+Description=Cockpit: wöchentliche Systemsicherung aufs RAID (borg)
+RequiresMountsFor=/media/RAID
+
+[Service]
+Type=oneshot
+Environment=COCKPIT_SYSTEM_BACKUP_IN_UNIT=1
+ExecStart=/opt/node-v20.19.1-linux-x64/bin/node /usr/local/lib/wireguard-ops-cockpit/cockpit-host-run.mjs weekly-backup
+# Der Helfer begrenzt die Sicherung selbst (timeoutSeconds, höchstens 6 h,
+# dazu prune und compact); das hier ist nur die äußere Grenze.
+TimeoutStartSec=8h
+Nice=10
+IOSchedulingClass=idle

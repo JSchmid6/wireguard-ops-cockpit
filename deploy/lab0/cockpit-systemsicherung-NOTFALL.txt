@@ -1,0 +1,106 @@
+NOTFALL: Lab0 aus der Systemsicherung zurückholen
+=================================================
+
+Diese Datei schreibt cockpit-host-run bei jeder Systemsicherung neu
+(Vorlage: deploy/lab0/cockpit-systemsicherung-NOTFALL.txt im Cockpit-Repo,
+doc/setup/host-run.md, Abschnitt 4). Sie liegt neben dem Repo, damit sie
+auch dann da ist, wenn Lab0 nicht mehr startet.
+
+Hier im Ordner {{TARGET}}:
+  repo/          borg-Repo, UNVERSCHLÜSSELT (keine Passphrase nötig)
+  borg           Standalone-borg (1.4.x), mit der gesichert wurde
+  NOTFALL.txt    diese Anleitung
+  PLATTEN.txt    lsblk und /proc/mdstat zum Zeitpunkt der letzten Sicherung
+                 (UUIDs der Dateisysteme, für fstab und Bootloader)
+
+Gesichert: {{SOURCES}} (je nur das eine Dateisystem, -x). NICHT gesichert:
+das RAID {{MOUNT}} selbst, Caches, /home/jochen/Nextcloud (synchronisiert
+neu), /opt/android-workbench, Docker-Abbilder (neu ziehen; Docker-Volumes
+sind drin). Was genau ausgeschlossen war, steht in
+/etc/wireguard-ops-cockpit/host-run-net.json im Archiv.
+
+Archive: vorlauf-<Zeit>-<Job> vor jedem verändernden Lauf durch die Tür,
+woche-<Zeit> wöchentlich. Zurück nur mit Jochens Entscheidung — alles, was
+seit dem Archiv geschrieben wurde, geht dabei verloren.
+
+Die Sicherung ist eine Kopie eines LAUFENDEN Systems: Datenbanken in
+Containern sind nicht absturzsicher gesichert.
+
+
+1. Rescue-System booten
+-----------------------
+USB-Stick mit einem Live-/Rescue-System (z. B. Ubuntu-Desktop "Ausprobieren"
+oder SystemRescue) booten, Netz ist nicht nötig. Alles Folgende als root
+(sudo -i).
+
+
+2. RAID einbinden (Intel IMSM, mdadm)
+-------------------------------------
+    mdadm --assemble --scan
+    cat /proc/mdstat            # erwartet: {{RAID}} : active raid10 ... [UUUU]
+    mkdir -p {{MOUNT}}
+    mount /dev/{{RAID}} {{MOUNT}}
+    ls {{TARGET}}
+
+Die md-Nummer kann im Rescue-System anders heißen (etwa md126 statt md127):
+dann das aktive raid10-Volume aus /proc/mdstat nehmen, nicht den Container
+(inactive / external:imsm). NICHTS auf dem RAID formatieren.
+
+    cd {{TARGET}}
+    ./borg --version
+    ./borg list repo            # Archive ansehen, eines wählen
+
+
+3. Root formatieren und einhängen
+---------------------------------
+Root liegt laut letztem Stand auf LVM (ubuntu-vg/ubuntu-lv); maßgeblich ist
+PLATTEN.txt. Die Platte mit / ist NICHT das RAID.
+
+    vgchange -ay
+    lsblk -o NAME,FSTYPE,UUID,SIZE
+    # UUID des alten Root-Dateisystems aus PLATTEN.txt nehmen, dann stimmen
+    # fstab und Bootloader ohne Änderung:
+    mkfs.ext4 -U <UUID-aus-PLATTEN.txt> /dev/ubuntu-vg/ubuntu-lv
+    mkdir -p /mnt/root
+    mount /dev/ubuntu-vg/ubuntu-lv /mnt/root
+    # /boot und /boot/efi (falls eigene Partitionen, siehe PLATTEN.txt):
+    # nur formatieren, wenn sie kaputt sind (mkfs.ext4 -U … bzw.
+    # mkfs.vfat -i <Seriennummer ohne Bindestrich> für EFI), sonst nur einhängen
+    mkdir -p /mnt/root/boot && mount /dev/<boot> /mnt/root/boot
+    mkdir -p /mnt/root/boot/efi && mount /dev/<efi> /mnt/root/boot/efi
+
+
+4. borg extract
+---------------
+borg legt Pfade ohne führenden / ab; ausgepackt wird ins aktuelle
+Verzeichnis:
+
+    cd /mnt/root
+    BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK=yes \
+    BORG_RELOCATED_REPO_ACCESS_IS_OK=yes \
+      {{TARGET}}/borg extract --numeric-ids --list \
+      {{REPO}}::<ARCHIVNAME>
+
+Fehlende, ausgeschlossene Verzeichnisse anlegen, die das System braucht:
+
+    mkdir -p tmp var/tmp var/cache proc sys dev run {{MOUNT}}
+    chmod 1777 tmp var/tmp
+
+
+5. fstab und Bootloader prüfen, grub-install
+--------------------------------------------
+    cat /mnt/root/etc/fstab     # UUIDs gegen lsblk -o NAME,UUID prüfen
+    for d in dev proc sys run; do mount --rbind /$d /mnt/root/$d; done
+    chroot /mnt/root
+      # UEFI:
+      grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu
+      # BIOS/Legacy stattdessen: grub-install /dev/<Systemplatte, nicht das RAID>
+      update-grub
+      update-initramfs -u -k all
+      exit
+    umount -R /mnt/root
+    reboot
+
+Nach dem Start: systemctl --failed, WireGuard (wg show), SSH, cat /proc/mdstat,
+Docker-Abbilder neu ziehen (docker compose pull), Nextcloud-Client
+synchronisiert /home/jochen/Nextcloud neu.

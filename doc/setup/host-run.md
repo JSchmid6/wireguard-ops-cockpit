@@ -1,6 +1,7 @@
 # Die allgemeine Tür: Host-Lauf mit Schloss und Türsteher
 
-Stand 30.09.2026. Betrifft `apps/api/src/host-run.ts`, `deploy/helpers/cockpit-host-run`,
+Stand 30.09.2026, Netz je Kiste seit 02.10.2026. Betrifft `apps/api/src/host-run.ts`,
+`deploy/helpers/cockpit-host-run`, `deploy/helpers/cockpit-host-run-net.mjs`,
 `deploy/systemd/wireguard-ops-cockpit-host-run-resume.service`, den Executor-Broker
 (`host.run`, `host.status`) und den Planer-Vertrag.
 
@@ -33,7 +34,8 @@ Planer ──► Plan mit einem ```host-run-Manifest (cockpit-host-run/v1)
         ──► Executor-Broker host.run ──► sudo cockpit-host-run.mjs start
               prüft das Schloss, legt /var/lib/wireguard-ops-cockpit/host-runs/<job>/ an,
               startet die Unit cockpit-host-run-<job> und kehrt sofort zurück
-        ──► Unit: borg jünger als 24 h? Snapshot beim Hoster. Schritte. Prüfschritte.
+        ──► Unit: Netz der Kiste (VPS: borg jünger als 24 h, Snapshot beim Hoster;
+              Lab0: RAID, Platz, Aufräum-Dienst, Systemsicherung). Schritte. Prüfschritte.
         ──► API folgt mit host.status, danach unabhängige Verifikation wie bisher
 ```
 
@@ -214,8 +216,31 @@ Absturz), meldet `status` den Lauf als gescheitert.
 
 ## 4. Netz darunter
 
-Vor jedem Lauf mit `mutates: true` (Standard; nur ein ausdrücklich lesender Plan setzt `false`,
-und das prüft der Türsteher):
+Welches Netz unter der Tür liegt, stellt jede Kiste in einer root-eigenen Datei ein:
+`/etc/wireguard-ops-cockpit/host-run-net.json` (root, 0644; der Ordner
+`/etc/wireguard-ops-cockpit` root, 0755 — geprüft werden nur Eigentümer und Rechte der Datei,
+nicht die des Ordners). Umgebungsvariablen gibt es dafür
+nicht: sudo setzt sie zurück, und die Lauf-Unit bekommt nur `COCKPIT_HOST_RUN_IN_UNIT`. Form
+und Grenzen prüft `deploy/helpers/cockpit-host-run-net.mjs` (installiert neben dem Helfer); die
+Datei nennt nur Werte, nie Befehle. Der Helfer liest sie vor jedem Lauf mit `mutates: true`
+(Standard; nur ein ausdrücklich lesender Plan setzt `false`, und das prüft der Türsteher) und
+noch einmal unmittelbar vor jedem Neustart-Schritt:
+
+- **Datei fehlt:** Netz des VPS (`hoster-snapshot`), wie vor dieser Einstellung.
+- **Datei gehört nicht root, ist für Gruppe oder andere schreibbar, kein reguläres File, oder
+  ihr Inhalt ist ungültig** (unbekanntes Feld, Wert außerhalb der Grenzen): kein verändernder
+  Lauf (`preflight_failed`); lesende Läufe gehen weiter.
+
+Die API liest dieselbe Datei beim Start, nur um dem Türsteher, dem Planer und Jochen ehrlich zu
+sagen, was darunter liegt (Prompt, Planer-Vertrag, Begründung der Entscheidung, Ergebnis) und um
+ihre Frist um die Dauer der Systemsicherung zu verlängern. Sie entscheidet damit nichts; nach
+einer Änderung der Datei die API neu starten. Die Datei muss deshalb für die API (`wgops`)
+lesbar sein (0644 in einem Verzeichnis mit 0755); kann sie sie nicht lesen, sagt sie das im
+Prompt und rechnet mit der längsten erlaubten Sicherung (6 h).
+
+Beispiele: `deploy/config/host-run-net.vps.json` und `deploy/config/host-run-net.lab0.json`.
+
+### VPS: `hoster-snapshot`
 
 1. `cockpit-borg-action status`: das letzte borg-Backup muss erfolgreich und jünger als 24 h
    sein. `last_run_end` ist die jüngste „Finished borgmatic…“-Zeile, die systemd nur beim
@@ -224,18 +249,221 @@ und das prüft der Türsteher):
 2. `cockpit-vps-snapshot create cockpit-run-<job> --wait 900`: Maschinen-Snapshot beim Hoster;
    ist das Kontingent voll, rotiert das Werkzeug den ältesten cockpit-eigenen Snapshot.
 
-Scheitert eines davon, läuft kein Schritt (`preflight_failed`). Scheitert später ein Schritt oder
-eine Prüfung, nennt das Protokoll die Snapshot-Kennung; zurückgespielt wird er nur mit Jochens
-Freigabe (ein Revert nimmt alles seit dem Snapshot mit).
+### Lab0: `system-backup`
+
+Lab0 ist eine physische Kiste: kein Hoster, kein Snapshot, keine Konsole aus der Ferne. Die
+Root-Platte ist LVM (`ubuntu-vg`, 465 GB, 0 GB frei), das RAID unter `/media/RAID` hält die
+VPS-Backups (02.10.2026: 5,5 T, 4,7 T belegt, 777 G frei, 87 %).
+
+**Entscheidung Jochen (02.10.2026):** Das Netz ist eine Systemsicherung aufs RAID mit **borg**
+(Platz ist knapp, viele Versionen kommen dazu: borg dedupliziert und komprimiert).
+Zurückgeholt wird im Notfall **vor Ort mit einem Rescue-System**. LVM-Umbau und eine Extra-SSD
+entfallen als zu aufwändig.
+
+Vor jedem verändernden Lauf, in dieser Reihenfolge (fehlt etwas, läuft kein Schritt,
+`preflight_failed`):
+
+1. **RAID gesund:** `/proc/mdstat` nennt das Array (`raidDevice`; auf Lab0 das IMSM-Volume
+   `md126` im Container `md127`) `active`, und alle Glieder sind da (`[4/4] [UUUU]`; ein `_`
+   oder `[4/3]` stoppt).
+2. **Sicherungsplatte eingehängt:** `mount` steht in `/proc/self/mountinfo` und liegt auf einem
+   anderen Gerät als `/`. Ohne diese Prüfung schriebe eine Sicherung bei nicht eingehängtem RAID
+   die Root-Platte voll.
+3. **Quellen vorhanden** (`sources`, Vorschlag `/`, `/boot`, `/boot/efi`). Mit
+   `--one-file-system` steigt borg von `/` aus nicht in `/boot` oder `/boot/efi` ab, wenn das
+   eigene Dateisysteme sind — dann überlappt nichts. Liegt `/boot` dagegen auf `/`, steht es
+   zweimal im Archiv (rc 0, Auspacken korrekt; borg dedupliziert die Datenblöcke, doppelt sind
+   nur die Einträge). Ob `/boot` und `/boot/efi` auf Lab0 eigene Dateisysteme sind, ist nicht
+   geprüft (`findmnt /boot /boot/efi`, siehe unten); sonst die Quelle aus der Datei nehmen.
+4. **Standalone-borg da:** `/usr/local/lib/wireguard-ops-cockpit/borg-standalone` ist eine
+   reguläre Datei, gehört root, ist für Gruppe und andere nicht schreibbar und meldet sich mit
+   `--version` als borg 1.4.x. borg schreibt dabei den eigenen Dateinamen vor die Version, die
+   installierte Binary also `borg-standalone 1.4.5` (gemessen mit dem Release 1.4.5,
+   `borg-linux-glibc231-x86_64`); der Helfer prüft die erste Zeile auf diesen Dateinamen (oder
+   `borg`, `borg.exe`) und genau `1.4.x`. Passt sie nicht, steht im Log Pfad und Ausgabe, etwa
+   `… is not borg 1.4.x (borg-standalone 1.2.8)`. Mit genau
+   dieser Binary sichert der Helfer, und eine Kopie legt er neben das Repo. Dazu die Vorlage der
+   Notfall-Anleitung neben dem Helfer (`cockpit-systemsicherung-NOTFALL.txt`).
+5. **Sicherungsordner gehört der Tür:** `target` fehlt, ist leer, oder ist ein Verzeichnis, das
+   root gehört und das Kennzeichen `.cockpit-systemsicherung` trägt. Einen fremden, nicht leeren
+   Ordner (etwa `backup_VServer` oder Claudes Sicherung vom 02.10.) übernimmt der Helfer **nie**.
+6. **Aufräum-Dienst ohne Anomalie** (`retentionService: true`): `cockpit-borg-retention status`
+   darf weder `angehalten` noch eine Anomalie melden. Eine Anomalie heißt: jemand hat
+   VPS-Backups auf dem RAID gelöscht; dann entscheidet Jochen zuerst
+   (`doc/setup/borg-retention.md`), bevor an der Kiste gebaut wird.
+7. **Platz:** frei auf der Sicherungsplatte muss mindestens sein, was die Quellen belegen
+   (ungünstiger Fall: eine volle erste Sicherung ohne Kompression und Deduplizierung; die
+   Ausschlüsse sind darin nicht abgezogen), plus `reserveGB`, die danach frei bleiben — damit eine
+   Systemsicherung nie die VPS-Backups verdrängt.
+
+Dann die Sicherung:
+
+8. **Ordner und Repo:** `target` wird root-eigen mit **0700** angelegt bzw. auf 0700 gesetzt (die
+   Sicherung enthält `/etc` und SSH-Schlüssel). Das Repo ist `<target>/repo`, beim ersten Mal
+   `borg init --encryption=none` — **unverschlüsselt**, damit das Rescue-System keine Passphrase
+   braucht. Ein eigenes Repo je Kiste; die VPS-Backups liegen in einem anderen.
+9. **Notfall-Bausatz neben dem Repo**, bei jeder Sicherung erneuert: `<target>/borg` (Kopie der
+   Standalone-Binary, 0700), `<target>/NOTFALL.txt` (Vorlage
+   `deploy/lab0/cockpit-systemsicherung-NOTFALL.txt` mit den Pfaden dieser Kiste: Rescue-Stick
+   booten, IMSM-RAID mit `mdadm --assemble --scan` einbinden, Root formatieren — mit der alten
+   UUID — und einhängen, `borg extract`, fstab und Bootloader prüfen bzw. `grub-install`) und
+   `<target>/PLATTEN.txt` (`lsblk` mit UUIDs und `/proc/mdstat` zum Zeitpunkt der Sicherung).
+10. **Archiv:** `borg create --one-file-system --numeric-ids --exclude-caches --compression
+    zstd,3` der Quellen nach `<target>/repo::vorlauf-<Zeit>-<job>`, `--lock-wait 600`, Zeitlimit
+    `timeoutSeconds` (danach SIGTERM, damit borg seine Sperre freigibt, eine Minute später
+    SIGKILL). `-x` hält das RAID, `/proc`, `/sys`, `/run` draußen. Ausschlüsse (`exclude`,
+    borg-Muster; Vorschlag nach der Entscheidung): `/swap.img`, `/tmp/*`, `/var/tmp/*`,
+    `/var/cache/*`, `/root/.cache/*`, `/home/*/.cache/*`, der Nextcloud-Sync-Ordner
+    `/home/jochen/Nextcloud`, `/opt/android-workbench` (Android-SDK und Emulator-Abbilder) und
+    die Docker-Abbilder (`/var/lib/docker/overlay2`, `image`, `buildkit`, dazu der Abbild-Speicher
+    von containerd). **Docker-Volumes (`/var/lib/docker/volumes`) bleiben drin.** borg-Ende 0 oder
+    1 (Warnung, etwa eine Datei änderte sich beim Lesen) gilt als Erfolg, ab 2 als Fehler.
+11. **Aufbewahrung, streng begrenzt:** `borg prune --glob-archives 'vorlauf-*'
+    --keep-last=<keepPreRun>` und danach `borg compact` — nur in `<target>/repo`, nur die
+    eigene Reihe. Die Wochen-Reihe `woche-*` und jedes andere Archiv bleiben unberührt; `borg
+    delete` ruft der Helfer nie auf. Scheitert prune oder compact, ist das neue Archiv trotzdem
+    vollständig: der Lauf geht weiter, Protokoll und Laufzustand (`upkeepError`) sagen es.
+
+Die Grenzen stehen in der root-eigenen Datei, nicht im Code: `keepPreRun` (Vorgabe 5, erlaubt
+1–20) und `keepWeekly` (Vorgabe 4, erlaubt 1–12). Ändern wie beim Aufräum-Dienst: innerhalb der
+Grenzen frei, die Form prüft der Helfer vor jeder Sicherung (ein Wert außerhalb oder ein
+unbekanntes Feld — auch das alte `keep` — stoppt jeden verändernden Lauf).
+
+Die Sicherung läuft einmal je Lauf, nicht nach einem Neustart. `systemBackup.path` im
+Laufzustand ist `<repo>::<archiv>`; es steht im Protokoll und im Ergebnis, und scheitert später
+ein Schritt, nennt das Protokoll das Archiv als Rückweg. Zurückgeholt wird nur mit Jochens
+Freigabe und **vor Ort** nach `NOTFALL.txt`.
+
+#### Wöchentlich per Timer
+
+Damit es überhaupt eine Systemsicherung gibt, auch wenn lange kein verändernder Lauf kommt:
+`cockpit-systemsicherung.timer` (sonntags 03:30, `Persistent=true`) startet
+`cockpit-systemsicherung.service`, und der ruft `cockpit-host-run.mjs weekly-backup` auf (nur in
+dieser Unit, `COCKPIT_SYSTEM_BACKUP_IN_UNIT=1`; sudoers erlaubt das Verb nicht). Dieselben
+Prüfungen 1–7, dasselbe Repo, eigene Reihe `woche-<Zeit>` mit eigener Aufbewahrung
+(`keepWeekly`). Läuft gerade ein Host-Lauf (auch einer, der auf seinen Neustart wartet), sichert
+der Timer nicht (Ende 75); bei einer anderen Kiste als `system-backup` endet er mit 78, bei
+einer gescheiterten Prüfung oder Sicherung mit 70, bei gescheitertem prune/compact mit 1 — jedes
+Mal steht die Unit auf `failed`, sichtbar in `systemctl --failed`. Units:
+`deploy/systemd/cockpit-systemsicherung.service` und `.timer`.
+
+**Gleichzeitig:** Die Wochen-Sicherung prüft unter der Start-Sperre der Tür, dass kein Lauf
+aktiv ist; solange ihre Unit aktiv ist, startet kein Host-Lauf (`start` endet mit 75, „the
+weekly system backup is running“ — den Lauf später neu bestellen). Dazu sperrt borg das Repo
+(`--lock-wait 600`).
+
+**Ehrliche Grenze:** Der Helfer prüft den Sicherungsordner (root, kein Symlink, unter `mount`,
+Kennzeichen) und vor jedem weiteren Schreiben und vor prune noch einmal, dass es derselbe Ordner
+ist (Gerät und Inode). Ein Tausch genau zwischen zwei Prüfungen bleibt möglich, wenn ein
+Nicht-root-Nutzer in `mount` schreiben darf; dann landen höchstens die Notfall-Dateien oder ein
+neues Repo im fremden Ordner. Fremde Archive prunt er auch dann nicht: prune nennt nur die
+eigenen Präfixe, und das VPS-Repo ist verschlüsselt (ohne Passphrase bricht borg ab). Vor dem
+Ausrollen `ls -ld /media/RAID` ansehen.
+
+**Abwägung (so entschieden):**
+
+| | borg-Archiv aufs RAID (gewählt) | rsync-Kopie aufs RAID | LVM-Snapshot (Umbau) |
+| --- | --- | --- | --- |
+| Platz | dedupliziert und komprimiert; viele Versionen kosten wenig | jede Version kostet geänderte Dateien ganz | in `ubuntu-vg` ist kein Platz |
+| Liegt auf | anderer Platte (RAID) | anderer Platte (RAID) | derselben Platte |
+| Konsistenz | Dateien eines laufenden Systems; Datenbanken nicht absturzsicher | ebenso | Zeitpunkt-genau |
+| Zurück | Rescue-System vor Ort, `borg extract` mit der Binary neben dem Repo | Rescue-System, rsync zurück | `lvconvert --merge` — nach einem kaputten Upgrade auch nur vor Ort |
+| Umbau | keiner | keiner | Root-LV offline verkleinern |
+
+### Neustart: wer hilft, wenn die Kiste nicht hochkommt
+
+`reboot` (beide Netze, optional):
+
+- `mustBeEnabled`: Gruppen von Units, von denen je mindestens eine `enabled` sein muss
+  (`systemctl is-enabled`), Vorschlag für Lab0 `[["wg-quick@wg0.service"], ["ssh.service",
+  "ssh.socket"]]` (Ubuntu startet SSH seit 22.10 oft über `ssh.socket`). Geprüft wird vor dem
+  Lauf, wenn der Plan einen Neustart enthält (`preflight_failed`, kein Schritt läuft), und
+  **noch einmal unmittelbar vor jedem Neustart-Schritt**: ein Release-Upgrade kann eine Unit
+  ersetzen oder abschalten. Fehlt dann eine, startet die Tür nicht neu, der Lauf endet als
+  `failed` und nennt die Systemsicherung als Rückweg.
+- `onSite: true`: Die Tür sagt es deutlich — im Prompt des Türstehers, im Planer-Vertrag, in der
+  Begründung der Entscheidung, die Jochen sieht („The plan reboots a physical host: if it does
+  not come back, only someone on site can help.“), und im Protokoll vor dem Neustart.
+
+Ehrlich: `enabled` heißt nur, dass systemd die Unit beim Hochfahren startet. Ob sie dann läuft
+(Konfiguration kaputt, Kernel bootet nicht, Platte fehlt), prüft die Tür vorher nicht. Kommt
+Lab0 nicht hoch, meldet die Tür den Lauf nach ihrer Frist als gescheitert — helfen kann nur
+jemand an der Kiste.
+
+### Allgemein
+
+Scheitert eine Prüfung des Netzes, läuft kein Schritt (`preflight_failed`). Scheitert später ein
+Schritt oder eine Prüfung, nennt das Protokoll den Rückweg (Snapshot-Kennung oder borg-Archiv
+der Systemsicherung); zurückgespielt wird nur mit Jochens Freigabe (ein Revert nimmt alles seit dem
+Snapshot bzw. der Sicherung mit).
 
 Der Plan braucht Prüfschritte und einen Rückweg (`rollback`, Pflichtfeld). Ein Neustart ist ein
 gewöhnlicher Schritt (`{"name":"reboot","reboot":true}`, höchstens drei): der Lauf schreibt
 vorher, wo er weitermacht, `wireguard-ops-cockpit-host-run-resume.service` startet die
 Fortsetzung beim Hochfahren (Phase `resuming`, nach erneuter Prüfung des Schlosses, ohne zweiten
-Snapshot; `status` hält eine Fortsetzung zwei Minuten lang nicht für gescheitert, solange ihre Unit
-noch startet), und die
+Snapshot und ohne zweite Sicherung; `status` hält eine Fortsetzung zwei Minuten lang nicht für
+gescheitert, solange ihre Unit noch startet), und die
 API — die mit dem Host neu gestartet ist — nimmt den Job aus seinem Datensatz wieder auf, folgt
 dem Lauf über `host.status` und meldet danach das Ergebnis samt Verifikation.
+
+### Ausrollen auf Lab0
+
+Lab0 rollt über sein eigenes Deploy-Skript aus (`homeserver-cockpit-deploy.sh` unter
+`/root/cockpit-deploy`, liegt nicht in diesem Repo; siehe `doc/setup/borg-retention.md`). Dazu
+gehören diese Zeilen in Schritt 8 — **ohne das Modul startet der Helfer gar nicht mehr**, auch
+nicht für lesende Läufe; ohne die Vorlage der Notfall-Anleitung stoppt jeder verändernde Lauf:
+
+```bash
+install -m 644 -o root -g root "$COCKPIT_DIR/deploy/helpers/cockpit-host-run-net.mjs" /usr/local/lib/wireguard-ops-cockpit/cockpit-host-run-net.mjs
+install -m 644 -o root -g root "$COCKPIT_DIR/deploy/lab0/cockpit-systemsicherung-NOTFALL.txt" /usr/local/lib/wireguard-ops-cockpit/cockpit-systemsicherung-NOTFALL.txt
+install -m 644 -o root -g root "$COCKPIT_DIR/deploy/systemd/cockpit-systemsicherung.service" /etc/systemd/system/cockpit-systemsicherung.service
+install -m 644 -o root -g root "$COCKPIT_DIR/deploy/systemd/cockpit-systemsicherung.timer" /etc/systemd/system/cockpit-systemsicherung.timer
+systemctl daemon-reload
+systemctl enable --now cockpit-systemsicherung.timer
+```
+
+Die Einstellungsdatei installiert das Skript **nur, wenn sie fehlt** — sonst überschriebe jedes
+Deploy die von Hand angepassten Werte (`keepPreRun`, `keepWeekly`, Ausschlüsse):
+
+```bash
+install -d -m 0755 -o root -g root /etc/wireguard-ops-cockpit
+[ -e /etc/wireguard-ops-cockpit/host-run-net.json ] || install -m 644 -o root -g root "$COCKPIT_DIR/deploy/config/host-run-net.lab0.json" /etc/wireguard-ops-cockpit/host-run-net.json
+```
+
+**Standalone-borg einmal von Hand** (nicht im Repo, kein Download im Deploy): die Version wie
+`borg --version` auf Lab0 (1.4.x) aus den Releases von borgbackup
+(`https://github.com/borgbackup/borg/releases`, Datei `borg-linux-glibc231-x86_64` samt
+`borg-linux-glibc231-x86_64.asc`; glibc 2.31 läuft auch auf älteren Rescue-Systemen), Signatur
+mit `gpg --verify` gegen den Release-Schlüssel von borgbackup prüfen, dann:
+
+```bash
+install -m 755 -o root -g root borg-linux-glibc231-x86_64 /usr/local/lib/wireguard-ops-cockpit/borg-standalone
+/usr/local/lib/wireguard-ops-cockpit/borg-standalone --version   # borg-standalone 1.4.5 (bzw. die installierte 1.4.x)
+```
+
+Vor dem ersten Lauf auf Lab0 von Hand prüfen und die Datei anpassen (diese Werte hat die Karte
+nicht auf Lab0 verifiziert): `cat /proc/mdstat` (Name des Volumes; Lab0-Status vom 02.10.2026
+18:05 zeigt `md126 : active raid10 … [4/4] [UUUU]` — IMSM-Nummern können sich nach einem
+Neustart ändern, dann stoppt die Tür mit „RAID … is not in /proc/mdstat“),
+`findmnt /media/RAID`, `findmnt /boot /boot/efi` (gibt es beide?), `ls /swap.img`,
+`systemctl is-enabled wg-quick@wg0.service ssh.service ssh.socket` (Name der WireGuard-Unit),
+`ls -d /opt/android-workbench /var/lib/docker/overlay2 /var/lib/containerd` (wo die Abbilder
+wirklich liegen), `df -h / /media/RAID`, `ls -ld /media/RAID/lab0-systemsicherung` (muss fehlen
+oder leer sein).
+
+**Erste Sicherung und Messung:** Die erste Sicherung ist voll und kann Stunden dauern
+(`timeoutSeconds`, Vorschlag 4 h). Sie lässt sich ohne Host-Lauf anstoßen:
+`systemctl start cockpit-systemsicherung.service` (läuft im Vordergrund bis zum Ende;
+`journalctl -u cockpit-systemsicherung.service` zeigt die borg-Statistik). Die Größe danach:
+`BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK=yes /usr/local/lib/wireguard-ops-cockpit/borg-standalone
+info /media/RAID/lab0-systemsicherung/repo` (Original, komprimiert, dedupliziert) und
+`du -sh /media/RAID/lab0-systemsicherung`. Erst danach das Release-Upgrade bestellen.
+
+Die Sicherung von Claude vom 02.10. (`/media/RAID/lab0-systemsicherung-20261002`, /etc und
+Paketliste) liegt außerhalb von `target` und bleibt unberührt.
+
+Der VPS braucht keine Datei und keinen Timer; `deploy/vps/vps-cockpit-deploy.sh` installiert nur
+das Modul.
 
 ## 5. Sondertüren
 
@@ -279,7 +507,7 @@ Weitere bekannte Grenzen:
   Ausgeben von Geheimnissen deshalb als Befund, egal wohin die Ausgabe geht.
 - Ein privater Schlüsselblock ohne END-Zeile wird höchstens 200 Zeilen lang geschwärzt, damit er
   nicht den Rest des Protokolls verschluckt.
-- `mutates: false` spart Snapshot und Backup-Prüfung. Stimmt die Behauptung nicht, ist das ein
+- `mutates: false` spart das ganze Netz (Snapshot und Backup-Prüfung bzw. Systemsicherung). Stimmt die Behauptung nicht, ist das ein
   X5-Befund des Türstehers — einen deterministischen Riegel dafür gibt es bewusst nicht.
 - Kommt ein angeforderter Neustart nicht (gleiche Boot-Kennung 30 Minuten nach der Anforderung),
   gilt der Lauf als gescheitert, und die Tür ist wieder frei. Kommt der Host gar nicht zurück,
@@ -300,6 +528,22 @@ vorbei. Der Runner markiert die Dateien der Tür als Fokus `host-door`.
   systemctl, borg und Snapshot — Schloss (Signatur, Ablauf, Drift, Capability), Netz (borg zu
   alt/gescheitert, Snapshot scheitert, lesender Lauf), Tür (Fehler, Zeitlimit, Prüfschritte,
   Schwärzung, Neustart mit Fortsetzung, ein Lauf zur Zeit).
+- `apps/api/test/host-run-helper.test.ts`, Block „net of a physical box“: Lab0-Netz mit Stubs
+  für borg (führt Archivnamen je Repo und prunt nach `--glob-archives`/`--keep-last` wie borg),
+  lsblk, `/proc/mdstat`, mountinfo und den Aufräum-Dienst — borg-Archiv statt borg-Status und
+  Snapshot mit genau diesen borg-Aufrufen (`init --encryption=none`, `create` mit `-x` und den
+  Ausschlüssen, `prune` nur der eigenen Reihe, `compact`), Ordner 0700 mit Binary, NOTFALL.txt
+  und PLATTEN.txt; Rotation: nur die eigene Reihe, fremde Archive (`vmd61162-…`) und die andere
+  Reihe bleiben; Wochen-Sicherung über `weekly-backup` mit eigener Reihe und Aufbewahrung, nicht
+  außerhalb ihrer Unit, nicht auf dem VPS-Netz, nicht während eines Host-Laufs; die
+  mitgelieferten Timer-Units; Stopp bei degradiertem RAID, nicht eingehängter Platte, Platte auf
+  `/`, angehaltenem Dienst, zu wenig Platz, fehlender Quelle, fehlender/falscher/fremd
+  schreibbarer borg-Binary, fehlender Notfall-Vorlage, fremdem Zielordner, altem `keep`,
+  ungültiger oder fremd schreibbarer Datei, borg-Fehler; borg-Warnung (1) gilt, gescheitertes
+  prune lässt den Lauf weiter; Neustart mit Hinweis „vor Ort“, kein Start ohne WireGuard, kein
+  Neustart, wenn ein Schritt SSH abschaltet.
+- `apps/api/test/host-run-net.test.ts`: Form und Grenzen der Einstellung, die mitgelieferten
+  Dateien, was Türsteher, Planer und Jochen auf Lab0 lesen.
 - `apps/api/test/host-run.test.ts`: Manifest, Fokus (der `/etc/apt`-Fall stoppt nicht mehr),
   Prompt, Belegprüfung, Entscheidung, Ergebnis.
 - `apps/api/test/host-run-flow.test.ts`: der Weg durch die API mit Brokern als Fakes — `pass`
@@ -310,4 +554,5 @@ vorbei. Der Runner markiert die Dateien der Tür als Fokus `host-door`.
 - `apps/api/test/host-run-resume.test.ts`: API-Neustart während eines Laufs (Broker als Fakes),
   auch wenn die API zwischen Start und Startmarke starb (`hostRunRequestedAt`).
 - `apps/executor-broker/test/index.test.mjs`: `host.run`/`host.status`.
-- `test/vps-cockpit-deploy.test.sh`: Helfer und Resume-Unit in der Deploy-Tabelle, Unit aktiviert.
+- `test/vps-cockpit-deploy.test.sh`: Helfer und Resume-Unit in der Deploy-Tabelle, Unit aktiviert
+  (der VPS bekommt den Wochen-Timer der Systemsicherung nicht).

@@ -1,0 +1,34 @@
+{
+  "version": "cockpit-host-run-net/v1",
+  "net": "system-backup",
+  "systemBackup": {
+    "target": "/media/RAID/lab0-systemsicherung",
+    "mount": "/media/RAID",
+    "raidDevice": "md126",
+    "sources": ["/", "/boot", "/boot/efi"],
+    "exclude": [
+      "/swap.img",
+      "/tmp/*",
+      "/var/tmp/*",
+      "/var/cache/*",
+      "/root/.cache/*",
+      "/home/*/.cache/*",
+      "/home/jochen/Nextcloud",
+      "/opt/android-workbench",
+      "/var/lib/docker/overlay2",
+      "/var/lib/docker/image",
+      "/var/lib/docker/buildkit",
+      "/var/lib/containerd/io.containerd.content.v1.content",
+      "/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs"
+    ],
+    "keepPreRun": 5,
+    "keepWeekly": 4,
+    "reserveGB": 100,
+    "timeoutSeconds": 14400
+  },
+  "retentionService": true,
+  "reboot": {
+    "onSite": true,
+    "mustBeEnabled": [["wg-quick@wg0.service"], ["ssh.service", "ssh.socket"]]
+  }
+}
