@@ -611,6 +611,10 @@ function makeServer(initiallyAuthenticated: boolean) {
 
     // Borg-Zustand: der Anzeige-Bereich holt beim Rendern den letzten Stand und
     // stösst höchstens eine Messung an (read-only).
+    if (url === "/api/borg/retention") {
+      return okResponse({ available: false, note: "not installed here", bounds: {}, window: {}, report: null });
+    }
+
     if (url === "/api/borg/status" || url === "/api/borg/status/refresh") {
       return okResponse(state.borgStatus);
     }

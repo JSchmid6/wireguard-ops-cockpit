@@ -25,6 +25,14 @@ const diskDevice = /^sd[a-z]$/;
 // (der Lauf hält dort die Repo-Sperre selbst) und kehren sofort zurück.
 const borgHelper = "/usr/local/sbin/cockpit-borg-action";
 const borgActions = new Set(["borg.status", "borg.check", "borg.repair"]);
+// Aufräum-Dienst auf Lab0 (doc/setup/borg-retention.md): fünf gepinnte Formen.
+// Ob eine Einstellung unter der Untergrenze oder ein Fortsetzen freigegeben ist,
+// entscheidet die API (nur Jochens Sitzung); der Helfer prüft Grenzen und Form
+// noch einmal selbst.
+const retentionHelper = "/usr/local/sbin/cockpit-borg-retention";
+const retentionActions = new Set(["borg.retention.status", "borg.retention.run", "borg.retention.set", "borg.retention.set-approved", "borg.retention.resume"]);
+const retentionSetting = /^(\d{1,3})-(\d{1,3})-(\d{1,3})-([01]\d|2[0-3]):([0-5]\d)$/;
+const retentionAnomaly = /^[a-f0-9]{16}$/;
 const selfUpdateActions = new Set(["self.update", "self.status", "self.diff"]);
 // server-dienste (the root supervisor of the agent's Docker services): the same
 // three forms, installed by its own helper, reviewed with its own guarantees.
@@ -43,10 +51,13 @@ export function validateRequest(value, now = Date.now()) {
   const expected = signature(value.payload);
   if (!/^[a-f0-9]{64}$/.test(value.signature) || !timingSafeEqual(Buffer.from(value.signature, "hex"), Buffer.from(expected, "hex"))) throw new Error("invalid request signature");
   const { action, target, expiresAt, envelopeDigest } = value.payload;
-  if (action !== "service.restart" && action !== "service.status" && action !== "capability.execute" && action !== "host.run" && action !== "host.status" && !diskActions.has(action) && !selfUpdateActions.has(action) && !diensteUpdateActions.has(action) && !borgActions.has(action)) throw new Error("unsupported capability action");
+  if (action !== "service.restart" && action !== "service.status" && action !== "capability.execute" && action !== "host.run" && action !== "host.status" && !diskActions.has(action) && !selfUpdateActions.has(action) && !diensteUpdateActions.has(action) && !borgActions.has(action) && !retentionActions.has(action)) throw new Error("unsupported capability action");
   if (action.startsWith("service.") && !services.has(target)) throw new Error("service target is not allowlisted");
   if (action === "borg.status" && target !== "state") throw new Error("borg status target is not allowlisted");
   if ((action === "borg.check" || action === "borg.repair") && target !== "repo") throw new Error("borg maintenance target is not allowlisted");
+  if ((action === "borg.retention.status" || action === "borg.retention.run") && target !== "state") throw new Error("borg retention target is not allowlisted");
+  if ((action === "borg.retention.set" || action === "borg.retention.set-approved") && (typeof target !== "string" || !retentionSetting.test(target))) throw new Error("borg retention setting is not valid");
+  if (action === "borg.retention.resume" && (typeof target !== "string" || !retentionAnomaly.test(target))) throw new Error("borg retention anomaly id is not valid");
   if (action === "disk.status" && target !== "md127") throw new Error("disk target is not allowlisted");
   if ((action === "disk.remove" || action === "disk.add" || action === "disk.smart" || action === "disk.smarttest") && (typeof target !== "string" || !diskDevice.test(target))) throw new Error("disk device is not allowlisted");
   if (action === "self.status" && target !== "state") throw new Error("self-update status target is not allowlisted");
@@ -127,6 +138,20 @@ export function execute(payload) {
       child.stderr.on("data", (chunk) => { borgError += chunk; });
       child.on("error", (reason) => resolve({ ok: false, error: reason.message }));
       child.on("close", (code) => resolve({ ok: code === 0, exitCode: code, output: borgOutput.slice(-40000), error: code === 0 ? null : [borgError, borgOutput].filter(Boolean).join("\n").slice(-4000) }));
+      return;
+    }
+    if (retentionActions.has(payload.action)) {
+      const verb = payload.action.slice("borg.retention.".length);
+      const setting = retentionSetting.exec(payload.target);
+      const retentionArgs = verb === "status" || verb === "run" ? [verb]
+        : verb === "resume" ? ["freigeben", payload.target]
+        : ["set", setting[1], setting[2], setting[3], `${setting[4]}:${setting[5]}`, ...(verb === "set-approved" ? ["--freigabe"] : [])];
+      const child = spawn("sudo", ["-n", retentionHelper, ...retentionArgs], { env: { PATH: "/usr/sbin:/usr/bin:/sbin:/bin" }, stdio: ["ignore", "pipe", "pipe"] });
+      let retentionOutput = ""; let retentionError = "";
+      child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => { retentionOutput += chunk; }); child.stderr.on("data", (chunk) => { retentionError += chunk; });
+      child.on("error", (reason) => resolve({ ok: false, error: reason.message }));
+      child.on("close", (code) => resolve({ ok: code === 0, exitCode: code, output: retentionOutput.slice(-60000), error: code === 0 ? null : [retentionError, retentionOutput].filter(Boolean).join("\n").slice(-4000) }));
       return;
     }
     if (payload.action.startsWith("disk.")) {

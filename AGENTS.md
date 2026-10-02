@@ -129,6 +129,18 @@ Bare-metal Ubuntu VPS (161.97.86.86) running:
   `/run/lock/cockpit-borg.lock` via `ExecStartPre` instead of failing.
 - `check`/`repair` units run with `Nice=10` and `IOSchedulingClass=idle` so a
   multi-hour run never crowds out Nextcloud or GitLab; `status` does not.
+- Retention lives on Lab0, not here (`doc/setup/borg-retention.md`): the VPS key is
+  append-only there and borgmatic here only creates and checks. Lab0's
+  `cockpit-borg-retention.timer` prunes the `vmd61162-*` series by the retention set in the
+  cockpit ("Backup retention", `/api/borg/retention`) and compacts as `borg`. Fixed bounds in
+  `deploy/helpers/cockpit-borg-retention-rules.mjs` (daily 3–30, weekly 2–12, monthly 0–24,
+  04:00–22:00); inside them changes are free and audited, below the minimum only with
+  Jochen's approval (admin session, confirmed, reason), never above the maximum or below one
+  daily archive. Before compacting it compares the archive ids with its last run; archives it
+  did not remove itself halt it ("angehalten", no compact) until Jochen approves exactly that
+  anomaly. The backup bolt frees only `cockpit-borg-retention status|run`, an in-bounds `set`
+  and `systemctl start cockpit-borg-retention.service`; everything else that touches the
+  service waits for the operator.
 
 ### Cockpit Runbooks
 - All host operations go through Cockpit Runbooks API

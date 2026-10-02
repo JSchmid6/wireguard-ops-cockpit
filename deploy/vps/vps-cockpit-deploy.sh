@@ -96,6 +96,9 @@ readonly TABLE=(
   "deploy/helpers/cockpit-host-run|$LIB/cockpit-host-run.mjs|755"
   # Backups löschen nur mit Freigabe: die eine Erkennung, die der Helfer importiert.
   "deploy/helpers/cockpit-backup-guard.mjs|$LIB/cockpit-backup-guard.mjs|644"
+  # …und die festen Grenzen des Aufräum-Diensts auf Lab0, die der Riegel importiert
+  # (der Dienst selbst läuft nur auf Lab0, doc/setup/borg-retention.md).
+  "deploy/helpers/cockpit-borg-retention-rules.mjs|$LIB/cockpit-borg-retention-rules.mjs|644"
   "deploy/systemd/wireguard-ops-cockpit-host-run-resume.service|$UNITS/wireguard-ops-cockpit-host-run-resume.service|644"
 )
 

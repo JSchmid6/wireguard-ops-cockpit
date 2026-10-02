@@ -229,7 +229,8 @@ root helpers the executor and the capability sandbox dispatch to (capability
 action, hermes-skill, email-archive deploy and auto-deploy, the three Nextcloud
 PHP helpers, service, disk, exact-file-replace, Nextcloud app/context,
 dienste-update, self-update action and runner, VPS snapshot, WordPress update,
-GitLab rootless-DinD policy),
+GitLab rootless-DinD policy, the host door with its backup bolt and the retention
+bounds the bolt imports),
 the sudoers file (checked with `visudo -cf` before and `visudo -c` after), the
 four service units and the API's broker drop-in, the email-archive auto-deploy
 service/timer, the

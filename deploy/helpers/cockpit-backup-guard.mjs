@@ -24,13 +24,23 @@
 //              ein Ziel aus einer Variable, deren Wert nicht im Plan steht.
 //
 // Frei bleibt die Routine: `systemctl start borgmatic.service`, ein nacktes
-// `borgmatic` (mit der konfigurierten Aufbewahrung), Lesen und Prüfen.
+// `borgmatic` (mit der konfigurierten Aufbewahrung), Lesen und Prüfen — und der
+// Aufräum-Dienst auf Lab0 (doc/setup/borg-retention.md): sein Lauf
+// (`cockpit-borg-retention run`, `systemctl start cockpit-borg-retention.service`),
+// sein `status` und eine Einstellung innerhalb der festen Grenzen
+// (`cockpit-borg-retention set <d> <w> <m> <HH:MM>`, geprüft gegen
+// cockpit-borg-retention-rules.mjs). Mit Freigabe: unter der Untergrenze
+// (`--freigabe`), Fortsetzen nach einer Anomalie (`freigeben`), den Dienst
+// stoppen, abschalten, umgehen oder seine Dateien ändern, prune mit eigenen
+// Werten, delete, recreate, compact von Hand.
 //
 // Ehrliche Grenze: Programme, die schon auf dem Host liegen und über ihren
 // Namen aufgerufen werden, nimmt der Riegel für das, was ihr Name sagt; ihren
 // Inhalt sieht er nicht. Deshalb liest der Türsteher weiterhin mit (X4).
 
-export const BACKUP_GUARD_VERSION = "cockpit-backup-guard/v1";
+import { classifyRetention, parseRetentionArgs } from "./cockpit-borg-retention-rules.mjs";
+
+export const BACKUP_GUARD_VERSION = "cockpit-backup-guard/v2";
 
 // Was die Backups sind. TOKEN greift im normalisierten Text (ohne Quotes und
 // Backslashes), also auch in b"o"rg und bo\rg.
@@ -42,8 +52,14 @@ const PROTECTED = [
   "/usr/lib/systemd/system/borgmatic.timer", "/usr/lib/systemd/system/borgmatic.service",
   "/usr/bin/borg", "/usr/bin/borgmatic", "/usr/local/sbin/cockpit-borg-action",
   "/media/RAID/backup_VServer", // das Repo, falls es je eingehängt ist; macht /media zum Vorfahren
+  // Der Aufräum-Dienst auf Lab0: Einstellung, Passphrase, Vergleichsstand, Code, Units.
+  "/etc/cockpit-borg-retention", "/var/lib/cockpit-borg-retention",
+  "/usr/local/sbin/cockpit-borg-retention",
+  "/usr/local/lib/wireguard-ops-cockpit/cockpit-borg-retention.mjs", "/usr/local/lib/wireguard-ops-cockpit/cockpit-borg-retention-rules.mjs",
+  "/etc/systemd/system/cockpit-borg-retention.service", "/etc/systemd/system/cockpit-borg-retention.service.d",
+  "/etc/systemd/system/cockpit-borg-retention.timer", "/etc/systemd/system/cockpit-borg-retention.timer.d",
 ];
-const UNITS = ["borgmatic.timer", "borgmatic.service", "timers.target"];
+const UNITS = ["borgmatic.timer", "borgmatic.service", "timers.target", "cockpit-borg-retention.timer", "cockpit-borg-retention.service"];
 const ANCESTORS = [...new Set(PROTECTED.flatMap((item) => {
   const parts = item.split("/").slice(1, -1);
   return ["/", ...parts.map((_, index) => `/${parts.slice(0, index + 1).join("/")}`)];
@@ -62,10 +78,10 @@ const READ_ONLY = new Set([
   "whereis", "type", "true", "false", "pgrep", "pidof", "ps", "id", "date", "hostname", "uptime", "free", "lsblk", "findmnt", "getent",
   "jq", "cut", "tr", "column", "nl", "tac", "strings", "zcat", "xzcat", "bzcat", "echo", "printf", "dpkg-query", "apt-cache", "sleep",
   "nproc", "uname", "whoami", "lsof", "ss", "find", "journalctl", "systemctl", "dpkg", "apt", "apt-mark", "command", "curl", "wget",
-  "borg", "borgmatic", "cockpit-borg-action", "sort", ":",
+  "borg", "borgmatic", "cockpit-borg-action", "cockpit-borg-retention", "sort", ":",
 ]);
 const SYSTEMCTL_READ = new Set(["status", "is-active", "is-enabled", "is-failed", "show", "cat", "list-timers", "list-units", "list-unit-files", "list-dependencies", "help"]);
-const ROUTINE_UNITS = new Set(["borgmatic", "borgmatic.service", "borgmatic.timer"]);
+const ROUTINE_UNITS = new Set(["borgmatic", "borgmatic.service", "borgmatic.timer", "cockpit-borg-retention", "cockpit-borg-retention.service", "cockpit-borg-retention.timer"]);
 const BORG_READ = new Set(["list", "info", "check", "create", "diff", "version", "repo-list", "repo-info"]);
 const BORGMATIC_ACTIONS = new Set(["list", "info", "rlist", "rinfo", "repo-list", "repo-info", "check", "create"]);
 const BORGMATIC_FLAGS = new Set(["--stats", "--list", "--json", "--progress", "--files", "--force", "--no-color", "--version"]);
@@ -559,6 +575,7 @@ function readOnlyForm(command, segmentText) {
     }
     case "borgmatic": return borgmaticReadOnly(args);
     case "cockpit-borg-action": return args.length === 1 && (args[0] === "status" || args[0] === "check");
+    case "cockpit-borg-retention": return retentionRoutine(args);
     case "systemctl": {
       const { verb, rest } = firstVerb(args, new Set(["-H", "--host", "-M", "--machine", "-t", "--type", "-p", "--property", "-o", "--output", "-n", "--lines", "--state"]));
       if (args.some((arg) => arg === "-H" || arg.startsWith("--host") || arg === "-M" || arg.startsWith("--machine"))) return false;
@@ -576,6 +593,16 @@ function readOnlyForm(command, segmentText) {
     case "command": return args[0] === "-v" || args[0] === "-V";
     default: return true;
   }
+}
+
+// Der Aufräum-Dienst: status, run und eine Einstellung innerhalb der Grenzen
+// sind Routine. Unter der Untergrenze (--freigabe), freigeben und jede andere
+// Form brauchen die Freigabe.
+function retentionRoutine(args) {
+  if (args.length === 1) return args[0] === "status" || args[0] === "run";
+  if (args[0] !== "set" || args.length !== 5) return false;
+  const verdict = classifyRetention(parseRetentionArgs(args.slice(1)));
+  return verdict.ok && verdict.belowMinimum.length === 0;
 }
 
 // Befehle, deren Wirkung ein unbekannter Wert nicht auf die Backups lenken
