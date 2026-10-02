@@ -27,6 +27,9 @@ export interface AppConfig {
   executorBrokerSocket: string | null;
   executorBrokerSecret: string | null;
   nodeEnv: string;
+  // Öffentliche Adresse der Weboberfläche (kein Geheimnis), für Direktlinks auf
+  // Karten in "Wartet auf dich". Ohne sie bleibt der Link relativ.
+  webUrl?: string | null;
 }
 
 function currentDirectory(): string {
@@ -70,6 +73,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     agentBrokerSocket: env.COCKPIT_AGENT_BROKER_SOCKET?.trim() || null,
     executorBrokerSocket: env.COCKPIT_EXECUTOR_BROKER_SOCKET?.trim() || null,
     executorBrokerSecret: env.COCKPIT_EXECUTOR_BROKER_SECRET?.trim() || null,
-    nodeEnv
+    nodeEnv,
+    webUrl: env.COCKPIT_WEB_URL?.trim() || null
   };
 }

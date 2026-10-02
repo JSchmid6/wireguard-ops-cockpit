@@ -10,6 +10,7 @@ This repository uses `/doc` as the implementation planning hub.
 - `setup/agent-stack.md` - project-specific agents, skills, MCP strategy, and model guidance
 - `setup/vps-handover.md` - VPS-local bring-up instructions, deployment files, and Copilot handover prompt
 - `setup/borg-retention.md` - the backup cleanup service on Lab0 (prune + compact, fixed bounds set in the cockpit, foreign deletions halt it until Jochen approves)
+- `setup/wartet-auf-dich.md` - the start page after login: everything Jochen must decide as phone-friendly cards (approve/reject with a mandatory reason, countdown to envelope expiry, "re-order" once expired), everything else behind "Mehr"; James forwards the direct link via Telegram
 - `setup/host-run.md` - the general host door: shell steps as root behind lock (signed envelope), doorkeeper (isolated reviewer) and safety net (borg + machine snapshot)
 
 ## Services

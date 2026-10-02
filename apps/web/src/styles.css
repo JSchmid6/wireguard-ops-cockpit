@@ -75,11 +75,11 @@ select {
 }
 
 .two-column {
-  grid-template-columns: repeat(auto-fit, minmax(22rem, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(22rem, 100%), 1fr));
 }
 
 .three-column {
-  grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(18rem, 100%), 1fr));
 }
 
 .panel {
@@ -337,4 +337,197 @@ small {
 
 .retention-runs th {
   text-align: left;
+}
+
+/* "Wartet auf dich" (Inbox.tsx): Handy zuerst — eine Spalte, große Knöpfe,
+   Lesbarkeit vor Dichte. Breitere Bildschirme bekommen nur mehr Rand. */
+.topbar-compact .topbar-title {
+  font-size: 1rem;
+  margin: 0;
+  color: #94a3b8;
+}
+
+.topbar-compact .topbar-user {
+  margin: 0;
+  font-size: 0.85rem;
+  color: #94a3b8;
+}
+
+.inbox {
+  display: grid;
+  gap: 1rem;
+  width: min(48rem, 100%);
+  margin: 0 auto;
+}
+
+.inbox-heading {
+  font-size: 1.6rem;
+  margin: 0;
+}
+
+.inbox-count {
+  color: #fcd34d;
+}
+
+.inbox-empty {
+  text-align: center;
+  padding: 2.5rem 1rem;
+  border: 1px solid rgba(110, 231, 183, 0.25);
+  border-radius: 1rem;
+  background: rgba(6, 78, 59, 0.25);
+}
+
+.inbox-empty-title {
+  font-size: 1.8rem;
+  font-weight: 700;
+  margin: 0 0 0.75rem;
+  color: #6ee7b7;
+}
+
+.inbox-empty-status {
+  margin: 0;
+  color: #94a3b8;
+  font-size: 0.95rem;
+}
+
+.inbox-card {
+  display: grid;
+  gap: 0.75rem;
+  padding: 1rem;
+  border-radius: 1rem;
+  border: 1px solid rgba(252, 211, 77, 0.35);
+  background: rgba(15, 23, 42, 0.92);
+  scroll-margin-top: 1rem;
+}
+
+.inbox-card-highlight {
+  border-color: #fcd34d;
+  box-shadow: 0 0 0 2px rgba(252, 211, 77, 0.45);
+}
+
+.inbox-card-expired {
+  border-color: rgba(148, 163, 184, 0.35);
+}
+
+.inbox-card-head {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.inbox-deadline {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: #fcd34d;
+}
+
+.inbox-deadline-expired {
+  color: #fda4af;
+}
+
+.inbox-title {
+  margin: 0;
+  font-size: 1.2rem;
+  line-height: 1.35;
+}
+
+.inbox-reason,
+.inbox-expired-note {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.inbox-expired-note {
+  color: #fda4af;
+}
+
+.inbox-findings {
+  list-style: none;
+  padding: 0;
+  margin: 0.5rem 0 0;
+  display: grid;
+  gap: 0.5rem;
+}
+
+.inbox-finding details {
+  border: 1px solid #1e293b;
+  border-radius: 0.75rem;
+  padding: 0.6rem 0.75rem;
+  background: rgba(2, 6, 23, 0.75);
+}
+
+.inbox-finding summary {
+  cursor: pointer;
+  display: grid;
+  gap: 0.2rem;
+  min-height: 2.75rem;
+  align-content: center;
+}
+
+.inbox-finding-meta {
+  color: #94a3b8;
+  font-size: 0.85rem;
+  overflow-wrap: anywhere;
+}
+
+.inbox-reason-field {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.inbox-actions {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.6rem;
+}
+
+.inbox-button {
+  min-height: 3.25rem;
+  font-size: 1.05rem;
+  font-weight: 600;
+  width: 100%;
+}
+
+.inbox-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.inbox-button-primary {
+  border-color: #34d399;
+  background: #065f46;
+  color: #ecfdf5;
+}
+
+.inbox-button-danger {
+  border-color: #fb7185;
+  background: #4c0519;
+  color: #ffe4e6;
+}
+
+.inbox-notice {
+  margin: 0;
+  color: #6ee7b7;
+}
+
+.more-toggle {
+  justify-self: center;
+  min-height: 3rem;
+  min-width: 10rem;
+  background: transparent;
+  border-color: #334155;
+  color: #94a3b8;
+}
+
+.more-content {
+  display: grid;
+  gap: 1rem;
+}
+
+@media (min-width: 40rem) {
+  .inbox-actions {
+    grid-template-columns: 1fr 1fr;
+  }
 }

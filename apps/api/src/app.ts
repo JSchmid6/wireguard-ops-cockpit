@@ -1,7 +1,7 @@
 import { createHash, createHmac } from "node:crypto";
 import { execSync, spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, statfs, writeFile } from "node:fs/promises";
 import path from "node:path";
 import Fastify from "fastify";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
@@ -45,6 +45,7 @@ import { runBrokerAgent } from "./agent-broker.js";
 import { runDynamicCapability, runExecutorAction, type ExecutorActionKind } from "./executor-broker.js";
 import { borgStatusRequestDigest, createBorgStatusService } from "./borg-status.js";
 import { createRetentionService, decideRetentionChange, readApproval, retentionRequestDigest, retentionTarget } from "./borg-retention.js";
+import { approvalCard, cardLink, hermesJobCard, retentionAnomalyCard, sortCards, type InboxCard } from "./inbox.js";
 import {
   capabilityManifestHash, capabilityNeedsOperatorApproval, capabilityPlannerContract,
   parseCapabilityManifest, readablePathsNeedingApproval, type CapabilityManifest,
@@ -2104,6 +2105,15 @@ export async function createApp(options: AppOptions = {}) {
     };
   }
 
+  // Wartet ein Job auf Jochen, bekommt James den Direktlink auf die Karte mit
+  // und schickt ihn per Telegram weiter — ohne dass das Cockpit selbst einen
+  // Bot-Token braucht.
+  function withOperatorLink(job: JobRecord): JobRecord & { operatorLink?: string } {
+    return job.subjectId === "hermes-change" && job.status === "blocked_user_approval"
+      ? { ...job, operatorLink: cardLink(`job-${job.id}`, config.webUrl ?? null) }
+      : job;
+  }
+
   function updateHermesJob(jobId: string, status: JobRecord["status"], detail: HermesExplanation, extra: Record<string, unknown> = {}): JobRecord {
     const updated = database.updateJob(jobId, {
       status,
@@ -2248,7 +2258,7 @@ export async function createApp(options: AppOptions = {}) {
       ? database.getJob(jobId)
       : database.getJobForActor(jobId, actor.id);
     if (!job) return reply.code(404).send({ message: "job not found" });
-    return { job };
+    return { job: withOperatorLink(job) };
   });
 
   app.post("/api/hermes/jobs/:jobId/approval", async (request, reply) => {
@@ -2267,6 +2277,10 @@ export async function createApp(options: AppOptions = {}) {
     }
     if (!body.decision || !["approved", "rejected"].includes(body.decision)) {
       return reply.code(400).send({ message: "decision must be approved or rejected" });
+    }
+    // Jede Entscheidung braucht einen Grund ("Wartet auf dich", Pflichtfeld).
+    if (typeof body.reason !== "string" || !body.reason.trim()) {
+      return reply.code(400).send({ message: "a reason is required for every decision" });
     }
     const intent = typeof job.output?.explanation === "object" && job.output.explanation
       ? String((job.output.explanation as Record<string, unknown>).intent || "Approved Hermes change")
@@ -2322,7 +2336,9 @@ export async function createApp(options: AppOptions = {}) {
     if (!proposalPath.startsWith(`${proposalRoot}${path.sep}`)) {
       return reply.code(409).send({ message: "stored proposal path is outside the protected proposal directory" });
     }
-    const session = job.sessionId ? database.getSessionRuntimeTargetForActor(job.sessionId, actor.id) : null;
+    // Die Sitzung gehört dem Auftraggeber (James' Automation-Konto), nicht dem
+    // freigebenden Admin: mit actor.id fände eine Admin-Freigabe sie nie.
+    const session = job.sessionId ? database.getSessionRuntimeTargetForActor(job.sessionId, jobOwnerId) : null;
     const planner = findAgent("planner-agent", "opencode");
     if (!session || session.tmuxBackend === "disabled" || !planner) {
       const blocked = updateHermesJob(job.id, "blocked_prerequisite", explanation({
@@ -3041,7 +3057,7 @@ Follow these rules:
     })();
 
     const current = await waitForHermesJob(job.id, actor.id, waitMs);
-    if (current && !["pending", "running"].includes(current.status)) return current;
+    if (current && !["pending", "running"].includes(current.status)) return withOperatorLink(current);
     return reply.code(202).send({
       jobId: job.id, sessionId: session.id, status: current?.status || "running", partial: true,
       message: "Change job continues. Poll GET /api/hermes/jobs/:jobId.", explanation: current?.output?.explanation,
@@ -3516,6 +3532,9 @@ Follow these rules:
     if (body.decision !== "approved" && body.decision !== "rejected") {
       return reply.code(400).send({ message: "decision must be approved or rejected" });
     }
+    if (typeof body.reason !== "string" || !body.reason.trim()) {
+      return reply.code(400).send({ message: "a reason is required for every decision" });
+    }
 
     if (
       body.decision === "approved" &&
@@ -3789,6 +3808,104 @@ Follow these rules:
     }
 
     return { approval: updatedApproval, job: updatedJob };
+  });
+
+  // ── Wartet auf dich ────────────────────────────────────────────────────
+  // Die Startseite: alles, was Jochen entscheiden muss, als Karten. Liest nur;
+  // entschieden wird über die bestehenden Wege. James kann dieselbe Liste mit
+  // dem Scope "GET /api/inbox" lesen (doc/setup/wartet-auf-dich.md).
+  app.get("/api/inbox", async (request, reply) => {
+    const actor = await requireActor(request, reply, database);
+    if (!actor) return;
+    const now = Date.now();
+    const webUrl = config.webUrl ?? null;
+    const cards: InboxCard[] = [];
+    // Ein Nicht-Admin (auch James' Token) sieht nur Jobs seines eigenen Kontos.
+    const visible = (jobId: string | null) => actor.role === "admin" || (jobId !== null && database.getJobOwnerId(jobId) === actor.id);
+    for (const job of database.listJobsByStatus("hermes-change", "blocked_user_approval")) {
+      if (!visible(job.id)) continue;
+      cards.push(hermesJobCard(job, now, webUrl));
+    }
+    for (const approval of database.listApprovalsForActor(actor.id, "pending")) {
+      cards.push(approvalCard(approval, database.getJob(approval.jobId), config.approvalTtlMinutes, now, webUrl));
+    }
+    const retention = await borgRetention.view();
+    const anomaly = retention.report?.state.status === "angehalten" ? retention.report.state.anomaly : null;
+    // Nach der Freigabe bleibt der Dienst bis zum Ende seines Laufs "angehalten",
+    // trägt aber die Freigabe für genau diese Anomalie: dann wartet nichts mehr.
+    const approvedAlready = anomaly !== null && retention.report?.state.approval?.anomalyId === anomaly.id;
+    if (anomaly && !approvedAlready && !database.hasAudit("borg.retention.anomaly_kept", anomaly.id)) {
+      cards.push(retentionAnomalyCard(anomaly, now, webUrl));
+    }
+    const borg = await borgStatus.measure({ waitMs: 0 });
+    let disk: { path: string; freeBytes: number; totalBytes: number } | null = null;
+    try {
+      const stats = await statfs("/");
+      disk = { path: "/", freeBytes: stats.bavail * stats.bsize, totalBytes: stats.blocks * stats.bsize };
+    } catch {
+      disk = null;
+    }
+    const reorders = database.listAuditsSince("hermes.change.reorder_requested", new Date(now - 24 * 3_600_000).toISOString())
+      .filter((audit) => visible(audit.targetId))
+      .map((audit) => ({ jobId: audit.targetId, requestedAt: audit.createdAt, intent: String(audit.details.intent ?? ""), note: audit.details.note ?? null }));
+    return {
+      generatedAt: new Date(now).toISOString(),
+      cards: sortCards(cards),
+      reorders,
+      status: {
+        lastRuns: database.listRecentJobs("hermes-change", 20).filter((job) => visible(job.id)).slice(0, 3).map((job) => ({ id: job.id, status: job.status, at: job.updatedAt })),
+        backup: borg.borg ? { lastRunEnd: borg.borg.lastRun.end, lastRunResult: borg.borg.lastRun.result, measuredAt: borg.measuredAt } : null,
+        disk,
+      },
+    };
+  });
+
+  // Abgelaufener Envelope: statt Freigeben "Neu bestellen lassen". Der alte
+  // Job wird geschlossen (nie wieder freigebbar), der Wunsch landet als Audit
+  // und in GET /api/inbox unter `reorders` — dort holt James ihn ab und bestellt
+  // dieselbe Absicht neu. Nur Jochens Sitzung, nie ein Automation-Token.
+  app.post("/api/inbox/jobs/:jobId/reorder", async (request, reply) => {
+    const actor = await requireActor(request, reply, database);
+    if (!actor) return;
+    if (actor.role === "automation") return reply.code(403).send({ message: "only the operator's session can ask for a re-order" });
+    const { jobId } = request.params as { jobId: string };
+    const job = actor.role === "admin" ? database.getJob(jobId) : database.getJobForActor(jobId, actor.id);
+    if (!job) return reply.code(404).send({ message: "job not found" });
+    // Neu bestellen geht, solange der Job wartet und sein Envelope abgelaufen ist —
+    // oder wenn eine Freigabe knapp zu spät kam und die Route ihn deshalb schon
+    // geschlossen hat (blocked_policy mit "execution envelope expired").
+    const closedAsExpired = job.status === "blocked_policy" && !job.output?.reorder
+      && Array.isArray(job.output?.envelopeErrors) && (job.output.envelopeErrors as unknown[]).includes("execution envelope expired");
+    if (job.subjectId !== "hermes-change" || (job.status !== "blocked_user_approval" && !closedAsExpired)) {
+      return reply.code(409).send({ message: "job is not awaiting operator approval" });
+    }
+    const card = hermesJobCard(job, Date.now(), null);
+    if (!closedAsExpired && !card.expired) return reply.code(409).send({ message: "the execution envelope is still valid; approve or reject it" });
+    const body = (request.body || {}) as { note?: unknown };
+    const note = typeof body.note === "string" && body.note.trim() ? body.note.trim().slice(0, 500) : null;
+    const intent = String((job.output?.explanation as Record<string, unknown> | undefined)?.intent || "Hermes change");
+    const closed = updateHermesJob(job.id, "blocked_policy", explanation({
+      phase: "finished", intent,
+      reason: "The approval window expired; the operator asked James to submit this change again.",
+      neededToContinue: ["James submits a new change job for the same trusted intent; this job is never approved."],
+      recommendedAction: "Submit a new change job for the same trusted intent.",
+    }), { ...job.output, reorder: { requestedAt: new Date().toISOString(), actorId: actor.id, note } });
+    database.createAudit({ actorId: actor.id, action: "hermes.change.reorder_requested", targetType: "job", targetId: job.id, details: { intent, note } });
+    return { job: closed };
+  });
+
+  // Anomalie des Aufräum-Dienstes ablehnen = angehalten lassen. Am Dienst
+  // ändert das nichts; die Karte verschwindet, der Zustand bleibt sichtbar.
+  app.post("/api/inbox/retention/:anomalyId/keep", async (request, reply) => {
+    const actor = await requireActor(request, reply, database);
+    if (!actor) return;
+    if (actor.role !== "admin") return reply.code(403).send({ message: "only Jochen's cockpit session decides about the retention service" });
+    const { anomalyId } = request.params as { anomalyId: string };
+    if (!/^[a-f0-9]{16}$/.test(anomalyId)) return reply.code(400).send({ message: "anomalyId must name the anomaly shown in the cockpit" });
+    const body = (request.body || {}) as { reason?: unknown };
+    if (typeof body.reason !== "string" || !body.reason.trim()) return reply.code(400).send({ message: "a reason is required for every decision" });
+    database.createAudit({ actorId: actor.id, action: "borg.retention.anomaly_kept", targetType: "borg-retention", targetId: anomalyId, details: { reason: body.reason.trim().slice(0, 500) } });
+    return { ok: true };
   });
 
   app.get("/api/agents", async (request, reply) => {

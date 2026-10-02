@@ -73,14 +73,18 @@ const planWith = (...manifests: Array<{ version: string }>) => [
   "## Intent", "Keep the host's packages current.",
 ].join("\n");
 
-async function setup(options: { plan: string; doorkeeper: string }) {
+async function setup(options: { plan: string; doorkeeper: string; ownedByAutomation?: boolean }) {
   const dir = mkdtempSync(path.join(tmpdir(), "host-run-flow-"));
   cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
   const seed = new CockpitDatabase(path.join(dir, "cockpit.sqlite"));
   seed.initialize();
   seed.seedAdmin("admin", "test-password");
   const admin = seed.authenticateUser("admin", "test-password")!;
-  const session = seed.upsertSession({ name: "hermes-flow", ownerId: admin.id, tmuxSessionName: "cockpit-hermes-flow", tmuxBackend: "tmux", terminalUrl: null });
+  // Im Betrieb bestellt James mit seinem Automation-Konto; die Sitzung gehört
+  // dann ihm, freigeben tut Jochens Admin-Sitzung.
+  const owner = options.ownedByAutomation ? seed.createUser("hermes-automation", "unusable-random-password", "automation") : admin;
+  const bearer = options.ownedByAutomation ? seed.rotateApiToken(owner.id, "hermes", ["POST /api/hermes/runbook"]) : null;
+  const session = seed.upsertSession({ name: "hermes-flow", ownerId: owner.id, tmuxSessionName: "cockpit-hermes-flow", tmuxBackend: "tmux", terminalUrl: null });
   seed.close();
 
   const executorCalls = await listen(path.join(dir, "executor.sock"), (request) => {
@@ -113,7 +117,7 @@ async function setup(options: { plan: string; doorkeeper: string }) {
     return inspect.getJob(jobId)!;
   };
   const submit = async () => {
-    const created = await app.inject({ method: "POST", url: "/api/hermes/runbook", headers: { cookie }, payload: { intent: "Keep the host's packages current", sessionId: session.id, timeoutMs: 0 } });
+    const created = await app.inject({ method: "POST", url: "/api/hermes/runbook", headers: bearer ? { authorization: `Bearer ${bearer}` } : { cookie }, payload: { intent: "Keep the host's packages current", sessionId: session.id, timeoutMs: 0 } });
     expect(created.statusCode).toBe(202);
     return settled(created.json().jobId as string);
   };
@@ -153,7 +157,7 @@ describe("host door through the API", () => {
     expect(JSON.stringify(job.output?.policy)).toContain("S3:L1");
     expect(flow.executorCalls.some((call) => call.payload.action === "host.run")).toBe(false);
 
-    const approved = await flow.app.inject({ method: "POST", url: `/api/hermes/jobs/${job.id}/approval`, headers: { cookie: flow.cookie }, payload: { decision: "approved" } });
+    const approved = await flow.app.inject({ method: "POST", url: `/api/hermes/jobs/${job.id}/approval`, headers: { cookie: flow.cookie }, payload: { decision: "approved", reason: "read the finding, this exact plan is fine" } });
     expect(approved.statusCode).toBe(202);
     const finished = await flow.settled(job.id);
     expect(finished.status).toBe("completed");
@@ -179,12 +183,28 @@ describe("host door through the API", () => {
     expect(flow.doorkeeperPrompts[0]).toContain("[backup-approval:backup]");
     expect(flow.executorCalls.some((call) => call.payload.action === "host.run")).toBe(false);
 
-    const approved = await flow.app.inject({ method: "POST", url: `/api/hermes/jobs/${job.id}/approval`, headers: { cookie: flow.cookie }, payload: { decision: "approved" } });
+    const approved = await flow.app.inject({ method: "POST", url: `/api/hermes/jobs/${job.id}/approval`, headers: { cookie: flow.cookie }, payload: { decision: "approved", reason: "read the finding, this exact plan is fine" } });
     expect(approved.statusCode).toBe(202);
     expect((await flow.settled(job.id)).status).toBe("completed");
     const start = flow.executorCalls.find((call) => call.payload.action === "host.run")!;
     expect(start.payload.envelope).toMatchObject({ operatorApproved: true });
     expect(start.payload.envelope.gatePassed).toBeUndefined();
+  });
+
+  it("runs James' job after Jochen's admin approval, in the session James owns", async () => {
+    const flow = await setup({ ownedByAutomation: true, plan: planWith(hostRunWithRepair), doorkeeper: "VERDICT: pass\nNOTES: routine" });
+    const job = await flow.submit();
+    expect(job.status).toBe("blocked_user_approval");
+
+    const withoutReason = await flow.app.inject({ method: "POST", url: `/api/hermes/jobs/${job.id}/approval`, headers: { cookie: flow.cookie }, payload: { decision: "approved" } });
+    expect(withoutReason.statusCode).toBe(400);
+    expect(withoutReason.json().message).toContain("reason");
+
+    const approved = await flow.app.inject({ method: "POST", url: `/api/hermes/jobs/${job.id}/approval`, headers: { cookie: flow.cookie }, payload: { decision: "approved", reason: "repair is wanted, snapshot exists" } });
+    expect(approved.statusCode).toBe(202);
+    const finished = await flow.settled(job.id);
+    expect(finished.status).toBe("completed");
+    expect(flow.executorCalls.find((call) => call.payload.action === "host.run")!.payload.envelope).toMatchObject({ operatorApproved: true });
   });
 
   it("stops without an approval offer when the doorkeeper flags without evidence", async () => {

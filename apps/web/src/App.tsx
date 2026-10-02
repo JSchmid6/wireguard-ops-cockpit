@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { formatOutput, request } from "./lib";
 import BorgPanel from "./BorgPanel";
 import RetentionPanel from "./RetentionPanel";
+import Inbox from "./Inbox";
 
 interface UserSummary {
   id: string;
@@ -258,6 +259,10 @@ export default function App() {
   const [credentials, setCredentials] = useState({ username: "admin", password: "change-me-now" });
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  // Alles außer "Wartet auf dich" liegt eingeklappt hinter "Mehr".
+  const [moreOpen, setMoreOpen] = useState(false);
+  // Jede Aktualisierung des Dashboards lädt auch "Wartet auf dich" neu.
+  const [inboxKey, setInboxKey] = useState(0);
 
   const selectedSession = useMemo(
     () => sessions.find((session) => session.id === selectedSessionId) || null,
@@ -326,6 +331,7 @@ export default function App() {
       setAgents(agentsResponse.agents);
       setApprovals(approvalsResponse.approvals);
       setAudits(auditsResponse.audits);
+      setInboxKey((key) => key + 1);
       setError("");
 
       if (!selectedSessionId && sessionsResponse.sessions[0]) {
@@ -504,24 +510,6 @@ export default function App() {
     }
   }
 
-  async function decideApproval(approvalId: string, decision: "approved" | "rejected") {
-    setBusy(true);
-    try {
-      await request(`/approvals/${approvalId}/decision`, {
-        method: "POST",
-        body: JSON.stringify({ decision })
-      });
-      await refreshDashboard();
-      if (selectedSessionId) {
-        await refreshSession(selectedSessionId);
-      }
-    } catch (nextError) {
-      setError(nextError instanceof Error ? nextError.message : "Unable to decide approval");
-    } finally {
-      setBusy(false);
-    }
-  }
-
   async function createSchedule(event: React.FormEvent) {
     event.preventDefault();
     if (!scheduleDraft.runbookId || !scheduleDraft.sessionId || !scheduleDraft.timeUtc) {
@@ -594,10 +582,10 @@ export default function App() {
 
   return (
     <main className="app-shell">
-      <header className="topbar">
+      <header className="topbar topbar-compact">
         <div>
-          <h1>WireGuard Ops Cockpit</h1>
-          <p>
+          <h1 className="topbar-title">WireGuard Ops Cockpit</h1>
+          <p className="topbar-user">
             Signed in as <strong>{user.username}</strong> ({user.role})
           </p>
         </div>
@@ -606,8 +594,22 @@ export default function App() {
         </button>
       </header>
 
+      {/* Die Startseite: was Jochen entscheiden muss (doc/setup/wartet-auf-dich.md). */}
+      <Inbox refreshKey={inboxKey} onDecided={refreshDashboard} />
+
+      <button
+        className="more-toggle"
+        aria-expanded={moreOpen}
+        aria-controls="more-content"
+        onClick={() => setMoreOpen((open) => !open)}
+      >
+        {moreOpen ? "Mehr ▴" : "Mehr ▾"}
+      </button>
+
       {error ? <p className="error">{error}</p> : null}
 
+      {moreOpen ? (
+      <div id="more-content" className="more-content">
       <section className="panel info-panel">
         <strong>Execution model</strong>
         <p>
@@ -987,18 +989,12 @@ export default function App() {
           <h2>Approvals</h2>
           <div className="panel-scroll">
             <ul className="list">
+              {/* Entschieden wird oben unter "Wartet auf dich" (mit Pflichtgrund). */}
               {approvals.map((approval) => (
                 <li key={approval.id}>
                   <strong>{approval.status}</strong>
                   <p>{approval.reason || "No reason recorded."}</p>
-                  <div className="actions">
-                    <button disabled={busy} onClick={() => decideApproval(approval.id, "approved")}>
-                      Approve
-                    </button>
-                    <button disabled={busy} onClick={() => decideApproval(approval.id, "rejected")}>
-                      Reject
-                    </button>
-                  </div>
+                  <a href={`#karte-approval-${approval.id}`}>Entscheiden unter „Wartet auf dich"</a>
                 </li>
               ))}
               {approvals.length === 0 ? <li>No pending approvals.</li> : null}
@@ -1022,6 +1018,8 @@ export default function App() {
           </ul>
         </div>
       </section>
+      </div>
+      ) : null}
     </main>
   );
 }
