@@ -594,6 +594,8 @@ sed -i 's/return { ok: true, action: payload.action };/return { ok: true, action
 echo '#includedir /tmp/evil' >> "$WORK/deploy/sudoers/cockpit-executor"
 echo '# comment only' >> "$WORK/deploy/sudoers/wireguard-ops-cockpit"
 echo 'export const host = "127.0.0.1";' >> "$WORK/apps/api/src/app.ts"
+echo 'export const doorkeeper = "isolated";' > "$WORK/apps/api/src/host-run.ts"
+echo 'export const bolt = "deterministic";' > "$WORK/deploy/helpers/cockpit-backup-guard.mjs"
 printf '{\n  "name": "fixture",\n  "dependencies": {\n    "left-pad": "^1.3.0"\n  }\n}\n' > "$WORK/package.json"
 cat > "$WORK/package-lock.json" <<'FIXTURE'
 {
@@ -660,6 +662,8 @@ expect_true "S10 no update-mechanism / broker-validation area" "$FIX/s10.out" \
   "not $(area update-mechanism) and not $(area broker-validation)"
 expect_true "S10 file-level areas" "$FIX/s10.out" \
   "'apps/api/src/app.ts' in $(area approval-and-auth)[0]['files'] and 'apps/executor-broker/src/index.mjs' in $(area brokers-and-agents)[0]['files'] and 'deploy/sudoers/wireguard-ops-cockpit' in $(area root-helpers)[0]['files'] and $(area ci)[0]['files'] == ['.github/workflows/ci.yml'] and $(area tests-deleted)[0]['files'] == ['test/example.test.sh']"
+expect_true "S10 host door area (G2/G5/G6/G9/G10)" "$FIX/s10.out" \
+  "$(area host-door)[0]['files'] == ['apps/api/src/host-run.ts', 'deploy/helpers/cockpit-backup-guard.mjs'] and $(area host-door)[0]['guarantees'] == ['G2', 'G5', 'G6', 'G9', 'G10'] and 'deploy/helpers/cockpit-backup-guard.mjs' in $(area root-helpers)[0]['files']"
 expect_true "S10 dependencies: risky package first, lockfile summarized" "$FIX/s10.out" \
   "$(area dependencies)[0]['files'] == ['package.json'] and $(area dependencies)[0]['lockfiles'] == ['package-lock.json'] and $(area dependencies)[0]['packages'][0].startswith('+evil-pkg@0.0.1 (install script; source: git+https://example.invalid/evil.git') and '+left-pad@1.3.0' in $(area dependencies)[0]['packages']"
 expect_true "S10 file classes" "$FIX/s10.out" \

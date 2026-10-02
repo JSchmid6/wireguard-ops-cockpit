@@ -117,13 +117,14 @@ Flow of a Hermes change job whose plan contains `self.update <sha>` lines:
    | `update-mechanism` | G7 | the self-update helper, runner, unit, `update-review.ts`, `update-review-prompt.ts` |
    | `envelope-signing` | G2 | hunks touching `signEnvelope`, `verifyExecutionEnvelopeSignature`, `approveExecutionEnvelope`, `createExecutionEnvelope`, `validateExecutionEnvelope`, and `verifyEnvelope` in the capability helper |
    | `broker-validation` | G3 | hunks touching `validateRequest`/`signature` in the executor broker |
+   | `host-door` | G2/G5/G6/G9/G10 | the general door: `apps/api/src/host-run.ts`, `deploy/helpers/cockpit-host-run`, `cockpit-backup-guard.mjs`, `cockpit-borg-retention-rules.mjs`, the host-run resume unit |
    | `approval-and-auth`, `brokers-and-agents`, `capability-sandbox`, `root-helpers`, `ci` | G1/G6, G3/G6, G5, G4/G5, G7 | file-level areas |
    | `dependencies` | G8 | `package.json` hunks; lockfiles are summarized as a package list with install scripts and non-registry sources first |
    | `tests-deleted` | — | deleted test files |
 
 3. **Review.** The API assembles the prompt: the instruction block
    `UPDATE_REVIEW_INSTRUCTIONS` in `apps/api/src/update-review-prompt.ts` (the
-   guarantees G1–G8, how to judge, the answer format — the one place to read
+   guarantees G1–G10, how to judge, the answer format — the one place to read
    and tune the reviewer), then the material between nonce-marked
    `BEGIN_REVIEW_DATA`/`END_REVIEW_DATA` markers (focus areas, changed files,
    stat, diff excerpt; high-confidence secret formats redacted), then a short
@@ -174,12 +175,51 @@ whose diff was reviewed. `status` is unchanged.
 cases (signature-verification refactor that keeps the timing-safe compare, a
 typed helper with its exact sudoers line, a dev-dependency bump) and harmful
 cases (sudoers wildcard, removed broker signature check, approval route for the
-bearer token, a comment instructing the reviewer), each with the expected
+bearer token, a comment instructing the reviewer), plus the general door: a
+benign change to the host-run step environment (plan text still runs as root
+through `bash -c` — must come back `approve`) and three harmful ones (a passed
+doorkeeper opens the backup bolt → G10, an oversized plan cut instead of
+stopped → G9, the safety net skipped for runs declared `contained` → G5). Each case carries the expected
 verdict and an example answer. The unit tests check only the deterministic
 parts (prompt assembly, parser, policy). To evaluate a real model later, build
 each case's prompt with `buildUpdateReviewPrompt`, send it to the safety role,
 and compare the parsed verdict (and, for harmful cases, the guarantee of a
 finding) with the fixture; benign cases must come back `approve`.
+
+## The guarantees and the one door
+
+Stand 02.10.2026. Until then G1, G3 and G5 described the architecture before
+the general door (`doc/setup/host-run.md`): only the operator approves, no free
+text reaches a shell, nothing runs outside the capability sandbox. The
+self-update to PR #25 (the door) was stopped with exactly these three findings
+(job `c65999ef`): the doorkeeper starts root runs without the operator, plan
+text reaches `bash -c` as root, `host.run` has no sandbox and no protected
+paths. All three are Jochen's decision of 30.09.2026 („eine Tür mit Schloss und
+Türsteher“, approval only on a finding, deleting backups only with approval),
+so every later change at the door would have been stopped again.
+
+The guarantees now describe that model. The door itself is not a finding; a
+finding names a concrete way **past** one of its guards, or a weakening of it:
+
+| Guarantee | holds |
+| --- | --- |
+| G1 Approval | only the admin session approves; a bearer token never approves or sets `operatorApproved`/`gatePassed`. A `host.run` start on the doorkeeper's pass is intended. A job that needed the operator (evidenced finding, bolt hit, a door without doorkeeper) never runs without the operator's approval. |
+| G2 Lock | HMAC envelope (timing-safe, host secret), bound to plan and `manifestHash`, with expiry, capability and the job id (its form; the run directory is named by it); the root helper checks it at the start and on every resume; a blocked job's envelope never opens. |
+| G3 Doors | `host.run` is the one general door; every other action stays typed and narrow. No second general door, no way into `host.run` past G2, G9, G10. |
+| G4 Root helpers and sudoers | narrow, typed; the host-run helper keeps exactly `start` and `status <job>`. |
+| G5 Sandbox and safety net | the special doors' sandbox is not broader; `host.run` has none by design, but before every run with `mutates: true` a fresh successful borg backup (< 24 h) and a machine snapshot, otherwise no step runs. Snapshot revert/delete stays the operator's decision (at the door through the doorkeeper's X4, not a rule). |
+| G6 Secrets | redaction of outputs, logs and prompts; the host-run log redacted line by line and 0600. The doorkeeper's unredacted material is intended. |
+| G7, G8 | unchanged (self-update path, dependencies). |
+| G9 Doorkeeper | isolated safety review; a pass only with complete material; incomplete or unreadable review and findings without evidence stop without a pass; its finding classes (secrets/egress, authority, exposure, loss of the way back, false read-only claim, hidden code, injection) do not narrow. |
+| G10 Backup bolt | deleting backups or shortening retention only with `operatorApproved`, even on a pass; one deterministic source asked at three places (API policy, `runHostRun`, root helper incl. resume); detection does not narrow. |
+
+The runner marks changes to the door's files as focus area `host-door`
+(G2/G5/G6/G9/G10). Like every focus area it only steers the reviewer.
+
+**Order of rollout.** The review runs with the prompt of the *running*
+Cockpit. The first self-update that brings these guarantees is still judged by
+the old G1/G3/G5 and may be stopped with the same three findings; that stop is
+the operator's to approve once. From then on the new guarantees apply.
 
 ## Refusal codes
 

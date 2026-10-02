@@ -285,6 +285,15 @@ Weitere bekannte Grenzen:
   gilt der Lauf als gescheitert, und die Tür ist wieder frei. Kommt der Host gar nicht zurück,
   gibt die API nach ihrer Frist (Zeitbudget plus eine Stunde je Neustart) auf.
 
+## Prüfung von Änderungen an der Tür
+
+Änderungen an der Tür selbst gehen wie jeder Cockpit-Code durch die Prüfung vor dem
+Selbstupdate (`doc/setup/self-update.md`, Abschnitt „The guarantees and the one door“). Deren
+Garantien bilden seit 02.10.2026 dieses Modell ab: dass `host.run` Plantext als root ohne
+Sandkasten ausführt und der Türsteher ohne Jochen freigibt, ist gewollt und kein Befund. Ein
+Befund ist ein Weg am Schloss (G2), am Türsteher (G9), am Backup-Riegel (G10) oder am Netz (G5)
+vorbei. Der Runner markiert die Dateien der Tür als Fokus `host-door`.
+
 ## Tests
 
 - `apps/api/test/host-run-helper.test.ts`: der echte Helfer mit Stubs für systemd-run,
