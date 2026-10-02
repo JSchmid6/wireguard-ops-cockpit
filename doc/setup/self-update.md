@@ -74,9 +74,12 @@ runner only.
    `web_url`). The runner verifies the host before activation: the four cockpit
    services are active, the socket files exist, `api_health` answers, and —
    when the WireGuard address is present — `web_url` answers. Where the deploy
-   script records the built web image (`state.json` `web_image`: name, id,
-   container; the VPS), the image tag must still be that id and the web
-   container must run, else 68. It then schedules
+   script records the built web image for this commit (`state.json`
+   `web_image`: commit, name, id, container; the VPS), the image tag must still
+   be that id and the web container must run, else 68. Without such a record
+   (Lab0; and once on the VPS: the first update after this check came is still
+   deployed by the previously installed script) the check reports
+   `not-recorded`. It then schedules
    the activation as a one-shot timer (`systemd-run --on-active=600`) and
    writes `activation.status=scheduled`.
 4. The activation waits for the run lock (a running deployment or review diff;

@@ -71,7 +71,7 @@ case "\$*" in
   *"config --images web"*) echo "wireguard-ops-cockpit-web" ;;
   "image inspect --format {{.Id}} wireguard-ops-cockpit-web") [ -e "$FIX/web-built" ] && echo "sha256:neu" || echo "sha256:alt" ;;
   *"compose"*"build web"*) [ -e "$FIX/fail-webbuild" ] && exit 1; : > "$FIX/web-built" ;;
-  *"compose"*"ps -a -q web"*) echo "c0ffee" ;;
+  *"compose"*"ps -a -q web"*) [ -e "$FIX/fail-webps" ] && exit 1; echo "c0ffee" ;;
   "inspect --format {{.Name}} c0ffee") echo "/wireguard-ops-cockpit-web-1" ;;
   "inspect --format {{.Image}} wireguard-ops-cockpit-web-1") [ -e "$FIX/web-swapped" ] && echo "sha256:neu" || echo "sha256:alt" ;;
 esac
@@ -91,7 +91,7 @@ targets() { grep -oE '^  "[^"|]+\|[^"|]+\|' "$SCRIPT" | cut -d'|' -f2 | sed -E \
   -e 's#\$UNITS#/etc/systemd/system#' -e 's#\$SUDOERS#/etc/sudoers.d/cockpit-executor#'; }
 fresh_host() { # host root: half the targets with old bytes, the other half absent; repo at A
   rm -rf "$FIX/root" "$FIX/repo" "$FIX/calls.log" "$FIX/fail-visudo" "$FIX/fail-build" "$FIX/fail-webbuild" "$FIX/web-active" \
-    "$FIX/web-built" "$FIX/web-swapped" "$FIX/web-stale"
+    "$FIX/web-built" "$FIX/web-swapped" "$FIX/web-stale" "$FIX/fail-webps"
   mkdir -p "$FIX/root/var/lib/wireguard-ops-cockpit"; chmod 750 "$FIX/root/var/lib/wireguard-ops-cockpit"
   # Fremdes Drop-in in dem Verzeichnis, in das unser neues Drop-in kommt (der
   # Host hat dort z. B. nach-gitlab-backup.conf): es gehört nicht zu diesem
@@ -176,6 +176,12 @@ check "Defer: state.json verbucht das gebaute Web-Abbild für die Aktivierung" '
 # 7: restart now, but the web unit leaves the old container running -> exit 68, said so
 fresh_host; : > "$FIX/web-active"; : > "$FIX/web-stale"; code=0; deploy "$B" now || code=$?
 check "Web nicht umgeschaltet: Exit 68 mit Grund" '[ "$code" = 68 ] && grep -q "runs sha256:alt, not the built sha256:neu" "$FIX/out.log"'
+
+# 8: the web container cannot be found after the build -> one rollback, completely logged
+fresh_host; : > "$FIX/web-active"; : > "$FIX/fail-webps"; code=0; deploy "$B" defer || code=$?
+check "Web-Container nicht auffindbar: Exit ungleich 0, Dateien bytegenau zurück" '[ "$code" != 0 ] && [ "$(after_sums)" = "$(cat "$FIX/vorher.sums")" ]'
+# (a second, swallowed rollback in the $(...) subshell would show up as a second tag reset)
+check "Web-Container nicht auffindbar: genau ein Rückfall, vollständig im Log" '[ "$(grep -c "^docker image tag " "$FIX/calls.log")" = 1 ] && grep -q "rollback complete" "$FIX/out.log"'
 
 echo
 [ "$fails" = 0 ] && echo "alles grün" || { echo "$fails rot"; exit 1; }

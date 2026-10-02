@@ -814,21 +814,27 @@ def state_web_url():
 
 def web_image_check(after_activation):
     """The web container against the image the deploy script built and recorded in
-    state.json (web_image: name, id, container). Hosts whose deploy script records
-    no web image (Lab0) skip it. Before the activation the image tag must still
-    point to the built image (nothing rebuilt or retagged it since) and the
-    container must run; after it the container must carry exactly that image."""
+    state.json (web_image: commit, name, id, container). Hosts whose deploy script
+    records no web image for this commit (Lab0; the first update after this check
+    came, still deployed by the old script) report "not-recorded". Before the
+    activation the image tag must still point to the built image (nothing rebuilt
+    or retagged it since) and the container must run; after it the container
+    must carry exactly that image."""
     state = read_json(STATE_FILE)
     built = state.get("web_image") if isinstance(state, dict) else None
-    if built is None:
-        return "skipped"
+    if built is None or (isinstance(built, dict) and built.get("commit") != ACTIVE_SHA):
+        # absent, or left over from another commit by a deploy script that does not record it
+        return "not-recorded"
     if not isinstance(built, dict) or not all(built.get(key) for key in ("name", "id", "container")):
         raise Failure(68, "verify", "state.json web_image is incomplete: %s" % json.dumps(built)[:200])
-    tag = run([DOCKER, "image", "inspect", "--format", "{{.Id}}", built["name"]], timeout=30)
+    try:
+        tag = run([DOCKER, "image", "inspect", "--format", "{{.Id}}", built["name"]], timeout=30)
+        running = run([DOCKER, "inspect", "--format", "{{.State.Running}} {{.Image}}", built["container"]], timeout=30)
+    except Failure as exc:
+        raise Failure(68, "verify", "web image check: %s" % exc.message)
     if tag.returncode != 0 or tag.stdout.strip() != built["id"]:
         raise Failure(68, "verify", "web image %s is %s, but the deploy built %s (rebuilt or retagged since)"
                       % (built["name"], tag.stdout.strip() or "missing", built["id"]))
-    running = run([DOCKER, "inspect", "--format", "{{.State.Running}} {{.Image}}", built["container"]], timeout=30)
     parts = running.stdout.split()
     if running.returncode != 0 or len(parts) != 2 or parts[0] != "true":
         raise Failure(68, "verify", "web container %s is not running" % built["container"])
@@ -1082,7 +1088,10 @@ def cmd_activate(sha):
         restart = subprocess.CompletedProcess([], 0, "", "")
     else:
         log("restarting %s to activate commit %s" % (" ".join(SERVICES), sha[:12]))
-        restart = run([SYSTEMCTL, "restart"] + SERVICES, timeout=300)
+        try:
+            restart = run([SYSTEMCTL, "restart"] + SERVICES, timeout=300)
+        except Failure as exc:
+            restart = subprocess.CompletedProcess([], 1, "", exc.message)
     restart_detail = restart.stderr.strip()[-300:]
     if not error:
         try:

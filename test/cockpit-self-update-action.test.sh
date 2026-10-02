@@ -272,7 +272,9 @@ cat > "$FIX/bin/docker" <<EOF
 # fixture stub (S16): the web image tag and the running web container.
 case "\$*" in
   "image inspect --format {{.Id}} fixture-web") cat "$FIX/docker-tag" 2>/dev/null || exit 1 ;;
-  "inspect --format {{.State.Running}} {{.Image}} fixture-web-1") echo "true \$(cat "$FIX/docker-running")" ;;
+  "inspect --format {{.State.Running}} {{.Image}} fixture-web-1")
+    [ -e "$FIX/docker-stopped" ] && running=false || running=true
+    echo "\$running \$(cat "$FIX/docker-running")" ;;
   *) echo "unexpected docker call: \$*" >&2; exit 1 ;;
 esac
 EOF
@@ -310,7 +312,7 @@ state = {
     "web_url": "https://10.0.0.5:18181", "activation": {"status": "pending"},
 }
 if os.path.exists(os.path.join(fix, "web-image-on")):  # S16: a deploy script that builds a web image
-    state["web_image"] = {"name": "fixture-web", "id": "sha256:neu", "container": "fixture-web-1"}
+    state["web_image"] = {"commit": sha, "name": "fixture-web", "id": "sha256:neu", "container": "fixture-web-1"}
 tmp = path + ".tmp"
 with open(tmp, "w", encoding="utf-8") as handle:
     json.dump(state, handle, sort_keys=True)
@@ -830,6 +832,33 @@ COCKPIT_SELF_UPDATE_ACTIVATION_LOCK_WAIT=1 "$RUNNER" activate "$C7" > "$FIX/s16f
 wait "$LOCKER"
 check "S16 run lock held past the wait -> 66, not a silent success" "$([ "$rc" -eq 66 ] && echo 0 || echo 1)" "rc=$rc"
 check "S16 busy activation noted as failed-busy" "$(tail -n 1 "$FIX/state/history.jsonl" | grep -q '"failed-busy"' && echo 0 || echo 1)" "$(tail -n 1 "$FIX/state/history.jsonl")"
+
+: > "$FIX/docker-stopped"
+"$RUNNER" activate "$C7" > "$FIX/s16h.out" 2>&1; rc=$?
+check "S16 web container stopped after the restart -> 68" \
+  "$([ "$rc" -eq 68 ] && grep -q "web container fixture-web-1 is not running" "$FIX/state/last-result.json" && echo 0 || echo 1)" "rc=$rc"
+rm -f "$FIX/docker-stopped"
+
+set_web_image() { # set_web_image <python expression on w>
+  python3 - "$FIX/state/state.json" "$1" <<'EOF'
+import json, sys
+path, expr = sys.argv[1:3]
+with open(path, encoding="utf-8") as handle:
+    state = json.load(handle)
+w = state["web_image"]
+exec(expr)
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(state, handle)
+EOF
+}
+set_web_image 'del w["container"]'
+"$RUNNER" activate "$C7" > "$FIX/s16i.out" 2>&1; rc=$?
+check "S16 incomplete web_image -> 68" \
+  "$([ "$rc" -eq 68 ] && grep -q "web_image is incomplete" "$FIX/state/last-result.json" && echo 0 || echo 1)" "rc=$rc"
+set_web_image 'w["container"] = "fixture-web-1"; w["commit"] = "'"$C1"'"'
+"$RUNNER" activate "$C7" > "$FIX/s16j.out" 2>&1; rc=$?
+check "S16 web_image left over from another commit: no false failure" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "rc=$rc $(head -c 300 "$FIX/s16j.out")"
+expect_json "S16 web_image of another commit: reported as not-recorded" "$FIX/state/last-result.json" "activation.checks.web_image" "not-recorded"
 
 C8="$(add_commit c8)"
 echo "sha256:fremd" > "$FIX/docker-tag"

@@ -165,18 +165,21 @@ install_table() {
 }
 
 build_web() { # new image under the compose tag; the old id is kept for the rollback
+  # Every $(...) ends in `|| true` and is checked afterwards: with set -E the ERR
+  # trap is inherited by command substitutions, so a failure inside one would run
+  # the rollback twice (once in the subshell, its log swallowed by the assignment).
   local id
-  WEB_IMAGE="$("${COMPOSE[@]}" config --images web | head -n 1)"
+  WEB_IMAGE="$("${COMPOSE[@]}" config --images web | head -n 1 || true)"
   [ -n "$WEB_IMAGE" ]
   WEB_BEFORE="$("$DOCKER" image inspect --format '{{.Id}}' "$WEB_IMAGE" 2>/dev/null || true)"
   "${COMPOSE[@]}" build web
   # Recorded so the runner can prove before and after the activation that the web
   # container carries exactly this image (cockpit-self-update-run web_image_check).
-  WEB_BUILT="$("$DOCKER" image inspect --format '{{.Id}}' "$WEB_IMAGE")"
+  WEB_BUILT="$("$DOCKER" image inspect --format '{{.Id}}' "$WEB_IMAGE" || true)"
   [ -n "$WEB_BUILT" ]
-  id="$("${COMPOSE[@]}" ps -a -q web | head -n 1)"
+  id="$("${COMPOSE[@]}" ps -a -q web | head -n 1 || true)"
   [ -n "$id" ]
-  WEB_CONTAINER="$("$DOCKER" inspect --format '{{.Name}}' "$id")"
+  WEB_CONTAINER="$("$DOCKER" inspect --format '{{.Name}}' "$id" || true)"
   WEB_CONTAINER="${WEB_CONTAINER#/}"
   [ -n "$WEB_CONTAINER" ]
   log "web image $WEB_IMAGE built as $WEB_BUILT (was ${WEB_BEFORE:-none}), container $WEB_CONTAINER"
@@ -247,7 +250,7 @@ try:
 except (FileNotFoundError, ValueError):
     state = {}
 state.update({"version": 1, "deployed_commit": sha, "previous_commit": old if old != sha else state.get("previous_commit"),
-              "web_url": web, "web_image": {"name": web_name, "id": web_id, "container": web_container},
+              "web_url": web, "web_image": {"commit": sha, "name": web_name, "id": web_id, "container": web_container},
               "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
               "updated_by": source})
 tmp = path + ".tmp"
