@@ -93,6 +93,9 @@ import {
   buildHostRunReviewPrompt,
   hostRunManifestHash,
   hostRunPlannerContract,
+  loadHostRunNet,
+  SYSTEM_BACKUP_BOUNDS,
+  type HostRunNet,
   hostRunPolicy,
   hostRunResultText,
   hostRunSafetyRecord,
@@ -114,6 +117,8 @@ interface AppOptions {
   // The doorkeeper of the general host door (prompt in, raw answer out).
   // Defaults to the agent broker's safety role; tests inject a stub.
   hostRunReviewRunner?: (prompt: string) => Promise<string>;
+  // The safety net under the host door (default: /etc/wireguard-ops-cockpit/host-run-net.json).
+  hostRunNet?: HostRunNet | null;
   // Interval of host.status polls while a host run is going (tests shorten it).
   hostRunPollMs?: number;
   // The borg helper's status report (`borg.status`, read-only). Defaults to the
@@ -702,11 +707,14 @@ async function requireActor(
 
 export async function createApp(options: AppOptions = {}) {
   const config = options.config || loadConfig();
+  // The safety net under the host door, as this host's helper is configured
+  // (read once at start; the helper reads it again before every run).
+  const hostRunNet = options.hostRunNet !== undefined ? options.hostRunNet : loadHostRunNet();
   const changeRuntimeFingerprint = hashCanonical({
     plannerModel: config.opencodeModel,
     safetyModel: config.safetyOpencodeModel,
     capabilityContract: hashCanonical(capabilityPlannerContract()),
-    hostRunContract: hashCanonical(hostRunPlannerContract()),
+    hostRunContract: hashCanonical(hostRunPlannerContract(hostRunNet)),
     brokerRoleContract: "ephemeral-role-workspace-v7",
     executorBoundaryContract: "dynamic-capability-v16-daemonless-kaniko",
   });
@@ -1991,7 +1999,7 @@ export async function createApp(options: AppOptions = {}) {
   // The reviewer prompt is kept next to the proposal (<jobId>-host-run-review.md,
   // 0600): exactly what the doorkeeper read.
   async function reviewHostRun(jobId: string, manifest: HostRunManifest, proposalDir: string): Promise<HostRunReviewOutcome> {
-    const material = buildHostRunReviewPrompt(manifest);
+    const material = buildHostRunReviewPrompt(manifest, { net: hostRunNet });
     const outcome: HostRunReviewOutcome = { manifestHash: hostRunManifestHash(manifest), complete: material.complete, missing: material.missing, focus: material.focus };
     if (!material.complete) return outcome;
     outcome.reviewPath = path.join(proposalDir, `${jobId}-host-run-review.md`);
@@ -2007,7 +2015,10 @@ export async function createApp(options: AppOptions = {}) {
   function hostRunDeadline(manifest: HostRunManifest, startedAt: number): number {
     const seconds = manifest.steps.reduce((sum, step) => sum + (step.timeoutSeconds || 0), 0) + manifest.checks.reduce((sum, check) => sum + check.timeoutSeconds, 0);
     const reboots = manifest.steps.filter((step) => step.reboot).length;
-    return startedAt + (seconds + 1800) * 1000 + (reboots + 1) * HOST_RUN_REBOOT_ALLOWANCE_MS;
+    // The system backup of a physical host runs before the first step (the helper's budget has it too).
+    // A net the API cannot read may be one: then the longest backup it allows.
+    const backup = !manifest.mutates ? 0 : hostRunNet === null ? SYSTEM_BACKUP_BOUNDS.timeoutSeconds[1] : hostRunNet.systemBackup?.timeoutSeconds ?? 0;
+    return startedAt + (seconds + backup + 1800) * 1000 + (reboots + 1) * HOST_RUN_REBOOT_ALLOWANCE_MS;
   }
 
   async function hostRunStatus(jobId: string): Promise<ReturnType<typeof parseHostRunStatus>> {
@@ -2831,7 +2842,7 @@ Follow these rules:
     const intent = requestedIntent;
     const untrustedEvidence = normalizeEvidence(body.evidence);
     const allowedCapabilities = normalizeAllowedCapabilities(body.allowedCapabilities);
-    const agentTask = `${buildAgentTask(intent, untrustedEvidence)}\n\nDYNAMIC CAPABILITY CONTRACT:\n${hostRunPlannerContract()}\n\n${capabilityPlannerContract()}`;
+    const agentTask = `${buildAgentTask(intent, untrustedEvidence)}\n\nDYNAMIC CAPABILITY CONTRACT:\n${hostRunPlannerContract(hostRunNet)}\n\n${capabilityPlannerContract()}`;
     const job = database.createJob({
       sessionId: session.id, kind: "runbook", subjectId: "hermes-change",
       status: "running", requiresApproval: false,
@@ -2905,7 +2916,7 @@ Follow these rules:
         let policy: PlanPolicyResult;
         if (hostRun) {
           const hostRunReview = await reviewHostRun(job.id, hostRun, proposalDir);
-          policy = hostRunPolicy(hostRun, hostRunReview);
+          policy = hostRunPolicy(hostRun, hostRunReview, hostRunNet);
           review = hostRunSafetyRecord(hostRun, hostRunReview, policy);
         } else {
           review = await safetyReviewRunner({

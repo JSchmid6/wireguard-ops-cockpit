@@ -1,0 +1,19 @@
+{
+  "version": "cockpit-host-run-net/v1",
+  "net": "system-backup",
+  "systemBackup": {
+    "target": "/media/RAID/lab0-systemsicherung",
+    "mount": "/media/RAID",
+    "raidDevice": "md126",
+    "sources": ["/", "/boot", "/boot/efi"],
+    "exclude": ["/swap.img", "/tmp/*", "/var/tmp/*", "/var/cache/apt/archives/*.deb"],
+    "keep": 3,
+    "reserveGB": 100,
+    "timeoutSeconds": 14400
+  },
+  "retentionService": true,
+  "reboot": {
+    "onSite": true,
+    "mustBeEnabled": [["wg-quick@wg0.service"], ["ssh.service", "ssh.socket"]]
+  }
+}

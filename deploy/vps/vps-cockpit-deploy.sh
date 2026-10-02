@@ -96,6 +96,9 @@ readonly TABLE=(
   "deploy/helpers/cockpit-host-run|$LIB/cockpit-host-run.mjs|755"
   # Backups löschen nur mit Freigabe: die eine Erkennung, die der Helfer importiert.
   "deploy/helpers/cockpit-backup-guard.mjs|$LIB/cockpit-backup-guard.mjs|644"
+  # Das Netz je Kiste (doc/setup/host-run.md, 4). Der VPS braucht keine
+  # Einstellungsdatei: ohne sie gilt sein Netz (borg-Frische und Snapshot).
+  "deploy/helpers/cockpit-host-run-net.mjs|$LIB/cockpit-host-run-net.mjs|644"
   # …und die festen Grenzen des Aufräum-Diensts auf Lab0, die der Riegel importiert
   # (der Dienst selbst läuft nur auf Lab0, doc/setup/borg-retention.md).
   "deploy/helpers/cockpit-borg-retention-rules.mjs|$LIB/cockpit-borg-retention-rules.mjs|644"

@@ -121,6 +121,7 @@ check "Erfolg: inaktive Web-Unit vor dem Web-Bau gestartet" 'start_before_build'
 check "Erfolg: Neustart inkl. Web-Unit" 'grep -q "^systemctl restart .*wireguard-ops-cockpit-web" "$FIX/calls.log"'
 check "Erfolg: Sicherungsordner entfernt" '[ -z "$(ls -d "$FIX"/root/var/lib/wireguard-ops-cockpit/self-update/deploy-backup.* 2>/dev/null)" ]'
 check "Erfolg: Datenordner des Dienstes bleibt 750" '[ "$(parent_mode)" = 750 ]'
+check "Erfolg: Netz-Modul der Tür neben dem Helfer" '[ "$(cat "$FIX/root/usr/local/lib/wireguard-ops-cockpit/cockpit-host-run-net.mjs")" = "B deploy/helpers/cockpit-host-run-net.mjs" ]'
 check "Erfolg: Wiederaufnahme der Host-Läufe beim Hochfahren aktiviert" 'grep -q "^systemctl enable --quiet wireguard-ops-cockpit-host-run-resume.service" "$FIX/calls.log"'
 # R2: das Drop-in für borgmatic.service. Das Verzeichnis gehört dem Paket, nicht
 # uns: hier wird nur die eigene Datei geschrieben.

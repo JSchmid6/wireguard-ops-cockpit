@@ -1,0 +1,4 @@
+{
+  "version": "cockpit-host-run-net/v1",
+  "net": "hoster-snapshot"
+}

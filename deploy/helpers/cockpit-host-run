@@ -20,11 +20,18 @@
 //              öffnet nur mit operatorApproved, auch bei bestandenem Türsteher
 //              (cockpit-backup-guard.mjs, dieselbe Erkennung wie in der API;
 //              installiert neben diesem Helfer).
-//   Netz       Vor einem Lauf, der den Systemzustand ändert (mutates, Standard):
-//              das letzte borg-Backup muss jünger als 24 h sein, dann ein
-//              Maschinen-Snapshot beim Hoster (cockpit-vps-snapshot, rotiert den
-//              ältesten cockpit-eigenen). Scheitert eines davon, läuft kein
-//              Schritt.
+//   Netz       Vor einem Lauf, der den Systemzustand ändert (mutates, Standard),
+//              je Kiste eingestellt in /etc/wireguard-ops-cockpit/host-run-net.json
+//              (cockpit-host-run-net.mjs, installiert neben diesem Helfer):
+//              VPS (hoster-snapshot, auch ohne Datei): das letzte borg-Backup
+//              jünger als 24 h, dann ein Maschinen-Snapshot beim Hoster
+//              (cockpit-vps-snapshot, rotiert den ältesten cockpit-eigenen).
+//              Lab0 (system-backup): RAID gesund, Sicherungsplatte eingehängt
+//              mit Platz, Aufräum-Dienst nicht angehalten, dann eine
+//              Dateisicherung von / (rsync, feste Anzahl) auf das RAID.
+//              Scheitert etwas davon, läuft kein Schritt. Vor einem Neustart
+//              prüft er, dass die eingestellten Units (WireGuard, SSH) beim
+//              Hochfahren starten.
 //
 // Verben (gepinnte Grammatik; sudoers erlaubt nur `start` und `status *`):
 //   start             stdin: {"manifest", "envelope"} — prüfen, Laufverzeichnis
@@ -44,11 +51,12 @@
 // test/cockpit-host-run.test.sh um. Über sudo kommen sie nie an (env_reset),
 // und die Units setzen nur COCKPIT_HOST_RUN_IN_UNIT.
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, openSync, fsyncSync, closeSync } from "node:fs";
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, statfsSync, writeFileSync, openSync, fsyncSync, closeSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { backupGuardHits } from "./cockpit-backup-guard.mjs";
+import { HOST_RUN_NET_FILE, defaultHostRunNet, parseHostRunNet } from "./cockpit-host-run-net.mjs";
 
 const env = process.env;
 const STATE_ROOT = env.HOST_RUN_STATE_DIR || "/var/lib/wireguard-ops-cockpit/host-runs";
@@ -58,6 +66,10 @@ const SYSTEMCTL = env.HOST_RUN_SYSTEMCTL || "/usr/bin/systemctl";
 const BORG_STATUS = env.HOST_RUN_BORG_STATUS ? [env.HOST_RUN_BORG_STATUS] : ["/usr/local/sbin/cockpit-borg-action", "status"];
 const SNAPSHOT = env.HOST_RUN_SNAPSHOT ? [env.HOST_RUN_SNAPSHOT] : ["/usr/bin/python3", "/usr/local/lib/wireguard-ops-cockpit/cockpit-vps-snapshot"];
 const BOOT_ID_FILE = env.HOST_RUN_BOOT_ID_FILE || "/proc/sys/kernel/random/boot_id";
+const RSYNC = env.HOST_RUN_RSYNC || "/usr/bin/rsync";
+const MDSTAT = env.HOST_RUN_MDSTAT || "/proc/mdstat";
+const MOUNTINFO = env.HOST_RUN_MOUNTINFO || "/proc/self/mountinfo";
+const RETENTION_STATUS = env.HOST_RUN_RETENTION_STATUS ? [env.HOST_RUN_RETENTION_STATUS] : ["/usr/local/sbin/cockpit-borg-retention", "status"];
 const SELF = fileURLToPath(import.meta.url);
 const STEP_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
@@ -69,6 +81,9 @@ const MAX_SCRIPT = 16000;
 const STEP_TIMEOUT_MAX = 10800;
 const CHECK_TIMEOUT_MAX = 1800;
 const BORG_MAX_AGE_HOURS = 24;
+// Name einer fertigen Systemsicherung: Zeitstempel zuerst, damit die
+// Reihenfolge der Namen die Reihenfolge der Sicherungen ist.
+const BACKUP_NAME = /^cockpit-run-\d{8}T\d{6}Z-[A-Za-z0-9_.-]{1,128}$/;
 const ACTIVE_PHASES = new Set(["preflight", "resuming", "running", "rebooting", "checking"]);
 const REBOOT_GRACE_MS = 30 * 60 * 1000;
 // Zwischen "resuming" (gespeichert) und dem Start der Unit liegt ein kurzes
@@ -146,6 +161,25 @@ function validateManifest(manifest) {
     if (!Number.isInteger(check.timeoutSeconds) || check.timeoutSeconds < 1 || check.timeoutSeconds > CHECK_TIMEOUT_MAX) bad(`timeout of ${check.name}`);
   }
   if (!Array.isArray(manifest.rollback) || manifest.rollback.length < 1) bad("rollback");
+}
+
+// ── Netz-Einstellung ───────────────────────────────────────────────────────
+// Eine root-eigene Datei je Kiste, keine Umgebung (sudo setzt sie zurück).
+// Fehlt sie, gilt das Netz des VPS. Gehört sie nicht dem Nutzer des Helfers
+// (root) oder ist sie für andere schreibbar, gilt sie als ungültig: dann läuft
+// kein verändernder Lauf.
+function loadNet() {
+  const file = `${CONFIG_DIR}/${HOST_RUN_NET_FILE}`;
+  let info;
+  try { info = lstatSync(file); } catch (error) {
+    if (error.code === "ENOENT") return { ok: true, net: defaultHostRunNet(), source: "default" };
+    return { ok: false, why: `net configuration ${file} is unreadable (${error.code})` };
+  }
+  if (!info.isFile() || info.uid !== process.getuid() || (info.mode & 0o022) !== 0) {
+    return { ok: false, why: `net configuration ${file} must be a regular file owned by root and not writable by group or others` };
+  }
+  try { return { ok: true, net: parseHostRunNet(JSON.parse(readFileSync(file, "utf8"))), source: file }; }
+  catch (error) { return { ok: false, why: `net configuration ${file} is invalid: ${String(error.message).slice(0, 300)}` }; }
 }
 
 // ── Schwärzen ──────────────────────────────────────────────────────────────
@@ -238,7 +272,10 @@ function startUnit(jobId, runtimeSeconds) {
 function runtimeBudget(manifest, fromStep = 0) {
   const steps = manifest.steps.slice(fromStep).reduce((sum, step) => sum + (step.reboot ? 0 : step.timeoutSeconds), 0);
   const checks = manifest.checks.reduce((sum, check) => sum + check.timeoutSeconds, 0);
-  return steps + checks + 1800; // + borg-Abfrage, Snapshot und Hochfahren
+  // Die Systemsicherung läuft nur vor dem ersten Schritt, nie nach einem Neustart.
+  const loaded = fromStep === 0 && manifest.mutates ? loadNet() : null;
+  const backup = loaded?.ok && loaded.net.systemBackup ? loaded.net.systemBackup.timeoutSeconds : 0;
+  return steps + checks + backup + 1800; // + borg-Abfrage, Snapshot und Hochfahren
 }
 
 // ── start ──────────────────────────────────────────────────────────────────
@@ -290,7 +327,7 @@ function startLocked(manifest, envelope) {
     mutates: manifest.mutates, phase: "preflight", status: "running", nextStep: 0, boots: [bootId()],
     steps: manifest.steps.map((step, index) => ({ index: index + 1, name: step.name, reboot: step.reboot === true, status: "pending" })),
     checks: manifest.checks.map((check, index) => ({ index: index + 1, name: check.name, status: "pending" })),
-    borg: null, snapshot: null, error: null, startedAt: now(), updatedAt: now(), finishedAt: null,
+    borg: null, snapshot: null, systemBackup: null, net: null, error: null, startedAt: now(), updatedAt: now(), finishedAt: null,
   };
   saveState(state);
   const problem = startUnit(envelope.jobId, runtimeBudget(manifest));
@@ -345,8 +382,11 @@ function resume() {
 
 // ── payload (in der Lauf-Unit) ─────────────────────────────────────────────
 function runScript(script, timeoutSeconds) {
+  return runCommand("/bin/bash", ["--noprofile", "--norc", "-eo", "pipefail", "-c", script], timeoutSeconds);
+}
+function runCommand(command, args, timeoutSeconds) {
   return new Promise((resolve) => {
-    const child = spawn("/bin/bash", ["--noprofile", "--norc", "-eo", "pipefail", "-c", script], {
+    const child = spawn(command, args, {
       cwd: "/", detached: true, stdio: ["ignore", "pipe", "pipe"],
       env: { PATH: STEP_PATH, LANG: "C.UTF-8", HOME: "/root", DEBIAN_FRONTEND: "noninteractive", NEEDRESTART_MODE: "a" },
     });
@@ -374,6 +414,9 @@ function finish(state, status, error = null) {
   log(`== ${now()} run finished: ${status}${error ? ` — ${error}` : ""}`);
   if (state.snapshot?.snapshotId && status !== "success") {
     log(`== return path: machine snapshot ${state.snapshot.snapshotId} (revert only with operator approval)`);
+  }
+  if (state.systemBackup?.path && status !== "success") {
+    log(`== return path: system backup ${state.systemBackup.path} (file level; restore on site from a live system, only with operator approval)`);
   }
 }
 
@@ -407,6 +450,143 @@ function takeSnapshot(jobId) {
   return { ok: true, record: { snapshotId: result.snapshot.snapshotId, name: result.snapshot.name, rotated: result.rotated || null, seconds: result.seconds ?? null } };
 }
 
+// ── Netz für eine physische Kiste (system-backup) ──────────────────────────
+// /proc/mdstat: das Array ist aktiv und alle Glieder sind da ([4/4] [UUUU]).
+function raidHealthy(device) {
+  let text;
+  try { text = readFileSync(MDSTAT, "utf8"); } catch { return { ok: false, why: "/proc/mdstat is unreadable" }; }
+  const lines = text.split("\n");
+  const start = lines.findIndex((line) => line.startsWith(`${device} :`));
+  if (start < 0) return { ok: false, why: `RAID ${device} is not in /proc/mdstat` };
+  if (!/^\S+ : active\b/.test(lines[start])) return { ok: false, why: `RAID ${device} is not active: ${lines[start].slice(0, 160)}` };
+  for (const line of lines.slice(start + 1)) {
+    if (!line.trim() || /^\S/.test(line)) break;
+    const members = line.match(/\[(\d+)\/(\d+)\]\s+\[([U_]+)\]/);
+    if (!members) continue;
+    const state = `[${members[1]}/${members[2]}] [${members[3]}]`;
+    if (members[1] !== members[2] || members[3].includes("_") || members[3].length !== Number(members[1])) return { ok: false, why: `RAID ${device} is degraded ${state}` };
+    return { ok: true, state };
+  }
+  return { ok: false, why: `RAID ${device}: no member status in /proc/mdstat` };
+}
+
+// Der Einhängepunkt muss eingehängt sein und auf einem anderen Dateisystem
+// liegen als / (sonst schriebe die Sicherung die Root-Platte voll).
+function mountpoints() {
+  try {
+    return readFileSync(MOUNTINFO, "utf8").split("\n").flatMap((line) => {
+      const fields = line.split(" ");
+      if (fields.length < 5) return [];
+      return [{ device: fields[2], point: fields[4].replace(/\\([0-7]{3})/g, (_, octal) => String.fromCharCode(parseInt(octal, 8))) }];
+    });
+  } catch { return null; }
+}
+
+function retentionHalted() {
+  const out = spawnSync(RETENTION_STATUS[0], RETENTION_STATUS.slice(1), { encoding: "utf8", timeout: 120000, maxBuffer: 4 * 1024 * 1024, env: { PATH: STEP_PATH, LANG: "C.UTF-8" } });
+  if (out.status !== 0) return { ok: false, why: `retention service status failed (exit ${out.status})` };
+  const lines = (out.stdout || "").split("\n");
+  const marker = lines.indexOf("== DATEN (cockpit-borg-retention/v1) ==");
+  let report;
+  try { report = JSON.parse(lines[marker + 1]); } catch { return { ok: false, why: "retention service status returned no report" }; }
+  if (marker < 0 || !report?.state) return { ok: false, why: "retention service status returned no report" };
+  if (report.state.status === "angehalten" || report.state.anomaly) {
+    return { ok: false, why: `the backup retention service is halted after an anomaly (${report.state.anomaly?.id || "no id"}); the operator decides first` };
+  }
+  return { ok: true, status: report.state.status };
+}
+
+function usedBytes(path) {
+  const info = statfsSync(path);
+  return (info.blocks - info.bfree) * info.bsize;
+}
+
+function backupStamp() { return new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z"); }
+
+function completedBackups(target) {
+  return readdirSync(target).filter((name) => BACKUP_NAME.test(name)).sort();
+}
+
+// Alles prüfen, was vor der Sicherung feststehen muss; nichts wird geschrieben.
+function systemBackupPreflight(net) {
+  const backup = net.systemBackup;
+  const raid = raidHealthy(backup.raidDevice);
+  if (!raid.ok) return raid;
+  const mounts = mountpoints();
+  if (!mounts) return { ok: false, why: "mountinfo is unreadable" };
+  const disk = mounts.filter((entry) => entry.point === backup.mount).at(-1);
+  if (!disk) return { ok: false, why: `the backup disk ${backup.mount} is not mounted` };
+  const root = mounts.filter((entry) => entry.point === "/").at(-1);
+  if (!root || root.device === disk.device) return { ok: false, why: `${backup.mount} is on the same filesystem as / ` };
+  for (const source of backup.sources) {
+    if (!existsSync(source)) return { ok: false, why: `backup source ${source} does not exist` };
+  }
+  if (net.retentionService) {
+    const retention = retentionHalted();
+    if (!retention.ok) return retention;
+  }
+  // Platz: so viel, wie die Quellen belegen (eine erste, volle Sicherung),
+  // und danach noch die Reserve. Mit --link-dest braucht eine Folgesicherung
+  // meist viel weniger; gerechnet wird mit dem ungünstigen Fall.
+  let needed = 0;
+  const seen = new Set();
+  for (const source of backup.sources) {
+    const device = statSync(source).dev;
+    if (seen.has(device)) continue;
+    seen.add(device);
+    needed += usedBytes(source);
+  }
+  const space = statfsSync(backup.mount);
+  const free = space.bavail * space.bsize;
+  const reserve = backup.reserveGB * 1024 ** 3;
+  const gb = (bytes) => Math.round(bytes / 1024 ** 3);
+  if (free - needed < reserve) return { ok: false, why: `not enough space on ${backup.mount}: ${gb(free)} GB free, the backup may need ${gb(needed)} GB and ${backup.reserveGB} GB must stay free` };
+  return { ok: true, record: { raid: raid.state, freeGB: gb(free), neededGB: gb(needed) } };
+}
+
+async function takeSystemBackup(net, jobId) {
+  const backup = net.systemBackup;
+  mkdirSync(backup.target, { recursive: true, mode: 0o700 });
+  const target = realpathSync(backup.target);
+  if (!target.startsWith(`${backup.mount}/`)) return { ok: false, why: `backup target ${backup.target} resolves outside ${backup.mount}` };
+  // Reste eines abgebrochenen Laufs: es läuft immer nur ein Lauf zur Zeit.
+  for (const name of readdirSync(target)) {
+    if (name.endsWith(".partial") && BACKUP_NAME.test(name.slice(0, -8))) rmSync(`${target}/${name}`, { recursive: true, force: true });
+  }
+  const previous = completedBackups(target).at(-1) || null;
+  const name = `cockpit-run-${backupStamp()}-${jobId}`;
+  const partial = `${target}/${name}.partial`;
+  const args = ["-aHAXxR", "--numeric-ids", "--stats", ...(previous ? [`--link-dest=${target}/${previous}`] : []),
+    ...backup.exclude.map((pattern) => `--exclude=${pattern}`), ...backup.sources, `${partial}/`];
+  const started = Date.now();
+  log(`== system backup to ${target}/${name}${previous ? ` (unchanged files linked to ${previous})` : " (first, full copy)"}; limit ${backup.timeoutSeconds} s`);
+  const result = await runCommand(RSYNC, args, backup.timeoutSeconds);
+  // 24: Dateien verschwanden während der Kopie — auf einem laufenden System normal.
+  if (result.timedOut || (result.code !== 0 && result.code !== 24)) {
+    rmSync(partial, { recursive: true, force: true });
+    return { ok: false, why: `system backup ${result.timedOut ? "hit its time limit" : `failed (rsync exit ${result.code})`}` };
+  }
+  renameSync(partial, `${target}/${name}`);
+  const removed = [];
+  for (const old of completedBackups(target).slice(0, -backup.keep)) {
+    rmSync(`${target}/${old}`, { recursive: true, force: true });
+    removed.push(old);
+  }
+  return { ok: true, record: { path: `${target}/${name}`, linkedTo: previous, removed, rsyncExit: result.code, seconds: Math.round((Date.now() - started) / 1000) } };
+}
+
+// Units, die nach einem Neustart wieder da sein müssen (WireGuard, SSH): je
+// Gruppe mindestens eine `enabled`. Ohne sie käme die Kiste vielleicht hoch,
+// wäre aber nicht erreichbar.
+function bootUnitsMissing(net) {
+  const missing = [];
+  for (const group of net.reboot.mustBeEnabled) {
+    const enabled = group.some((unit) => (spawnSync(SYSTEMCTL, ["is-enabled", unit], { encoding: "utf8", timeout: 15000 }).stdout || "").trim() === "enabled");
+    if (!enabled) missing.push(group.join(" or "));
+  }
+  return missing;
+}
+
 async function payload(jobId) {
   if (env.COCKPIT_HOST_RUN_IN_UNIT !== "1") fail("the payload runs only inside its own unit", 64);
   if (!JOB_ID.test(jobId || "")) fail("invalid job id");
@@ -419,15 +599,45 @@ async function payload(jobId) {
   if (state.phase === "preflight") {
     log(`== ${now()} host run ${jobId}: ${manifest.name} (ordered by ${state.actorId}, unit ${state.unit})`);
     if (manifest.mutates) {
-      const borg = borgFresh();
-      state.borg = borg.record || null;
+      const loaded = loadNet();
+      if (!loaded.ok) return finish(state, "preflight_failed", `${loaded.why}; nothing was executed`);
+      const { net } = loaded;
+      state.net = { net: net.net, source: loaded.source, onSite: net.reboot.onSite };
       saveState(state);
-      if (!borg.ok) return finish(state, "preflight_failed", `${borg.why}; nothing was executed`);
-      log(`== borg: last backup ${borg.record.lastRunEnd} (${borg.record.ageHours} h ago)`);
-      const snap = takeSnapshot(jobId);
-      if (!snap.ok) return finish(state, "preflight_failed", `${snap.why}; nothing was executed`);
-      state.snapshot = snap.record;
-      log(`== machine snapshot ${snap.record.snapshotId}${snap.record.rotated ? ` (rotated ${snap.record.rotated.snapshotId})` : ""}`);
+      log(`== safety net: ${net.net} (${loaded.source})`);
+      const reboots = manifest.steps.some((step) => step.reboot === true);
+      if (reboots && net.reboot.onSite) log("== physical host: if it does not come back after the reboot, only someone on site can help (no hoster console, no machine snapshot)");
+      if (reboots) {
+        const missing = bootUnitsMissing(net);
+        if (missing.length) return finish(state, "preflight_failed", `not enabled at boot, the host might come back unreachable: ${missing.join("; ")}; nothing was executed`);
+      }
+      if (net.retentionService && net.net !== "system-backup") {
+        const retention = retentionHalted();
+        if (!retention.ok) return finish(state, "preflight_failed", `${retention.why}; nothing was executed`);
+      }
+      if (net.net === "system-backup") {
+        // Ein Dateisystemfehler (etwa ein RAID, das read-only umgehängt wurde)
+        // ist ein gescheitertes Netz mit Grund, kein Absturz der Unit.
+        const guarded = async (action) => { try { return await action(); } catch (error) { return { ok: false, why: `system backup: ${String(error.message).slice(0, 300)}` }; } };
+        const ready = await guarded(() => systemBackupPreflight(net));
+        if (!ready.ok) return finish(state, "preflight_failed", `${ready.why}; nothing was executed`);
+        log(`== RAID ${net.systemBackup.raidDevice} ${ready.record.raid}, ${ready.record.freeGB} GB free on ${net.systemBackup.mount} (backup may need ${ready.record.neededGB} GB)`);
+        const made = await guarded(() => takeSystemBackup(net, jobId));
+        if (!made.ok) return finish(state, "preflight_failed", `${made.why}; nothing was executed`);
+        state.systemBackup = made.record;
+        saveState(state);
+        log(`== system backup ${made.record.path} (${made.record.seconds} s${made.record.removed.length ? `, removed ${made.record.removed.join(", ")}` : ""})`);
+      } else {
+        const borg = borgFresh();
+        state.borg = borg.record || null;
+        saveState(state);
+        if (!borg.ok) return finish(state, "preflight_failed", `${borg.why}; nothing was executed`);
+        log(`== borg: last backup ${borg.record.lastRunEnd} (${borg.record.ageHours} h ago)`);
+        const snap = takeSnapshot(jobId);
+        if (!snap.ok) return finish(state, "preflight_failed", `${snap.why}; nothing was executed`);
+        state.snapshot = snap.record;
+        log(`== machine snapshot ${snap.record.snapshotId}${snap.record.rotated ? ` (rotated ${snap.record.rotated.snapshotId})` : ""}`);
+      }
     } else {
       log("== declared read-only (mutates false): no snapshot, no backup check");
     }
@@ -444,6 +654,16 @@ async function payload(jobId) {
     const step = manifest.steps[index];
     const record = state.steps[index];
     if (step.reboot === true) {
+      // Die Schritte davor können eine Unit abgeschaltet oder ersetzt haben
+      // (ein Release-Upgrade etwa): unmittelbar vor dem Neustart noch einmal.
+      const loaded = loadNet();
+      const missing = loaded.ok ? bootUnitsMissing(loaded.net) : [loaded.why];
+      if (missing.length) {
+        Object.assign(record, { status: "failed", startedAt: now(), endedAt: now() });
+        state.nextStep = index + 1;
+        return finish(state, "failed", `step ${index + 1} (${step.name}): the host was not rebooted, it might come back unreachable — not enabled at boot: ${missing.join("; ")}`);
+      }
+      if (loaded.net.reboot.onSite) log("== physical host: if it does not come back, only someone on site can help");
       Object.assign(record, { status: "rebooting", startedAt: now() });
       Object.assign(state, { phase: "rebooting", nextStep: index + 1, rebootRequestedAt: now() });
       saveState(state);

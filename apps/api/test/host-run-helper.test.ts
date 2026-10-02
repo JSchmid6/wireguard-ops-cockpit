@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { createHash, createHmac } from "node:crypto";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,6 +18,7 @@ const HELPER = fileURLToPath(new URL("../../../deploy/helpers/cockpit-host-run",
 const GUARD = fileURLToPath(new URL("../../../deploy/helpers/cockpit-backup-guard.mjs", import.meta.url));
 // Der Riegel importiert die Grenzen des Aufräum-Diensts; installiert liegen beide nebeneinander.
 const RETENTION_RULES = fileURLToPath(new URL("../../../deploy/helpers/cockpit-borg-retention-rules.mjs", import.meta.url));
+const NET = fileURLToPath(new URL("../../../deploy/helpers/cockpit-host-run-net.mjs", import.meta.url));
 const SECRET = "test-envelope-secret-0123456789";
 const HOSTER_SECRET = "hoster-client-secret-abcdef";
 
@@ -39,6 +40,10 @@ function hookEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
     HOST_RUN_BORG_STATUS: path.join(dir, "borg-status"),
     HOST_RUN_SNAPSHOT: path.join(dir, "snapshot"),
     HOST_RUN_BOOT_ID_FILE: path.join(dir, "boot_id"),
+    HOST_RUN_RSYNC: path.join(dir, "rsync"),
+    HOST_RUN_MDSTAT: path.join(dir, "mdstat"),
+    HOST_RUN_MOUNTINFO: path.join(dir, "mountinfo"),
+    HOST_RUN_RETENTION_STATUS: path.join(dir, "retention-status"),
     STUB_DIR: dir,
     ...extra,
   };
@@ -89,6 +94,7 @@ beforeEach(() => {
   copyFileSync(HELPER, helper);
   copyFileSync(GUARD, path.join(dir, "cockpit-backup-guard.mjs"));
   copyFileSync(RETENTION_RULES, path.join(dir, "cockpit-borg-retention-rules.mjs"));
+  copyFileSync(NET, path.join(dir, "cockpit-host-run-net.mjs"));
   mkdirSync(path.join(dir, "etc"));
   write(path.join(dir, "etc", "api.env"), `COCKPIT_EXECUTION_ENVELOPE_SECRET=${SECRET}\n`, 0o600);
   write(path.join(dir, "etc", "contabo.env"), `CONTABO_CLIENT_SECRET=${HOSTER_SECRET}\n`, 0o600);
@@ -107,6 +113,7 @@ beforeEach(() => {
     "  is-active) echo \"${STUB_UNIT_STATE:-inactive}\";;",
     "  reboot) echo reboot >> \"$STUB_DIR/reboot.log\"; exit \"${STUB_REBOOT_RC:-0}\";;",
     "  is-system-running) echo running;;",
+    "  is-enabled) [ -e \"$STUB_DIR/disabled-$2\" ] && { echo disabled; exit 1; }; echo enabled;;",
     "esac",
   ].join("\n"));
   write(path.join(dir, "borg-status"), [
@@ -430,5 +437,217 @@ describe("cockpit-host-run: door", () => {
     const out = run(["start"], request(manifest()), { STUB_SYSTEMD_RUN_FAIL: "1" });
     expect(out.code).toBe(70);
     expect(status().state.status).toBe("failed");
+  });
+});
+
+// The net of a physical box (Lab0): RAID, mounted backup disk, space, the
+// retention service, then a file-level system backup with rsync. rsync, the
+// retention status, /proc/mdstat and mountinfo are stubs; the helper starts
+// rsync and the status with a clean environment, so those stubs take their
+// directory from their own text and their switches from files.
+describe("cockpit-host-run: net of a physical box (system-backup)", () => {
+  let raid: string;
+  let target: string;
+
+  function lab0Net(patch: Record<string, unknown> = {}, backupPatch: Record<string, unknown> = {}) {
+    return {
+      version: "cockpit-host-run-net/v1", net: "system-backup",
+      systemBackup: { target, mount: raid, raidDevice: "md0", sources: ["/proc"], exclude: ["/swap.img"], keep: 2, reserveGB: 0, timeoutSeconds: 600, ...backupPatch },
+      retentionService: true,
+      reboot: { onSite: true, mustBeEnabled: [["wg-quick@wg0.service"], ["ssh.service", "ssh.socket"]] },
+      ...patch,
+    };
+  }
+  function writeNet(value: unknown, mode = 0o644) {
+    write(path.join(dir, "etc", "host-run-net.json"), JSON.stringify(value), mode);
+  }
+  function backups() {
+    return existsSync(target) ? readdirSync(target).sort() : [];
+  }
+
+  beforeEach(() => {
+    raid = path.join(dir, "raid");
+    target = path.join(raid, "lab0-systemsicherung");
+    mkdirSync(raid);
+    write(path.join(dir, "mdstat"), [
+      "Personalities : [raid6] [raid5] [raid4]",
+      "md0 : active raid5 sdd1[4] sdc1[2] sdb1[1] sda1[0]",
+      "      2929890816 blocks super 1.2 level 5, 512k chunk, algorithm 2 [4/4] [UUUU]",
+      "",
+      "unused devices: <none>",
+    ].join("\n"), 0o644);
+    write(path.join(dir, "mountinfo"), [
+      "26 1 253:0 / / rw,relatime shared:1 - ext4 /dev/mapper/ubuntu--vg-ubuntu--lv rw",
+      "30 26 8:1 / /boot rw,relatime shared:2 - ext4 /dev/sde2 rw",
+      `40 26 9:0 / ${raid} rw,relatime shared:3 - ext4 /dev/md0 rw`,
+    ].join("\n"), 0o644);
+    write(path.join(dir, "rsync"), [
+      "#!/bin/bash",
+      `printf '%s\\n' "$*" >> "${dir}/rsync.log"`,
+      "for last; do :; done",
+      "mkdir -p \"$last\" && echo copied > \"$last/marker\"",
+      `[ -e "${dir}/rsync-rc" ] && exit "$(cat "${dir}/rsync-rc")"`,
+      "echo 'Number of files: 3'",
+    ].join("\n"));
+    write(path.join(dir, "retention-status"), [
+      "#!/bin/bash",
+      "echo '== DATEN (cockpit-borg-retention/v1) =='",
+      `if [ -e "${dir}/retention-halted" ]; then echo '{"state":{"status":"angehalten","anomaly":{"id":"0123456789abcdef"}}}'; else echo '{"state":{"status":"ok","anomaly":null}}'; fi`,
+    ].join("\n"));
+    writeNet(lab0Net());
+  });
+
+  it("checks RAID, disk, space and the retention service, then backs up / instead of borg and the hoster snapshot", () => {
+    expect(run(["start"], request(manifest())).code).toBe(0);
+    const { state, logTail } = status();
+    expect(state.status).toBe("success");
+    expect(state.snapshot).toBeNull();
+    expect(state.borg).toBeNull();
+    expect(existsSync(path.join(dir, "borg.log"))).toBe(false);
+    expect(existsSync(path.join(dir, "snapshot.log"))).toBe(false);
+    const [name] = backups();
+    expect(name).toMatch(/^cockpit-run-\d{8}T\d{6}Z-job-1$/);
+    expect(state.systemBackup).toMatchObject({ path: path.join(target, name), linkedTo: null, removed: [] });
+    expect(state.net).toMatchObject({ net: "system-backup", onSite: true });
+    const args = readFileSync(path.join(dir, "rsync.log"), "utf8").trim();
+    expect(args).toBe(`-aHAXxR --numeric-ids --stats --exclude=/swap.img /proc ${path.join(target, name)}.partial/`);
+    expect(logTail).toContain("RAID md0 [4/4] [UUUU]");
+    expect(logTail).toContain("Number of files: 3");
+  });
+
+  it("links unchanged files to the last backup and keeps a fixed number", () => {
+    mkdirSync(target, { recursive: true });
+    for (const old of ["cockpit-run-20260901T010000Z-a", "cockpit-run-20260902T010000Z-b", "cockpit-run-20260903T010000Z-c", "cockpit-run-20260904T010000Z-crashed.partial", "handgemacht"]) mkdirSync(path.join(target, old));
+    expect(run(["start"], request(manifest())).code).toBe(0);
+    const { state } = status();
+    expect(state.status).toBe("success");
+    expect(readFileSync(path.join(dir, "rsync.log"), "utf8")).toContain(`--link-dest=${path.join(target, "cockpit-run-20260903T010000Z-c")} `);
+    expect(state.systemBackup.removed).toEqual(["cockpit-run-20260901T010000Z-a", "cockpit-run-20260902T010000Z-b"]);
+    // keep 2: the last old one and the new one; a foreign directory is never touched.
+    expect(backups()).toEqual(["cockpit-run-20260903T010000Z-c", expect.stringMatching(/-job-1$/), "handgemacht"]);
+  });
+
+  it.each([
+    ["a degraded RAID", () => writeFileSync(path.join(dir, "mdstat"), "md0 : active raid5 sdc1[2] sdb1[1] sda1[0]\n      2929890816 blocks [4/3] [UUU_]\n"), "degraded [4/3] [UUU_]"],
+    ["a missing RAID", () => writeFileSync(path.join(dir, "mdstat"), "unused devices: <none>\n"), "RAID md0 is not in /proc/mdstat"],
+    ["an unmounted backup disk", () => writeFileSync(path.join(dir, "mountinfo"), "26 1 253:0 / / rw - ext4 /dev/mapper/vg-root rw\n"), "is not mounted"],
+    ["a backup disk on the root filesystem", () => writeFileSync(path.join(dir, "mountinfo"), `26 1 253:0 / / rw - ext4 /dev/x rw\n40 26 253:0 / ${raid} rw - ext4 /dev/x rw\n`), "same filesystem as /"],
+    ["a halted retention service", () => writeFileSync(path.join(dir, "retention-halted"), ""), "halted after an anomaly (0123456789abcdef)"],
+    ["too little space", () => writeNet(lab0Net({}, { reserveGB: 10000 })), "not enough space"],
+    ["a missing source", () => writeNet(lab0Net({}, { sources: ["/proc", "/does-not-exist"] })), "backup source /does-not-exist does not exist"],
+    ["an invalid configuration", () => writeNet({ ...lab0Net(), extra: true }), "unknown field extra"],
+    ["a configuration others may write", () => writeNet(lab0Net(), 0o666), "owned by root and not writable"],
+  ])("stops before any step on %s", (_label, arrange, message) => {
+    arrange();
+    run(["start"], request(manifest()));
+    const { state } = status();
+    expect(state.status).toBe("preflight_failed");
+    expect(state.error).toContain(message);
+    expect(state.error).toContain("nothing was executed");
+    expect(existsSync(path.join(dir, "step-one"))).toBe(false);
+    expect(existsSync(path.join(dir, "rsync.log"))).toBe(false);
+    expect(existsSync(path.join(dir, "snapshot.log"))).toBe(false);
+  });
+
+  it("passes Lab0's real RAID (IMSM raid10 md126) with the shipped configuration", () => {
+    const shipped = JSON.parse(readFileSync(fileURLToPath(new URL("../../../deploy/config/host-run-net.lab0.json", import.meta.url)), "utf8"));
+    writeNet(lab0Net({}, { raidDevice: shipped.systemBackup.raidDevice }));
+    // As Lab0 shows it (test/cockpit-borg-action.test.sh): the volume md126 in the IMSM container md127.
+    writeFileSync(path.join(dir, "mdstat"), [
+      "Personalities : [raid10]",
+      "md126 : active raid10 sda[4] sdb[2] sdc[1] sdd[0]",
+      "      5860528128 blocks super external:/md127/0 64K chunks 2 near-copies [4/4] [UUUU]",
+      "",
+      "md127 : inactive sdd[3](S) sdc[2](S) sdb[1](S) sda[0](S)",
+      "      20804 blocks super external:imsm",
+      "",
+    ].join("\n"));
+    run(["start"], request(manifest()));
+    expect(status().state.status).toBe("success");
+    expect(status().logTail).toContain("RAID md126 [4/4] [UUUU]");
+  });
+
+  it("ends with a reason, not a crash, when the backup disk refuses a write", () => {
+    mkdirSync(raid, { recursive: true });
+    writeFileSync(target, "not a directory");
+    run(["start"], request(manifest()));
+    const { state } = status();
+    expect(state.status).toBe("preflight_failed");
+    expect(state.error).toContain("system backup:");
+    expect(existsSync(path.join(dir, "step-one"))).toBe(false);
+  });
+
+  it("stops before any step when rsync fails and leaves no half backup", () => {
+    writeFileSync(path.join(dir, "rsync-rc"), "23");
+    run(["start"], request(manifest()));
+    const { state } = status();
+    expect(state.status).toBe("preflight_failed");
+    expect(state.error).toContain("rsync exit 23");
+    expect(existsSync(path.join(dir, "step-one"))).toBe(false);
+    expect(backups()).toEqual([]);
+  });
+
+  it("accepts files vanishing during the copy (rsync 24)", () => {
+    writeFileSync(path.join(dir, "rsync-rc"), "24");
+    run(["start"], request(manifest()));
+    expect(status().state.status).toBe("success");
+  });
+
+  it("needs no net for a declared read-only run, even with a broken configuration", () => {
+    writeNet({ version: "nope" });
+    run(["start"], request(manifest({ mutates: false })));
+    expect(status().state.status).toBe("success");
+    expect(existsSync(path.join(dir, "rsync.log"))).toBe(false);
+  });
+
+  it("says before a reboot that only someone on site helps, and checks WireGuard and SSH come back", () => {
+    writeFileSync(path.join(dir, "disabled-ssh.service"), ""); // ssh.socket is enough
+    run(["start"], request(manifest({ steps: [{ name: "reboot", reboot: true }, { name: "after", run: `touch ${dir}/after`, timeoutSeconds: 30 }],
+      checks: [{ name: "after ran", run: `test -f ${dir}/after`, timeoutSeconds: 30 }] })));
+    expect(status().state.phase).toBe("rebooting");
+    expect(status().logTail).toContain("only someone on site can help");
+    writeFileSync(path.join(dir, "boot_id"), "boot-b\n");
+    run(["resume"]);
+    expect(status().state.status).toBe("success");
+    // One system backup for the whole run, not one per boot.
+    expect(readFileSync(path.join(dir, "rsync.log"), "utf8").trim().split("\n")).toHaveLength(1);
+  });
+
+  it("does not start a run with a reboot when WireGuard would not come back", () => {
+    writeFileSync(path.join(dir, "disabled-wg-quick@wg0.service"), "");
+    run(["start"], request(manifest({ steps: [{ name: "one", run: `touch ${dir}/step-one`, timeoutSeconds: 30 }, { name: "reboot", reboot: true }] })));
+    const { state } = status();
+    expect(state.status).toBe("preflight_failed");
+    expect(state.error).toContain("not enabled at boot");
+    expect(state.error).toContain("wg-quick@wg0.service");
+    expect(existsSync(path.join(dir, "step-one"))).toBe(false);
+    expect(existsSync(path.join(dir, "reboot.log"))).toBe(false);
+  });
+
+  it("does not reboot when a step disabled SSH on the way", () => {
+    run(["start"], request(manifest({ steps: [
+      { name: "upgrade", run: `touch ${dir}/disabled-ssh.service ${dir}/disabled-ssh.socket`, timeoutSeconds: 30 },
+      { name: "reboot", reboot: true },
+      { name: "never", run: `touch ${dir}/never`, timeoutSeconds: 30 },
+    ] })));
+    const { state, logTail } = status();
+    expect(state.status).toBe("failed");
+    expect(state.error).toContain("the host was not rebooted");
+    expect(state.error).toContain("ssh.service or ssh.socket");
+    expect(state.steps[1].status).toBe("failed");
+    expect(existsSync(path.join(dir, "reboot.log"))).toBe(false);
+    expect(existsSync(path.join(dir, "never"))).toBe(false);
+    expect(logTail).toContain("return path: system backup");
+  });
+
+  it("keeps the VPS net when the configuration says so, with the boot check on top", () => {
+    writeNet({ version: "cockpit-host-run-net/v1", net: "hoster-snapshot", reboot: { mustBeEnabled: [["wg-quick@wg0.service"]] } });
+    writeFileSync(path.join(dir, "disabled-wg-quick@wg0.service"), "");
+    run(["start"], request(manifest({ steps: [{ name: "reboot", reboot: true }] })));
+    expect(status().state.error).toContain("wg-quick@wg0.service");
+    rmSync(path.join(dir, "disabled-wg-quick@wg0.service"));
+    run(["start"], request(manifest(), {}, "job-2"));
+    expect(status("job-2").state).toMatchObject({ status: "success", snapshot: { snapshotId: "snap-42" } });
+    expect(existsSync(path.join(dir, "rsync.log"))).toBe(false);
   });
 });
