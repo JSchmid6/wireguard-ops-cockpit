@@ -7,6 +7,7 @@ import { createApp } from "../src/app.js";
 import { RETENTION_MARKER } from "../src/borg-retention.js";
 import type { AppConfig } from "../src/config.js";
 import { CockpitDatabase } from "../src/db.js";
+import { createExecutionEnvelope } from "../src/hermes-security.js";
 import { approvalCard, cardLink, hermesJobCard, jobFindings, oneSentence, retentionAnomalyCard, sortCards } from "../src/inbox.js";
 
 // "Wartet auf dich": die Karten lesen nur, was Job und Freigabe gespeichert
@@ -114,7 +115,7 @@ function config(dbPath: string): AppConfig {
 
 const anomalyId = "0123456789abcdef";
 
-async function setup(options: { halted?: boolean } = {}) {
+async function setup(options: { halted?: boolean; approvedAnomaly?: boolean } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "inbox-api-"));
   tempDirs.push(dir);
   const dbPath = path.join(dir, "cockpit.sqlite");
@@ -128,7 +129,7 @@ async function setup(options: { halted?: boolean } = {}) {
         installed: { service: true, timer: true, passphrase: "ok" }, settings: null, settingsError: null,
         timer: { active: "active", next: null }, service: { active: "inactive" },
         state: options.halted
-          ? { status: "angehalten", anomaly: { id: anomalyId, detectedAt: "2026-10-02T04:00:05.000Z", phase: "before-prune", count: 1, missing: [{ id: "a".repeat(64), name: "vmd61162-2026-09-30T00:37:11" }] }, approval: null, baselineAt: null }
+          ? { status: "angehalten", anomaly: { id: anomalyId, detectedAt: "2026-10-02T04:00:05.000Z", phase: "before-prune", count: 1, missing: [{ id: "a".repeat(64), name: "vmd61162-2026-09-30T00:37:11" }] }, approval: options.approvedAnomaly ? { anomalyId, at: "2026-10-02T09:00:00.000Z" } : null, baselineAt: null }
           : { status: "ok", anomaly: null, approval: null, baselineAt: null },
         inventory: { at: null, count: 0, archives: [] }, space: null, repoStats: null, runs: [],
       })}\n`;
@@ -140,6 +141,8 @@ async function setup(options: { halted?: boolean } = {}) {
   const admin = database.authenticateUser("admin", "test-password")!;
   const automation = database.authenticateUser("hermes-automation", "unusable-random-password")!;
   const token = database.rotateApiToken(automation.id, "hermes", ["GET /api/inbox", "GET /api/hermes/jobs/:jobId", "POST /api/inbox/jobs/:jobId/reorder"]);
+  const other = database.createUser("other-automation", "unusable-random-password", "automation");
+  const unscopedToken = database.rotateApiToken(other.id, "other", ["GET /api/runbooks"]);
   const jamesSession = database.upsertSession({ name: "hermes-rb", ownerId: automation.id, tmuxSessionName: "cockpit-hermes-rb", tmuxBackend: "tmux", terminalUrl: null });
   const adminSession = database.upsertSession({ name: "admin-own", ownerId: admin.id, tmuxSessionName: "cockpit-admin-own", tmuxBackend: "tmux", terminalUrl: null });
   const blocked = (sessionId: string, expiresAt: string) => database.createJob({
@@ -149,19 +152,21 @@ async function setup(options: { halted?: boolean } = {}) {
   const fresh = blocked(jamesSession.id, new Date(Date.now() + 20 * 60_000).toISOString());
   const stale = blocked(jamesSession.id, new Date(Date.now() - 60_000).toISOString());
   const foreign = blocked(adminSession.id, new Date(Date.now() + 10 * 60_000).toISOString());
+  const foreignStale = blocked(adminSession.id, new Date(Date.now() - 60_000).toISOString());
   database.close();
   const login = await app.inject({ method: "POST", url: "/api/auth/login", payload: { username: "admin", password: "test-password" } });
   const inspect = () => { const db = new CockpitDatabase(dbPath); db.initialize(); return db; };
-  return { app, admin: { cookie: login.headers["set-cookie"] as string }, automation: { authorization: `Bearer ${token}` }, fresh, stale, foreign, inspect };
+  return { app, admin: { cookie: login.headers["set-cookie"] as string }, automation: { authorization: `Bearer ${token}` }, unscoped: { authorization: `Bearer ${unscopedToken}` }, fresh, stale, foreign, foreignStale, inspect };
 }
 
 describe("GET /api/inbox", () => {
   it("lists every blocked Hermes job for the admin, with link, deadline and findings", async () => {
-    const { app, admin, fresh, stale, foreign } = await setup();
+    const { app, admin, fresh, stale, foreign, foreignStale } = await setup();
     const response = await app.inject({ method: "GET", url: "/api/inbox", headers: admin });
     expect(response.statusCode).toBe(200);
     const body = response.json();
-    expect(body.cards.map((card: { jobId: string }) => card.jobId)).toEqual([foreign.id, fresh.id, stale.id]);
+    expect(body.cards.map((card: { jobId: string }) => card.jobId).slice(0, 2)).toEqual([foreign.id, fresh.id]);
+    expect(body.cards.map((card: { jobId: string }) => card.jobId).slice(2).sort()).toEqual([stale.id, foreignStale.id].sort());
     const card = body.cards.find((item: { jobId: string }) => item.jobId === fresh.id);
     expect(card).toMatchObject({ kind: "backup-bolt", expired: false, link: `https://cockpit.example/#karte-job-${fresh.id}` });
     expect(card.findings).toHaveLength(3);
@@ -173,12 +178,18 @@ describe("GET /api/inbox", () => {
   });
 
   it("shows James only his own jobs, and only with the scope", async () => {
-    const { app, automation, fresh, stale } = await setup();
+    const { app, admin, automation, unscoped, fresh, stale, foreignStale } = await setup();
     const response = await app.inject({ method: "GET", url: "/api/inbox", headers: automation });
     expect(response.statusCode).toBe(200);
     expect(response.json().cards.map((card: { jobId: string }) => card.jobId).sort()).toEqual([fresh.id, stale.id].sort());
-    const unscoped = await app.inject({ method: "GET", url: "/api/inbox", headers: { authorization: "Bearer nope" } });
-    expect(unscoped.statusCode).toBe(401);
+    expect(response.json().status.lastRuns.map((run: { id: string }) => run.id).sort()).toEqual([fresh.id, stale.id].sort());
+    expect((await app.inject({ method: "GET", url: "/api/inbox", headers: unscoped })).statusCode).toBe(403);
+    expect((await app.inject({ method: "GET", url: "/api/inbox", headers: { authorization: "Bearer nope" } })).statusCode).toBe(401);
+
+    // Die Neubestellung eines fremden Jobs landet nicht bei James.
+    expect((await app.inject({ method: "POST", url: `/api/inbox/jobs/${foreignStale.id}/reorder`, headers: admin, payload: {} })).statusCode).toBe(200);
+    expect((await app.inject({ method: "GET", url: "/api/inbox", headers: automation })).json().reorders).toEqual([]);
+    expect((await app.inject({ method: "GET", url: "/api/inbox", headers: admin })).json().reorders).toEqual([expect.objectContaining({ jobId: foreignStale.id })]);
   });
 
   it("hands James the direct link with a blocked job", async () => {
@@ -206,7 +217,39 @@ describe("GET /api/inbox", () => {
   });
 });
 
+describe("halted retention service after the approval", () => {
+  it("shows no card while the approved run is still pending", async () => {
+    const { app, admin } = await setup({ halted: true, approvedAnomaly: true });
+    const body = (await app.inject({ method: "GET", url: "/api/inbox", headers: admin })).json();
+    expect(body.cards.some((card: { anomalyId?: string }) => card.anomalyId === anomalyId)).toBe(false);
+  });
+});
+
 describe("POST /api/inbox/jobs/:jobId/reorder", () => {
+  it("still re-orders a job whose approval came just too late", async () => {
+    const { app, admin, stale, inspect } = await setup();
+    // Ein echt signierter, abgelaufener Envelope: die Freigabe-Route prüft ihn
+    // vollständig und schließt den Job mit "execution envelope expired".
+    const db = inspect();
+    const current = db.getJob(stale.id)!;
+    const intent = hostRunOutput.explanation.intent;
+    const output = { ...current.output!, plan: "plan", policy: hostRunOutput.policy, capabilities: ["host.run"] };
+    const envelope = createExecutionEnvelope({
+      jobId: stale.id, actorId: db.getJobOwnerId(stale.id)!, sessionId: current.sessionId!, intent, evidence: [], plan: "plan",
+      safety: output.safety, policy: output.policy, capabilities: ["host.run"], ttlMinutes: 30, signingSecret: "test-envelope-secret",
+      now: new Date(Date.now() - 31 * 60_000),
+    });
+    db.updateJob(stale.id, { status: "blocked_user_approval", output: { ...output, envelope }, completedAt: null });
+    db.close();
+    const late = await app.inject({ method: "POST", url: `/api/hermes/jobs/${stale.id}/approval`, headers: admin, payload: { decision: "approved", reason: "eben noch" } });
+    expect(late.statusCode).toBe(409);
+    expect(late.json().job.status).toBe("blocked_policy");
+    const reordered = await app.inject({ method: "POST", url: `/api/inbox/jobs/${stale.id}/reorder`, headers: admin, payload: {} });
+    expect(reordered.statusCode).toBe(200);
+    expect(reordered.json().job.output.reorder).toBeTruthy();
+    expect((await app.inject({ method: "POST", url: `/api/inbox/jobs/${stale.id}/reorder`, headers: admin, payload: {} })).statusCode).toBe(409);
+  });
+
   it("closes an expired job for good and queues the re-order for James", async () => {
     const { app, admin, automation, stale, inspect } = await setup();
     const response = await app.inject({ method: "POST", url: `/api/inbox/jobs/${stale.id}/reorder`, headers: admin, payload: { note: "bitte neu" } });

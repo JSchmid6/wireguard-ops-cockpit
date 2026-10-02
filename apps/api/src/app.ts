@@ -3820,8 +3820,10 @@ Follow these rules:
     const now = Date.now();
     const webUrl = config.webUrl ?? null;
     const cards: InboxCard[] = [];
+    // Ein Nicht-Admin (auch James' Token) sieht nur Jobs seines eigenen Kontos.
+    const visible = (jobId: string | null) => actor.role === "admin" || (jobId !== null && database.getJobOwnerId(jobId) === actor.id);
     for (const job of database.listJobsByStatus("hermes-change", "blocked_user_approval")) {
-      if (actor.role !== "admin" && database.getJobOwnerId(job.id) !== actor.id) continue;
+      if (!visible(job.id)) continue;
       cards.push(hermesJobCard(job, now, webUrl));
     }
     for (const approval of database.listApprovalsForActor(actor.id, "pending")) {
@@ -3829,7 +3831,10 @@ Follow these rules:
     }
     const retention = await borgRetention.view();
     const anomaly = retention.report?.state.status === "angehalten" ? retention.report.state.anomaly : null;
-    if (anomaly && !database.hasAudit("borg.retention.anomaly_kept", anomaly.id)) {
+    // Nach der Freigabe bleibt der Dienst bis zum Ende seines Laufs "angehalten",
+    // trägt aber die Freigabe für genau diese Anomalie: dann wartet nichts mehr.
+    const approvedAlready = anomaly !== null && retention.report?.state.approval?.anomalyId === anomaly.id;
+    if (anomaly && !approvedAlready && !database.hasAudit("borg.retention.anomaly_kept", anomaly.id)) {
       cards.push(retentionAnomalyCard(anomaly, now, webUrl));
     }
     const borg = await borgStatus.measure({ waitMs: 0 });
@@ -3841,13 +3846,14 @@ Follow these rules:
       disk = null;
     }
     const reorders = database.listAuditsSince("hermes.change.reorder_requested", new Date(now - 24 * 3_600_000).toISOString())
+      .filter((audit) => visible(audit.targetId))
       .map((audit) => ({ jobId: audit.targetId, requestedAt: audit.createdAt, intent: String(audit.details.intent ?? ""), note: audit.details.note ?? null }));
     return {
       generatedAt: new Date(now).toISOString(),
       cards: sortCards(cards),
       reorders,
       status: {
-        lastRuns: database.listRecentJobs("hermes-change", 3).map((job) => ({ id: job.id, status: job.status, at: job.updatedAt })),
+        lastRuns: database.listRecentJobs("hermes-change", 20).filter((job) => visible(job.id)).slice(0, 3).map((job) => ({ id: job.id, status: job.status, at: job.updatedAt })),
         backup: borg.borg ? { lastRunEnd: borg.borg.lastRun.end, lastRunResult: borg.borg.lastRun.result, measuredAt: borg.measuredAt } : null,
         disk,
       },
@@ -3865,11 +3871,16 @@ Follow these rules:
     const { jobId } = request.params as { jobId: string };
     const job = actor.role === "admin" ? database.getJob(jobId) : database.getJobForActor(jobId, actor.id);
     if (!job) return reply.code(404).send({ message: "job not found" });
-    if (job.subjectId !== "hermes-change" || job.status !== "blocked_user_approval") {
+    // Neu bestellen geht, solange der Job wartet und sein Envelope abgelaufen ist —
+    // oder wenn eine Freigabe knapp zu spät kam und die Route ihn deshalb schon
+    // geschlossen hat (blocked_policy mit "execution envelope expired").
+    const closedAsExpired = job.status === "blocked_policy" && !job.output?.reorder
+      && Array.isArray(job.output?.envelopeErrors) && (job.output.envelopeErrors as unknown[]).includes("execution envelope expired");
+    if (job.subjectId !== "hermes-change" || (job.status !== "blocked_user_approval" && !closedAsExpired)) {
       return reply.code(409).send({ message: "job is not awaiting operator approval" });
     }
     const card = hermesJobCard(job, Date.now(), null);
-    if (!card.expired) return reply.code(409).send({ message: "the execution envelope is still valid; approve or reject it" });
+    if (!closedAsExpired && !card.expired) return reply.code(409).send({ message: "the execution envelope is still valid; approve or reject it" });
     const body = (request.body || {}) as { note?: unknown };
     const note = typeof body.note === "string" && body.note.trim() ? body.note.trim().slice(0, 500) : null;
     const intent = String((job.output?.explanation as Record<string, unknown> | undefined)?.intent || "Hermes change");

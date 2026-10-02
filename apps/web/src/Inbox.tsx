@@ -120,8 +120,11 @@ function Card({ card, now, highlighted, onDone }: { card: InboxCard; now: number
   const [reason, setReason] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  // Kam die Freigabe knapp zu spät (Handyuhr, letzte Sekunden), lehnt der
+  // Server sie ab; die Karte bleibt und bietet dann "Neu bestellen lassen".
+  const [refusedAsExpired, setRefusedAsExpired] = useState(false);
   const left = card.expiresAt ? countdown(card.expiresAt, now) : null;
-  const expired = card.expired || (card.expiresAt !== null && left === null);
+  const expired = card.expired || refusedAsExpired || (card.expiresAt !== null && left === null);
   const trimmed = reason.trim();
   // Der Aufräum-Dienst verlangt für die Freigabe mindestens 10 Zeichen (borg-retention.ts).
   const minLength = card.kind === "retention-anomaly" ? 10 : 1;
@@ -149,7 +152,9 @@ function Card({ card, now, highlighted, onDone }: { card: InboxCard; now: number
       const labels = { approve: "Freigegeben", reject: "Abgelehnt", reorder: "Neu bestellt" };
       await onDone(`${labels[kind]}: ${card.title}`);
     } catch (nextError) {
-      setError(nextError instanceof Error ? nextError.message : "Die Entscheidung ging nicht durch.");
+      const message = nextError instanceof Error ? nextError.message : "Die Entscheidung ging nicht durch.";
+      if (kind === "approve" && /expired|envelope validation failed/i.test(message)) setRefusedAsExpired(true);
+      setError(message);
     } finally {
       setBusy(false);
     }
@@ -177,11 +182,13 @@ function Card({ card, now, highlighted, onDone }: { card: InboxCard; now: number
       ) : null}
       {expired ? (
         <p className="inbox-expired-note">
-          Die Frist ist abgelaufen: Diese Freigabe gilt nicht mehr. Lass James die Änderung neu bestellen — dann wird sie frisch geprüft.
+          {card.kind === "approval"
+            ? "Die Frist ist abgelaufen: Diese Freigabe gilt nicht mehr. Plane den Lauf unter „Mehr“ neu; hier kannst du sie nur noch ablehnen."
+            : "Die Frist ist abgelaufen: Diese Freigabe gilt nicht mehr. Lass James die Änderung neu bestellen — dann wird sie frisch geprüft."}
         </p>
       ) : null}
       <label className="inbox-reason-field">
-        {expired ? "Notiz an James (optional)" : `Grund (Pflicht${minLength > 1 ? `, mind. ${minLength} Zeichen` : ""})`}
+        {expired && card.kind !== "approval" ? "Notiz an James (optional)" : `Grund (Pflicht${minLength > 1 ? `, mind. ${minLength} Zeichen` : ""})`}
         <textarea value={reason} rows={2} onChange={(event) => setReason(event.target.value)} />
       </label>
       <div className="inbox-actions">

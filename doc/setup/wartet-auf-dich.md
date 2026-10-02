@@ -14,7 +14,7 @@ Knöpfe über die volle Breite und mindestens 52 px hoch, Befunde zum Aufklappen
 | Änderung von James | `hermes-change`-Job in `blocked_user_approval` (Türsteher-Befund, Update-Prüfer-Stopp, Plan-Policy) | `POST /api/hermes/jobs/:id/approval` | derselbe Weg mit `rejected` |
 | Backup-Riegel | derselbe Job, wenn der Riegel (`cockpit-backup-guard.mjs`) angeschlagen hat — also auch ein `cockpit-borg-retention set` unter der Untergrenze, den James bestellt | wie oben | wie oben |
 | Freigabe | offener Eintrag in `approvals` (Runbook- und Agentenpläne) | `POST /api/approvals/:id/decision` | derselbe Weg mit `rejected` |
-| Aufräum-Dienst | Lab0-Dienst `angehalten` nach einer Anomalie (Archive fehlen, die er nicht selbst entfernt hat) | `POST /api/borg/retention/resume` (Grund ≥ 10 Zeichen, wie bisher) | `POST /api/inbox/retention/:anomalyId/keep`: der Dienst bleibt angehalten, die Karte verschwindet, ein Audit hält den Grund fest |
+| Aufräum-Dienst | Lab0-Dienst `angehalten` nach einer Anomalie (Archive fehlen, die er nicht selbst entfernt hat), solange er für genau diese Anomalie keine Freigabe trägt (nach `freigeben` bleibt er bis zum Ende seines Laufs `angehalten`) | `POST /api/borg/retention/resume` (Grund ≥ 10 Zeichen, wie bisher) | `POST /api/inbox/retention/:anomalyId/keep`: der Dienst bleibt angehalten, die Karte verschwindet, ein Audit hält den Grund fest |
 
 Eine Einstellung unter der Untergrenze, die Jochen selbst im Bereich „Backup retention" setzt,
 fragt dort direkt nach seiner Freigabe — sie wartet auf niemanden und erscheint deshalb nicht als
@@ -47,7 +47,17 @@ Envelope wirklich abgelaufen ist) schließt den alten Job endgültig (`blocked_p
 `output.reorder`), schreibt das Audit `hermes.change.reorder_requested` und listet den Wunsch
 24 Stunden lang in `GET /api/inbox` unter `reorders` (Job-Id, Absicht, Notiz). James bestellt
 dieselbe Absicht neu; die neue Bestellung wird frisch geplant, geprüft und signiert. Eine alte
-Freigabe wird nie wiederverwendet.
+Freigabe wird nie wiederverwendet. `reorders` zeigt einem Automation-Token nur Jobs seines eigenen
+Kontos — die Absicht eines anderen Kontos wird nie zu James' Bestellung.
+
+Kommt eine Freigabe knapp zu spät (letzte Sekunden des Countdowns, Handyuhr geht nach), schließt
+die Freigabe-Route den Job wie bisher mit „execution envelope expired". Die Karte bleibt dann
+stehen und bietet „Neu bestellen lassen"; die Route nimmt auch einen so geschlossenen Job an
+(einmal).
+
+Eine abgelaufene **Plan-Freigabe** aus `approvals` (Runbook- oder Agentenplan aus der
+Oberfläche, nicht von James) lässt sich nicht neu bestellen: Die Karte sagt, den Lauf unter
+„Mehr" neu zu planen, und erlaubt nur noch Ablehnen.
 
 ## Hinweis an Jochen über James (Telegram)
 

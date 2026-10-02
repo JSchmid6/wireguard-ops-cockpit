@@ -181,6 +181,27 @@ describe("Wartet auf dich", () => {
     expect(screen.getByText("Selbstupdate auf PR #25 einspielen.")).toBeTruthy();
   });
 
+  it("offers the re-order when the server refuses an approval as expired", async () => {
+    const fetchMock = serve([hermesCard()], { "/api/hermes/jobs/j1/approval": { status: 409, body: { message: "execution envelope validation failed" } } });
+    const user = userEvent.setup();
+    render(<Inbox />);
+    await user.type(await screen.findByLabelText(/Grund \(Pflicht\)/), "knapp");
+    await user.click(screen.getByRole("button", { name: "Freigeben" }));
+    expect(await screen.findByRole("button", { name: "Neu bestellen lassen" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Freigeben" })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Neu bestellen lassen" }));
+    await waitFor(() => expect(posted(fetchMock, "/api/inbox/jobs/j1/reorder")).toEqual({ note: "knapp" }));
+  });
+
+  it("tells an expired plan approval to be planned again and only allows rejecting it", async () => {
+    serve([{ ...hermesCard(), id: "approval-a1", kind: "approval", jobId: "jx", approvalId: "a1", findings: [], expired: true, expiresAt: new Date(Date.now() - 1000).toISOString() }]);
+    render(<Inbox />);
+    expect(await screen.findByText(/Plane den Lauf unter „Mehr“ neu/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Freigeben" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Neu bestellen lassen" })).toBeNull();
+    expect(screen.getByLabelText(/Grund \(Pflicht\)/)).toBeTruthy();
+  });
+
   it("shows a load error", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, status: 401, json: async () => ({ message: "authentication required" }) })));
     render(<Inbox />);
