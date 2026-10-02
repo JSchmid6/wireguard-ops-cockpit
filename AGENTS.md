@@ -14,7 +14,7 @@
 
 If a required helper is not allowlisted, execution fails closed and the job explains which prerequisite or operator action is missing. There is no `ALL` fallback and no runtime sudoers mutation.
 
-**The general host door** (`doc/setup/host-run.md`): host administration (package updates, Docker, kernel with reboot, GitLab in stages) is a `host-run` manifest of shell steps that the static helper `cockpit-host-run` runs as root in a transient unit. Lock: only an envelope signed by the API opens, bound to the exact manifest hash, expiring. Doorkeeper: the isolated safety reviewer reads the concrete steps; deterministic hits are its focus, never a stop; `pass` starts the run, only an evidenced finding goes to the operator, incomplete review material stops. Safety net: borg backup younger than 24 h and a machine snapshot before any mutating run. Honest limit: the API credentials are readable inside the agent container, so the doorkeeper is the real safeguard — the snapshot undoes damage, not exfiltration.
+**The general host door** (`doc/setup/host-run.md`): host administration (package updates, Docker, kernel with reboot, GitLab in stages) is a `host-run` manifest of shell steps that the static helper `cockpit-host-run` runs as root in a transient unit. Lock: only an envelope signed by the API opens, bound to the exact manifest hash, expiring. Doorkeeper: the isolated safety reviewer reads the concrete steps; deterministic hits are its focus, never a stop; `pass` starts the run, only an evidenced finding goes to the operator, incomplete review material stops. Safety net: borg backup younger than 24 h and a machine snapshot before any mutating run. Backup bolt (the one exception to "no approval as a rule"): a run that deletes backups or shortens their retention (borg/borgmatic delete/prune/compact/recreate, retention edits, the repo path, ssh to another machine, stopping or bypassing `borgmatic.timer`) or hides its code (eval, decoding, piping into a shell, scripts the run did not write) needs the operator's approval even with the doorkeeper's `pass`; `deploy/helpers/cockpit-backup-guard.mjs` decides deterministically for the API policy and again in the root helper. Honest limit: the API credentials are readable inside the agent container, so the doorkeeper is the real safeguard — the snapshot undoes damage, not exfiltration.
 
 Three-stage execution pipeline, all in tmux sessions owned by `wgops` user:
 
@@ -108,7 +108,10 @@ Bare-metal Ubuntu VPS (161.97.86.86) running:
   code fence changes nothing — and the executor refuses a repair without the
   approval bound to exactly that job. A `host-run` plan does not pass the plan
   policy; there the doorkeeper's instructions make a borg repair (and a snapshot
-  delete/revert) an X4 finding, which goes to the operator.
+  delete/revert) an X4 finding, which goes to the operator; the deterministic backup bolt
+  (`deploy/helpers/cockpit-backup-guard.mjs`) additionally stops every host run that repairs,
+  deletes, prunes, compacts or recreates, edits the retention, touches the repo path or Lab0, or
+  bypasses `borgmatic.timer`, until the operator approves (API policy and root helper).
 - Every verb runs in its own transient systemd unit (`status` with
   `--wait --pipe --collect`, `check`/`repair` as `cockpit-borg-<verb>-<stamp>`
   without waiting): the executor's sandbox has no network, no writable

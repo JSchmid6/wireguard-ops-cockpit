@@ -87,6 +87,7 @@ import {
   type UpdateTarget,
 } from "./update-review.js";
 import {
+  backupGuardHits,
   buildHostRunReviewPrompt,
   hostRunManifestHash,
   hostRunPlannerContract,
@@ -1936,6 +1937,10 @@ export async function createApp(options: AppOptions = {}) {
 
   async function runHostRun(envelope: ExecutionEnvelope, manifest: HostRunManifest): Promise<string> {
     if (!config.executorBrokerSocket || !config.executorBrokerSecret) throw new Error("executor broker is not configured");
+    // Backup bolt (host-run.ts): the policy already stops such a run for the
+    // operator; this is the second check before the helper, which asks a third time.
+    const backup = backupGuardHits(manifest);
+    if (backup.length > 0 && !envelope.operatorApproved) throw new Error(`the host run touches the backups and runs only with the operator's approval (${backup[0].where} ${backup[0].reason})`);
     // Marked before the start: an API that dies between the helper's answer
     // and the record below still follows the run after its restart.
     const requested = database.getJob(envelope.jobId);
