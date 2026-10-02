@@ -36,6 +36,7 @@ const repoFile = ${JSON.stringify(repoFile)};
 fs.appendFileSync(${JSON.stringify(callsFile)}, JSON.stringify(["borg", ...args, "PASSCOMMAND=" + (process.env.BORG_PASSCOMMAND ? "set" : "missing"), "PASSPHRASE=" + (process.env.BORG_PASSPHRASE ? "set" : "none")]) + "\\n");
 const repo = JSON.parse(fs.readFileSync(repoFile, "utf8"));
 if (repo.fail === args[0]) { process.stderr.write("Failed to create/acquire the lock\\n"); process.exit(2); }
+if (args[0] === "list" && repo.listFailsAfterPrune && repo.pruned) { process.stderr.write("Connection closed\\n"); process.exit(2); }
 if (args[0] === "list") { process.stdout.write(JSON.stringify({ archives: repo.archives })); process.exit(0); }
 if (args[0] === "prune") {
   const keep = Number(args[args.indexOf("--keep-daily") + 1]);
@@ -44,10 +45,14 @@ if (args[0] === "prune") {
   for (const [i, a] of removed.entries()) process.stderr.write("Pruning archive (" + (i + 1) + "/" + removed.length + "):  " + a.name + "  Sun, 2026-09-27 00:37:12 [" + a.id + "]\\n");
   const gone = new Set([...removed.map((a) => a.id), ...(repo.foreignDuringPrune || [])]);
   repo.archives = repo.archives.filter((a) => !gone.has(a.id));
+  repo.pruned = true;
   fs.writeFileSync(repoFile, JSON.stringify(repo));
   process.exit(0);
 }
-if (args[0] === "compact") process.exit(0);
+if (args[0] === "compact") {
+  if (repo.foreignDuringCompact) { const gone = new Set(repo.foreignDuringCompact); repo.archives = repo.archives.filter((a) => !gone.has(a.id)); delete repo.foreignDuringCompact; fs.writeFileSync(repoFile, JSON.stringify(repo)); }
+  process.exit(0);
+}
 if (args[0] === "info") { process.stdout.write(JSON.stringify({ cache: { stats: { unique_csize: 1000, total_size: 5000 } } })); process.exit(0); }
 process.exit(2);
 `);
@@ -72,7 +77,6 @@ function hookEnv(extra: Record<string, string> = {}) {
     BORG_RETENTION_TEST: "1",
     BORG_RETENTION_CONFIG_DIR: path.join(dir, "etc"),
     BORG_RETENTION_STATE_DIR: path.join(dir, "state"),
-    BORG_RETENTION_LOG_DIR: path.join(dir, "log"),
     BORG_RETENTION_UNIT_DIR: path.join(dir, "units"),
     BORG_RETENTION_REPO: path.join(dir, "repo"),
     BORG_RETENTION_BORG: borg,
@@ -134,7 +138,8 @@ describe("cockpit-borg-retention: the service run", () => {
     writeRepo([...readRepo().archives as never[], archive(6)]); // das nächtliche Backup kam dazu
     const out = serviceRun();
     expect(out.code, out.stderr).toBe(0);
-    expect(borgVerbs().slice(4)).toEqual(["list", "prune", "list", "compact", "info"]);
+    expect(borgVerbs().slice(4)).toEqual(["list", "prune", "list", "compact", "list", "info"]);
+    expect(calls().find((call) => call[1] === "compact")).toEqual(expect.arrayContaining(["--lock-wait", "1"]));
     expect(lastRun()).toMatchObject({ result: "ok", before: 4, after: 3, pruned: 1, compacted: true });
     expect(state().repoStats).toMatchObject({ uniqueCompressedBytes: 1000, totalSizeBytes: 5000 });
   });
@@ -179,7 +184,44 @@ describe("cockpit-borg-retention: the service run", () => {
     const out = serviceRun();
     expect(out.code).toBe(3);
     expect(borgVerbs().slice(4)).toEqual(["list", "prune", "list"]);
-    expect(state()).toMatchObject({ status: "angehalten", anomaly: { phase: "after-prune", count: 1 } });
+    expect(state()).toMatchObject({ status: "angehalten", anomaly: { phase: "after-prune", count: 1, missing: [{ id: id(5) }] } });
+    // Was prune selbst entfernt hat (Archiv 3), gilt nicht als fremd: nach der
+    // Freigabe für Archiv 5 geht es weiter, ohne Schleife.
+    expect(state().baseline.map((item: { id: string }) => item.id)).toEqual([id(4), id(5), id(6)]);
+    expect(helper(["freigeben", state().anomaly.id]).code).toBe(0);
+    const resumed = serviceRun();
+    expect(resumed.code, resumed.stderr).toBe(0);
+    expect(lastRun()).toMatchObject({ result: "ok", compacted: true });
+  });
+
+  it("does not take its own prune for a foreign loss when the run breaks after prune", () => {
+    serviceRun();
+    // borg list nach prune scheitert: der Lauf endet mit Fehler …
+    writeRepo([archive(3), archive(4), archive(5), archive(6)], { listFailsAfterPrune: true });
+    expect(serviceRun().code).toBe(1);
+    expect(readRepo().archives.map((item) => item.id)).toEqual([id(4), id(5), id(6)]);
+    writeRepo(readRepo().archives as never[]);
+    // … und der nächste Lauf hält Archiv 3 (selbst gepruned) nicht für fremd.
+    const next = serviceRun();
+    expect(next.code, next.stderr).toBe(0);
+    expect(state().status).toBe("ok");
+  });
+
+  it("skips compact when the repository is busy right before it", () => {
+    serviceRun();
+    writeRepo(readRepo().archives as never[], { fail: "compact" });
+    const out = serviceRun();
+    expect(out.code, out.stderr).toBe(0);
+    expect(lastRun()).toMatchObject({ result: "ok", compacted: false });
+    expect(lastRun().compactSkipped).toMatch(/repository busy right before compact/);
+  });
+
+  it("halts and says so when an archive vanished while compacting", () => {
+    serviceRun();
+    writeRepo(readRepo().archives as never[], { foreignDuringCompact: [id(4)] });
+    const out = serviceRun();
+    expect(out.code).toBe(3);
+    expect(state()).toMatchObject({ status: "angehalten", anomaly: { phase: "after-compact", missing: [{ id: id(4) }] } });
   });
 
   it("goes on only with Jochen's approval for exactly the anomaly he saw", () => {
@@ -200,18 +242,24 @@ describe("cockpit-borg-retention: the service run", () => {
     expect(out.code, out.stderr).toBe(0);
     expect(lastRun()).toMatchObject({ result: "ok", compacted: true });
     expect(state()).toMatchObject({ status: "ok", anomaly: null, approval: null });
-    expect(readFileSync(path.join(dir, "log", "einstellungen.jsonl"), "utf8")).toContain(anomaly);
+    expect(readFileSync(path.join(dir, "state", "einstellungen.jsonl"), "utf8")).toContain(anomaly);
   });
 
-  it("an approval does not cover further archives lost after it", () => {
+  it("an approval does not cover further archives lost after it, a new one covers all", () => {
     serviceRun();
     writeRepo([archive(4), archive(5), archive(6)]);
     serviceRun();
     helper(["freigeben", state().anomaly.id]);
     writeRepo([archive(5), archive(6)]); // archive 4 vanished after the approval
     expect(serviceRun().code).toBe(3);
-    expect(state().anomaly.missing).toEqual([{ id: id(4), name: archive(4).name }]);
+    // Die neue Anomalie nennt den ganzen Verlust gegen den Vergleichsstand …
+    expect(state().anomaly.missing).toEqual([{ id: id(3), name: archive(3).name }, { id: id(4), name: archive(4).name }]);
     expect(borgVerbs()).not.toContain("compact");
+    // … und ihre Freigabe führt weiter, ohne dass die erste wieder auftaucht.
+    expect(helper(["freigeben", state().anomaly.id]).code).toBe(0);
+    const resumed = serviceRun();
+    expect(resumed.code, resumed.stderr).toBe(0);
+    expect(state()).toMatchObject({ status: "ok", anomaly: null });
   });
 
   it("runs the retention set in the cockpit, also monthly", () => {
@@ -257,7 +305,7 @@ describe("cockpit-borg-retention: settings", () => {
     expect(readFileSync(path.join(dir, "units", "cockpit-borg-retention.timer.d", "uhrzeit.conf"), "utf8")).toContain("OnCalendar=\nOnCalendar=*-*-* 06:30:00\n");
     expect(calls()).toContainEqual(["systemctl", "daemon-reload"]);
     expect(calls()).toContainEqual(["systemctl", "try-restart", "cockpit-borg-retention.timer"]);
-    expect(readFileSync(path.join(dir, "log", "einstellungen.jsonl"), "utf8")).toContain("\"freigabe\":false");
+    expect(readFileSync(path.join(dir, "state", "einstellungen.jsonl"), "utf8")).toContain("\"freigabe\":false");
   });
 
   it("needs --freigabe below the minimum and refuses beyond the bounds", () => {

@@ -8,9 +8,10 @@
 // über borg serve. Die Einstellung kommt aus dem Cockpit und bleibt in festen
 // Grenzen (cockpit-borg-retention-rules.mjs).
 //
-// Fremde Löschungen werden nie endgültig: vor prune und noch einmal vor compact
-// vergleicht der Lauf den Archivbestand (über die Archiv-id) mit seinem letzten
-// Lauf. Fehlt ein Archiv, das er nicht selbst entfernt hat — etwa vom VPS im
+// Fremde Löschungen werden nie endgültig: vor prune und nach prune (vor
+// compact) vergleicht der Lauf den Archivbestand (über die Archiv-id) mit seinem
+// letzten Lauf; compact wartet nicht auf die Sperre, und danach wird noch einmal
+// verglichen. Fehlt ein Archiv, das er nicht selbst entfernt hat — etwa vom VPS im
 // append-only-Modus zum Löschen vorgemerkt —, kompaktiert er nicht, setzt seinen
 // Status auf "angehalten" und endet mit 3 (die Unit steht dann auf failed, das
 // Cockpit zeigt es). Weiter geht es nur mit Jochens Freigabe (`freigeben`), und
@@ -35,8 +36,10 @@
 // (Passphrase, Repo-Besitzer).
 //
 // Prüf-Haken (BORG_RETENTION_*) lenken Pfade und Werkzeuge für
-// apps/api/test/borg-retention-helper.test.ts um. Über sudo kommen sie nie an
-// (env_reset), und die Unit setzt nur COCKPIT_BORG_RETENTION_IN_UNIT.
+// apps/api/test/borg-retention-helper.test.ts um. Sie gelten nur außerhalb des
+// installierten Orts (/usr/local/lib/wireguard-ops-cockpit/): die installierte
+// Kopie liest sie nie — auch dann nicht, wenn ein Drop-in oder die Umgebung des
+// systemd-Managers sie der Unit unterschiebt.
 import { createHash } from "node:crypto";
 import { appendFileSync, chownSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, statfsSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
@@ -49,27 +52,30 @@ import {
 } from "./cockpit-borg-retention-rules.mjs";
 
 const env = process.env;
-const CONFIG_DIR = env.BORG_RETENTION_CONFIG_DIR || "/etc/cockpit-borg-retention";
-const STATE_DIR = env.BORG_RETENTION_STATE_DIR || "/var/lib/cockpit-borg-retention";
-const LOG_DIR = env.BORG_RETENTION_LOG_DIR || "/var/log/cockpit-borg-retention";
-const UNIT_DIR = env.BORG_RETENTION_UNIT_DIR || "/etc/systemd/system";
-const REPO = env.BORG_RETENTION_REPO || "/media/RAID/backup_VServer/borg";
-const BORG = env.BORG_RETENTION_BORG || "/usr/bin/borg";
-const SYSTEMCTL = env.BORG_RETENTION_SYSTEMCTL || "/usr/bin/systemctl";
-const TEST_MODE = env.BORG_RETENTION_TEST === "1";
+const INSTALLED = fileURLToPath(import.meta.url).startsWith("/usr/local/lib/wireguard-ops-cockpit/");
+const hook = (name, fallback) => (!INSTALLED && env[name]) || fallback;
+const CONFIG_DIR = hook("BORG_RETENTION_CONFIG_DIR", "/etc/cockpit-borg-retention");
+const STATE_DIR = hook("BORG_RETENTION_STATE_DIR", "/var/lib/cockpit-borg-retention");
+const UNIT_DIR = hook("BORG_RETENTION_UNIT_DIR", "/etc/systemd/system");
+const REPO = hook("BORG_RETENTION_REPO", "/media/RAID/backup_VServer/borg");
+const BORG = hook("BORG_RETENTION_BORG", "/usr/bin/borg");
+const SYSTEMCTL = hook("BORG_RETENTION_SYSTEMCTL", "/usr/bin/systemctl");
+const TEST_MODE = hook("BORG_RETENTION_TEST", "") === "1";
 
 const SETTINGS_FILE = `${CONFIG_DIR}/aufbewahrung.json`;
 const PASSPHRASE_FILE = `${CONFIG_DIR}/passphrase`; // root 0600, über LoadCredential in die Unit
 const STATE_FILE = `${STATE_DIR}/zustand.json`;
 const RUNS_FILE = `${STATE_DIR}/laeufe.jsonl`;
-const SETTINGS_LOG = `${LOG_DIR}/einstellungen.jsonl`;
+// Im Zustandsverzeichnis, das der Backup-Riegel schützt (ein Protokoll unter
+// /var/log ließe sich ohne Freigabe löschen).
+const SETTINGS_LOG = `${STATE_DIR}/einstellungen.jsonl`;
 const SERVICE = "cockpit-borg-retention.service";
 const TIMER = "cockpit-borg-retention.timer";
 const TIMER_DROPIN_DIR = `${UNIT_DIR}/${TIMER}.d`;
 const TIMER_DROPIN = `${TIMER_DROPIN_DIR}/uhrzeit.conf`;
 const PATH = "/usr/sbin:/usr/bin:/sbin:/bin";
 
-const LOCK_WAIT = env.BORG_RETENTION_LOCK_WAIT || "3600"; // das nächtliche Backup darf zu Ende laufen
+const LOCK_WAIT = hook("BORG_RETENTION_LOCK_WAIT", "3600"); // das nächtliche Backup darf zu Ende laufen
 const MAX_RUNS_KEPT = 100;
 const MAX_RUNS_SHOWN = 10;
 const MAX_ARCHIVES_SHOWN = 60;
@@ -243,13 +249,15 @@ function setRetention(args) {
     `OnCalendar=*-*-* ${verdict.settings.time}:00`,
     "",
   ].join("\n"), { mode: 0o644 });
-  const reload = systemctl(["daemon-reload"]);
-  if (reload.code !== 0) throw new Stop(69, `systemctl daemon-reload failed: ${clip(reload.err)}`);
-  // try-restart: rechnet die neue Uhrzeit ein, startet aber keinen gestoppten Timer.
-  systemctl(["try-restart", TIMER]);
-  mkdirSync(LOG_DIR, { recursive: true, mode: 0o750 });
+  // Erst protokollieren: ab hier gilt die Einstellung für den nächsten Lauf,
+  // auch wenn das Neuladen des Timers unten scheitert.
+  mkdirSync(STATE_DIR, { recursive: true, mode: 0o750 });
   const entry = { at: record.geaendert, vorher: before, nachher: verdict.settings, freigabe: record.freigabe, unterUntergrenze: verdict.belowMinimum };
   appendLine(SETTINGS_LOG, entry);
+  const reload = systemctl(["daemon-reload"]);
+  if (reload.code !== 0) throw new Stop(69, `setting stored, but systemctl daemon-reload failed (the time applies after the next reload): ${clip(reload.err)}`);
+  // try-restart: rechnet die neue Uhrzeit ein, startet aber keinen gestoppten Timer.
+  systemctl(["try-restart", TIMER]);
   return entry;
 }
 
@@ -262,8 +270,7 @@ function approveResume(args) {
   if (state.anomaly.id !== args[0]) throw new Stop(77, `the approval names anomaly ${args[0]}, the service halted for ${state.anomaly.id}; look again`);
   state.approval = { anomalyId: state.anomaly.id, at: now() };
   writeJsonAtomic(STATE_FILE, state, 0o640);
-  mkdirSync(LOG_DIR, { recursive: true, mode: 0o750 });
-  appendLine(SETTINGS_LOG, { at: state.approval.at, freigegeben: state.anomaly });
+  appendLine(SETTINGS_LOG, { at: state.approval.at, freigegeben: { id: state.anomaly.id, count: state.anomaly.count, missing: state.anomaly.missing } });
   const start = systemctl(["start", "--no-block", SERVICE]);
   return { approved: state.anomaly.id, missing: state.anomaly.count, started: start.code === 0 };
 }
@@ -358,8 +365,10 @@ export function runService() {
     record.before = before.length;
     const firstRun = !Array.isArray(state.baseline);
     if (!firstRun) {
-      const foreign = missingArchives(state.baseline, before).filter((item) => !accepted.has(item.id));
-      if (foreign.length > 0) halt(state, record, anomalyOf(foreign, "before-prune"));
+      // Die Anomalie nennt ALLE fehlenden Archive, auch schon freigegebene:
+      // eine neue Freigabe deckt dann den ganzen Verlust, nicht nur den Rest.
+      const missing = missingArchives(state.baseline, before);
+      if (missing.some((item) => !accepted.has(item.id))) halt(state, record, anomalyOf(missing, "before-prune"));
     }
 
     const pruneArgs = ["prune", "--list", "--lock-wait", LOCK_WAIT, "--glob-archives", PRUNE_ARCHIVE_GLOB, "--keep-daily", String(settings.keepDaily), "--keep-weekly", String(settings.keepWeekly)];
@@ -369,13 +378,21 @@ export function runService() {
     record.pruned = pruned.length;
     record.prunedNames = pruned.slice(0, 20).map((item) => item.name);
 
+    // Sofort festhalten, was dieser Dienst selbst entfernt hat: der neue
+    // Vergleichsstand ist der Bestand vor prune ohne das, was prune genannt hat.
+    // Scheitert unten etwas, hält der nächste Lauf die eigenen Löschungen nicht
+    // für fremde — und was prune nicht genannt hat, bleibt darin und fällt auf.
+    const prunedIds = new Set(pruned.filter((item) => item.id).map((item) => item.id));
+    const prunedNames = new Set(pruned.filter((item) => !item.id).map((item) => item.name));
+    state.baseline = before.filter((item) => !prunedIds.has(item.id) && !prunedNames.has(item.name));
+    state.baselineAt = now();
+    writeJsonAtomic(STATE_FILE, state, 0o640);
+
     const after = listArchives(borgEnvironment);
     record.after = after.length;
     const unexplained = unexplainedLoss(before, after, pruned);
     if (unexplained.length > 0) halt(state, record, anomalyOf(unexplained, "after-prune"));
 
-    // Der neue Vergleichsstand gilt ab jetzt, auch wenn compact unten scheitert:
-    // was prune entfernt hat, hat dieser Dienst entfernt.
     state.status = "ok";
     state.baseline = after;
     state.baselineAt = now();
@@ -384,10 +401,26 @@ export function runService() {
     writeJsonAtomic(STATE_FILE, state, 0o640);
 
     if (firstRun) {
-      record.compactSkipped = "first run: no earlier inventory to compare with, compact follows on the next run";
+      record.compactSkipped = "first run: inventory recorded, compact follows on the next run";
     } else {
-      borg(["compact", "--lock-wait", LOCK_WAIT, REPO], borgEnvironment);
-      record.compacted = true;
+      // Kein Warten auf die Sperre: hält sie jemand zwischen der Prüfung oben und
+      // hier (etwa ein Löschversuch vom VPS), wird heute nicht kompaktiert,
+      // statt nach dem Warten eine ungeprüfte Löschung endgültig zu machen.
+      try {
+        borg(["compact", "--lock-wait", "1", REPO], borgEnvironment);
+        record.compacted = true;
+      } catch (error) {
+        if (!/lock/i.test(error.message)) throw error;
+        record.compactSkipped = clip(`repository busy right before compact, not compacted today: ${error.message}`);
+      }
+      // Und hinterher noch einmal nachsehen: fehlt jetzt etwas, ist es zu spät
+      // für dieses Archiv — der Dienst hält trotzdem an und sagt es.
+      const final = listArchives(borgEnvironment);
+      const lost = missingArchives(after, final);
+      if (lost.length > 0) {
+        state.baseline = after;
+        halt(state, record, anomalyOf(lost, "after-compact"));
+      }
     }
     try {
       const info = JSON.parse(borg(["info", "--json", "--lock-wait", LOCK_WAIT, REPO], borgEnvironment).out);

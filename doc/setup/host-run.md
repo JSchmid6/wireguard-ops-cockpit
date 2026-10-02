@@ -177,8 +177,9 @@ Grenzen (`deploy/helpers/cockpit-borg-retention-rules.mjs`, dieselbe Datei wie i
 und `systemctl start cockpit-borg-retention.service`. Freigabe braucht: `set` unter der Untergrenze
 oder mit `--freigabe`, `freigeben` (Fortsetzen nach einer Anomalie), jede andere Form des Helfers,
 `systemctl stop|disable|mask|edit` an seinem Timer oder seiner Unit, und jedes Schreiben in
-`/etc/cockpit-borg-retention`, `/var/lib/cockpit-borg-retention`, seine Units samt `.d`-Verzeichnissen
-und seinen Code. Der Riegel heißt seitdem `cockpit-backup-guard/v2`.
+`/etc/cockpit-borg-retention`, `/var/lib/cockpit-borg-retention`, seine Units samt `.d`-Verzeichnissen,
+die Drop-ins, die systemd ohne „borg“ im Namen auf sie anwendet (`cockpit-.service.d`,
+`cockpit-.timer.d`, `service.d`, `timer.d` in `/etc`, `/run`, `/usr/lib/systemd/system`), und seinen Code. Der Riegel heißt seitdem `cockpit-backup-guard/v2`.
 
 Ehrliche Grenze: Programme, die schon auf dem Host liegen und über ihren Namen oder aus den
 System-Verzeichnissen (`/usr`, `/opt/gitlab`) aufgerufen werden, nimmt der Riegel für das, was ihr

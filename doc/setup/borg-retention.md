@@ -24,12 +24,18 @@ als `borg`, dem Besitzer des Repos):
 4. `borg prune --list --glob-archives 'vmd61162-*' --keep-daily D --keep-weekly W
    [--keep-monthly M]`: nur die Serie des nächtlichen VPS-Backups; Handarchive mit
    anderem Namen fasst er nie an,
-5. listet erneut und prüft, dass nur fehlt, was prune selbst genannt hat,
-6. merkt sich den neuen Bestand als Vergleichsstand,
-7. `borg compact`, danach `borg info --json` für die Repo-Größe.
+5. merkt sich sofort, was prune selbst entfernt hat (Vergleichsstand = Bestand vor prune
+   ohne die von prune genannten Archive),
+6. listet erneut und prüft, dass nur fehlt, was prune selbst genannt hat; danach gilt der
+   neue Bestand als Vergleichsstand,
+7. `borg compact --lock-wait 1`, danach noch einmal `borg list` (fehlt jetzt etwas, hält er
+   an) und `borg info --json` für die Repo-Größe.
 
-Alle borg-Aufrufe warten bis zu einer Stunde auf die Repo-Sperre (`--lock-wait 3600`):
-läuft das Backup noch, wartet der Dienst, statt zu scheitern. Der Lauf hat `Nice=10` und
+list und prune warten bis zu einer Stunde auf die Repo-Sperre (`--lock-wait 3600`): läuft
+das Backup noch, wartet der Dienst, statt zu scheitern. `compact` wartet nicht: hält jemand
+die Sperre zwischen der letzten Prüfung und compact (etwa ein Löschversuch vom VPS), wird an
+diesem Tag nicht kompaktiert (`compactSkipped`), statt nach dem Warten eine ungeprüfte
+Löschung endgültig zu machen. Der Lauf hat `Nice=10` und
 `IOSchedulingClass=idle`.
 
 Die Passphrase liest der Dienst aus `/etc/cockpit-borg-retention/passphrase` (root, 0600).
@@ -53,7 +59,8 @@ Verglichen wird über die **Archiv-id**, nicht nur den Namen: ein `recreate` ode
 behält vielleicht den Namen, aber nicht die id.
 
 Fehlt etwas, das der Dienst nicht selbst entfernt hat: kein compact (und bei Befund vor
-prune auch kein prune), Status **„angehalten“**, Rückgabewert 3 (die Unit steht auf
+prune auch kein prune), Status **„angehalten“**, die Anomalie nennt **alle** fehlenden Archive
+gegenüber dem Vergleichsstand, Rückgabewert 3 (die Unit steht auf
 `failed`). Gemeldet wird über das **Cockpit**: das Panel „Backup retention“ zeigt den Status
 rot, die fehlenden Archive und den Zeitpunkt; dazu `systemctl --failed` auf Lab0. Jeder
 weitere Timer-Lauf bleibt angehalten und fasst das Repo nicht an.
@@ -61,11 +68,14 @@ weitere Timer-Lauf bleibt angehalten und fasst das Repo nicht an.
 Weiter geht es nur mit **Jochens Freigabe** (`freigeben <anomalie-id>`, im Cockpit „Approve
 and resume“). Sie gilt genau für die Archive, die er gesehen hat (die id der Anomalie ist ein
 Hash ihrer Archiv-ids). Fehlt nach der Freigabe noch ein weiteres Archiv, hält der Dienst
-erneut an. Nach der Freigabe startet der Lauf sofort und kompaktiert — dann sind die
+erneut an; die neue Anomalie nennt dann den ganzen Verlust (auch die schon freigegebenen
+Archive), ihre Freigabe deckt alles. Nach der Freigabe startet der Lauf sofort und kompaktiert — dann sind die
 freigegebenen Archive endgültig weg.
 
 Der **erste Lauf** hat keinen Vergleichsstand: er prunt, merkt sich den Bestand und
-kompaktiert erst beim nächsten Lauf. Bis dahin kann Jochen den Bestand im Cockpit ansehen.
+kompaktiert erst beim nächsten Lauf. Das schützt nicht vor Löschungen, die schon vor dem
+ersten Lauf vorgemerkt waren (siehe Ehrliche Grenzen) — es lässt Jochen nur einen Tag, den
+Bestand im Cockpit anzusehen.
 
 ## Feste Grenzen
 
@@ -104,8 +114,14 @@ Anfrage unter der Untergrenze ohne Freigabe endet mit 409 (`needsApproval`, Audi
 **Backup-Riegel** (`deploy/helpers/cockpit-backup-guard.mjs`, `doc/setup/host-run.md` 2a):
 frei sind nur `/usr/local/sbin/cockpit-borg-retention status|run`, `set D W M HH:MM` innerhalb
 der Grenzen und `systemctl start cockpit-borg-retention.service`. Alles andere, was den Dienst
-oder seine Dateien berührt, ist ein Treffer und wartet auf Jochen. Der Helfer über `node …mjs`
-statt über seinen sbin-Namen ist ebenfalls ein Treffer.
+oder seine Dateien berührt, ist ein Treffer und wartet auf Jochen — auch Drop-ins, die systemd
+ohne „borg“ im Namen auf seine Units anwendet (`cockpit-.service.d`, `cockpit-.timer.d`,
+`service.d`, `timer.d` in `/etc`, `/run` und `/usr/lib/systemd/system`). Der Helfer über
+`node …mjs` statt über seinen sbin-Namen ist ebenfalls ein Treffer.
+
+Die Prüf-Haken des Helfers (`BORG_RETENTION_*`, nur für die Tests) wirken nur außerhalb des
+installierten Orts: die Kopie unter `/usr/local/lib/wireguard-ops-cockpit/` liest sie nie,
+auch wenn ein Drop-in oder die Umgebung des systemd-Managers sie setzt.
 
 ## Schnittstellen
 
@@ -115,7 +131,7 @@ Helfer (`/usr/local/sbin/cockpit-borg-retention`, sudo nur für den Executor):
 | --- | --- | --- |
 | `status` | Datenblock `== DATEN (cockpit-borg-retention/v1) ==` + eine JSON-Zeile: Einstellung, Grenzen, Timer, Status, Anomalie, letzte 10 Läufe, Bestand (letzter Lauf), Platz (`statfs` des Repos), Repo-Größe | 0 |
 | `run` | `systemctl start --no-block cockpit-borg-retention.service` | 0 / 69 |
-| `set D W M HH:MM [--freigabe]` | Einstellung schreiben, Timer-Drop-in `cockpit-borg-retention.timer.d/uhrzeit.conf`, `daemon-reload`, `try-restart` des Timers, Zeile in `/var/log/cockpit-borg-retention/einstellungen.jsonl` | 0 / 65 außerhalb / 77 unter der Untergrenze ohne `--freigabe` |
+| `set D W M HH:MM [--freigabe]` | Einstellung schreiben, Timer-Drop-in `cockpit-borg-retention.timer.d/uhrzeit.conf`, Zeile in `einstellungen.jsonl`, `daemon-reload`, `try-restart` des Timers | 0 / 65 außerhalb / 77 unter der Untergrenze ohne `--freigabe` / 69 gespeichert, aber Reload gescheitert |
 | `freigeben <id>` | Freigabe für genau diese Anomalie, startet den Lauf | 0 / 3 nicht angehalten oder Lauf aktiv / 77 andere Anomalie |
 | `--im-dienst` | der Lauf; nur aus der Unit (`COCKPIT_BORG_RETENTION_IN_UNIT`, nie als root) | 0 / 1 borg-Fehler / 3 angehalten / 65, 77 Einstellung ungültig / 78 Einrichtung fehlt |
 
@@ -139,7 +155,7 @@ Dateien auf Lab0:
 | `/etc/cockpit-borg-retention/aufbewahrung.json` | root 644 | Einstellung (ohne Datei gilt die Vorgabe) |
 | `/etc/cockpit-borg-retention/passphrase` | root 600 | Passphrase (einmalig von Hand) |
 | `/var/lib/cockpit-borg-retention/zustand.json`, `laeufe.jsonl`, `borg/` | borg (StateDirectory) | Status, Vergleichsstand, Läufe (letzte 100), borg-Cache und -Sicherheitsdaten |
-| `/var/log/cockpit-borg-retention/einstellungen.jsonl` | root 640 | jede Änderung und Freigabe |
+| `/var/lib/cockpit-borg-retention/einstellungen.jsonl` | root 640 (im Verzeichnis des Diensts) | jede Änderung und Freigabe |
 
 ## Ausrollen
 
@@ -154,7 +170,6 @@ install -m 644 -o root -g root "$COCKPIT_DIR/deploy/helpers/cockpit-borg-retenti
 install -m 644 "$COCKPIT_DIR/deploy/systemd/cockpit-borg-retention.service" /etc/systemd/system/cockpit-borg-retention.service
 install -m 644 "$COCKPIT_DIR/deploy/systemd/cockpit-borg-retention.timer" /etc/systemd/system/cockpit-borg-retention.timer
 install -d -m 0755 -o root -g root /etc/cockpit-borg-retention
-install -d -m 0750 -o root -g root /var/log/cockpit-borg-retention
 # Schritt 11, nach daemon-reload:
 systemctl enable --now cockpit-borg-retention.timer
 ```
@@ -176,8 +191,16 @@ Einmalig von Hand (nicht Teil des Deploys): die Passphrase ablegen, z. B.
   ersten Lauf zu prüfen (`borg info` mit der Passphrase); diese Karte hat das nicht verifiziert.
 - **Vergleich nur ab dem Vergleichsstand:** Geschützt ist, was beim letzten Lauf im Repo war.
   Ein Archiv, das zwischen zwei Läufen entsteht und wieder vorgemerkt wird, fällt nicht auf.
-  Vor dem ersten Lauf vorgemerkte Löschungen erkennt der Dienst nicht; der erste Lauf
-  kompaktiert deshalb nicht.
+  Vor dem ersten Lauf vorgemerkte Löschungen erkennt der Dienst nicht; der zweite Lauf macht
+  sie endgültig. Wer das ausschließen will, sieht vor dem zweiten Lauf (am Tag nach dem
+  Ausrollen) den Bestand im Cockpit gegen `borg list` vom VPS durch.
+- **Fenster vor compact:** Zwischen der letzten Prüfung und dem Start von compact liegen
+  Millisekunden ohne Repo-Sperre. compact wartet nicht auf die Sperre und es gibt eine Prüfung
+  danach; eine Löschung, die genau in dieses Fenster fällt und vor compact fertig ist, wird
+  trotzdem endgültig — der Dienst meldet sie dann (Status „angehalten“, Phase `after-compact`).
+- **Prüf-Haken:** Dass die installierte Kopie die `BORG_RETENTION_*`-Haken nicht liest, hängt
+  am Installationsort; die Tests laufen aus dem Repo und können den installierten Ort nicht
+  nachstellen (dafür bräuchte es root).
 - **Serie:** prune räumt nur Archive `vmd61162-*`. Ändert sich der Hostname des VPS, prunt
   der Dienst nichts mehr (die Läufe zeigen dann `pruned 0`, das RAID füllt sich). Das ist die
   sichere Richtung, will aber gesehen werden.

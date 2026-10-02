@@ -135,6 +135,10 @@ const needsApproval: Array<[string, string]> = [
   ["retention rules replaced", "cp /tmp/rules.mjs /usr/local/lib/wireguard-ops-cockpit/cockpit-borg-retention-rules.mjs"],
   ["prune as the repo owner", "sudo -u borg borg prune --keep-daily 3 --keep-weekly 2 /media/RAID/backup_VServer/borg"],
   ["compact by hand", "runuser -u borg -- borg compact /media/RAID/backup_VServer/borg"],
+  ["prefix drop-in switches the timer off", "mkdir -p /etc/systemd/system/cockpit-.timer.d\nprintf '[Unit]\\nConditionPathExists=/nie\\n' > /etc/systemd/system/cockpit-.timer.d/aus.conf\nsystemctl daemon-reload"],
+  ["prefix drop-in changes the service", "cat > /etc/systemd/system/cockpit-.service.d/z.conf <<'EOF'\n[Service]\nExecStart=\nExecStart=/bin/true\nEOF"],
+  ["global drop-in in /run", "tee /run/systemd/system/timer.d/x.conf <<'EOF'\n[Timer]\nOnCalendar=\nEOF"],
+  ["unit overridden in /run", "cp /tmp/x.timer /run/systemd/system/cockpit-borg-retention.timer"],
 ];
 
 describe("backup bolt: the routine and ordinary host work stay free", () => {

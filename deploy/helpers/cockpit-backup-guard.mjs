@@ -58,6 +58,11 @@ const PROTECTED = [
   "/usr/local/lib/wireguard-ops-cockpit/cockpit-borg-retention.mjs", "/usr/local/lib/wireguard-ops-cockpit/cockpit-borg-retention-rules.mjs",
   "/etc/systemd/system/cockpit-borg-retention.service", "/etc/systemd/system/cockpit-borg-retention.service.d",
   "/etc/systemd/system/cockpit-borg-retention.timer", "/etc/systemd/system/cockpit-borg-retention.timer.d",
+  // Drop-ins, die systemd ebenfalls auf diese Units anwendet, ohne dass ihr Name
+  // "borg" enthält: Präfix-Drop-ins (cockpit-.service.d) und globale (service.d),
+  // in jedem Unit-Verzeichnis. Darüber ließe sich der Dienst sonst still abschalten.
+  ...["/etc/systemd/system", "/etc/systemd/system.control", "/run/systemd/system", "/run/systemd/system.control", "/run/systemd/transient", "/usr/local/lib/systemd/system", "/usr/lib/systemd/system", "/lib/systemd/system"]
+    .flatMap((dir) => ["cockpit-.service.d", "cockpit-.timer.d", "service.d", "timer.d"].map((name) => `${dir}/${name}`)),
 ];
 const UNITS = ["borgmatic.timer", "borgmatic.service", "timers.target", "cockpit-borg-retention.timer", "cockpit-borg-retention.service"];
 const ANCESTORS = [...new Set(PROTECTED.flatMap((item) => {
