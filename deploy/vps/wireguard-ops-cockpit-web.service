@@ -4,16 +4,17 @@ Documentation=https://github.com/JSchmid6/wireguard-ops-cockpit/blob/main/doc/se
 Requires=docker.service
 After=docker.service network-online.target
 
-# The image is built by vps-cockpit-deploy.sh; this unit only (re)creates the
-# container from the image that is already there. `up -d --no-build` is a no-op
-# when nothing changed and swaps the container when the deploy built a new image,
-# so a restart of this unit is the web part of the self-update activation (the
-# runner restarts it with the four services, after its pre-activation checks).
+# The image is built by vps-cockpit-deploy.sh; this unit only recreates the
+# container from the image that is already there. `--force-recreate` makes every
+# start swap the container instead of trusting compose's change detection, so a
+# restart of this unit is the web part of the self-update activation (the runner
+# restarts it with the four services, after its pre-activation checks, and then
+# checks that the container carries the image the deploy built).
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=/opt/wireguard-ops-cockpit
-ExecStart=/usr/bin/docker compose --env-file .env -f docker-compose.vps.yml up -d --no-build web
+ExecStart=/usr/bin/docker compose --env-file .env -f docker-compose.vps.yml up -d --no-build --force-recreate web
 TimeoutStartSec=300
 
 [Install]
