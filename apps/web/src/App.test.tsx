@@ -609,6 +609,20 @@ function makeServer(initiallyAuthenticated: boolean) {
       return okResponse({ user: state.user });
     }
 
+    // "Wartet auf dich": offene Freigaben erscheinen als Karten.
+    if (url === "/api/inbox") {
+      return okResponse({
+        generatedAt: "2026-04-19T12:30:00.000Z",
+        cards: state.approvals.map((approval) => ({
+          id: `approval-${approval.id}`, kind: "approval", title: approval.reason, reason: approval.reason, findings: [],
+          createdAt: approval.createdAt, expiresAt: "2099-01-01T00:00:00.000Z", expired: false,
+          link: `/#karte-approval-${approval.id}`, jobId: approval.jobId, approvalId: approval.id
+        })),
+        reorders: [],
+        status: { lastRuns: [], backup: null, disk: null }
+      });
+    }
+
     // Borg-Zustand: der Anzeige-Bereich holt beim Rendern den letzten Stand und
     // stösst höchstens eine Messung an (read-only).
     if (url === "/api/borg/retention") {
@@ -749,6 +763,10 @@ function makeServer(initiallyAuthenticated: boolean) {
 
     if (url.startsWith("/api/approvals/") && method === "POST") {
       const approvalId = url.split("/")[3];
+      // Wie der Server: keine Entscheidung ohne Grund.
+      if (!String(JSON.parse(String(init?.body || "{}")).reason || "").trim()) {
+        return errorResponse("a reason is required for every decision", 400);
+      }
       state.approvals = state.approvals.filter((approval) => approval.id !== approvalId);
       if (approvalId === "approval-supervised-agent") {
         state.sessionDetails[state.lastSupervisedSessionId].plans.unshift(
@@ -852,6 +870,12 @@ describe("App", () => {
 
     await user.click(screen.getByRole("button", { name: "Sign in" }));
 
+    // Startseite: "Wartet auf dich" mit der offenen Freigabe, alles andere zu.
+    expect(await screen.findByRole("heading", { name: /Wartet auf dich/ })).toBeTruthy();
+    expect(await screen.findByText("Human review required", { selector: "h3" })).toBeTruthy();
+    expect(screen.queryByText("Recent audit trail")).toBeNull();
+    await user.click(screen.getByRole("button", { name: /Mehr/ }));
+
     expect(await screen.findByText("Recent audit trail")).toBeTruthy();
     expect(screen.getByText(/Signed in as/)).toBeTruthy();
     expect(screen.queryByText("authentication required")).toBeNull();
@@ -884,6 +908,7 @@ describe("App", () => {
 
     render(<App />);
 
+    await clickWhenReady(user, "Mehr ▾");
     expect(await screen.findByText("Open terminal bridge")).toBeTruthy();
 
     const sessionInput = screen.getByPlaceholderText("incident-debug");
@@ -982,13 +1007,19 @@ describe("App", () => {
     });
     expect(await screen.findByText(/agent · pending_approval · high/)).toBeTruthy();
 
-    await clickWhenReady(user, "Approve");
+    // Freigeben geht nur über die Karte und nur mit Grund.
+    await screen.findByText("Supervised repair agent requires operator approval before it starts.", { selector: "h3" });
+    expect((screen.getAllByRole("button", { name: "Freigeben" })[0] as HTMLButtonElement).disabled).toBe(true);
+    await user.type(screen.getAllByLabelText(/Grund \(Pflicht/)[0], "observed launch is fine");
+    await clickWhenReady(user, "Freigeben");
     expect((await screen.findAllByText(/Checkpoint contract/)).length).toBeGreaterThan(0);
     await clickWhenReady(user, "Mark checkpoint reviewed");
     expect(await screen.findByText(/waiting at checkpoint Choose the next bounded follow-up/i)).toBeTruthy();
 
-    await clickWhenReady(user, "Approve");
+    await user.type(screen.getAllByLabelText(/Grund \(Pflicht/)[0], "reviewed");
+    await clickWhenReady(user, "Freigeben");
     expect(await screen.findByText("No pending approvals.")).toBeTruthy();
+    expect(await screen.findByText("Nichts wartet auf dich")).toBeTruthy();
 
     await clickWhenReady(user, "Sign out");
     expect(await screen.findByRole("button", { name: "Sign in" })).toBeTruthy();
@@ -997,8 +1028,10 @@ describe("App", () => {
   it("zeigt den Borg-Zustand mit Quelle und Zeitstempel je Wert", async () => {
     makeServer(true);
 
+    const user = userEvent.setup();
     render(<App />);
 
+    await clickWhenReady(user, "Mehr ▾");
     expect(await screen.findByText("Borg backup")).toBeTruthy();
 
     // Der Zustand kommt asynchron über /api/borg/status — auf den ersten Wert

@@ -143,6 +143,7 @@ Bare-metal Ubuntu VPS (161.97.86.86) running:
   service waits for the operator.
 
 ### Cockpit Runbooks
+- "Wartet auf dich" (`doc/setup/wartet-auf-dich.md`) is the start page: `GET /api/inbox` lists blocked `hermes-change` jobs, pending approvals and a halted Lab0 retention service as cards; every decision needs a non-empty reason (also enforced by the API); an expired envelope is never approved but closed via `POST /api/inbox/jobs/:id/reorder` so James re-submits the same intent. The cockpit holds no Telegram token: a blocked job carries `operatorLink`, which James forwards. Approving James' job runs it in the session of the job owner, never of the approving admin.
 - All host operations go through Cockpit Runbooks API
 - Planner (opencode) reviews for safety BEFORE any execution
 - Generated proposals are stored as job evidence; they never register themselves as permanent runbooks

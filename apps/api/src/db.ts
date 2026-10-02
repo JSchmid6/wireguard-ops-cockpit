@@ -699,6 +699,21 @@ export class CockpitDatabase {
     return rows.map((row) => this.mapJob(row));
   }
 
+  // Jobs eines Gegenstands in einem Zustand, älteste zuerst ("Wartet auf dich").
+  listJobsByStatus(subjectId: string, status: JobStatus): JobRecord[] {
+    const rows = this.database
+      .prepare("SELECT * FROM jobs WHERE subject_id = ? AND status = ? ORDER BY datetime(created_at) ASC")
+      .all(subjectId, status) as JobRow[];
+    return rows.map((row) => this.mapJob(row));
+  }
+
+  listRecentJobs(subjectId: string, limit = 3): JobRecord[] {
+    const rows = this.database
+      .prepare("SELECT * FROM jobs WHERE subject_id = ? ORDER BY datetime(updated_at) DESC LIMIT ?")
+      .all(subjectId, limit) as JobRow[];
+    return rows.map((row) => this.mapJob(row));
+  }
+
   listJobsForSession(sessionId: string): JobRecord[] {
     const rows = this.database
       .prepare("SELECT * FROM jobs WHERE session_id = ? ORDER BY datetime(created_at) DESC")
@@ -1079,6 +1094,21 @@ export class CockpitDatabase {
       )
       .get(action, sinceIso, runtimeFingerprint) as { count: number };
     return row.count;
+  }
+
+  // Für "Wartet auf dich": gibt es zu diesem Ziel schon eine Entscheidung?
+  hasAudit(action: string, targetId: string): boolean {
+    const row = this.database
+      .prepare("SELECT 1 AS hit FROM audits WHERE action = ? AND target_id = ? LIMIT 1")
+      .get(action, targetId) as { hit: number } | undefined;
+    return Boolean(row);
+  }
+
+  listAuditsSince(action: string, sinceIso: string, limit = 50): AuditRecord[] {
+    const rows = this.database
+      .prepare("SELECT * FROM audits WHERE action = ? AND datetime(created_at) >= datetime(?) ORDER BY datetime(created_at) DESC LIMIT ?")
+      .all(action, sinceIso, limit) as AuditRow[];
+    return rows.map((row) => this.mapAudit(row));
   }
 
   getAudit(id: string): AuditRecord | null {
