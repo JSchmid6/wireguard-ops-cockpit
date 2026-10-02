@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import type { ExecutionReview } from "@wireguard-ops-cockpit/domain";
 
 import { backupGuardHits, type BackupGuardHit } from "../../../deploy/helpers/cockpit-backup-guard.mjs";
-import { HOST_RUN_NET_FILE, SYSTEM_BACKUP_BOUNDS, defaultHostRunNet, describeHostRunNet, parseHostRunNet, type HostRunNet } from "../../../deploy/helpers/cockpit-host-run-net.mjs";
+import { HOST_RUN_NET_FILE, SYSTEM_BACKUP_BOUNDS, SYSTEM_BACKUP_UPKEEP_SECONDS, defaultHostRunNet, describeHostRunNet, parseHostRunNet, type HostRunNet } from "../../../deploy/helpers/cockpit-host-run-net.mjs";
 
 import { READABLE_PROTECTED_PATH } from "./capability-manifest.js";
 import { hashCanonical } from "./hermes-security.js";
@@ -29,7 +29,7 @@ import { redactSecrets } from "./update-review.js";
 //               review at all).
 //   safety net  the helper, per host (deploy/helpers/cockpit-host-run-net.mjs):
 //               on the VPS borg younger than 24 h and a machine snapshot, on
-//               Lab0 a file-level system backup to the RAID, before any run
+//               Lab0 a borg system backup to the RAID, before any run
 //               that changes the system. This module reads the same file only
 //               to tell the doorkeeper and the planner what lies underneath.
 //   backup bolt the one exception to "no approval as a rule" (Jochen,
@@ -40,7 +40,7 @@ import { redactSecrets } from "./update-review.js";
 
 export { backupGuardHits, type BackupGuardHit };
 export type { HostRunNet };
-export { SYSTEM_BACKUP_BOUNDS };
+export { SYSTEM_BACKUP_BOUNDS, SYSTEM_BACKUP_UPKEEP_SECONDS };
 
 export const HOST_RUN_NET_PATH = `/etc/wireguard-ops-cockpit/${HOST_RUN_NET_FILE}`;
 
@@ -597,7 +597,7 @@ export function hostRunResultText(manifest: HostRunManifest, result: HostRunStat
     `EXIT_CODE: ${result.success ? 0 : 1}`,
     `WHAT_RAN: host run "${manifest.name}": ${steps.map((step) => `${step.index} ${step.name} ${step.status}`).join(", ")}; checks: ${checks.map((check) => `${check.index} ${check.name} ${check.status}`).join(", ")}`,
     `OUTPUT: ${result.logTail.slice(-30000)}`,
-    `NOTES: run ${result.status}${result.error ? ` — ${result.error}` : ""}${result.snapshotId ? `; machine snapshot ${result.snapshotId} (revert only with operator approval)` : ""}${result.systemBackupPath ? `; system backup ${result.systemBackupPath} (file level, restore on site only with operator approval)` : ""}; executed by the general host door as root in a transient unit`,
+    `NOTES: run ${result.status}${result.error ? ` — ${result.error}` : ""}${result.snapshotId ? `; machine snapshot ${result.snapshotId} (revert only with operator approval)` : ""}${result.systemBackupPath ? `; system backup ${result.systemBackupPath} (borg archive, restore on site from a rescue system only with operator approval)` : ""}; executed by the general host door as root in a transient unit`,
   ].join("\n");
 }
 

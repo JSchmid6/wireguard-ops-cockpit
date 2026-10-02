@@ -95,6 +95,7 @@ import {
   hostRunPlannerContract,
   loadHostRunNet,
   SYSTEM_BACKUP_BOUNDS,
+  SYSTEM_BACKUP_UPKEEP_SECONDS,
   type HostRunNet,
   hostRunPolicy,
   hostRunResultText,
@@ -2017,7 +2018,11 @@ export async function createApp(options: AppOptions = {}) {
     const reboots = manifest.steps.filter((step) => step.reboot).length;
     // The system backup of a physical host runs before the first step (the helper's budget has it too).
     // A net the API cannot read may be one: then the longest backup it allows.
-    const backup = !manifest.mutates ? 0 : hostRunNet === null ? SYSTEM_BACKUP_BOUNDS.timeoutSeconds[1] : hostRunNet.systemBackup?.timeoutSeconds ?? 0;
+    // Dazu prune und compact nach dem Archiv.
+    // The file as it is now, not as at the API's start: a net set up later must not cut the deadline.
+    const net = options.hostRunNet !== undefined ? options.hostRunNet : loadHostRunNet();
+    const archive = !manifest.mutates ? 0 : net === null ? SYSTEM_BACKUP_BOUNDS.timeoutSeconds[1] : net.systemBackup?.timeoutSeconds ?? 0;
+    const backup = archive ? archive + 2 * SYSTEM_BACKUP_UPKEEP_SECONDS : 0;
     return startedAt + (seconds + backup + 1800) * 1000 + (reboots + 1) * HOST_RUN_REBOOT_ALLOWANCE_MS;
   }
 

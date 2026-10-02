@@ -250,55 +250,114 @@ Beispiele: `deploy/config/host-run-net.vps.json` und `deploy/config/host-run-net
 ### Lab0: `system-backup`
 
 Lab0 ist eine physische Kiste: kein Hoster, kein Snapshot, keine Konsole aus der Ferne. Die
-Root-Platte ist LVM (`ubuntu-vg`, 465 GB, 0 GB frei), das RAID unter `/media/RAID` hat Platz und
-hält die VPS-Backups. Vor jedem verändernden Lauf, in dieser Reihenfolge:
+Root-Platte ist LVM (`ubuntu-vg`, 465 GB, 0 GB frei), das RAID unter `/media/RAID` hält die
+VPS-Backups (02.10.2026: 5,5 T, 4,7 T belegt, 777 G frei, 87 %).
+
+**Entscheidung Jochen (02.10.2026):** Das Netz ist eine Systemsicherung aufs RAID mit **borg**
+(Platz ist knapp, viele Versionen kommen dazu: borg dedupliziert und komprimiert).
+Zurückgeholt wird im Notfall **vor Ort mit einem Rescue-System**. LVM-Umbau und eine Extra-SSD
+entfallen als zu aufwändig.
+
+Vor jedem verändernden Lauf, in dieser Reihenfolge (fehlt etwas, läuft kein Schritt,
+`preflight_failed`):
 
 1. **RAID gesund:** `/proc/mdstat` nennt das Array (`raidDevice`; auf Lab0 das IMSM-Volume
-   `md126` im Container `md127`) `active`, und alle
-   Glieder sind da (`[4/4] [UUUU]`; ein `_` oder `[4/3]` stoppt).
+   `md126` im Container `md127`) `active`, und alle Glieder sind da (`[4/4] [UUUU]`; ein `_`
+   oder `[4/3]` stoppt).
 2. **Sicherungsplatte eingehängt:** `mount` steht in `/proc/self/mountinfo` und liegt auf einem
    anderen Gerät als `/`. Ohne diese Prüfung schriebe eine Sicherung bei nicht eingehängtem RAID
    die Root-Platte voll.
 3. **Quellen vorhanden** (`sources`, Vorschlag `/`, `/boot`, `/boot/efi`).
-4. **Aufräum-Dienst nicht angehalten** (`retentionService: true`):
-   `cockpit-borg-retention status` darf weder `angehalten` noch eine Anomalie melden. Eine
-   Anomalie heißt: jemand hat VPS-Backups auf dem RAID gelöscht; dann entscheidet Jochen zuerst
+4. **Standalone-borg da:** `/usr/local/lib/wireguard-ops-cockpit/borg-standalone` ist eine
+   reguläre Datei, gehört root, ist für Gruppe und andere nicht schreibbar und meldet sich mit
+   `--version` als `borg 1.4.x` (die Standalone-Binary schreibt `borg.exe 1.4.x`). Mit genau
+   dieser Binary sichert der Helfer, und eine Kopie legt er neben das Repo. Dazu die Vorlage der
+   Notfall-Anleitung neben dem Helfer (`cockpit-systemsicherung-NOTFALL.txt`).
+5. **Sicherungsordner gehört der Tür:** `target` fehlt, ist leer, oder ist ein Verzeichnis, das
+   root gehört und das Kennzeichen `.cockpit-systemsicherung` trägt. Einen fremden, nicht leeren
+   Ordner (etwa `backup_VServer` oder Claudes Sicherung vom 02.10.) übernimmt der Helfer **nie**.
+6. **Aufräum-Dienst ohne Anomalie** (`retentionService: true`): `cockpit-borg-retention status`
+   darf weder `angehalten` noch eine Anomalie melden. Eine Anomalie heißt: jemand hat
+   VPS-Backups auf dem RAID gelöscht; dann entscheidet Jochen zuerst
    (`doc/setup/borg-retention.md`), bevor an der Kiste gebaut wird.
-5. **Platz:** frei auf der Sicherungsplatte muss mindestens sein, was die Quellen belegen
-   (ungünstiger Fall: eine volle erste Sicherung), plus `reserveGB`, die danach frei bleiben —
-   damit eine Systemsicherung nie die VPS-Backups verdrängt.
-6. **Systemsicherung:** `rsync -aHAXxR --numeric-ids` der Quellen nach
-   `<target>/cockpit-run-<Zeit>-<job>.partial/`, `--link-dest` auf die jüngste fertige Sicherung
-   (unveränderte Dateien sind Hardlinks und kosten keinen Platz), `exclude` (Vorschlag
-   `/swap.img`, `/tmp/*`, `/var/tmp/*`, `.deb`-Cache). `-x` bleibt auf dem Dateisystem jeder
-   Quelle, das RAID und `/proc`, `/sys`, `/run` kommen nicht mit. Zeitlimit `timeoutSeconds`.
-   rsync-Ende 0 oder 24 (Dateien verschwanden während der Kopie) gilt als Erfolg, alles andere
-   als Fehler; dann wird die halbe Sicherung gelöscht. Danach Umbenennen ohne `.partial`.
-7. **Festes Aufbewahrungs-Fenster:** die `keep` jüngsten fertigen Sicherungen bleiben
-   (Vorschlag 3), ältere löscht der Helfer **nach** der neuen. Er fasst nur Verzeichnisse mit
-   genau seinem Namensmuster an; alles andere unter `target` (und die VPS-Backups daneben)
-   bleibt. Reste eines abgebrochenen Laufs (`….partial`) räumt der nächste Lauf weg.
+7. **Platz:** frei auf der Sicherungsplatte muss mindestens sein, was die Quellen belegen
+   (ungünstiger Fall: eine volle erste Sicherung ohne Kompression und Deduplizierung; die
+   Ausschlüsse sind darin nicht abgezogen), plus `reserveGB`, die danach frei bleiben — damit eine
+   Systemsicherung nie die VPS-Backups verdrängt.
 
-Die Sicherung läuft einmal je Lauf, nicht nach einem Neustart. Ihr Pfad steht im Laufzustand
-(`systemBackup`), im Protokoll und im Ergebnis; scheitert später ein Schritt, nennt das
-Protokoll ihn als Rückweg. Zurückgespielt wird nur mit Jochens Freigabe und **vor Ort** (siehe
-unten).
+Dann die Sicherung:
 
-**Abwägung: Dateisicherung statt LVM-Snapshot.**
+8. **Ordner und Repo:** `target` wird root-eigen mit **0700** angelegt bzw. auf 0700 gesetzt (die
+   Sicherung enthält `/etc` und SSH-Schlüssel). Das Repo ist `<target>/repo`, beim ersten Mal
+   `borg init --encryption=none` — **unverschlüsselt**, damit das Rescue-System keine Passphrase
+   braucht. Ein eigenes Repo je Kiste; die VPS-Backups liegen in einem anderen.
+9. **Notfall-Bausatz neben dem Repo**, bei jeder Sicherung erneuert: `<target>/borg` (Kopie der
+   Standalone-Binary, 0700), `<target>/NOTFALL.txt` (Vorlage
+   `deploy/lab0/cockpit-systemsicherung-NOTFALL.txt` mit den Pfaden dieser Kiste: Rescue-Stick
+   booten, IMSM-RAID mit `mdadm --assemble --scan` einbinden, Root formatieren — mit der alten
+   UUID — und einhängen, `borg extract`, fstab und Bootloader prüfen bzw. `grub-install`) und
+   `<target>/PLATTEN.txt` (`lsblk` mit UUIDs und `/proc/mdstat` zum Zeitpunkt der Sicherung).
+10. **Archiv:** `borg create --one-file-system --numeric-ids --exclude-caches --compression
+    zstd,3` der Quellen nach `<target>/repo::vorlauf-<Zeit>-<job>`, `--lock-wait 600`, Zeitlimit
+    `timeoutSeconds` (danach SIGTERM, damit borg seine Sperre freigibt, eine Minute später
+    SIGKILL). `-x` hält das RAID, `/proc`, `/sys`, `/run` draußen. Ausschlüsse (`exclude`,
+    borg-Muster; Vorschlag nach der Entscheidung): `/swap.img`, `/tmp/*`, `/var/tmp/*`,
+    `/var/cache/*`, `/root/.cache/*`, `/home/*/.cache/*`, der Nextcloud-Sync-Ordner
+    `/home/jochen/Nextcloud`, `/opt/android-workbench` (Android-SDK und Emulator-Abbilder) und
+    die Docker-Abbilder (`/var/lib/docker/overlay2`, `image`, `buildkit`, dazu der Abbild-Speicher
+    von containerd). **Docker-Volumes (`/var/lib/docker/volumes`) bleiben drin.** borg-Ende 0 oder
+    1 (Warnung, etwa eine Datei änderte sich beim Lesen) gilt als Erfolg, ab 2 als Fehler.
+11. **Aufbewahrung, streng begrenzt:** `borg prune --glob-archives 'vorlauf-*'
+    --keep-last=<keepPreRun>` und danach `borg compact` — nur in `<target>/repo`, nur die
+    eigene Reihe. Die Wochen-Reihe `woche-*` und jedes andere Archiv bleiben unberührt; `borg
+    delete` ruft der Helfer nie auf. Scheitert prune oder compact, ist das neue Archiv trotzdem
+    vollständig: der Lauf geht weiter, Protokoll und Laufzustand (`upkeepError`) sagen es.
 
-| | Dateisicherung aufs RAID (gewählt) | LVM-Snapshot (Umbau) |
-| --- | --- | --- |
-| Umbau | keiner | Root-LV verkleinern (ext4 nur offline, von einem Live-System, vor Ort), um Platz für Snapshots in `ubuntu-vg` zu schaffen |
-| Liegt auf | anderer Platte (RAID) — überlebt auch einen Defekt der Root-Platte | derselben Platte wie das Original |
-| Konsistenz | Dateien eines laufenden Systems nacheinander kopiert; Datenbanken in Containern sind nicht absturzsicher gesichert | Zeitpunkt-genau (absturzsicher) |
-| Dauer vor dem Lauf | erste Sicherung lang (Stunden möglich), danach nur Änderungen | Sekunden |
-| Zurück | Live-System vor Ort booten, rsync zurück, Bootloader prüfen | `lvconvert --merge` und Neustart — bei einem Release-Upgrade, das nicht mehr bootet, aber auch nur vor Ort |
-| Risiko | Platz auf dem RAID (Reserve-Prüfung) | volles Snapshot-Volumen macht den Snapshot ungültig; ein Release-Upgrade schreibt viel |
+Die Grenzen stehen in der root-eigenen Datei, nicht im Code: `keepPreRun` (Vorgabe 5, erlaubt
+1–20) und `keepWeekly` (Vorgabe 4, erlaubt 1–12). Ändern wie beim Aufräum-Dienst: innerhalb der
+Grenzen frei, die Form prüft der Helfer vor jeder Sicherung (ein Wert außerhalb oder ein
+unbekanntes Feld — auch das alte `keep` — stoppt jeden verändernden Lauf).
 
-Entscheidend: Für das Upgrade auf 26.04 hilft Lab0 im schlimmsten Fall ohnehin nur jemand vor
-Ort; dann ist eine Sicherung auf einer **anderen** Platte mehr wert als ein schneller Snapshot
-auf derselben, und sie braucht keinen riskanten Umbau der Root-Platte. Wer später LVM-Snapshots
-will, kann das als drittes Netz ergänzen, nachdem in `ubuntu-vg` Platz geschaffen wurde.
+Die Sicherung läuft einmal je Lauf, nicht nach einem Neustart. `systemBackup.path` im
+Laufzustand ist `<repo>::<archiv>`; es steht im Protokoll und im Ergebnis, und scheitert später
+ein Schritt, nennt das Protokoll das Archiv als Rückweg. Zurückgeholt wird nur mit Jochens
+Freigabe und **vor Ort** nach `NOTFALL.txt`.
+
+#### Wöchentlich per Timer
+
+Damit es überhaupt eine Systemsicherung gibt, auch wenn lange kein verändernder Lauf kommt:
+`cockpit-systemsicherung.timer` (sonntags 03:30, `Persistent=true`) startet
+`cockpit-systemsicherung.service`, und der ruft `cockpit-host-run.mjs weekly-backup` auf (nur in
+dieser Unit, `COCKPIT_SYSTEM_BACKUP_IN_UNIT=1`; sudoers erlaubt das Verb nicht). Dieselben
+Prüfungen 1–7, dasselbe Repo, eigene Reihe `woche-<Zeit>` mit eigener Aufbewahrung
+(`keepWeekly`). Läuft gerade ein Host-Lauf (auch einer, der auf seinen Neustart wartet), sichert
+der Timer nicht (Ende 75); bei einer anderen Kiste als `system-backup` endet er mit 78, bei
+einer gescheiterten Prüfung oder Sicherung mit 70, bei gescheitertem prune/compact mit 1 — jedes
+Mal steht die Unit auf `failed`, sichtbar in `systemctl --failed`. Units:
+`deploy/systemd/cockpit-systemsicherung.service` und `.timer`.
+
+**Gleichzeitig:** Die Wochen-Sicherung prüft unter der Start-Sperre der Tür, dass kein Lauf
+aktiv ist; solange ihre Unit aktiv ist, startet kein Host-Lauf (`start` endet mit 75, „the
+weekly system backup is running“ — den Lauf später neu bestellen). Dazu sperrt borg das Repo
+(`--lock-wait 600`).
+
+**Ehrliche Grenze:** Der Helfer prüft den Sicherungsordner (root, kein Symlink, unter `mount`,
+Kennzeichen) und vor jedem weiteren Schreiben und vor prune noch einmal, dass es derselbe Ordner
+ist (Gerät und Inode). Ein Tausch genau zwischen zwei Prüfungen bleibt möglich, wenn ein
+Nicht-root-Nutzer in `mount` schreiben darf; dann landen höchstens die Notfall-Dateien oder ein
+neues Repo im fremden Ordner. Fremde Archive prunt er auch dann nicht: prune nennt nur die
+eigenen Präfixe, und das VPS-Repo ist verschlüsselt (ohne Passphrase bricht borg ab). Vor dem
+Ausrollen `ls -ld /media/RAID` ansehen.
+
+**Abwägung (so entschieden):**
+
+| | borg-Archiv aufs RAID (gewählt) | rsync-Kopie aufs RAID | LVM-Snapshot (Umbau) |
+| --- | --- | --- | --- |
+| Platz | dedupliziert und komprimiert; viele Versionen kosten wenig | jede Version kostet geänderte Dateien ganz | in `ubuntu-vg` ist kein Platz |
+| Liegt auf | anderer Platte (RAID) | anderer Platte (RAID) | derselben Platte |
+| Konsistenz | Dateien eines laufenden Systems; Datenbanken nicht absturzsicher | ebenso | Zeitpunkt-genau |
+| Zurück | Rescue-System vor Ort, `borg extract` mit der Binary neben dem Repo | Rescue-System, rsync zurück | `lvconvert --merge` — nach einem kaputten Upgrade auch nur vor Ort |
+| Umbau | keiner | keiner | Root-LV offline verkleinern |
 
 ### Neustart: wer hilft, wenn die Kiste nicht hochkommt
 
@@ -323,8 +382,8 @@ jemand an der Kiste.
 ### Allgemein
 
 Scheitert eine Prüfung des Netzes, läuft kein Schritt (`preflight_failed`). Scheitert später ein
-Schritt oder eine Prüfung, nennt das Protokoll den Rückweg (Snapshot-Kennung oder Pfad der
-Systemsicherung); zurückgespielt wird nur mit Jochens Freigabe (ein Revert nimmt alles seit dem
+Schritt oder eine Prüfung, nennt das Protokoll den Rückweg (Snapshot-Kennung oder borg-Archiv
+der Systemsicherung); zurückgespielt wird nur mit Jochens Freigabe (ein Revert nimmt alles seit dem
 Snapshot bzw. der Sicherung mit).
 
 Der Plan braucht Prüfschritte und einen Rückweg (`rollback`, Pflichtfeld). Ein Neustart ist ein
@@ -338,28 +397,61 @@ dem Lauf über `host.status` und meldet danach das Ergebnis samt Verifikation.
 
 ### Ausrollen auf Lab0
 
-Lab0 rollt über sein eigenes Deploy-Skript aus (`homeserver-cockpit-deploy.sh`, liegt nicht in
-diesem Repo; siehe `doc/setup/borg-retention.md`). Dazu gehören zwei Zeilen in Schritt 8 —
-**ohne das Modul startet der Helfer gar nicht mehr**, auch nicht für lesende Läufe:
+Lab0 rollt über sein eigenes Deploy-Skript aus (`homeserver-cockpit-deploy.sh` unter
+`/root/cockpit-deploy`, liegt nicht in diesem Repo; siehe `doc/setup/borg-retention.md`). Dazu
+gehören diese Zeilen in Schritt 8 — **ohne das Modul startet der Helfer gar nicht mehr**, auch
+nicht für lesende Läufe; ohne die Vorlage der Notfall-Anleitung stoppt jeder verändernde Lauf:
 
 ```bash
 install -m 644 -o root -g root "$COCKPIT_DIR/deploy/helpers/cockpit-host-run-net.mjs" /usr/local/lib/wireguard-ops-cockpit/cockpit-host-run-net.mjs
-install -m 644 -o root -g root "$COCKPIT_DIR/deploy/config/host-run-net.lab0.json" /etc/wireguard-ops-cockpit/host-run-net.json
+install -m 644 -o root -g root "$COCKPIT_DIR/deploy/lab0/cockpit-systemsicherung-NOTFALL.txt" /usr/local/lib/wireguard-ops-cockpit/cockpit-systemsicherung-NOTFALL.txt
+install -m 644 -o root -g root "$COCKPIT_DIR/deploy/systemd/cockpit-systemsicherung.service" /etc/systemd/system/cockpit-systemsicherung.service
+install -m 644 -o root -g root "$COCKPIT_DIR/deploy/systemd/cockpit-systemsicherung.timer" /etc/systemd/system/cockpit-systemsicherung.timer
+systemctl daemon-reload
+systemctl enable --now cockpit-systemsicherung.timer
+```
+
+Die Einstellungsdatei installiert das Skript **nur, wenn sie fehlt** — sonst überschriebe jedes
+Deploy die von Hand angepassten Werte (`keepPreRun`, `keepWeekly`, Ausschlüsse):
+
+```bash
+[ -e /etc/wireguard-ops-cockpit/host-run-net.json ] || install -m 644 -o root -g root "$COCKPIT_DIR/deploy/config/host-run-net.lab0.json" /etc/wireguard-ops-cockpit/host-run-net.json
+```
+
+**Standalone-borg einmal von Hand** (nicht im Repo, kein Download im Deploy): die Version wie
+`borg --version` auf Lab0 (1.4.x) aus den Releases von borgbackup
+(`https://github.com/borgbackup/borg/releases`, Datei `borg-linux-glibc231-x86_64` samt
+`borg-linux-glibc231-x86_64.asc`; glibc 2.31 läuft auch auf älteren Rescue-Systemen), Signatur
+mit `gpg --verify` gegen den Release-Schlüssel von borgbackup prüfen, dann:
+
+```bash
+install -m 755 -o root -g root borg-linux-glibc231-x86_64 /usr/local/lib/wireguard-ops-cockpit/borg-standalone
+/usr/local/lib/wireguard-ops-cockpit/borg-standalone --version   # borg.exe 1.4.x
 ```
 
 Vor dem ersten Lauf auf Lab0 von Hand prüfen und die Datei anpassen (diese Werte hat die Karte
-nicht auf Lab0 verifiziert): `cat /proc/mdstat` (Name des Volumes; die Test-Fixtures dieses
-Repos zeigen `md126 : active raid10 … [4/4] [UUUU]` — IMSM-Nummern können sich nach einem
+nicht auf Lab0 verifiziert): `cat /proc/mdstat` (Name des Volumes; Lab0-Status vom 02.10.2026
+18:05 zeigt `md126 : active raid10 … [4/4] [UUUU]` — IMSM-Nummern können sich nach einem
 Neustart ändern, dann stoppt die Tür mit „RAID … is not in /proc/mdstat“),
 `findmnt /media/RAID`, `findmnt /boot /boot/efi` (gibt es beide?), `ls /swap.img`,
 `systemctl is-enabled wg-quick@wg0.service ssh.service ssh.socket` (Name der WireGuard-Unit),
-`df -h / /media/RAID`, `command -v rsync`. Die erste Sicherung ist voll und kann Stunden dauern
-(`timeoutSeconds`, Vorschlag 4 h); sinnvoll ist ein erster harmloser verändernder Lauf, der nur
-die Sicherung anlegt, bevor das Release-Upgrade kommt. Die Sicherung von Claude vom 02.10.
-(`/media/RAID/lab0-systemsicherung-20261002`, /etc und Paketliste) liegt außerhalb von `target`
-und bleibt unberührt.
+`ls -d /opt/android-workbench /var/lib/docker/overlay2 /var/lib/containerd` (wo die Abbilder
+wirklich liegen), `df -h / /media/RAID`, `ls -ld /media/RAID/lab0-systemsicherung` (muss fehlen
+oder leer sein).
 
-Der VPS braucht keine Datei; `deploy/vps/vps-cockpit-deploy.sh` installiert nur das Modul.
+**Erste Sicherung und Messung:** Die erste Sicherung ist voll und kann Stunden dauern
+(`timeoutSeconds`, Vorschlag 4 h). Sie lässt sich ohne Host-Lauf anstoßen:
+`systemctl start cockpit-systemsicherung.service` (läuft im Vordergrund bis zum Ende;
+`journalctl -u cockpit-systemsicherung.service` zeigt die borg-Statistik). Die Größe danach:
+`BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK=yes /usr/local/lib/wireguard-ops-cockpit/borg-standalone
+info /media/RAID/lab0-systemsicherung/repo` (Original, komprimiert, dedupliziert) und
+`du -sh /media/RAID/lab0-systemsicherung`. Erst danach das Release-Upgrade bestellen.
+
+Die Sicherung von Claude vom 02.10. (`/media/RAID/lab0-systemsicherung-20261002`, /etc und
+Paketliste) liegt außerhalb von `target` und bleibt unberührt.
+
+Der VPS braucht keine Datei und keinen Timer; `deploy/vps/vps-cockpit-deploy.sh` installiert nur
+das Modul.
 
 ## 5. Sondertüren
 
@@ -425,11 +517,19 @@ vorbei. Der Runner markiert die Dateien der Tür als Fokus `host-door`.
   alt/gescheitert, Snapshot scheitert, lesender Lauf), Tür (Fehler, Zeitlimit, Prüfschritte,
   Schwärzung, Neustart mit Fortsetzung, ein Lauf zur Zeit).
 - `apps/api/test/host-run-helper.test.ts`, Block „net of a physical box“: Lab0-Netz mit Stubs
-  für rsync, `/proc/mdstat`, mountinfo und den Aufräum-Dienst — Sicherung statt borg und
-  Snapshot, `--link-dest` und festes Fenster (fremde Verzeichnisse bleiben), Stopp bei
-  degradiertem RAID, nicht eingehängter Platte, Platte auf `/`, angehaltenem Dienst, zu wenig
-  Platz, fehlender Quelle, ungültiger oder fremd schreibbarer Datei, rsync-Fehler; Neustart mit
-  Hinweis „vor Ort“, kein Start ohne WireGuard, kein Neustart, wenn ein Schritt SSH abschaltet.
+  für borg (führt Archivnamen je Repo und prunt nach `--glob-archives`/`--keep-last` wie borg),
+  lsblk, `/proc/mdstat`, mountinfo und den Aufräum-Dienst — borg-Archiv statt borg-Status und
+  Snapshot mit genau diesen borg-Aufrufen (`init --encryption=none`, `create` mit `-x` und den
+  Ausschlüssen, `prune` nur der eigenen Reihe, `compact`), Ordner 0700 mit Binary, NOTFALL.txt
+  und PLATTEN.txt; Rotation: nur die eigene Reihe, fremde Archive (`vmd61162-…`) und die andere
+  Reihe bleiben; Wochen-Sicherung über `weekly-backup` mit eigener Reihe und Aufbewahrung, nicht
+  außerhalb ihrer Unit, nicht auf dem VPS-Netz, nicht während eines Host-Laufs; die
+  mitgelieferten Timer-Units; Stopp bei degradiertem RAID, nicht eingehängter Platte, Platte auf
+  `/`, angehaltenem Dienst, zu wenig Platz, fehlender Quelle, fehlender/falscher/fremd
+  schreibbarer borg-Binary, fehlender Notfall-Vorlage, fremdem Zielordner, altem `keep`,
+  ungültiger oder fremd schreibbarer Datei, borg-Fehler; borg-Warnung (1) gilt, gescheitertes
+  prune lässt den Lauf weiter; Neustart mit Hinweis „vor Ort“, kein Start ohne WireGuard, kein
+  Neustart, wenn ein Schritt SSH abschaltet.
 - `apps/api/test/host-run-net.test.ts`: Form und Grenzen der Einstellung, die mitgelieferten
   Dateien, was Türsteher, Planer und Jochen auf Lab0 lesen.
 - `apps/api/test/host-run.test.ts`: Manifest, Fokus (der `/etc/apt`-Fall stoppt nicht mehr),
@@ -442,4 +542,5 @@ vorbei. Der Runner markiert die Dateien der Tür als Fokus `host-door`.
 - `apps/api/test/host-run-resume.test.ts`: API-Neustart während eines Laufs (Broker als Fakes),
   auch wenn die API zwischen Start und Startmarke starb (`hostRunRequestedAt`).
 - `apps/executor-broker/test/index.test.mjs`: `host.run`/`host.status`.
-- `test/vps-cockpit-deploy.test.sh`: Helfer und Resume-Unit in der Deploy-Tabelle, Unit aktiviert.
+- `test/vps-cockpit-deploy.test.sh`: Helfer und Resume-Unit in der Deploy-Tabelle, Unit aktiviert
+  (der VPS bekommt den Wochen-Timer der Systemsicherung nicht).

@@ -15,10 +15,15 @@
 //
 //   hoster-snapshot  VPS: das letzte borg-Backup jünger als 24 h, dann ein
 //                    Maschinen-Snapshot beim Hoster (cockpit-vps-snapshot).
-//   system-backup    physische Kiste (Lab0): RAID gesund, Ziel auf dem
-//                    eingehängten RAID, genug Platz, Aufräum-Dienst nicht
-//                    angehalten, dann eine Dateisicherung der Quellen per
-//                    rsync (--link-dest auf die vorige) mit fester Anzahl.
+//   system-backup    physische Kiste (Lab0, Entscheidung Jochen 02.10.2026):
+//                    RAID gesund, Ziel auf dem eingehängten RAID, genug Platz,
+//                    Aufräum-Dienst ohne Anomalie, dann ein borg-Archiv der
+//                    Quellen (unverschlüsselt, -x) im eigenen Repo <target>/repo,
+//                    daneben die Standalone-borg-Binary und NOTFALL.txt für das
+//                    Rescue-System. Aufbewahrung je Reihe: keepPreRun Vor-Lauf-
+//                    und keepWeekly Wochen-Archive (Timer
+//                    cockpit-systemsicherung.timer); geprunt wird nur in diesem
+//                    Repo und nur nach den eigenen Archivnamen.
 //
 // reboot (beide Netze, optional): onSite sagt, dass nur jemand vor Ort hilft,
 // wenn die Kiste nach einem Neustart nicht hochkommt; mustBeEnabled nennt
@@ -29,12 +34,17 @@ export const HOST_RUN_NET_VERSION = "cockpit-host-run-net/v1";
 export const HOST_RUN_NET_FILE = "host-run-net.json";
 
 export const SYSTEM_BACKUP_BOUNDS = Object.freeze({
-  keep: [1, 10],
+  keepPreRun: [1, 20],
+  keepWeekly: [1, 12],
   reserveGB: [0, 10000],
   timeoutSeconds: [600, 21600],
   sources: [1, 8],
   exclude: [0, 32],
 });
+
+// Nach dem Archiv: prune und compact, je höchstens so lange (Helfer und API
+// rechnen es in ihre Fristen ein).
+export const SYSTEM_BACKUP_UPKEEP_SECONDS = 1800;
 
 const DEFAULT_NET = Object.freeze({ version: HOST_RUN_NET_VERSION, net: "hoster-snapshot", systemBackup: null, retentionService: false, reboot: { onSite: false, mustBeEnabled: [] } });
 
@@ -82,7 +92,7 @@ function parseReboot(value) {
 
 function parseSystemBackup(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("systemBackup must be an object");
-  exactKeys(value, ["target", "mount", "raidDevice", "sources", "exclude", "keep", "reserveGB", "timeoutSeconds"], "systemBackup");
+  exactKeys(value, ["target", "mount", "raidDevice", "sources", "exclude", "keepPreRun", "keepWeekly", "reserveGB", "timeoutSeconds"], "systemBackup");
   const mount = cleanPath(value.mount);
   if (!mount || mount === "/") throw new Error("systemBackup.mount must be the absolute mount point of the backup disk (not /)");
   const target = cleanPath(value.target);
@@ -100,11 +110,12 @@ function parseSystemBackup(value) {
   });
   const exclude = value.exclude ?? [];
   if (!Array.isArray(exclude) || exclude.length > SYSTEM_BACKUP_BOUNDS.exclude[1] || !exclude.every((item) => typeof item === "string" && /^\/[^\n\0]{0,200}$/.test(item))) {
-    throw new Error("systemBackup.exclude must list at most 32 absolute rsync patterns");
+    throw new Error("systemBackup.exclude must list at most 32 absolute borg patterns");
   }
   return {
     target, mount, raidDevice: value.raidDevice, sources: cleanSources, exclude: [...exclude],
-    keep: integer(value.keep, SYSTEM_BACKUP_BOUNDS.keep, "systemBackup.keep"),
+    keepPreRun: integer(value.keepPreRun, SYSTEM_BACKUP_BOUNDS.keepPreRun, "systemBackup.keepPreRun"),
+    keepWeekly: integer(value.keepWeekly, SYSTEM_BACKUP_BOUNDS.keepWeekly, "systemBackup.keepWeekly"),
     reserveGB: integer(value.reserveGB, SYSTEM_BACKUP_BOUNDS.reserveGB, "systemBackup.reserveGB"),
     timeoutSeconds: integer(value.timeoutSeconds, SYSTEM_BACKUP_BOUNDS.timeoutSeconds, "systemBackup.timeoutSeconds"),
   };
@@ -146,7 +157,7 @@ export function describeHostRunNet(net) {
   if (net.net === "system-backup") {
     const backup = net.systemBackup;
     return {
-      summary: `the RAID ${backup.raidDevice} must be healthy, the backup disk ${backup.mount} mounted with enough space${net.retentionService ? ", the backup retention service not halted" : ""}, then the runner copies ${backup.sources.join(", ")} as a file-level system backup to ${backup.target} (rsync, the last ${backup.keep} kept). There is no machine snapshot: restoring that backup means booting a live system on site; a file copy of a running system is not crash-consistent for databases`,
+      summary: `the RAID ${backup.raidDevice} must be healthy, the backup disk ${backup.mount} mounted with enough space${net.retentionService ? ", the backup retention service not halted" : ""}, then the runner creates a borg archive of ${backup.sources.join(", ")} (unencrypted, one file system each) in its own repository ${backup.target}/repo on the RAID (the last ${backup.keepPreRun} pre-run archives and ${backup.keepWeekly} weekly archives kept). There is no machine snapshot: restoring that system backup means booting a rescue system on site (NOTFALL.txt and a standalone borg binary lie next to the repository); a backup of a running system is not crash-consistent for databases`,
       reboot,
     };
   }

@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { createHash, createHmac } from "node:crypto";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,6 +19,8 @@ const GUARD = fileURLToPath(new URL("../../../deploy/helpers/cockpit-backup-guar
 // Der Riegel importiert die Grenzen des Aufräum-Diensts; installiert liegen beide nebeneinander.
 const RETENTION_RULES = fileURLToPath(new URL("../../../deploy/helpers/cockpit-borg-retention-rules.mjs", import.meta.url));
 const NET = fileURLToPath(new URL("../../../deploy/helpers/cockpit-host-run-net.mjs", import.meta.url));
+// Die Notfall-Anleitung der Systemsicherung; installiert liegt sie neben dem Helfer.
+const NOTFALL = fileURLToPath(new URL("../../../deploy/lab0/cockpit-systemsicherung-NOTFALL.txt", import.meta.url));
 const SECRET = "test-envelope-secret-0123456789";
 const HOSTER_SECRET = "hoster-client-secret-abcdef";
 
@@ -40,7 +42,8 @@ function hookEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
     HOST_RUN_BORG_STATUS: path.join(dir, "borg-status"),
     HOST_RUN_SNAPSHOT: path.join(dir, "snapshot"),
     HOST_RUN_BOOT_ID_FILE: path.join(dir, "boot_id"),
-    HOST_RUN_RSYNC: path.join(dir, "rsync"),
+    HOST_RUN_BORG: path.join(dir, "borg"),
+    HOST_RUN_LSBLK: path.join(dir, "lsblk"),
     HOST_RUN_MDSTAT: path.join(dir, "mdstat"),
     HOST_RUN_MOUNTINFO: path.join(dir, "mountinfo"),
     HOST_RUN_RETENTION_STATUS: path.join(dir, "retention-status"),
@@ -95,6 +98,7 @@ beforeEach(() => {
   copyFileSync(GUARD, path.join(dir, "cockpit-backup-guard.mjs"));
   copyFileSync(RETENTION_RULES, path.join(dir, "cockpit-borg-retention-rules.mjs"));
   copyFileSync(NET, path.join(dir, "cockpit-host-run-net.mjs"));
+  copyFileSync(NOTFALL, path.join(dir, "cockpit-systemsicherung-NOTFALL.txt"));
   mkdirSync(path.join(dir, "etc"));
   write(path.join(dir, "etc", "api.env"), `COCKPIT_EXECUTION_ENVELOPE_SECRET=${SECRET}\n`, 0o600);
   write(path.join(dir, "etc", "contabo.env"), `CONTABO_CLIENT_SECRET=${HOSTER_SECRET}\n`, 0o600);
@@ -440,19 +444,24 @@ describe("cockpit-host-run: door", () => {
   });
 });
 
-// The net of a physical box (Lab0): RAID, mounted backup disk, space, the
-// retention service, then a file-level system backup with rsync. rsync, the
-// retention status, /proc/mdstat and mountinfo are stubs; the helper starts
-// rsync and the status with a clean environment, so those stubs take their
-// directory from their own text and their switches from files.
+// The net of a physical box (Lab0, Jochen's decision of 02.10.2026): RAID,
+// mounted backup disk, space, the retention service, then a borg archive in
+// the door's own repository on the RAID, the standalone binary and NOTFALL.txt
+// next to it, and retention per series only by the door's own archive names.
+// borg, lsblk, the retention status, /proc/mdstat and mountinfo are stubs; the
+// helper starts them with a clean environment, so those stubs take their
+// directory from their own text and their switches from files. The borg stub
+// keeps the archive names of a repository in <repo>/archives and prunes them
+// by --glob-archives/--keep-last like borg.
 describe("cockpit-host-run: net of a physical box (system-backup)", () => {
   let raid: string;
   let target: string;
+  let repo: string;
 
   function lab0Net(patch: Record<string, unknown> = {}, backupPatch: Record<string, unknown> = {}) {
     return {
       version: "cockpit-host-run-net/v1", net: "system-backup",
-      systemBackup: { target, mount: raid, raidDevice: "md0", sources: ["/proc"], exclude: ["/swap.img"], keep: 2, reserveGB: 0, timeoutSeconds: 600, ...backupPatch },
+      systemBackup: { target, mount: raid, raidDevice: "md0", sources: ["/proc"], exclude: ["/swap.img", "/home/jochen/Nextcloud"], keepPreRun: 2, keepWeekly: 3, reserveGB: 0, timeoutSeconds: 600, ...backupPatch },
       retentionService: true,
       reboot: { onSite: true, mustBeEnabled: [["wg-quick@wg0.service"], ["ssh.service", "ssh.socket"]] },
       ...patch,
@@ -461,13 +470,29 @@ describe("cockpit-host-run: net of a physical box (system-backup)", () => {
   function writeNet(value: unknown, mode = 0o644) {
     write(path.join(dir, "etc", "host-run-net.json"), JSON.stringify(value), mode);
   }
-  function backups() {
-    return existsSync(target) ? readdirSync(target).sort() : [];
+  function borgCalls(verb?: string) {
+    const file = path.join(dir, "borg-calls.log");
+    const calls = existsSync(file) ? readFileSync(file, "utf8").trim().split("\n") : [];
+    return verb ? calls.filter((line) => line.startsWith(`${verb} `)) : calls;
+  }
+  function archives() {
+    const file = path.join(repo, "archives");
+    return existsSync(file) ? readFileSync(file, "utf8").trim().split("\n").filter(Boolean) : [];
+  }
+  function seedRepo(names: string[]) {
+    mkdirSync(repo, { recursive: true });
+    writeFileSync(path.join(target, ".cockpit-systemsicherung"), "");
+    writeFileSync(path.join(repo, "config"), "[repository]\n");
+    writeFileSync(path.join(repo, "archives"), names.map((name) => `${name}\n`).join(""));
+  }
+  function weekly(extra: Record<string, string> = { COCKPIT_SYSTEM_BACKUP_IN_UNIT: "1" }) {
+    return run(["weekly-backup"], "", extra);
   }
 
   beforeEach(() => {
     raid = path.join(dir, "raid");
     target = path.join(raid, "lab0-systemsicherung");
+    repo = path.join(target, "repo");
     mkdirSync(raid);
     write(path.join(dir, "mdstat"), [
       "Personalities : [raid6] [raid5] [raid4]",
@@ -481,14 +506,28 @@ describe("cockpit-host-run: net of a physical box (system-backup)", () => {
       "30 26 8:1 / /boot rw,relatime shared:2 - ext4 /dev/sde2 rw",
       `40 26 9:0 / ${raid} rw,relatime shared:3 - ext4 /dev/md0 rw`,
     ].join("\n"), 0o644);
-    write(path.join(dir, "rsync"), [
+    write(path.join(dir, "borg"), [
       "#!/bin/bash",
-      `printf '%s\\n' "$*" >> "${dir}/rsync.log"`,
+      `D="${dir}"`,
+      "[ \"$1\" = --version ] && { cat \"$D/borg-version\" 2>/dev/null || echo 'borg.exe 1.4.1'; exit 0; }",
+      "printf '%s\\n' \"$*\" >> \"$D/borg-calls.log\"",
+      "[ \"$BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK\" = yes ] || { echo 'unencrypted repo access refused' >&2; exit 2; }",
+      "cmd=$1; shift",
       "for last; do :; done",
-      "mkdir -p \"$last\" && echo copied > \"$last/marker\"",
-      `[ -e "${dir}/rsync-rc" ] && exit "$(cat "${dir}/rsync-rc")"`,
-      "echo 'Number of files: 3'",
+      "[ -e \"$D/borg-$cmd-rc\" ] && exit \"$(cat \"$D/borg-$cmd-rc\")\"",
+      "case \"$cmd\" in",
+      "  init) mkdir -p \"$last\" && echo '[repository]' > \"$last/config\";;",
+      "  create) for a; do case \"$a\" in *::*) r=${a%%::*}; n=${a#*::};; esac; done",
+      "    echo \"$n\" >> \"$r/archives\"; echo \"Archive name: $n\";;",
+      "  prune) glob=; keep=; while [ $# -gt 0 ]; do case \"$1\" in --glob-archives) glob=$2; shift;; --keep-last=*) keep=${1#--keep-last=};; esac; shift; done",
+      "    [ -n \"$glob\" ] && [ -n \"$keep\" ] || { echo 'prune without glob or keep' >&2; exit 2; }",
+      "    prefix=${glob%\\*}; mine=$(grep -c \"^$prefix\" \"$last/archives\"); drop=$((mine - keep)); i=0",
+      "    : > \"$last/archives.new\"",
+      "    while read -r a; do if [[ $a == \"$prefix\"* ]]; then i=$((i + 1)); [ $i -le $drop ] && { echo \"Pruning archive: $a\"; continue; }; fi; echo \"$a\" >> \"$last/archives.new\"; done < \"$last/archives\"",
+      "    mv \"$last/archives.new\" \"$last/archives\";;",
+      "esac",
     ].join("\n"));
+    write(path.join(dir, "lsblk"), "#!/bin/bash\necho 'NAME TYPE FSTYPE UUID'\necho 'ubuntu--vg-ubuntu--lv lvm ext4 1111-root'\n");
     write(path.join(dir, "retention-status"), [
       "#!/bin/bash",
       "echo '== DATEN (cockpit-borg-retention/v1) =='",
@@ -497,7 +536,7 @@ describe("cockpit-host-run: net of a physical box (system-backup)", () => {
     writeNet(lab0Net());
   });
 
-  it("checks RAID, disk, space and the retention service, then backs up / instead of borg and the hoster snapshot", () => {
+  it("checks RAID, disk, space and the retention service, then makes a borg archive instead of borg status and the hoster snapshot", () => {
     expect(run(["start"], request(manifest())).code).toBe(0);
     const { state, logTail } = status();
     expect(state.status).toBe("success");
@@ -505,26 +544,124 @@ describe("cockpit-host-run: net of a physical box (system-backup)", () => {
     expect(state.borg).toBeNull();
     expect(existsSync(path.join(dir, "borg.log"))).toBe(false);
     expect(existsSync(path.join(dir, "snapshot.log"))).toBe(false);
-    const [name] = backups();
-    expect(name).toMatch(/^cockpit-run-\d{8}T\d{6}Z-job-1$/);
-    expect(state.systemBackup).toMatchObject({ path: path.join(target, name), linkedTo: null, removed: [] });
+    const [archive] = archives();
+    expect(archive).toMatch(/^vorlauf-\d{8}T\d{6}Z-job-1$/);
+    expect(state.systemBackup).toMatchObject({ path: `${repo}::${archive}`, repo, archive, series: "preRun", keep: 2, repoCreated: true, borgExit: 0, upkeepError: null });
     expect(state.net).toMatchObject({ net: "system-backup", onSite: true });
-    const args = readFileSync(path.join(dir, "rsync.log"), "utf8").trim();
-    expect(args).toBe(`-aHAXxR --numeric-ids --stats --exclude=/swap.img /proc ${path.join(target, name)}.partial/`);
+    // Unencrypted repository, one file system, the configured excludes, own series only.
+    expect(borgCalls()).toEqual([
+      `init --encryption=none ${repo}`,
+      `create --lock-wait 600 --one-file-system --numeric-ids --exclude-caches --compression zstd,3 --stats --show-rc --exclude /swap.img --exclude /home/jochen/Nextcloud ${repo}::${archive} /proc`,
+      `prune --lock-wait 600 --list --glob-archives vorlauf-* --keep-last=2 ${repo}`,
+      `compact --lock-wait 600 ${repo}`,
+    ]);
     expect(logTail).toContain("RAID md0 [4/4] [UUUU]");
-    expect(logTail).toContain("Number of files: 3");
+    expect(logTail).toContain("borg.exe 1.4.1");
+    expect(logTail).toContain(`Archive name: ${archive}`);
   });
 
-  it("links unchanged files to the last backup and keeps a fixed number", () => {
-    mkdirSync(target, { recursive: true });
-    for (const old of ["cockpit-run-20260901T010000Z-a", "cockpit-run-20260902T010000Z-b", "cockpit-run-20260903T010000Z-c", "cockpit-run-20260904T010000Z-crashed.partial", "handgemacht"]) mkdirSync(path.join(target, old));
-    expect(run(["start"], request(manifest())).code).toBe(0);
+  it("keeps root's directory private and puts the standalone binary, NOTFALL.txt and the disk layout next to the repository", () => {
+    mkdirSync(target, { mode: 0o755 });
+    run(["start"], request(manifest()));
+    expect(status().state.status).toBe("success");
+    expect(statSync(target).mode & 0o777).toBe(0o700);
+    expect(readdirSync(target).sort()).toEqual([".cockpit-systemsicherung", "NOTFALL.txt", "PLATTEN.txt", "borg", "repo"]);
+    expect(readFileSync(path.join(target, "borg"), "utf8")).toBe(readFileSync(path.join(dir, "borg"), "utf8"));
+    expect(statSync(path.join(target, "borg")).mode & 0o777).toBe(0o700);
+    const guide = readFileSync(path.join(target, "NOTFALL.txt"), "utf8");
+    expect(guide).not.toContain("{{");
+    expect(guide).toContain(`${target}/borg extract --numeric-ids --list`);
+    expect(guide).toContain(`${repo}::<ARCHIVNAME>`);
+    expect(guide).toContain("mdadm --assemble --scan");
+    expect(guide).toContain("grub-install");
+    expect(guide).toContain("cat /mnt/root/etc/fstab");
+    expect(statSync(path.join(target, "NOTFALL.txt")).mode & 0o777).toBe(0o600);
+    const layout = readFileSync(path.join(target, "PLATTEN.txt"), "utf8");
+    expect(layout).toContain("1111-root");
+    expect(layout).toContain("md0 : active raid5");
+  });
+
+  it("prunes only its own pre-run series in its own repository and never a foreign archive", () => {
+    mkdirSync(target);
+    seedRepo([
+      "vmd61162-2026-09-30T00:37:00", "vorlauf-20260901T010000Z-a", "woche-20260906T033000Z", "vorlauf-20260902T010000Z-b",
+      "woche-20260913T033000Z", "vorlauf-20260903T010000Z-c", "handgemacht",
+    ]);
+    run(["start"], request(manifest()));
     const { state } = status();
     expect(state.status).toBe("success");
-    expect(readFileSync(path.join(dir, "rsync.log"), "utf8")).toContain(`--link-dest=${path.join(target, "cockpit-run-20260903T010000Z-c")} `);
-    expect(state.systemBackup.removed).toEqual(["cockpit-run-20260901T010000Z-a", "cockpit-run-20260902T010000Z-b"]);
-    // keep 2: the last old one and the new one; a foreign directory is never touched.
-    expect(backups()).toEqual(["cockpit-run-20260903T010000Z-c", expect.stringMatching(/-job-1$/), "handgemacht"]);
+    expect(state.systemBackup.repoCreated).toBe(false);
+    expect(borgCalls("init")).toEqual([]);
+    // keepPreRun 2: the last old one and the new one; the weekly series and foreign archives stay.
+    expect(archives()).toEqual([
+      "vmd61162-2026-09-30T00:37:00", "woche-20260906T033000Z", "woche-20260913T033000Z", "vorlauf-20260903T010000Z-c", "handgemacht",
+      expect.stringMatching(/^vorlauf-\d{8}T\d{6}Z-job-1$/),
+    ]);
+    expect(status().logTail).toContain("Pruning archive: vorlauf-20260901T010000Z-a");
+  });
+
+  it("makes the weekly backup with the same checks, its own series and its own retention", () => {
+    mkdirSync(target);
+    seedRepo(["woche-20260906T033000Z", "vorlauf-20260901T010000Z-a", "woche-20260913T033000Z", "woche-20260920T033000Z", "vorlauf-20260902T010000Z-b", "vorlauf-20260903T010000Z-c"]);
+    const out = weekly();
+    expect(out.stderr).toBe("");
+    expect(out.code).toBe(0);
+    expect(out.stdout).toContain("RAID md0 [4/4] [UUUU]");
+    expect(borgCalls("prune")).toEqual([`prune --lock-wait 600 --list --glob-archives woche-* --keep-last=3 ${repo}`]);
+    // keepWeekly 3: two old weekly archives and the new one; pre-run archives untouched.
+    expect(archives()).toEqual([
+      "vorlauf-20260901T010000Z-a", "woche-20260913T033000Z", "woche-20260920T033000Z", "vorlauf-20260902T010000Z-b", "vorlauf-20260903T010000Z-c",
+      expect.stringMatching(/^woche-\d{8}T\d{6}Z$/),
+    ]);
+    // No host run was started for it.
+    expect(existsSync(path.join(dir, "units.log"))).toBe(false);
+  });
+
+  it.each([
+    ["outside its unit", () => {}, { COCKPIT_SYSTEM_BACKUP_IN_UNIT: "" }, 64, "only inside cockpit-systemsicherung.service"],
+    ["on a host with the VPS net", () => writeNet({ version: "cockpit-host-run-net/v1", net: "hoster-snapshot" }), undefined, 78, "the timer belongs only on a host with net system-backup"],
+    ["with a broken configuration", () => writeNet({ ...lab0Net(), keep: 3 }), undefined, 78, "unknown field keep"],
+    ["on a degraded RAID", () => writeFileSync(path.join(dir, "mdstat"), "md0 : active raid5 sdc1[2] sdb1[1] sda1[0]\n      2929890816 blocks [4/3] [UUU_]\n"), undefined, 70, "degraded [4/3] [UUU_]"],
+    ["with a halted retention service", () => writeFileSync(path.join(dir, "retention-halted"), ""), undefined, 70, "halted after an anomaly"],
+  ])("does not make the weekly backup %s", (_label, arrange, extra, code, message) => {
+    arrange();
+    const out = weekly(extra);
+    expect(out.code).toBe(code);
+    expect(out.stderr).toContain(message);
+    expect(borgCalls("create")).toEqual([]);
+  });
+
+  it("does not back up into a running host run", () => {
+    expect(run(["start"], request(manifest({ steps: [{ name: "reboot", reboot: true }] }))).code).toBe(0);
+    expect(status().state.phase).toBe("rebooting");
+    const out = weekly();
+    expect(out.code).toBe(75);
+    expect(out.stderr).toContain("host run job-1 is active");
+    expect(borgCalls("create")).toHaveLength(1);
+  });
+
+  it("does not start a host run while the weekly backup runs", () => {
+    const out = run(["start"], request(manifest()), { STUB_UNIT_STATE: "active" });
+    expect(out.code).toBe(75);
+    expect(out.stderr).toContain("the weekly system backup is running");
+    expect(borgCalls()).toEqual([]);
+    // The start lock is released: the next start goes through.
+    expect(existsSync(path.join(dir, "runs", ".start.lock"))).toBe(false);
+  });
+
+  it("ships the weekly timer for Lab0: the helper's verb in its own unit, weekly, catching up after boot", () => {
+    const unit = (name: string) => readFileSync(fileURLToPath(new URL(`../../../deploy/systemd/${name}`, import.meta.url)), "utf8");
+    const service = unit("cockpit-systemsicherung.service");
+    expect(service).toMatch(/^ExecStart=\/opt\/node-v20\.19\.1-linux-x64\/bin\/node \/usr\/local\/lib\/wireguard-ops-cockpit\/cockpit-host-run\.mjs weekly-backup$/m);
+    expect(service).toMatch(/^Environment=COCKPIT_SYSTEM_BACKUP_IN_UNIT=1$/m);
+    expect(service).toMatch(/^Type=oneshot$/m);
+    expect(service).toMatch(/^RequiresMountsFor=\/media\/RAID$/m);
+    const timer = unit("cockpit-systemsicherung.timer");
+    expect(timer).toMatch(/^OnCalendar=Sun \*-\*-\* 03:30:00$/m);
+    expect(timer).toMatch(/^Persistent=true$/m);
+    expect(timer).toMatch(/^WantedBy=timers\.target$/m);
+    // The VPS has no system backup: its deploy script does not install the timer.
+    expect(readFileSync(fileURLToPath(new URL("../../../deploy/vps/vps-cockpit-deploy.sh", import.meta.url)), "utf8")).not.toContain("cockpit-systemsicherung");
   });
 
   it.each([
@@ -535,6 +672,13 @@ describe("cockpit-host-run: net of a physical box (system-backup)", () => {
     ["a halted retention service", () => writeFileSync(path.join(dir, "retention-halted"), ""), "halted after an anomaly (0123456789abcdef)"],
     ["too little space", () => writeNet(lab0Net({}, { reserveGB: 10000 })), "not enough space"],
     ["a missing source", () => writeNet(lab0Net({}, { sources: ["/proc", "/does-not-exist"] })), "backup source /does-not-exist does not exist"],
+    ["a missing standalone borg", () => rmSync(path.join(dir, "borg")), "standalone borg binary"],
+    ["a borg that is not 1.4", () => writeFileSync(path.join(dir, "borg-version"), "borg 1.2.8\n"), "is not borg 1.4.x (borg 1.2.8)"],
+    ["a borg others may write", () => chmodSync(path.join(dir, "borg"), 0o775), "not writable by group or others"],
+    ["a missing emergency guide", () => rmSync(path.join(dir, "cockpit-systemsicherung-NOTFALL.txt")), "emergency guide"],
+    ["a symlink as target", () => { mkdirSync(path.join(dir, "elsewhere")); symlinkSync(path.join(dir, "elsewhere"), target); }, "must be a directory owned by root"],
+    ["a foreign directory as target", () => { mkdirSync(path.join(target, "borg"), { recursive: true }); }, "was not created by the host door; it is never taken over"],
+    ["an old configuration with a single keep", () => writeNet({ ...lab0Net(), systemBackup: { ...lab0Net().systemBackup, keep: 3 } }), "unknown field keep"],
     ["an invalid configuration", () => writeNet({ ...lab0Net(), extra: true }), "unknown field extra"],
     ["a configuration others may write", () => writeNet(lab0Net(), 0o666), "owned by root and not writable"],
   ])("stops before any step on %s", (_label, arrange, message) => {
@@ -545,7 +689,7 @@ describe("cockpit-host-run: net of a physical box (system-backup)", () => {
     expect(state.error).toContain(message);
     expect(state.error).toContain("nothing was executed");
     expect(existsSync(path.join(dir, "step-one"))).toBe(false);
-    expect(existsSync(path.join(dir, "rsync.log"))).toBe(false);
+    expect(borgCalls()).toEqual([]);
     expect(existsSync(path.join(dir, "snapshot.log"))).toBe(false);
   });
 
@@ -567,37 +711,46 @@ describe("cockpit-host-run: net of a physical box (system-backup)", () => {
     expect(status().logTail).toContain("RAID md126 [4/4] [UUUU]");
   });
 
-  it("ends with a reason, not a crash, when the backup disk refuses a write", () => {
-    mkdirSync(raid, { recursive: true });
+  it("ends with a reason, not a crash, when the target is no directory", () => {
     writeFileSync(target, "not a directory");
     run(["start"], request(manifest()));
     const { state } = status();
     expect(state.status).toBe("preflight_failed");
-    expect(state.error).toContain("system backup:");
+    expect(state.error).toContain("must be a directory owned by root");
     expect(existsSync(path.join(dir, "step-one"))).toBe(false);
   });
 
-  it("stops before any step when rsync fails and leaves no half backup", () => {
-    writeFileSync(path.join(dir, "rsync-rc"), "23");
+  it("stops before any step when borg create fails", () => {
+    writeFileSync(path.join(dir, "borg-create-rc"), "2");
     run(["start"], request(manifest()));
     const { state } = status();
     expect(state.status).toBe("preflight_failed");
-    expect(state.error).toContain("rsync exit 23");
+    expect(state.error).toContain("borg exit 2");
     expect(existsSync(path.join(dir, "step-one"))).toBe(false);
-    expect(backups()).toEqual([]);
+    expect(borgCalls("prune")).toEqual([]);
   });
 
-  it("accepts files vanishing during the copy (rsync 24)", () => {
-    writeFileSync(path.join(dir, "rsync-rc"), "24");
+  it("accepts a borg warning (files changed while reading, exit 1)", () => {
+    writeFileSync(path.join(dir, "borg-create-rc"), "1");
     run(["start"], request(manifest()));
-    expect(status().state.status).toBe("success");
+    expect(status().state).toMatchObject({ status: "success", systemBackup: { borgExit: 1 } });
+  });
+
+  it("runs on with the complete archive when prune fails, and says so", () => {
+    writeFileSync(path.join(dir, "borg-prune-rc"), "2");
+    run(["start"], request(manifest()));
+    const { state, logTail } = status();
+    expect(state.status).toBe("success");
+    expect(state.systemBackup.upkeepError).toBe("borg prune failed (exit 2)");
+    expect(borgCalls("compact")).toEqual([]);
+    expect(logTail).toContain("warning: borg prune failed (exit 2); the new archive is complete");
   });
 
   it("needs no net for a declared read-only run, even with a broken configuration", () => {
     writeNet({ version: "nope" });
     run(["start"], request(manifest({ mutates: false })));
     expect(status().state.status).toBe("success");
-    expect(existsSync(path.join(dir, "rsync.log"))).toBe(false);
+    expect(borgCalls()).toEqual([]);
   });
 
   it("says before a reboot that only someone on site helps, and checks WireGuard and SSH come back", () => {
@@ -610,7 +763,7 @@ describe("cockpit-host-run: net of a physical box (system-backup)", () => {
     run(["resume"]);
     expect(status().state.status).toBe("success");
     // One system backup for the whole run, not one per boot.
-    expect(readFileSync(path.join(dir, "rsync.log"), "utf8").trim().split("\n")).toHaveLength(1);
+    expect(borgCalls("create")).toHaveLength(1);
   });
 
   it("does not start a run with a reboot when WireGuard would not come back", () => {
@@ -624,7 +777,7 @@ describe("cockpit-host-run: net of a physical box (system-backup)", () => {
     expect(existsSync(path.join(dir, "reboot.log"))).toBe(false);
   });
 
-  it("does not reboot when a step disabled SSH on the way", () => {
+  it("does not reboot when a step disabled SSH on the way, and names the archive as return path", () => {
     run(["start"], request(manifest({ steps: [
       { name: "upgrade", run: `touch ${dir}/disabled-ssh.service ${dir}/disabled-ssh.socket`, timeoutSeconds: 30 },
       { name: "reboot", reboot: true },
@@ -637,7 +790,8 @@ describe("cockpit-host-run: net of a physical box (system-backup)", () => {
     expect(state.steps[1].status).toBe("failed");
     expect(existsSync(path.join(dir, "reboot.log"))).toBe(false);
     expect(existsSync(path.join(dir, "never"))).toBe(false);
-    expect(logTail).toContain("return path: system backup");
+    expect(logTail).toContain(`return path: system backup ${repo}::vorlauf-`);
+    expect(logTail).toContain("NOTFALL.txt");
   });
 
   it("keeps the VPS net when the configuration says so, with the boot check on top", () => {
@@ -648,6 +802,6 @@ describe("cockpit-host-run: net of a physical box (system-backup)", () => {
     rmSync(path.join(dir, "disabled-wg-quick@wg0.service"));
     run(["start"], request(manifest(), {}, "job-2"));
     expect(status("job-2").state).toMatchObject({ status: "success", snapshot: { snapshotId: "snap-42" } });
-    expect(existsSync(path.join(dir, "rsync.log"))).toBe(false);
+    expect(borgCalls()).toEqual([]);
   });
 });

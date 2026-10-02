@@ -38,10 +38,14 @@ function manifest(steps: unknown[]): HostRunManifest {
 const upgrade = manifest([{ name: "upgrade", run: "do-release-upgrade -f DistUpgradeViewNonInteractive" }, { name: "reboot", reboot: true }]);
 
 describe("parseHostRunNet", () => {
-  it("reads the shipped files: Lab0 a system backup on the RAID, the VPS as before", () => {
+  it("reads the shipped files: Lab0 a borg system backup on the RAID as decided, the VPS as before", () => {
     const net = lab0();
     expect(net.net).toBe("system-backup");
-    expect(net.systemBackup).toMatchObject({ mount: "/media/RAID", target: "/media/RAID/lab0-systemsicherung", raidDevice: "md126", keep: 3 });
+    expect(net.systemBackup).toMatchObject({ mount: "/media/RAID", target: "/media/RAID/lab0-systemsicherung", raidDevice: "md126", sources: ["/", "/boot", "/boot/efi"], keepPreRun: 5, keepWeekly: 4 });
+    // Jochen's decision (02.10.2026): without caches, the Nextcloud sync folder and reloadable bulk data; Docker volumes stay.
+    expect(net.systemBackup?.exclude).toEqual(expect.arrayContaining(["/var/cache/*", "/home/jochen/Nextcloud", "/opt/android-workbench", "/var/lib/docker/overlay2", "/var/lib/docker/image"]));
+    expect(net.systemBackup?.exclude.some((pattern) => pattern.startsWith("/var/lib/docker/volumes"))).toBe(false);
+    expect(net.systemBackup?.exclude.some((pattern) => pattern.startsWith("/media/RAID"))).toBe(false); // -x keeps the RAID out
     expect(net.reboot).toEqual({ onSite: true, mustBeEnabled: [["wg-quick@wg0.service"], ["ssh.service", "ssh.socket"]] });
     expect(net.retentionService).toBe(true);
     const vps = parseHostRunNet(JSON.parse(readFileSync(CONFIG("host-run-net.vps.json"), "utf8")));
@@ -71,7 +75,10 @@ describe("parseHostRunNet", () => {
     ["a source on the backup disk", backup({ sources: ["/media/RAID/backup_VServer"] }), "lies on the backup disk"],
     ["a relative source", backup({ sources: ["etc"] }), "not an absolute path"],
     ["no RAID array", backup({ raidDevice: "/dev/sda" }), "md array"],
-    ["keep 0", backup({ keep: 0 }), "keep must be an integer from 1 to 10"],
+    ["keepPreRun 0", backup({ keepPreRun: 0 }), "keepPreRun must be an integer from 1 to 20"],
+    ["keepWeekly 13", backup({ keepWeekly: 13 }), "keepWeekly must be an integer from 1 to 12"],
+    ["no weekly retention", backup({ keepWeekly: undefined }), "keepWeekly must be an integer"],
+    ["the old single keep", backup({ keep: 3 }), "unknown field keep"],
     ["an endless time limit", backup({ timeoutSeconds: 100000 }), "timeoutSeconds"],
     ["a unit name with a command", { ...base, reboot: { onSite: true, mustBeEnabled: [["ssh.service; reboot"]] } }, "unit names"],
     ["a system backup on the VPS net", { ...base, net: "hoster-snapshot" }, "systemBackup belongs to net system-backup"],
@@ -100,7 +107,9 @@ describe("loadHostRunNet (API side)", () => {
 describe("what the door says on Lab0", () => {
   it("tells the doorkeeper about the system backup and the reboot of a physical host", () => {
     const { prompt } = buildHostRunReviewPrompt(upgrade, { net: lab0(), nonce: "n" });
-    expect(prompt).toContain("file-level system backup to /media/RAID/lab0-systemsicherung");
+    expect(prompt).toContain("borg archive of /, /boot, /boot/efi (unencrypted, one file system each) in its own repository /media/RAID/lab0-systemsicherung/repo");
+    expect(prompt).toContain("the last 5 pre-run archives and 4 weekly archives kept");
+    expect(prompt).toContain("booting a rescue system on site (NOTFALL.txt");
     expect(prompt).toContain("There is no machine snapshot");
     expect(prompt).not.toContain("machine snapshot at the hoster");
     expect(prompt).toContain("only someone on site can help");
@@ -129,11 +138,12 @@ describe("what the door says on Lab0", () => {
 
   it("tells the planner, and names the system backup in the result", () => {
     const contract = hostRunPlannerContract(lab0());
-    expect(contract).toContain("file-level system backup");
+    expect(contract).toContain("borg archive");
     expect(contract).toContain("only someone on site can help");
     expect(contract).not.toContain("younger than 24 h");
-    const result = parseHostRunStatus(JSON.stringify({ ok: true, state: { phase: "finished", status: "failed", error: "step 1 exited 1", steps: [], checks: [], systemBackup: { path: "/media/RAID/lab0-systemsicherung/cockpit-run-20261002T120000Z-j1" } }, logTail: "" }));
-    expect(result.systemBackupPath).toBe("/media/RAID/lab0-systemsicherung/cockpit-run-20261002T120000Z-j1");
-    expect(hostRunResultText(upgrade, result)).toContain("system backup /media/RAID/lab0-systemsicherung/cockpit-run-20261002T120000Z-j1 (file level, restore on site only with operator approval)");
+    const archive = "/media/RAID/lab0-systemsicherung/repo::vorlauf-20261002T120000Z-j1";
+    const result = parseHostRunStatus(JSON.stringify({ ok: true, state: { phase: "finished", status: "failed", error: "step 1 exited 1", steps: [], checks: [], systemBackup: { path: archive } }, logTail: "" }));
+    expect(result.systemBackupPath).toBe(archive);
+    expect(hostRunResultText(upgrade, result)).toContain(`system backup ${archive} (borg archive, restore on site from a rescue system only with operator approval)`);
   });
 });

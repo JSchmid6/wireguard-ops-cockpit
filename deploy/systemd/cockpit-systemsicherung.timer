@@ -1,0 +1,14 @@
+# Wöchentlich, damit es eine Systemsicherung gibt, auch wenn lange kein
+# verändernder Lauf durch die Tür kommt. Sonntags früh: nach dem nächtlichen
+# Backup des VPS, vor dem Aufräum-Dienst (täglich 06:00); Persistent holt
+# einen verpassten Lauf nach dem Hochfahren nach.
+[Unit]
+Description=Cockpit: wöchentliche Systemsicherung aufs RAID
+
+[Timer]
+OnCalendar=Sun *-*-* 03:30:00
+Persistent=true
+RandomizedDelaySec=0
+
+[Install]
+WantedBy=timers.target

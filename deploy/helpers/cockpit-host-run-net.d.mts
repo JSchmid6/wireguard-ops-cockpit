@@ -5,7 +5,8 @@ export interface HostRunSystemBackup {
   raidDevice: string;
   sources: string[];
   exclude: string[];
-  keep: number;
+  keepPreRun: number;
+  keepWeekly: number;
   reserveGB: number;
   timeoutSeconds: number;
 }
@@ -18,7 +19,8 @@ export interface HostRunNet {
 }
 export declare const HOST_RUN_NET_VERSION: "cockpit-host-run-net/v1";
 export declare const HOST_RUN_NET_FILE: "host-run-net.json";
-export declare const SYSTEM_BACKUP_BOUNDS: Readonly<Record<"keep" | "reserveGB" | "timeoutSeconds" | "sources" | "exclude", [number, number]>>;
+export declare const SYSTEM_BACKUP_BOUNDS: Readonly<Record<"keepPreRun" | "keepWeekly" | "reserveGB" | "timeoutSeconds" | "sources" | "exclude", [number, number]>>;
+export declare const SYSTEM_BACKUP_UPKEEP_SECONDS: number;
 export declare function parseHostRunNet(value: unknown): HostRunNet;
 export declare function defaultHostRunNet(): HostRunNet;
 export declare function describeHostRunNet(net: HostRunNet | null): { summary: string; reboot: string };
