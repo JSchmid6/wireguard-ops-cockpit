@@ -217,7 +217,9 @@ Absturz), meldet `status` den Lauf als gescheitert.
 ## 4. Netz darunter
 
 Welches Netz unter der Tür liegt, stellt jede Kiste in einer root-eigenen Datei ein:
-`/etc/wireguard-ops-cockpit/host-run-net.json` (root, 0644). Umgebungsvariablen gibt es dafür
+`/etc/wireguard-ops-cockpit/host-run-net.json` (root, 0644; der Ordner
+`/etc/wireguard-ops-cockpit` root, 0755 — geprüft werden nur Eigentümer und Rechte der Datei,
+nicht die des Ordners). Umgebungsvariablen gibt es dafür
 nicht: sudo setzt sie zurück, und die Lauf-Unit bekommt nur `COCKPIT_HOST_RUN_IN_UNIT`. Form
 und Grenzen prüft `deploy/helpers/cockpit-host-run-net.mjs` (installiert neben dem Helfer); die
 Datei nennt nur Werte, nie Befehle. Der Helfer liest sie vor jedem Lauf mit `mutates: true`
@@ -267,10 +269,19 @@ Vor jedem verändernden Lauf, in dieser Reihenfolge (fehlt etwas, läuft kein Sc
 2. **Sicherungsplatte eingehängt:** `mount` steht in `/proc/self/mountinfo` und liegt auf einem
    anderen Gerät als `/`. Ohne diese Prüfung schriebe eine Sicherung bei nicht eingehängtem RAID
    die Root-Platte voll.
-3. **Quellen vorhanden** (`sources`, Vorschlag `/`, `/boot`, `/boot/efi`).
+3. **Quellen vorhanden** (`sources`, Vorschlag `/`, `/boot`, `/boot/efi`). Mit
+   `--one-file-system` steigt borg von `/` aus nicht in `/boot` oder `/boot/efi` ab, wenn das
+   eigene Dateisysteme sind — dann überlappt nichts. Liegt `/boot` dagegen auf `/`, steht es
+   zweimal im Archiv (rc 0, Auspacken korrekt; borg dedupliziert die Datenblöcke, doppelt sind
+   nur die Einträge). Ob `/boot` und `/boot/efi` auf Lab0 eigene Dateisysteme sind, ist nicht
+   geprüft (`findmnt /boot /boot/efi`, siehe unten); sonst die Quelle aus der Datei nehmen.
 4. **Standalone-borg da:** `/usr/local/lib/wireguard-ops-cockpit/borg-standalone` ist eine
    reguläre Datei, gehört root, ist für Gruppe und andere nicht schreibbar und meldet sich mit
-   `--version` als `borg 1.4.x` (die Standalone-Binary schreibt `borg.exe 1.4.x`). Mit genau
+   `--version` als borg 1.4.x. borg schreibt dabei den eigenen Dateinamen vor die Version, die
+   installierte Binary also `borg-standalone 1.4.5` (gemessen mit dem Release 1.4.5,
+   `borg-linux-glibc231-x86_64`); der Helfer prüft die erste Zeile auf diesen Dateinamen (oder
+   `borg`, `borg.exe`) und genau `1.4.x`. Passt sie nicht, steht im Log Pfad und Ausgabe, etwa
+   `… is not borg 1.4.x (borg-standalone 1.2.8)`. Mit genau
    dieser Binary sichert der Helfer, und eine Kopie legt er neben das Repo. Dazu die Vorlage der
    Notfall-Anleitung neben dem Helfer (`cockpit-systemsicherung-NOTFALL.txt`).
 5. **Sicherungsordner gehört der Tür:** `target` fehlt, ist leer, oder ist ein Verzeichnis, das
@@ -415,6 +426,7 @@ Die Einstellungsdatei installiert das Skript **nur, wenn sie fehlt** — sonst �
 Deploy die von Hand angepassten Werte (`keepPreRun`, `keepWeekly`, Ausschlüsse):
 
 ```bash
+install -d -m 0755 -o root -g root /etc/wireguard-ops-cockpit
 [ -e /etc/wireguard-ops-cockpit/host-run-net.json ] || install -m 644 -o root -g root "$COCKPIT_DIR/deploy/config/host-run-net.lab0.json" /etc/wireguard-ops-cockpit/host-run-net.json
 ```
 
@@ -426,7 +438,7 @@ mit `gpg --verify` gegen den Release-Schlüssel von borgbackup prüfen, dann:
 
 ```bash
 install -m 755 -o root -g root borg-linux-glibc231-x86_64 /usr/local/lib/wireguard-ops-cockpit/borg-standalone
-/usr/local/lib/wireguard-ops-cockpit/borg-standalone --version   # borg.exe 1.4.x
+/usr/local/lib/wireguard-ops-cockpit/borg-standalone --version   # borg-standalone 1.4.5 (bzw. die installierte 1.4.x)
 ```
 
 Vor dem ersten Lauf auf Lab0 von Hand prüfen und die Datei anpassen (diese Werte hat die Karte

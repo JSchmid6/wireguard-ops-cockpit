@@ -56,7 +56,7 @@
 // und die Units setzen nur COCKPIT_HOST_RUN_IN_UNIT.
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { appendFileSync, chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, statfsSync, writeFileSync, openSync, fsyncSync, closeSync } from "node:fs";
-import { dirname } from "node:path";
+import { basename, dirname } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -547,15 +547,24 @@ function borg(args, timeoutSeconds) {
 // einem laufenden System normal), ab 2 Fehler.
 function borgFailed(result) { return result.timedOut || result.code > 1; }
 
+// borg schreibt bei --version den eigenen Dateinamen und die Version, die
+// installierte Standalone-Binary also „borg-standalone 1.4.5“, ihre Kopie
+// neben dem Repo „borg 1.4.5“. Geprüft wird die erste Zeile: Name der Datei
+// (oder borg, borg.exe) und genau 1.4.x.
+function isBorg14(name, output) {
+  const match = /^(\S+) 1\.4\.\d+$/.exec(output.split("\n")[0].trim());
+  return Boolean(match) && [name, "borg", "borg.exe"].includes(match[1]);
+}
+
 // Die Binary gehört root, ist für niemand anderen schreibbar und meldet sich
-// als borg 1.4.x (die Standalone-Binary nennt sich borg.exe).
+// als borg 1.4.x.
 function borgBinary() {
   let info;
   try { info = lstatSync(BORG); } catch { return { ok: false, why: `the standalone borg binary ${BORG} is missing (doc/setup/host-run.md, section 4)` }; }
   if (!info.isFile() || info.uid !== process.getuid() || (info.mode & 0o022) !== 0) return { ok: false, why: `${BORG} must be a regular file owned by root and not writable by group or others` };
   const out = spawnSync(BORG, ["--version"], { encoding: "utf8", timeout: 120000, env: { PATH: STEP_PATH, LANG: "C.UTF-8", HOME: "/root" } });
   const version = (out.stdout || "").trim();
-  if (out.status !== 0 || !/^borg(?:\.exe)? 1\.4\.\d+/.test(version)) return { ok: false, why: `${BORG} is not borg 1.4.x (${version.slice(0, 80) || `exit ${out.status}`})` };
+  if (out.status !== 0 || !isBorg14(basename(BORG), version)) return { ok: false, why: `${BORG} is not borg 1.4.x (${version.slice(0, 80) || `exit ${out.status}`})` };
   return { ok: true, version: version.split("\n")[0] };
 }
 

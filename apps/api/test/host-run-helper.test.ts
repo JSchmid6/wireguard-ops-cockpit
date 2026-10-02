@@ -42,7 +42,7 @@ function hookEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
     HOST_RUN_BORG_STATUS: path.join(dir, "borg-status"),
     HOST_RUN_SNAPSHOT: path.join(dir, "snapshot"),
     HOST_RUN_BOOT_ID_FILE: path.join(dir, "boot_id"),
-    HOST_RUN_BORG: path.join(dir, "borg"),
+    HOST_RUN_BORG: path.join(dir, "borg-standalone"),
     HOST_RUN_LSBLK: path.join(dir, "lsblk"),
     HOST_RUN_MDSTAT: path.join(dir, "mdstat"),
     HOST_RUN_MOUNTINFO: path.join(dir, "mountinfo"),
@@ -506,10 +506,11 @@ describe("cockpit-host-run: net of a physical box (system-backup)", () => {
       "30 26 8:1 / /boot rw,relatime shared:2 - ext4 /dev/sde2 rw",
       `40 26 9:0 / ${raid} rw,relatime shared:3 - ext4 /dev/md0 rw`,
     ].join("\n"), 0o644);
-    write(path.join(dir, "borg"), [
+    write(path.join(dir, "borg-standalone"), [
+      // Like the real binary: borg prints its own file name, then the version.
       "#!/bin/bash",
       `D="${dir}"`,
-      "[ \"$1\" = --version ] && { cat \"$D/borg-version\" 2>/dev/null || echo 'borg.exe 1.4.1'; exit 0; }",
+      "[ \"$1\" = --version ] && { cat \"$D/borg-version\" 2>/dev/null || echo \"${0##*/} 1.4.5\"; exit 0; }",
       "printf '%s\\n' \"$*\" >> \"$D/borg-calls.log\"",
       "[ \"$BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK\" = yes ] || { echo 'unencrypted repo access refused' >&2; exit 2; }",
       "cmd=$1; shift",
@@ -556,7 +557,7 @@ describe("cockpit-host-run: net of a physical box (system-backup)", () => {
       `compact --lock-wait 600 ${repo}`,
     ]);
     expect(logTail).toContain("RAID md0 [4/4] [UUUU]");
-    expect(logTail).toContain("borg.exe 1.4.1");
+    expect(logTail).toContain("borg-standalone 1.4.5");
     expect(logTail).toContain(`Archive name: ${archive}`);
   });
 
@@ -566,7 +567,7 @@ describe("cockpit-host-run: net of a physical box (system-backup)", () => {
     expect(status().state.status).toBe("success");
     expect(statSync(target).mode & 0o777).toBe(0o700);
     expect(readdirSync(target).sort()).toEqual([".cockpit-systemsicherung", "NOTFALL.txt", "PLATTEN.txt", "borg", "repo"]);
-    expect(readFileSync(path.join(target, "borg"), "utf8")).toBe(readFileSync(path.join(dir, "borg"), "utf8"));
+    expect(readFileSync(path.join(target, "borg"), "utf8")).toBe(readFileSync(path.join(dir, "borg-standalone"), "utf8"));
     expect(statSync(path.join(target, "borg")).mode & 0o777).toBe(0o700);
     const guide = readFileSync(path.join(target, "NOTFALL.txt"), "utf8");
     expect(guide).not.toContain("{{");
@@ -672,9 +673,11 @@ describe("cockpit-host-run: net of a physical box (system-backup)", () => {
     ["a halted retention service", () => writeFileSync(path.join(dir, "retention-halted"), ""), "halted after an anomaly (0123456789abcdef)"],
     ["too little space", () => writeNet(lab0Net({}, { reserveGB: 10000 })), "not enough space"],
     ["a missing source", () => writeNet(lab0Net({}, { sources: ["/proc", "/does-not-exist"] })), "backup source /does-not-exist does not exist"],
-    ["a missing standalone borg", () => rmSync(path.join(dir, "borg")), "standalone borg binary"],
-    ["a borg that is not 1.4", () => writeFileSync(path.join(dir, "borg-version"), "borg 1.2.8\n"), "is not borg 1.4.x (borg 1.2.8)"],
-    ["a borg others may write", () => chmodSync(path.join(dir, "borg"), 0o775), "not writable by group or others"],
+    ["a missing standalone borg", () => rmSync(path.join(dir, "borg-standalone")), "standalone borg binary"],
+    ["a borg that is not 1.4", () => writeFileSync(path.join(dir, "borg-version"), "borg-standalone 1.2.8\n"), "is not borg 1.4.x (borg-standalone 1.2.8)"],
+    ["a borg with a look-alike version", () => writeFileSync(path.join(dir, "borg-version"), "borg-standalone 1.40.1\n"), "is not borg 1.4.x (borg-standalone 1.40.1)"],
+    ["a program that is not borg", () => writeFileSync(path.join(dir, "borg-version"), "restic 1.4.5\n"), "is not borg 1.4.x (restic 1.4.5)"],
+    ["a borg others may write", () => chmodSync(path.join(dir, "borg-standalone"), 0o775), "not writable by group or others"],
     ["a missing emergency guide", () => rmSync(path.join(dir, "cockpit-systemsicherung-NOTFALL.txt")), "emergency guide"],
     ["a symlink as target", () => { mkdirSync(path.join(dir, "elsewhere")); symlinkSync(path.join(dir, "elsewhere"), target); }, "must be a directory owned by root"],
     ["a foreign directory as target", () => { mkdirSync(path.join(target, "borg"), { recursive: true }); }, "was not created by the host door; it is never taken over"],
