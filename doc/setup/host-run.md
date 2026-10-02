@@ -143,11 +143,12 @@ Helfers) und jedes `cd`-Ziel aufgelöst.
 - Schreiben, Löschen, Verschieben in `/etc/borgmatic`, `/etc/borgmatic.d`, `/root/.config/borg`,
   `/root/.cache/borg`, `/root/.ssh`, den borgmatic-Units, `/usr/bin/borg*` — auch über einen
   Vorfahren bei Befehlen, die ganze Bäume treffen (`rm -rf /etc/b*`, `cd /etc && rm -rf *`,
-  `docker run -v /:/host`),
+  `docker run -v /:/host`, `git clean -fdx /etc`, `rm -rf /media` als Vorfahr des Repo-Pfads),
 - jede Zeile, die den Repo-Pfad (`/media/RAID`, `backup_VServer`), Lab0 (`10.0.0.5`, `lab0`)
   oder `timers.target` nennt und nicht nur liest,
 - `systemctl stop|disable|mask|edit …` an `borgmatic.timer`/`.service` (auch per Glob wie
-  `*.timer`), Paket entfernen, Cron-Eintrag herausfiltern (die Ausgabe eines Backup-Befehls
+  `*.timer`), `systemctl isolate|rescue|emergency` und `init`/`telinit` (halten alle Timer an),
+  Paket entfernen, Cron-Eintrag herausfiltern (die Ausgabe eines Backup-Befehls
   fließt in einen schreibenden Befehl).
 
 **Freigabe nötig (`uncertain`)** — der Text, der läuft, ist nicht der Text im Plan:

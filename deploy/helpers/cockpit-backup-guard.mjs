@@ -41,6 +41,7 @@ const PROTECTED = [
   "/lib/systemd/system/borgmatic.timer", "/lib/systemd/system/borgmatic.service",
   "/usr/lib/systemd/system/borgmatic.timer", "/usr/lib/systemd/system/borgmatic.service",
   "/usr/bin/borg", "/usr/bin/borgmatic", "/usr/local/sbin/cockpit-borg-action",
+  "/media/RAID/backup_VServer", // das Repo, falls es je eingehängt ist; macht /media zum Vorfahren
 ];
 const UNITS = ["borgmatic.timer", "borgmatic.service", "timers.target"];
 const ANCESTORS = [...new Set(PROTECTED.flatMap((item) => {
@@ -51,7 +52,7 @@ const DEFAULT_CWD = "/"; // cockpit-host-run startet jeden Schritt mit cwd "/"
 
 // Befehle, die einen ganzen Baum treffen: für sie zählt auch ein Vorfahr eines
 // geschützten Pfads (rm -rf /etc, mv /root …, docker -v /:/host).
-const BULK = new Set(["rm", "rmdir", "mv", "cp", "find", "cd", "pushd", "chroot", "mount", "umount", "rsync", "tar", "unzip", "docker", "podman", "systemd-nspawn", "nsenter", "chmod", "chown", "chgrp", "chattr", "setfacl", "shred"]);
+const BULK = new Set(["rm", "rmdir", "mv", "cp", "find", "cd", "pushd", "chroot", "mount", "umount", "rsync", "tar", "unzip", "docker", "podman", "systemd-nspawn", "nsenter", "chmod", "chown", "chgrp", "chattr", "setfacl", "shred", "git"]);
 const SHELLS = new Set(["sh", "bash", "dash", "zsh", "ksh", "ash", "mksh", "busybox"]);
 const INTERPRETERS = /^(?:python[\d.]*|perl[\d.]*|ruby[\d.]*|node|nodejs|php[\d.]*|lua[\d.]*|tclsh|Rscript|pwsh)$/;
 const REMOTE_SHELL = new Set(["ssh", "scp", "sftp", "sshfs", "autossh", "mosh", "sshpass", "rclone"]);
@@ -791,7 +792,10 @@ function checkSegment(text, { piped, quoted }, line, context, cwds, hit) {
   const touchesPath = targets.some((target) => !target.includes(OPAQUE) && [...cwds].some((cwd) => pathTouches(resolvePath(target, cwd), bulk)));
   const unitGlob = /^(?:systemctl|service|invoke-rc\.d|deb-systemd-invoke|update-rc\.d)$/.test(name)
     && command.args.some((arg) => GLOB.test(arg) && UNITS.some((unit) => globRegex(arg).test(unit)));
-  const touching = TOKEN.test(text) || touchesPath || unitGlob;
+  // Ein Wechsel des Ziels hält alle Timer an, auch borgmatic.timer.
+  const isolate = (name === "systemctl" && command.args.some((arg) => /^(?:isolate|rescue|emergency)$/.test(arg)))
+    || (/^(?:init|telinit)$/.test(name) && command.args.length > 0);
+  const touching = TOKEN.test(text) || touchesPath || unitGlob || isolate;
   const readOnly = readOnlyForm(strict, text);
   if (touching && !readOnly) {
     hit(line.id, "backup", `${name} touches the backups (borg repository, retention, borgmatic configuration or timer)`, code);
