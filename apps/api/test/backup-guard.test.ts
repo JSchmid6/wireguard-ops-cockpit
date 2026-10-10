@@ -176,6 +176,15 @@ const needsApproval: Array<[string, string]> = [
   ["brace with a slash under GitLab", "rm -rf /var/opt/gitlab/{backups/old,tmp}"],
   ["brace with a slash from /", "rm -rf /{tmp/a,var/backups/alt}"],
   ["delete command piped into a shell", "echo 'borg delete ::a' | bash"],
+  ["xargs into a protected directory", "ls /etc | xargs -I{} rm -rf /etc/{}"],
+  ["GitLab rotation idiom", "ls /var/opt/gitlab/backups | head -n -3 | xargs -I{} rm -f /var/opt/gitlab/backups/{}"],
+  ["brace hides the placeholder", "rm -rf /var/backups/{,{}}"],
+  ["retention piped into tee", "echo \"gitlab_rails['backup_keep_time'] = 3600\" | tee -a /etc/gitlab/gitlab.rb"],
+  ["delete text piped into install", "printf 'rm -rf /var/backups/*\\n' | install -m755 /dev/stdin /etc/cron.daily/wipe"],
+  ["delete text piped into dd", "printf 'rm -rf /var/backups/*\\n' | dd of=/etc/cron.d/x"],
+  ["logrotate hook", "cat > /etc/logrotate.d/x <<'EOF'\n/var/log/x { daily\n  postrotate\n    rm -rf /var/opt/gitlab/backups/*\n  endscript }\nEOF"],
+  ["gitlab.rb ruby", "cat >> /etc/gitlab/gitlab.rb <<'EOF'\nsystem(\"rm -rf /var/opt/gitlab/backups\")\nEOF"],
+  ["bashrc", "echo 'rm -rf /var/backups/*' >> /root/.bashrc"],
   ["GitLab retention appended", "echo \"gitlab_rails['backup_keep_time'] = 3600\" >> /etc/gitlab/gitlab.rb"],
   ["delete of a backup in python", "python3 -c 'import shutil; shutil.rmtree(\"/var/backups/hermes-umschalten\")'"],
 ];
@@ -205,7 +214,6 @@ const doorkeeperDecides: Array<[string, string]> = [
   ["retention helper through node", "/opt/node-v20.19.1-linux-x64/bin/node /usr/local/lib/wireguard-ops-cockpit/cockpit-borg-retention.mjs set 7 4 6 06:00"],
   ["docker run with a backup mount", "docker run --rm -v /var/backups:/b alpine ls /b"],
   ["rm with a variable target", "rm -rf \"$X\""],
-  ["xargs", "ls /etc | xargs -I{} rm -rf /etc/{}"],
   ["ssh to Lab0 that reads", "ssh borg@10.0.0.5 df -h /media/RAID"],
 ];
 

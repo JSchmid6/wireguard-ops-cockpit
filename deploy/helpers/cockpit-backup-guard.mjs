@@ -736,10 +736,11 @@ function phraseBolt(text) {
   return null;
 }
 
-// Dateien, deren Inhalt später läuft: Skripte, Cron, Units, Startdateien.
-const RUNNABLE = /^\/etc\/cron|^\/var\/spool\/cron|^\/(?:etc|run|usr\/lib|lib|usr\/local\/lib)\/systemd\/|^\/etc\/(?:rc\.local|profile|bash\.bashrc|init\.d\/|update-motd\.d\/|apt\/apt\.conf\.d\/)|\/s?bin\/|\.(?:sh|bash|py|pl|rb|php|service|timer)$/;
+// Reine Datendateien: Notizen, Logs, Tabellen. Jede andere Datei kann später
+// als root laufen (Skript, Cron, logrotate-Hook, gitlab.rb, udev, .bashrc …).
+const DATA_ONLY = /\.(?:md|txt|log|csv|tsv|json|ya?ml\.example)$|^\/var\/log\/|^\/run\/[^/]+\/[^/]+\.(?:json|txt|log)$/;
 function runnableTarget(path, context) {
-  return path.includes(OPAQUE) || path.includes("$") || context.executed.has(path) || RUNNABLE.test(path);
+  return context.executed.has(path) || !DATA_ONLY.test(path);
 }
 
 const pathTokens = (text) => (text.match(/(?:^|[\s=:'"(,])(\/[^\s;|&<>()`,:='"]*)/g) || []).map((token) => resolvePath(token.replace(/^[\s=:'"(,]/, ""), "/"));
@@ -837,7 +838,7 @@ function analyzeScript(prefix, text, context, hits, language = "shell") {
           if (result.name === "crontab") hit(line.id, "backup", "rewrites the crontab from output about the backups: that drops or changes their schedule", code);
           else hit(line.id, "mention", "output about the backups flows into a command that changes something", code);
         }
-        if (segment.piped && echoed && result.runsInput) hit(line.id, "backup", `${echoed} (text piped into ${result.name || "a command"})`, code);
+        if (segment.piped && echoed && (result.runsInput || (echoed.retention && !result.readOnly))) hit(line.id, "backup", `${echoed.reason} (text piped into ${result.name || "a command"})`, code);
         if (segment.piped && result.deletesFromInput && found.some((path) => touchesBolted(path))) hit(line.id, "backup", `${result.name} deletes what find lists in the backups`, code);
         touching ||= result.touching;
         nextEchoed ||= result.echoed;
@@ -927,7 +928,7 @@ function segmentBolt(text, command, name, readOnly, cwds, context, line) {
     const targets = redirectTargets(text).flatMap((target) => [...cwds].map((cwd) => resolvePath(target, cwd)));
     if (targets.length === 0) return null;
     if (RETENTION_PHRASE.test(text)) return "changes the retention of the backups";
-    if (targets.some((target) => runnableTarget(target, context))) { const phrase = phraseBolt(text); if (phrase) return phrase; }
+    if (targets.some((target) => runnableTarget(target, context))) { const phrase = codeBolt(text); if (phrase) return `text written into a file that can run: ${phrase.replace(/^code that /, "")}`; }
   } else if (!readOnly) {
     const phrase = phraseBolt(text);
     if (phrase) return phrase;
@@ -970,7 +971,7 @@ function segmentBolt(text, command, name, readOnly, cwds, context, line) {
   if (name === "dpkg" && args.some((arg) => /^(?:-r|-P|--remove|--purge)$/.test(arg)) && args.some((arg) => /borg/i.test(arg))) return "removes the backup software";
 
   // Pfade: löschen, überschreiben, schreiben.
-  const resolveAll = (list) => list.filter((target) => !target.includes(OPAQUE) && !target.includes("{}")).flatMap((target) => [...cwds].map((cwd) => resolvePath(target, cwd)));
+  const resolveAll = (list) => list.filter((target) => !target.includes(OPAQUE) && target !== "{}").map((target) => target.replaceAll("{}", "*")).flatMap((target) => [...cwds].map((cwd) => resolvePath(target, cwd)));
   const words = pathWords(args, name);
   const operands = args.filter((arg) => !arg.startsWith("-"));
   let deleted = [];
@@ -1130,10 +1131,11 @@ function checkSegment(text, { piped, quoted }, line, context, cwds, hit) {
   return {
     touching, readOnly, name,
     deletesFromInput: command.prefixes.includes("xargs") && (DELETERS.has(name) || name === "mv"),
-    runsInput: isShell || isInterpreter || /^(?:source|\.|at|batch|crontab|ssh|autossh|xargs)$/.test(name) || command.prefixes.includes("xargs")
-      || [...redirectTargets(text), ...(name === "tee" ? command.args.filter((arg) => !arg.startsWith("-")) : [])]
-        .flatMap((target) => [...cwds].map((cwd) => resolvePath(target, cwd))).some((target) => runnableTarget(target, context)),
-    echoed: ECHOES.has(name) ? phraseBolt(text) : null,
+    // Führt der Befehl seine Eingabe aus oder schreibt er sie dorthin, wo sie
+    // später laufen kann? Frei: Lesen, logger, tee/Umleitung nur in Datendateien.
+    runsInput: !readOnly && !ECHOES.has(name) && !(name === "tee" && command.args.filter((arg) => !arg.startsWith("-"))
+      .flatMap((target) => [...cwds].map((cwd) => resolvePath(target, cwd))).every((target) => !runnableTarget(target, context))),
+    echoed: ECHOES.has(name) && codeBolt(text) ? { reason: codeBolt(text), retention: RETENTION_PHRASE.test(text) } : null,
     found: name === "find" ? findStarts(command.args).filter((start) => !start.includes(OPAQUE)).flatMap((start) => [...cwds].map((cwd) => resolvePath(start, cwd))) : [],
   };
 }
