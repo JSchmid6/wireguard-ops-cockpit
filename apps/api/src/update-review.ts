@@ -157,6 +157,8 @@ export interface UpdateReviewOutcome {
   coverage: UpdateReviewCoverage[];
   answer?: UpdateReviewAnswer | null;
   reviewerError?: string | null;
+  // The engine that wrote the answer (agent broker), shown with the verdict.
+  reviewer?: string | null;
 }
 
 // Structurally identical to the plan policy in app.ts.
@@ -504,6 +506,7 @@ export function updateReviewFindings(outcome: UpdateReviewOutcome): { reasons: s
   const needed: string[] = [];
   const evidence = outcome.bindings.map((binding) =>
     `pre-install review of ${binding.sha.slice(0, 12)}: base ${binding.base.slice(0, 12)}, diff sha256 ${binding.diffSha256}`);
+  if (outcome.reviewer) evidence.push(`reviewer: ${outcome.reviewer}`);
   if (outcome.unavailable) {
     reasons.push(`the review input is unavailable (${outcome.unavailable.slice(0, 300)})`);
     evidence.push(`review input unavailable: ${outcome.unavailable.slice(0, 600)}`);
@@ -610,6 +613,7 @@ export function summarizeUpdateReview(diffs: UpdateDiff[], outcome: UpdateReview
     coverage: outcome.coverage,
     unavailable: outcome.unavailable || null,
     reviewerError: outcome.reviewerError || null,
+    reviewer: outcome.reviewer || null,
     verdict: outcome.answer?.verdict ?? null,
     problem: outcome.answer?.problem ?? null,
     findings: outcome.answer?.findings ?? [],

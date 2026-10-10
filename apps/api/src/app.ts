@@ -41,7 +41,7 @@ import {
   listDynamicRunbooks
 } from "./registries.js";
 import { generateRunbookSafetyReview, type SafetyReviewRunner } from "./safety-review.js";
-import { runBrokerAgent } from "./agent-broker.js";
+import { runBrokerAgent, runBrokerAgentReport, reviewerLabel, reviewerText, type ReviewerAnswer } from "./agent-broker.js";
 import { runDynamicCapability, runExecutorAction, type ExecutorActionKind } from "./executor-broker.js";
 import { borgStatusRequestDigest, createBorgStatusService } from "./borg-status.js";
 import { createRetentionService, decideRetentionChange, readApproval, retentionRequestDigest, retentionTarget } from "./borg-retention.js";
@@ -109,11 +109,12 @@ interface AppOptions {
   bootstrapUsers?: Array<{ username: string; password: string; role?: UserSummary["role"] }>;
   safetyReviewRunner?: SafetyReviewRunner;
   // The isolated reviewer of a self-update's code (prompt in, raw answer out).
-  // Defaults to the agent broker's safety role; tests inject a stub.
-  updateReviewRunner?: (prompt: string) => Promise<string>;
+  // Defaults to the agent broker's safety role; tests inject a stub. The
+  // answer may carry the engine that wrote it (shown with the verdict).
+  updateReviewRunner?: (prompt: string) => Promise<ReviewerAnswer>;
   // The doorkeeper of the general host door (prompt in, raw answer out).
   // Defaults to the agent broker's safety role; tests inject a stub.
-  hostRunReviewRunner?: (prompt: string) => Promise<string>;
+  hostRunReviewRunner?: (prompt: string) => Promise<ReviewerAnswer>;
   // Interval of host.status polls while a host run is going (tests shorten it).
   hostRunPollMs?: number;
   // The borg helper's status report (`borg.status`, read-only). Defaults to the
@@ -707,7 +708,7 @@ export async function createApp(options: AppOptions = {}) {
     safetyModel: config.safetyOpencodeModel,
     capabilityContract: hashCanonical(capabilityPlannerContract()),
     hostRunContract: hashCanonical(hostRunPlannerContract()),
-    brokerRoleContract: "ephemeral-role-workspace-v7",
+    brokerRoleContract: "ephemeral-role-workspace-v8-claude-cli",
     executorBoundaryContract: "dynamic-capability-v16-daemonless-kaniko",
   });
   if (config.nodeEnv === "production" && config.adminPassword === "change-me-now") {
@@ -1974,17 +1975,17 @@ export async function createApp(options: AppOptions = {}) {
   // The update reviewer gets the prompt unwrapped, like the plan safety review
   // (runIsolatedAgent would add the planner template). Without the agent
   // broker there is no isolated reviewer: the review fails closed.
-  const updateReviewRunner = options.updateReviewRunner || (async (prompt: string) => {
+  const updateReviewRunner = options.updateReviewRunner || (async (prompt: string): Promise<ReviewerAnswer> => {
     if (!config.agentBrokerSocket) throw new Error("the isolated reviewer needs the agent broker");
-    return await runBrokerAgent(config.agentBrokerSocket, "safety", prompt);
+    return await runBrokerAgentReport(config.agentBrokerSocket, "safety", prompt);
   });
 
   // The doorkeeper of the general host door: the same isolated safety role,
   // its own instructions (host-run.ts). Without the agent broker there is no
   // isolated reviewer, and the review is incomplete.
-  const hostRunReviewRunner = options.hostRunReviewRunner || (async (prompt: string) => {
+  const hostRunReviewRunner = options.hostRunReviewRunner || (async (prompt: string): Promise<ReviewerAnswer> => {
     if (!config.agentBrokerSocket) throw new Error("the isolated reviewer needs the agent broker");
-    return await runBrokerAgent(config.agentBrokerSocket, "safety", prompt);
+    return await runBrokerAgentReport(config.agentBrokerSocket, "safety", prompt);
   });
   const hostRunPollMs = options.hostRunPollMs ?? HOST_RUN_POLL_MS;
 
@@ -1997,7 +1998,9 @@ export async function createApp(options: AppOptions = {}) {
     outcome.reviewPath = path.join(proposalDir, `${jobId}-host-run-review.md`);
     await writeFile(outcome.reviewPath, material.prompt, { encoding: "utf-8", mode: 0o600 });
     try {
-      outcome.answer = verifyHostRunFindings(parseHostRunReviewAnswer(redactSecrets(await hostRunReviewRunner(material.prompt))), manifest);
+      const reviewed = await hostRunReviewRunner(material.prompt);
+      outcome.reviewer = reviewerLabel(reviewed);
+      outcome.answer = verifyHostRunFindings(parseHostRunReviewAnswer(redactSecrets(reviewerText(reviewed))), manifest);
     } catch (error) {
       outcome.reviewerError = error instanceof Error ? error.message : "reviewer failed";
     }
@@ -2085,7 +2088,9 @@ export async function createApp(options: AppOptions = {}) {
     await writeFile(reviewPath, prompt, { encoding: "utf-8", mode: 0o600 });
     const outcome: UpdateReviewOutcome = { kind, bindings: updateBindings(diffs), coverage };
     try {
-      outcome.answer = verifyQuotes(parseUpdateReviewAnswer(redactSecrets(await updateReviewRunner(prompt))), prompt);
+      const reviewed = await updateReviewRunner(prompt);
+      outcome.reviewer = reviewerLabel(reviewed);
+      outcome.answer = verifyQuotes(parseUpdateReviewAnswer(redactSecrets(reviewerText(reviewed))), prompt);
     } catch (error) {
       outcome.reviewerError = error instanceof Error ? error.message : "reviewer failed";
     }

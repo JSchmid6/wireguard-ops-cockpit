@@ -5,7 +5,7 @@ import path from "node:path";
 import type { ExecutionReview, ExecutionRiskClass, PlanReviewVerdict, RunbookDefinition } from "@wireguard-ops-cockpit/domain";
 import type { AppConfig } from "./config.js";
 import { SCRIPTS } from "./registries.js";
-import { runBrokerAgent } from "./agent-broker.js";
+import { describeEngine, runBrokerAgentReport } from "./agent-broker.js";
 
 type SafetyVerdict = Extract<PlanReviewVerdict, "passed" | "approval_required" | "blocked">;
 
@@ -54,6 +54,8 @@ interface CopilotReviewResult {
   completedAt: string;
   durationMs: number;
   model: string | null;
+  // Set only when an engine other than the Claude CLI wrote the review.
+  engineLabel?: string | null;
 }
 
 function resolveScriptPath(scriptIdOrPath: string, repoRoot: string): string {
@@ -211,10 +213,10 @@ export async function generateRunbookSafetyReview(
     return {
       actorId: "safety-agent",
       verdict: effectiveVerdict,
-      summary:
+      summary: `${runtimeResult.engineLabel ? `[${runtimeResult.engineLabel}] ` : ""}${
         effectiveVerdict === "approval_required" && parsed.verdict === "passed" && input.runbook.requiresApproval
           ? `${parsed.summary} Human approval stays mandatory because this runbook requests a privileged helper.`
-          : parsed.summary,
+          : parsed.summary}`,
       details: {
         schemaVersion: REVIEW_SCHEMA_VERSION,
         source: runtimeSource,
@@ -255,8 +257,13 @@ export async function generateRunbookSafetyReview(
 async function runBrokerSafetyReview(prompt: string, runtime: SafetyReviewRuntimeConfig): Promise<CopilotReviewResult> {
   const startedAt = new Date().toISOString();
   const started = Date.now();
-  const stdout = await runBrokerAgent(runtime.agentBrokerSocket!, "safety", prompt);
-  return { stdout, exitCode: 0, startedAt, completedAt: new Date().toISOString(), durationMs: Date.now() - started, model: runtime.opencodeModel };
+  const report = await runBrokerAgentReport(runtime.agentBrokerSocket!, "safety", prompt);
+  // The broker names the engine and model it actually ran; the API's own
+  // opencode model setting is only the fallback for an older broker.
+  return {
+    stdout: report.output, exitCode: 0, startedAt, completedAt: new Date().toISOString(), durationMs: Date.now() - started,
+    model: describeEngine(report.engine) ?? runtime.opencodeModel, engineLabel: report.engine?.etikett ?? null,
+  };
 }
 
 function buildPromptPayload(input: RunbookSafetyReviewInput) {
