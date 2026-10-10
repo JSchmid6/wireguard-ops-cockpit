@@ -431,6 +431,8 @@ export interface HostRunReviewOutcome {
   answer?: HostRunReviewAnswer | null;
   reviewerError?: string | null;
   reviewPath?: string | null;
+  // The engine that wrote the answer (agent broker), shown with the verdict.
+  reviewer?: string | null;
 }
 
 export interface HostRunPolicy {
@@ -459,7 +461,7 @@ function describeBackupHit(hit: BackupGuardHit): string {
 export function hostRunPolicy(manifest: HostRunManifest, outcome: HostRunReviewOutcome): HostRunPolicy {
   const zone = manifest.mutates ? "yellow" : "green";
   const backup = backupGuardHits(manifest);
-  const base = { rollbackAvailable: true, evidence: [`host-run manifest ${outcome.manifestHash.slice(0, 16)}: ${manifest.steps.length} step(s), ${manifest.checks.length} check(s), mutates ${manifest.mutates}`, `focus hits: ${outcome.focus.length}`, ...(backup.length ? [`backup bolt: ${backup.length} hit(s), operator approval required`] : [])] };
+  const base = { rollbackAvailable: true, evidence: [`host-run manifest ${outcome.manifestHash.slice(0, 16)}: ${manifest.steps.length} step(s), ${manifest.checks.length} check(s), mutates ${manifest.mutates}`, `focus hits: ${outcome.focus.length}`, ...(outcome.reviewer ? [`reviewer: ${outcome.reviewer}`] : []), ...(backup.length ? [`backup bolt: ${backup.length} hit(s), operator approval required`] : [])] };
   const backupEvidence = backup.slice(0, 12).map(describeBackupHit);
   const backupReason = backup.length ? `The run touches the backups (${backup.slice(0, 3).map((hit) => `${hit.where} ${hit.reason}`).join("; ").slice(0, 300)}); deleting backups or shortening their retention always needs the operator's approval.` : "";
   const incomplete = (why: string, evidence: string[] = []): HostRunPolicy => ({
@@ -511,6 +513,7 @@ export function hostRunSafetyRecord(manifest: HostRunManifest, outcome: HostRunR
       focus: outcome.focus,
       reviewPath: outcome.reviewPath ?? null,
       reviewerError: outcome.reviewerError ?? null,
+      reviewer: outcome.reviewer ?? null,
       verdict: outcome.answer?.verdict ?? null,
       problem: outcome.answer?.problem ?? null,
       findings: outcome.answer?.findings ?? [],

@@ -1,25 +1,30 @@
 import net from "node:net";
 import fs from "node:fs";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { createRunDir, reapOrphanedRuns, superviseRun, writeVerdict } from "./supervisor.mjs";
+import { engineFor, prepareEngine, readEngineConfig } from "./engines.mjs";
 
 const socketPath = process.env.COCKPIT_AGENT_BROKER_SOCKET || "/run/wireguard-ops-cockpit/agent.sock";
-const executable = process.env.COCKPIT_OPENCODE_EXECUTABLE || "opencode";
-const plannerModel = process.env.COCKPIT_OPENCODE_MODEL || "";
-const safetyModel = process.env.COCKPIT_SAFETY_OPENCODE_MODEL || plannerModel;
 const workspaceRoot = process.env.COCKPIT_AGENT_WORKSPACE_ROOT || "/var/lib/wireguard-ops-agent/sessions";
-const opencodeConfig = process.env.COCKPIT_OPENCODE_CONFIG || "/var/lib/wireguard-ops-agent/.config/opencode/opencode.jsonc";
 const contextRoot = new URL("../context/", import.meta.url);
 const staleWorkspaceAgeMs = 24 * 60 * 60 * 1000;
 const allowedRoles = new Set(["planner", "research", "runner", "safety", "verifier"]);
 // The safety role also reviews the diff of a Cockpit self-update (a bounded
-// excerpt, see apps/api/src/update-review.ts), so it gets a larger budget. The
-// prompt is one argv element of opencode: Linux caps a single argument at
-// 128 KiB (MAX_ARG_STRLEN), hence the byte bound.
+// excerpt, see apps/api/src/update-review.ts), so it gets a larger budget.
+// opencode receives the prompt as one argv element: Linux caps a single
+// argument at 128 KiB (MAX_ARG_STRLEN), hence the byte bound. Claude and
+// Codex read the prompt from stdin; the bound stays the same for every engine.
 const promptLimits = { safety: 100000 };
 const defaultPromptLimit = 30000;
 const promptByteLimit = 120000;
 const requestLineLimit = 1048576;
+// Wall-clock budget per role, preflight included; the API socket waits 15 s
+// longer (apps/api/src/agent-broker.ts): two 5 s kill graces plus margin.
+// Measured 2026-08-18 (deepseek-v4-pro): a 10-step read-only exploration took
+// almost five minutes, and a core+plugins update plus its backup can exceed ten
+// minutes without anything being wrong. The Claude measurements of 2026-10-10
+// (doc/setup/agent-claude-cli.md) stay well inside these budgets.
+export const ROLE_TIMEOUT_MS = { runner: 1800000, research: 120000, planner: 900000, safety: 900000, verifier: 900000 };
 
 export function validateRequest(value) {
   if (!value || typeof value !== "object") throw new Error("request must be an object");
@@ -51,73 +56,90 @@ export function cleanupStaleWorkspaces(root = workspaceRoot, now = Date.now()) {
   }
 }
 
+// Common contract + architecture + role contract. opencode reads it as the
+// workspace AGENTS.md; the Claude CLI does not read AGENTS.md on its own and
+// gets the same text through --append-system-prompt.
+export function roleContext(role) {
+  const common = fs.readFileSync(new URL("AGENTS.md", contextRoot), "utf8");
+  const architecture = fs.readFileSync(new URL("system-architecture.md", contextRoot), "utf8");
+  const instructions = fs.readFileSync(new URL(`${role}.md`, contextRoot), "utf8");
+  return `${common.trim()}\n\n${architecture.trim()}\n\n${instructions.trim()}\n`;
+}
+
 export function createSessionWorkspace(request, root = workspaceRoot) {
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   const workspace = fs.mkdtempSync(path.join(root, `agent-${request.requestId}-${request.role}-`));
   fs.chmodSync(workspace, 0o700);
-  const common = fs.readFileSync(new URL("AGENTS.md", contextRoot), "utf8");
-  const architecture = fs.readFileSync(new URL("system-architecture.md", contextRoot), "utf8");
-  const role = fs.readFileSync(new URL(`${request.role}.md`, contextRoot), "utf8");
-  fs.writeFileSync(path.join(workspace, "AGENTS.md"), `${common.trim()}\n\n${architecture.trim()}\n\n${role.trim()}\n`, { mode: 0o600 });
+  fs.writeFileSync(path.join(workspace, "AGENTS.md"), roleContext(request.role), { mode: 0o600 });
   return workspace;
 }
 
-export function runAgent(request) {
-  return new Promise((resolve) => {
-    const model = request.role === "planner" || request.role === "research" || request.role === "runner" ? plannerModel : safetyModel;
-    const opencodeAgent = request.role === "runner" ? "build" : "plan";
-    const args = ["run", "--auto", "--pure", "--agent", opencodeAgent, ...(model ? ["--model", model] : []), "--print-logs", request.prompt];
-    let workspace;
-    try {
-      workspace = createSessionWorkspace(request);
-    } catch (error) {
-      resolve({ ok: false, error: `agent workspace setup failed: ${error.message}` });
-      return;
+function publicEngine(verdict) {
+  return { antrieb: verdict.antrieb, modell: verdict.modell, cliVersion: verdict.cliVersion, etikett: verdict.etikett, lauf: verdict.lauf };
+}
+
+// One supervised run: preflight → own process group → events.jsonl → verdict
+// (lauf.json). Anything but "erfolg" is ok:false; the API treats that as no
+// review, so nothing is approved (fail closed). There is no silent fallback to
+// another engine.
+export async function runAgent(request, { config = readEngineConfig(), timeouts = ROLE_TIMEOUT_MS, graceMs } = {}) {
+  const started = Date.now();
+  const deadline = started + timeouts[request.role];
+  const runId = `${request.requestId}-${request.role}`.slice(0, 96);
+  const engineName = engineFor(request.role, config);
+  let runDir;
+  let workspace;
+  try {
+    runDir = createRunDir(config.runsRoot, runId);
+    workspace = createSessionWorkspace(request);
+  } catch (error) {
+    if (runDir) fs.rmSync(runDir, { recursive: true, force: true });
+    return { ok: false, error: `agent workspace setup failed: ${error.message}` };
+  }
+  let result;
+  try {
+    const prepared = await prepareEngine(request.role, request.prompt, roleContext(request.role), config, { workspace, runDir });
+    if (!prepared.ok) {
+      const ende = Date.now();
+      const verdict = {
+        lauf: runId, rolle: request.role, antrieb: engineName, modell: null, etikett: prepared.label || null, status: "nicht_verfuegbar", grund: prepared.grund,
+        exitCode: null, signal: null, start: new Date(started).toISOString(), ende: new Date(ende).toISOString(), dauerMs: ende - started, cliVersion: prepared.cliVersion || null,
+      };
+      writeVerdict(config.runsRoot, runDir, verdict);
+      result = {
+        ok: false, error: `agent engine ${engineName} not available: ${prepared.grund}; no review, nothing is approved`,
+        verdict: { status: verdict.status, grund: verdict.grund, dauerMs: verdict.dauerMs }, engine: publicEngine(verdict),
+      };
+    } else {
+      const run = await superviseRun({
+        runsRoot: config.runsRoot, runDir, runId, role: request.role, engine: prepared.engine, cwd: workspace, deadline, started,
+        ...(graceMs !== undefined ? { graceMs } : {}),
+      });
+      const { verdict } = run;
+      const summary = { status: verdict.status, grund: verdict.grund, dauerMs: verdict.dauerMs };
+      result = verdict.status === "erfolg"
+        ? { ok: true, exitCode: verdict.exitCode, output: run.output, error: null, verdict: summary, engine: publicEngine(verdict) }
+        : {
+          ok: false, exitCode: verdict.exitCode, verdict: summary, engine: publicEngine(verdict),
+          error: `agent engine ${verdict.antrieb} ${verdict.status}: ${verdict.grund}${verdict.antrieb === "opencode" && run.stderr ? `\n${run.stderr}` : ""}`,
+        };
     }
-    const child = spawn(executable, args, {
-      cwd: workspace,
-      env: {
-        HOME: process.env.HOME,
-        PATH: process.env.PATH,
-        DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY,
-        OPENCODE_CONFIG: opencodeConfig,
-        NODE_ENV: "production",
-      },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    const finish = (result) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (forceKillTimer) clearTimeout(forceKillTimer);
-      try { removeSessionWorkspace(workspace); }
-      catch (error) { result = { ok: false, error: `agent workspace cleanup failed: ${error.message}` }; }
-      resolve(result);
-    };
-    let forceKillTimer;
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      forceKillTimer = setTimeout(() => child.kill("SIGKILL"), 5000);
-    // Measured 2026-08-18: a 10-step read-only exploration with deepseek-v4-pro
-      // takes almost exactly five minutes, so the old 300s default killed every
-      // planning phase at the moment it finished exploring — the WordPress
-      // update died mid-handoff with "completed: []". The runner budget rises
-      // with it: a core+plugins update plus its backup can exceed ten minutes
-      // without anything being wrong.
-      }, request.role === "runner" ? 1800000 : request.role === "research" ? 120000 : 900000);
-    child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => { if (stdout.length < 2_000_000) stdout += chunk; });
-    child.stderr.on("data", (chunk) => { if (stderr.length < 200_000) stderr += chunk; });
-    child.on("error", (error) => finish({ ok: false, error: error.message }));
-    child.on("close", (code) => finish({ ok: code === 0, exitCode: code, output: stdout, error: code === 0 ? null : stderr.slice(-4000) }));
-  });
+  } catch (error) {
+    result = { ok: false, error: `agent run failed: ${error.message}` };
+    try {
+      if (!fs.existsSync(path.join(runDir, "lauf.json"))) {
+        writeVerdict(config.runsRoot, runDir, { lauf: runId, rolle: request.role, antrieb: engineName, status: "fehler", grund: `Broker-Fehler: ${error.message}`, start: new Date(started).toISOString(), ende: new Date().toISOString(), dauerMs: Date.now() - started, cliVersion: null });
+      }
+    } catch { /* the answer to the API already says fehler */ }
+  }
+  try { removeSessionWorkspace(workspace); }
+  catch (error) { result = { ok: false, error: `agent workspace cleanup failed: ${error.message}` }; }
+  return result;
 }
 
 if (process.env.NODE_ENV !== "test") {
   cleanupStaleWorkspaces();
+  await reapOrphanedRuns(readEngineConfig().runsRoot);
   try { fs.unlinkSync(socketPath); } catch (error) { if (error.code !== "ENOENT") throw error; }
   const server = net.createServer((connection) => {
     let input = ""; let handled = false;

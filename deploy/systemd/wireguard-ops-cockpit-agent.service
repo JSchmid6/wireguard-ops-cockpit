@@ -13,6 +13,22 @@ Environment=PATH=/opt/node-v20.19.1-linux-x64/bin:/usr/local/bin:/usr/bin:/bin
 Environment=COCKPIT_AGENT_BROKER_SOCKET=/run/cockpit-agent/agent.sock
 Environment=COCKPIT_AGENT_WORKSPACE_ROOT=/var/lib/wireguard-ops-agent/sessions
 Environment=COCKPIT_OPENCODE_CONFIG=/var/lib/wireguard-ops-agent/.config/opencode/opencode.jsonc
+# Engines (doc/setup/agent-claude-cli.md): planner/research/runner on the
+# Claude CLI (subscription); safety/verifier on another model family, today
+# DeepSeek/opencode (DEEPSEEK_API_KEY, COCKPIT_SAFETY_OPENCODE_MODEL in
+# agent.env), later Codex. Claude never reviews; the broker never falls back
+# to another engine: an unavailable engine answers "nicht verfuegbar" and
+# nothing is approved.
+Environment=COCKPIT_AGENT_ENGINE_WORK=claude
+Environment=COCKPIT_AGENT_ENGINE_REVIEW=opencode
+Environment=COCKPIT_AGENT_RUNS_ROOT=/var/lib/wireguard-ops-agent/runs
+Environment=COCKPIT_CLAUDE_EXECUTABLE=/usr/local/bin/claude
+Environment=COCKPIT_CLAUDE_CONFIG_DIR=/var/lib/wireguard-ops-agent/claude-config
+# Long-lived token of the broker's own identity (claude setup-token), never the
+# login of root or James: owner cockpit-agent, mode 0400, outside the repository.
+Environment=COCKPIT_CLAUDE_TOKEN_FILE=/etc/wireguard-ops-agent/claude-oauth-token
+Environment=COCKPIT_CLAUDE_REVIEW_MODEL=opus
+Environment=COCKPIT_CLAUDE_WORK_MODEL=sonnet
 EnvironmentFile=/etc/wireguard-ops-cockpit/agent.env
 RuntimeDirectory=cockpit-agent
 RuntimeDirectoryMode=0770

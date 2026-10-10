@@ -6,8 +6,12 @@ import path from "node:path";
 process.env.NODE_ENV = "test";
 process.env.COCKPIT_OPENCODE_EXECUTABLE = "/bin/true";
 process.env.COCKPIT_AGENT_WORKSPACE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-agent-run-"));
+process.env.COCKPIT_AGENT_RUNS_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-agent-runs-"));
 const { cleanupStaleWorkspaces, createSessionWorkspace, removeSessionWorkspace, runAgent, validateRequest } = await import("../src/index.mjs");
-test.after(() => fs.rmSync(process.env.COCKPIT_AGENT_WORKSPACE_ROOT, { recursive: true, force: true }));
+test.after(() => {
+  fs.rmSync(process.env.COCKPIT_AGENT_WORKSPACE_ROOT, { recursive: true, force: true });
+  fs.rmSync(process.env.COCKPIT_AGENT_RUNS_ROOT, { recursive: true, force: true });
+});
 test("agent broker accepts only bounded roles and prompts", () => {
   assert.deepEqual(validateRequest({ requestId: "12345678", role: "planner", prompt: "inspect" }), { requestId: "12345678", role: "planner", prompt: "inspect" });
   assert.deepEqual(validateRequest({ requestId: "12345678", role: "research", prompt: "inspect" }), { requestId: "12345678", role: "research", prompt: "inspect" });
@@ -51,7 +55,16 @@ test("startup cleanup removes stale bounded workspaces but preserves unrelated d
 });
 
 test("agent process exit removes its complete session workspace", async () => {
+  // The verifier runs on DeepSeek/opencode by default; a stand-in answers.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-fake-opencode-"));
+  const fake = path.join(dir, "opencode");
+  fs.writeFileSync(fake, "#!/bin/sh\n[ \"$1\" = --version ] && echo 1.0.0 || echo done\n", { mode: 0o755 });
+  const before = process.env.COCKPIT_OPENCODE_EXECUTABLE;
+  process.env.COCKPIT_OPENCODE_EXECUTABLE = fake;
   const result = await runAgent({ requestId: "87654321", role: "verifier", prompt: "verify" });
+  process.env.COCKPIT_OPENCODE_EXECUTABLE = before;
+  fs.rmSync(dir, { recursive: true, force: true });
   assert.equal(result.ok, true);
+  assert.match(result.engine.etikett, /DeepSeek\/opencode .*andere Modellfamilie als Claude/);
   assert.deepEqual(fs.readdirSync(process.env.COCKPIT_AGENT_WORKSPACE_ROOT), []);
 });
