@@ -1289,11 +1289,10 @@ export async function createApp(options: AppOptions = {}) {
   }
 
   function filterSensitiveContent(text: string): string {
-    // Remove API keys, tokens, passwords, and debug noise from output
-    return text
-      .replace(/sk-[a-zA-Z0-9]{20,}/g, "[REDACTED:API_KEY]")
-      .replace(/glpat-[a-zA-Z0-9_.-]{20,}/g, "[REDACTED:TOKEN]")
-      .replace(/eyJ[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,}/g, "[REDACTED:JWT]")
+    // Remove API keys, tokens, passwords, and debug noise from output. The
+    // token formats are redactSecrets' (update-review.ts), so the Claude
+    // setup token (sk-ant-oat01-…) is caught here as well.
+    return redactSecrets(text)
       .replace(/password[=:]\s*\S+/gi, "password=[REDACTED]")
       .replace(/passphrase[=:]\s*\S+/gi, "passphrase=[REDACTED]")
       .replace(/timestamp=.*level=.*/g, "")  // Remove debug log lines

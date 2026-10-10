@@ -163,8 +163,13 @@ Each run gets a directory `$COCKPIT_AGENT_RUNS_ROOT/<requestId>-<role>/` (0700):
 
 The engine's environment is only `HOME`, `PATH`, `CLAUDE_CONFIG_DIR`,
 `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`,
-`DISABLE_AUTOUPDATER=1` and the run marker. The token is never written to
-events, verdicts or logs.
+`DISABLE_AUTOUPDATER=1` and the run marker. The broker itself never writes
+the token to events, verdicts or logs. If the runner reads it anyway (token
+file or `/proc/<pid>/environ`, see the honest limit below), it is in that
+run's `events.jsonl` in plain text. On the API path the runner handoff, the
+verifier prompt and the stored job result go through `filterSensitiveContent`,
+which uses the token patterns of `redactSecrets` (`sk-ant-oat01-…` included):
+there it is redacted.
 
 ## Time limits
 
@@ -239,7 +244,8 @@ token.
   `0`).
 - **Honest limit**: the runner runs as the same OS user. With Bash it could
   read the token file or `/proc/<claude-pid>/environ`, and the output would
-  then be in `events.jsonl` and in its answer. Deny rules cannot lock Bash.
+  then be in `events.jsonl` and in its answer (the API redacts it from the
+  handoff, the verifier prompt and the job result). Deny rules cannot lock Bash.
   This is the same class of risk as the old `DEEPSEEK_API_KEY` in the opencode
   environment. The safeguards are the role prompt and the reviewed plan, and
   the runner never receives a free task. In a test, the runner refused an
