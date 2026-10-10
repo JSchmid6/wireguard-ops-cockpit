@@ -54,6 +54,7 @@ const free: Array<[string, string]> = [
   ["reading the configuration", "grep keep_daily /etc/borgmatic/config.yaml\ncp /etc/borgmatic/config.yaml /root/config.yaml.copy"],
   ["mentions in text output", "echo \"borg prune läuft nachts\"\necho \"keep_daily bleibt 7\"\nlogger \"borgmatic prune fertig\"\necho 'borg delete' | grep -c delete"],
   ["glob in another working directory", "cd /tmp/build && rm -f *.deb"],
+  ["heredoc printed to stdout", "cat <<'EOF'\nHinweis: borg prune läuft nachts über borgmatic\nEOF"],
   ["find -exec rm outside the backups", "find /var/log/app -name '*.gz' -mtime +30 -exec rm -f {} \\;\nfind /tmp -name '*.tmp' | xargs -I{} rm -f {}"],
   ["notes and logs that mention the backups", "cat > /root/NOTIZ.md <<'EOF'\nAlte Dumps unter /var/backups nie per rm löschen\nEOF\necho \"borgmatic: create, dann prune\" | tee -a /var/log/cockpit.log"],
 ];
@@ -176,6 +177,7 @@ const needsApproval: Array<[string, string]> = [
   ["brace with a slash under GitLab", "rm -rf /var/opt/gitlab/{backups/old,tmp}"],
   ["brace with a slash from /", "rm -rf /{tmp/a,var/backups/alt}"],
   ["delete command piped into a shell", "echo 'borg delete ::a' | bash"],
+  ["heredoc piped into a shell", "cat <<'EOF' | bash\nborg delete ::a\nEOF"],
   ["xargs into a protected directory", "ls /etc | xargs -I{} rm -rf /etc/{}"],
   ["GitLab rotation idiom", "ls /var/opt/gitlab/backups | head -n -3 | xargs -I{} rm -f /var/opt/gitlab/backups/{}"],
   ["brace hides the placeholder", "rm -rf /var/backups/{,{}}"],

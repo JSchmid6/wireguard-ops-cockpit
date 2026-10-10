@@ -879,7 +879,9 @@ function analyzeScript(prefix, text, context, hits, language = "shell") {
       if (remote && LAB0_HOST.test(remote.host) && REMOTE_DELETE.test(` ${bodyText}`)) hit(heredoc.line.id, "backup", `deletes on Lab0 (${remote.host}), the machine that holds the borg repository`, heredoc.line.raw);
       continue;
     }
-    const runnable = targets.length === 0 || Boolean(shebang) || targets.some((target) => runnableTarget(target, context));
+    // cat <<EOF ohne Umleitung und ohne Pipe gibt nur Text aus.
+    const printsOnly = targets.length === 0 && name === "cat" && !/\|/.test(heredoc.line.code);
+    const runnable = !printsOnly && (targets.length === 0 || Boolean(shebang) || targets.some((target) => runnableTarget(target, context)));
     for (const item of heredoc.body) {
       rawCheck(item.id, item.raw);
       const bolt = runnable ? codeBolt(item.raw) : (RETENTION_PHRASE.test(normalize(item.raw)) ? "changes the retention of the backups" : null);
