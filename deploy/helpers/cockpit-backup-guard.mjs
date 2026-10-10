@@ -579,7 +579,6 @@ function globRegex(glob) {
     if (char === "*") pattern += "[^/]*";
     else if (char === "?") pattern += "[^/]";
     else if (char === "[") { const end = glob.indexOf("]", i + 1); if (end < 0) pattern += "\\["; else { pattern += `[${glob.slice(i + 1, end).replace(/^!/, "^").replace(/\\/g, "\\\\")}]`; i = end; } }
-    else if (char === "{" && glob[i + 1] === "}") { pattern += "[^/]*"; i += 1; } // {} von xargs -I{} / find -exec: jeder Name
     else if (char === "{") { const end = glob.indexOf("}", i + 1); if (end < 0) pattern += "\\{"; else { pattern += `(?:${glob.slice(i + 1, end).split(",").map((alt) => alt.replace(/[.+^$()|\\]/g, "\\$&").replace(/\*/g, "[^/]*").replace(/\?/g, "[^/]")).join("|")})`; i = end; } }
     else pattern += char.replace(/[.+^$()|\\\]}]/g, "\\$&");
   }
@@ -591,7 +590,17 @@ const within = (path, root) => path === root || path.startsWith(root === "/" ? "
 // Berührt dieser (aufgelöste) Pfad die Backups? bulk: der Befehl trifft ganze
 // Bäume, dann zählt auch ein Vorfahr.
 // list: welche Orte zählen (Vorgabe: alles, was den Rückweg berührt).
+// {a,b/c} → a, b/c (auch verschachtelt, höchstens 64 Varianten).
+function expandBraces(path, limit = 64) {
+  const open = path.search(/\{[^{}]*,[^{}]*\}/);
+  if (open < 0) return [path];
+  const close = path.indexOf("}", open);
+  const variants = path.slice(open + 1, close).split(",").flatMap((alt) => expandBraces(path.slice(0, open) + alt + path.slice(close + 1), limit));
+  return variants.length > limit ? [path.slice(0, open) + "*" + path.slice(close + 1)] : variants;
+}
+
 function pathTouches(path, bulk, list = PROTECTED, ancestors = ANCESTORS) {
+  if (/\{[^{}]*,[^{}]*\}/.test(path)) return expandBraces(path).some((variant) => pathTouches(resolvePath(variant, "/"), bulk, list, ancestors));
   if (GLOB.test(path)) {
     // Ein Glob trifft einen geschützten Ort, wenn seine ersten Teile auf ihn
     // passen (dann liegt jeder Treffer darin), oder — bei Bäumen — wenn er auf
@@ -727,6 +736,12 @@ function phraseBolt(text) {
   return null;
 }
 
+// Dateien, deren Inhalt später läuft: Skripte, Cron, Units, Startdateien.
+const RUNNABLE = /^\/etc\/cron|^\/var\/spool\/cron|^\/(?:etc|run|usr\/lib|lib|usr\/local\/lib)\/systemd\/|^\/etc\/(?:rc\.local|profile|bash\.bashrc|init\.d\/|update-motd\.d\/|apt\/apt\.conf\.d\/)|\/s?bin\/|\.(?:sh|bash|py|pl|rb|php|service|timer)$/;
+function runnableTarget(path, context) {
+  return path.includes(OPAQUE) || path.includes("$") || context.executed.has(path) || RUNNABLE.test(path);
+}
+
 const pathTokens = (text) => (text.match(/(?:^|[\s=:'"(,])(\/[^\s;|&<>()`,:='"]*)/g) || []).map((token) => resolvePath(token.replace(/^[\s=:'"(,]/, ""), "/"));
 const namesUnit = (path) => path.split("/").some((part) => UNITS.some((unit) => part === unit || part === `${unit}.d`));
 
@@ -822,7 +837,7 @@ function analyzeScript(prefix, text, context, hits, language = "shell") {
           if (result.name === "crontab") hit(line.id, "backup", "rewrites the crontab from output about the backups: that drops or changes their schedule", code);
           else hit(line.id, "mention", "output about the backups flows into a command that changes something", code);
         }
-        if (segment.piped && echoed && !result.readOnly && !ECHOES.has(result.name)) hit(line.id, "backup", `${echoed} (text piped into ${result.name || "a command"})`, code);
+        if (segment.piped && echoed && result.runsInput) hit(line.id, "backup", `${echoed} (text piped into ${result.name || "a command"})`, code);
         if (segment.piped && result.deletesFromInput && found.some((path) => touchesBolted(path))) hit(line.id, "backup", `${result.name} deletes what find lists in the backups`, code);
         touching ||= result.touching;
         nextEchoed ||= result.echoed;
@@ -863,9 +878,10 @@ function analyzeScript(prefix, text, context, hits, language = "shell") {
       if (remote && LAB0_HOST.test(remote.host) && REMOTE_DELETE.test(` ${bodyText}`)) hit(heredoc.line.id, "backup", `deletes on Lab0 (${remote.host}), the machine that holds the borg repository`, heredoc.line.raw);
       continue;
     }
+    const runnable = targets.length === 0 || Boolean(shebang) || targets.some((target) => runnableTarget(target, context));
     for (const item of heredoc.body) {
       rawCheck(item.id, item.raw);
-      const bolt = codeBolt(item.raw);
+      const bolt = runnable ? codeBolt(item.raw) : (RETENTION_PHRASE.test(normalize(item.raw)) ? "changes the retention of the backups" : null);
       if (bolt) hit(item.id, "backup", `a file this run writes: ${bolt.replace(/^code that /, "")}`, item.raw);
       else if (TOKEN.test(normalize(item.raw)) || redirectOrPathTouches(normalize(item.raw))) hit(item.id, "mention", "a file this run writes names the backups", item.raw);
       const exec = item.raw.match(/^\s*Exec[A-Za-z]*\s*=\s*[-@:+!]*(.*)$/);
@@ -905,8 +921,14 @@ function segmentBolt(text, command, name, readOnly, cwds, context, line) {
   // Lesen ist nie Löschen. echo/printf/logger geben Text aus: ein Löschwort
   // darin zählt erst, wenn es in eine Datei geht (hier) oder in eine Pipe
   // (analyzeScript, am nächsten Befehl).
-  if (ECHOES.has(name) && redirectTargets(text).length === 0) return null;
-  if (!readOnly) {
+  if (ECHOES.has(name)) {
+    // Text in eine Datei: eine Aufbewahrung zählt immer (gitlab.rb, Konfig),
+    // ein Löschbefehl nur, wenn die Datei später läuft (Skript, Cron, Unit).
+    const targets = redirectTargets(text).flatMap((target) => [...cwds].map((cwd) => resolvePath(target, cwd)));
+    if (targets.length === 0) return null;
+    if (RETENTION_PHRASE.test(text)) return "changes the retention of the backups";
+    if (targets.some((target) => runnableTarget(target, context))) { const phrase = phraseBolt(text); if (phrase) return phrase; }
+  } else if (!readOnly) {
     const phrase = phraseBolt(text);
     if (phrase) return phrase;
   }
@@ -948,7 +970,7 @@ function segmentBolt(text, command, name, readOnly, cwds, context, line) {
   if (name === "dpkg" && args.some((arg) => /^(?:-r|-P|--remove|--purge)$/.test(arg)) && args.some((arg) => /borg/i.test(arg))) return "removes the backup software";
 
   // Pfade: löschen, überschreiben, schreiben.
-  const resolveAll = (list) => list.filter((target) => !target.includes(OPAQUE)).flatMap((target) => [...cwds].map((cwd) => resolvePath(target, cwd)));
+  const resolveAll = (list) => list.filter((target) => !target.includes(OPAQUE) && !target.includes("{}")).flatMap((target) => [...cwds].map((cwd) => resolvePath(target, cwd)));
   const words = pathWords(args, name);
   const operands = args.filter((arg) => !arg.startsWith("-"));
   let deleted = [];
@@ -977,7 +999,7 @@ function segmentBolt(text, command, name, readOnly, cwds, context, line) {
   // "alte Sicherungen" rm …) verschiebt das Befehlswort. Darum zählt auch ein
   // Löschbefehl weiter hinten in einem Befehl, der nicht nur liest.
   const later = words.length === 0 ? -1 : command.args.findIndex((arg) => DELETERS.has(baseName(arg)) || baseName(arg) === "mv");
-  if (later >= 0 && !DELETERS.has(name) && name !== "mv") deleted.push(...resolveAll(pathWords(command.args.slice(later + 1), "rm")));
+  if (later >= 0 && !DELETERS.has(name) && name !== "mv" && name !== "find") deleted.push(...resolveAll(pathWords(command.args.slice(later + 1), "rm")));
 
   if (deleted.some((path) => touchesBolted(path) || namesUnit(path))) return `${name} deletes or moves backups or their configuration`;
   if (overwritten.some((path) => touchesConfig(path) || touchesData(path, false) || namesUnit(path))) return `${name} overwrites backups or their configuration`;
@@ -1032,7 +1054,7 @@ function checkSegment(text, { piped, quoted }, line, context, cwds, hit) {
     const bolt = phraseBolt(text);
     if (bolt) hit(line.id, "backup", bolt, code);
     else if (TOKEN.test(text)) hit(line.id, "mention", "a value that names the backups", code);
-    return { touching: TOKEN.test(text), readOnly: true, name, deletesFromInput: false, echoed: null, found: [] };
+    return { touching: TOKEN.test(text), readOnly: true, name, deletesFromInput: false, runsInput: false, echoed: null, found: [] };
   }
 
   // Wer läuft? Ein dynamischer Name ist unsicher.
@@ -1040,7 +1062,7 @@ function checkSegment(text, { piped, quoted }, line, context, cwds, hit) {
     hit(line.id, "uncertain", "the command name is built at run time", code);
     const bolt = phraseBolt(text);
     if (bolt) hit(line.id, "backup", bolt, code);
-    return { touching: true, readOnly: false, name, deletesFromInput: false, echoed: null, found: [] };
+    return { touching: true, readOnly: false, name, deletesFromInput: false, runsInput: true, echoed: null, found: [] };
   }
   if (name === "alias" || name === "hash" && command.args.includes("-p") || name === "enable" && command.args.some((arg) => arg.startsWith("-f"))) {
     hit(line.id, "uncertain", `${name} changes what a command name runs`, code);
@@ -1108,6 +1130,9 @@ function checkSegment(text, { piped, quoted }, line, context, cwds, hit) {
   return {
     touching, readOnly, name,
     deletesFromInput: command.prefixes.includes("xargs") && (DELETERS.has(name) || name === "mv"),
+    runsInput: isShell || isInterpreter || /^(?:source|\.|at|batch|crontab|ssh|autossh|xargs)$/.test(name) || command.prefixes.includes("xargs")
+      || [...redirectTargets(text), ...(name === "tee" ? command.args.filter((arg) => !arg.startsWith("-")) : [])]
+        .flatMap((target) => [...cwds].map((cwd) => resolvePath(target, cwd))).some((target) => runnableTarget(target, context)),
     echoed: ECHOES.has(name) ? phraseBolt(text) : null,
     found: name === "find" ? findStarts(command.args).filter((start) => !start.includes(OPAQUE)).flatMap((start) => [...cwds].map((cwd) => resolvePath(start, cwd))) : [],
   };

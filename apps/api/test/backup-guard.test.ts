@@ -54,6 +54,8 @@ const free: Array<[string, string]> = [
   ["reading the configuration", "grep keep_daily /etc/borgmatic/config.yaml\ncp /etc/borgmatic/config.yaml /root/config.yaml.copy"],
   ["mentions in text output", "echo \"borg prune läuft nachts\"\necho \"keep_daily bleibt 7\"\nlogger \"borgmatic prune fertig\"\necho 'borg delete' | grep -c delete"],
   ["glob in another working directory", "cd /tmp/build && rm -f *.deb"],
+  ["find -exec rm outside the backups", "find /var/log/app -name '*.gz' -mtime +30 -exec rm -f {} \\;\nfind /tmp -name '*.tmp' | xargs -I{} rm -f {}"],
+  ["notes and logs that mention the backups", "cat > /root/NOTIZ.md <<'EOF'\nAlte Dumps unter /var/backups nie per rm löschen\nEOF\necho \"borgmatic: create, dann prune\" | tee -a /var/log/cockpit.log"],
 ];
 
 // Jede Form aus dem Auftrag, und Umwege, die der Text verdeckt.
@@ -89,7 +91,6 @@ const needsApproval: Array<[string, string]> = [
   ["relative from /", "rm -rf root/.config"],
   ["home", "rm -rf ~/.config/borg"],
   ["script the run writes", "cat > /tmp/x.sh <<'EOF'\nborg delete ::a\nEOF\nbash /tmp/x.sh"],
-  ["xargs", "ls /etc | xargs -I{} rm -rf /etc/{}"],
   ["mount point of the repo", "rm -rf /media"],
   ["git clean of an ancestor", "git clean -fdx /etc"],
   ["all timers stopped by a target switch", "systemctl isolate rescue.target"],
@@ -171,6 +172,11 @@ const needsApproval: Array<[string, string]> = [
   ["sed -i on a backup", "sed -i d /var/backups/apt.extended_states.0"],
   ["snapshot deleted with bundled curl flags", "curl -fsSX DELETE https://api.contabo.com/v1/compute/instances/1/snapshots/abc"],
   ["find piped into xargs rm", "find /var/backups -mtime +7 | xargs rm -f"],
+  ["brace with a slash", "rm -rf /var/{backups/alt,tmp/x}"],
+  ["brace with a slash under GitLab", "rm -rf /var/opt/gitlab/{backups/old,tmp}"],
+  ["brace with a slash from /", "rm -rf /{tmp/a,var/backups/alt}"],
+  ["delete command piped into a shell", "echo 'borg delete ::a' | bash"],
+  ["GitLab retention appended", "echo \"gitlab_rails['backup_keep_time'] = 3600\" >> /etc/gitlab/gitlab.rb"],
   ["delete of a backup in python", "python3 -c 'import shutil; shutil.rmtree(\"/var/backups/hermes-umschalten\")'"],
 ];
 
@@ -199,6 +205,7 @@ const doorkeeperDecides: Array<[string, string]> = [
   ["retention helper through node", "/opt/node-v20.19.1-linux-x64/bin/node /usr/local/lib/wireguard-ops-cockpit/cockpit-borg-retention.mjs set 7 4 6 06:00"],
   ["docker run with a backup mount", "docker run --rm -v /var/backups:/b alpine ls /b"],
   ["rm with a variable target", "rm -rf \"$X\""],
+  ["xargs", "ls /etc | xargs -I{} rm -rf /etc/{}"],
   ["ssh to Lab0 that reads", "ssh borg@10.0.0.5 df -h /media/RAID"],
 ];
 
