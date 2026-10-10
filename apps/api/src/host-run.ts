@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 
 import type { ExecutionReview } from "@wireguard-ops-cockpit/domain";
 
-import { backupGuardHits, type BackupGuardHit } from "../../../deploy/helpers/cockpit-backup-guard.mjs";
+import { backupGuardFocus, backupGuardHits, type BackupGuardHit } from "../../../deploy/helpers/cockpit-backup-guard.mjs";
 
 import { READABLE_PROTECTED_PATH } from "./capability-manifest.js";
 import { hashCanonical } from "./hermes-security.js";
@@ -28,12 +28,15 @@ import { redactSecrets } from "./update-review.js";
 //   safety net  the helper: borg backup younger than 24 h and a machine
 //               snapshot before any run that changes the system.
 //   backup bolt the one exception to "no approval as a rule" (Jochen,
-//               30.09.2026): a run that deletes backups or shortens their
-//               retention needs the operator's approval, even when the
-//               doorkeeper passes. deploy/helpers/cockpit-backup-guard.mjs
-//               decides deterministically; the helper asks it again.
+//               30.09.2026, narrowed 10.10.2026): a run that deletes backups,
+//               changes their retention or switches them off needs the
+//               operator's approval, even when the doorkeeper passes.
+//               deploy/helpers/cockpit-backup-guard.mjs decides
+//               deterministically; the helper asks it again. What the bolt
+//               cannot read or what only names the backups is focus for the
+//               doorkeeper (backup-focus), never an automatic stop.
 
-export { backupGuardHits, type BackupGuardHit };
+export { backupGuardFocus, backupGuardHits, type BackupGuardHit };
 
 export type HostRunRisk = "contained" | "exposure" | "data_loss" | "identity_or_secret";
 
@@ -210,6 +213,9 @@ export function classifyHostRunFocus(manifest: HostRunManifest): HostRunFocus[] 
   }
   for (const hit of backupGuardHits(manifest)) {
     focus.push({ where: hit.where, kind: `backup-approval:${hit.kind}`, reason: `${hit.reason}; this run goes to the operator whatever the verdict` });
+  }
+  for (const hit of backupGuardFocus(manifest)) {
+    focus.push({ where: hit.where, kind: `backup-focus:${hit.kind}`, reason: `${hit.reason}; does it delete backups, change their retention or switch them off? Then it is X4` });
   }
   if (!manifest.mutates) {
     const writes = lines.filter((line) => line.id.startsWith("S") && MUTATION_HINT.test(line.text)).map((line) => line.id);

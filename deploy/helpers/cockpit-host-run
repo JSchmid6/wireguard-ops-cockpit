@@ -16,10 +16,12 @@
 //              Safety-Reviewer liest diese Schritte, bevor der Envelope
 //              entsteht. Hier wird nichts mehr eingestuft oder abgelehnt, was
 //              er gesehen hat.
-//   Riegel     Ein Lauf, der Backups löscht oder ihre Aufbewahrung verkürzt,
-//              öffnet nur mit operatorApproved, auch bei bestandenem Türsteher
-//              (cockpit-backup-guard.mjs, dieselbe Erkennung wie in der API;
-//              installiert neben diesem Helfer).
+//   Riegel     Ein Lauf, der Backups löscht, ihre Aufbewahrung ändert oder
+//              sie abschaltet, öffnet nur mit operatorApproved, auch bei
+//              bestandenem Türsteher (cockpit-backup-guard.mjs, backupGuardHits,
+//              dieselbe Erkennung wie in der API; installiert neben diesem
+//              Helfer). Was der Riegel nur als Hinweis für den Türsteher meldet
+//              (backupGuardFocus), hat der Türsteher schon gelesen.
 //   Netz       Vor einem Lauf, der den Systemzustand ändert (mutates, Standard):
 //              das letzte borg-Backup muss jünger als 24 h sein, dann ein
 //              Maschinen-Snapshot beim Hoster (cockpit-vps-snapshot, rotiert den
@@ -69,6 +71,7 @@ const MAX_SCRIPT = 16000;
 const STEP_TIMEOUT_MAX = 10800;
 const CHECK_TIMEOUT_MAX = 1800;
 const BORG_MAX_AGE_HOURS = 24;
+const SNAPSHOT_NAME_MAX = 30; // Grenze des Hosters (Contabo) für Snapshot-Namen
 const ACTIVE_PHASES = new Set(["preflight", "resuming", "running", "rebooting", "checking"]);
 const REBOOT_GRACE_MS = 30 * 60 * 1000;
 // Zwischen "resuming" (gespeichert) und dem Start der Unit liegt ein kurzes
@@ -396,7 +399,10 @@ function borgFresh() {
 }
 
 function takeSnapshot(jobId) {
-  const name = `cockpit-run-${jobId}`.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 60);
+  // Der Hoster nimmt höchstens 30 Zeichen (10.10.2026: HTTP 400 bei
+  // cockpit-run-<volle UUID>, 48 Zeichen). Die ersten 8 Zeichen der Job-ID
+  // genügen zum Wiederfinden; die Snapshot-ID steht ohnehin im Laufzustand.
+  const name = `cockpit-run-${jobId.slice(0, 8)}`.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, SNAPSHOT_NAME_MAX);
   const made = spawnSync(SNAPSHOT[0], [...SNAPSHOT.slice(1), "create", name, "--wait", "900"], {
     encoding: "utf8", timeout: 1000000, maxBuffer: 1024 * 1024, env: { PATH: STEP_PATH, LANG: "C.UTF-8" },
   });

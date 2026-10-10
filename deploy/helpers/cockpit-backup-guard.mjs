@@ -2,56 +2,83 @@
 // (doc/setup/host-run.md, Abschnitt „Backup-Riegel“).
 //
 // Vorgabe Jochen, 30.09.2026: „Ein Admin muss auch die Backups löschen können.
-// Aber halt mit Freigabe.“ Diese Datei ist die eine Quelle der Erkennung: die
-// API (apps/api/src/host-run.ts) fragt sie, bevor sie einen Envelope signiert,
-// und der Root-Helfer (deploy/helpers/cockpit-host-run, installiert daneben
-// als cockpit-backup-guard.mjs) fragt sie noch einmal, bevor er startet. Ein
-// Treffer heißt: der Lauf startet nur mit operatorApproved, auch wenn der
-// Türsteher grün gibt.
+// Aber halt mit Freigabe.“ Geschärft am 10.10.2026: „Ich bin eh der Meinung,
+// dass Updates nicht freigegeben werden müssten.“ Die Freigabe gilt NUR für
+// echtes Löschen von Sicherungen; alles andere ist Sache des Türstehers.
 //
+// Diese Datei ist die eine Quelle der Erkennung: die API
+// (apps/api/src/host-run.ts) fragt sie, bevor sie einen Envelope signiert, und
+// der Root-Helfer (deploy/helpers/cockpit-host-run, installiert daneben als
+// cockpit-backup-guard.mjs) fragt sie noch einmal, bevor er startet.
 // Deterministisch, ohne Modell. Gelesen wird jede Zeile, die läuft (Schritte
 // und Prüfschritte), samt der Skripte, die der Lauf per Heredoc schreibt.
 //
-//   backup     ein Befehl berührt die Backups und ist keine der freien
-//              Leseformen: borg/borgmatic außer list/info/check/create, die
-//              borgmatic-Konfiguration, borg-Schlüssel und -Cache, die Units
-//              borgmatic.timer/.service, timers.target, den Repo-Pfad, Lab0
-//              (10.0.0.5).
-//   uncertain  der Text, der läuft, ist nicht der Text, der hier steht:
-//              ssh zu einem anderen Rechner (ob es Lab0 ist, sagt der Text
-//              nicht), eval/Dekodieren, Code aus einer Pipe, ein Skript, das
-//              der Lauf nicht selbst schreibt, ein dynamischer Befehlsname,
-//              ein Ziel aus einer Variable, deren Wert nicht im Plan steht.
+// Zwei Ausgaben:
 //
-// Frei bleibt die Routine: `systemctl start borgmatic.service`, ein nacktes
-// `borgmatic` (mit der konfigurierten Aufbewahrung), Lesen und Prüfen — und der
-// Aufräum-Dienst auf Lab0 (doc/setup/borg-retention.md): sein Lauf
-// (`cockpit-borg-retention run`, `systemctl start cockpit-borg-retention.service`),
-// sein `status` und eine Einstellung innerhalb der festen Grenzen
-// (`cockpit-borg-retention set <d> <w> <m> <HH:MM>`, geprüft gegen
-// cockpit-borg-retention-rules.mjs). Mit Freigabe: unter der Untergrenze
-// (`--freigabe`), Fortsetzen nach einer Anomalie (`freigeben`), den Dienst
-// stoppen, abschalten, umgehen oder seine Dateien ändern, prune mit eigenen
-// Werten, delete, recreate, compact von Hand.
+//   backupGuardHits   der Riegel (Art "backup"): der Lauf startet nur mit
+//                     operatorApproved, auch wenn der Türsteher grün gibt.
+//                     Er greift bei
+//                     - borg/borgmatic delete, prune, compact, recreate,
+//                       break-lock, Schlüsseländerung, check --repair, einem
+//                       borgmatic-Lauf mit fremder Konfiguration oder Override;
+//                     - jeder Änderung der Aufbewahrung (keep_*, keepDaily …,
+//                       backup_keep_time; der Aufräum-Dienst auf Lab0 außerhalb
+//                       seiner Routine);
+//                     - Schreiben in die borgmatic-/Retention-Konfiguration,
+//                       borg-Schlüssel, Units, Drop-ins und Generatoren;
+//                     - Löschen, Verschieben oder Überschreiben (rm, mv, shred,
+//                       truncate, dd, find -delete, rsync --delete, git clean)
+//                       in Backup-Zielen: borg-Repo, /var/backups,
+//                       /var/opt/gitlab/backups — auch über einen Vorfahren
+//                       (rm -rf /var) und per ssh auf Lab0;
+//                     - Abschalten, Stoppen oder Maskieren der borgmatic- und
+//                       Retention-Units (auch per Glob oder Zielwechsel), dem
+//                       Entfernen der borg-Pakete, dem Streichen ihres Cron-
+//                       Eintrags;
+//                     - dem Löschen eines Maschinen-Snapshots
+//                       (cockpit-vps-snapshot delete, DELETE …/snapshots). Die
+//                       Rotation des Werkzeugs selbst (create räumt den ältesten
+//                       eigenen Snapshot) bleibt frei (Jochen, 28.09.2026).
+//   backupGuardFocus  Hinweise für den Türsteher (Art "mention" oder
+//                     "uncertain"), die den Lauf NICHT anhalten: ein Befehl
+//                     nennt oder berührt die Backups, ohne zu löschen
+//                     (apt-Updates mit borgbackup, docker run mit einer
+//                     Einhängung, Lesen); oder der ausgeführte Text ist nicht
+//                     der gelesene (eval, Dekodieren, Code aus einer Pipe, ein
+//                     Skript, das der Plan nicht zeigt, ein Ziel aus einer
+//                     unbekannten Variable, ssh zu einem anderen Rechner). Dort
+//                     entscheidet der Türsteher mit Belegpflicht (X4 verlangt,
+//                     jede Verschleierung eines Löschbefehls zu melden).
+//
+// Frei bleiben die Routine und das Lesen: `systemctl start borgmatic.service`,
+// ein nacktes `borgmatic` (mit der konfigurierten Aufbewahrung), borg
+// list/info/check/create, der Aufräum-Dienst auf Lab0 (doc/setup/borg-retention.md)
+// mit `run`, `status` und `set` innerhalb der festen Grenzen
+// (cockpit-borg-retention-rules.mjs), Paket-Updates, lesende docker-Befehle,
+// Erwähnungen in Kommentaren. Neue Sicherungen anlegen (cp/install/mkdir nach
+// /var/backups) löscht nichts und ist frei.
 //
 // Ehrliche Grenze: Programme, die schon auf dem Host liegen und über ihren
 // Namen aufgerufen werden, nimmt der Riegel für das, was ihr Name sagt; ihren
-// Inhalt sieht er nicht. Deshalb liest der Türsteher weiterhin mit (X4).
+// Inhalt sieht er nicht. Text, den er nicht lesen kann, hält ihn nicht an —
+// dafür liest der Türsteher mit (X4) und belegt seinen Befund.
 
 import { classifyRetention, parseRetentionArgs } from "./cockpit-borg-retention-rules.mjs";
 
-export const BACKUP_GUARD_VERSION = "cockpit-backup-guard/v2";
+export const BACKUP_GUARD_VERSION = "cockpit-backup-guard/v3";
 
 // Was die Backups sind. TOKEN greift im normalisierten Text (ohne Quotes und
 // Backslashes), also auch in b"o"rg und bo\rg.
 const TOKEN = /borg|backup_vserver|\/media\/raid|\b10\.0\.0\.5\b|\blab0\b|timers\.target/i;
-const PROTECTED = [
-  "/etc/borgmatic", "/etc/borgmatic.d", "/root/.config/borg", "/root/.cache/borg", "/root/.borgmatic", "/root/.ssh",
+// Was der Riegel schützt. CONFIG: jedes Schreiben dort ändert, was gesichert
+// und wie lange aufbewahrt wird, oder schaltet die Sicherung ab.
+const CONFIG = [
+  "/etc/borgmatic", "/etc/borgmatic.d", "/root/.config/borg", "/root/.borgmatic",
   "/etc/systemd/system/borgmatic.timer", "/etc/systemd/system/borgmatic.service",
   "/lib/systemd/system/borgmatic.timer", "/lib/systemd/system/borgmatic.service",
   "/usr/lib/systemd/system/borgmatic.timer", "/usr/lib/systemd/system/borgmatic.service",
+  "/etc/systemd/system/timers.target.wants/borgmatic.timer",
   "/usr/bin/borg", "/usr/bin/borgmatic", "/usr/local/sbin/cockpit-borg-action",
-  "/media/RAID/backup_VServer", // das Repo, falls es je eingehängt ist; macht /media zum Vorfahren
   // Der Aufräum-Dienst auf Lab0: Einstellung, Passphrase, Vergleichsstand, Code, Units.
   "/etc/cockpit-borg-retention", "/var/lib/cockpit-borg-retention",
   "/usr/local/sbin/cockpit-borg-retention",
@@ -70,11 +97,24 @@ const PROTECTED = [
   "/run/systemd/generator", "/run/systemd/generator.early", "/run/systemd/generator.late",
   "/etc/systemd/system.attached", "/run/systemd/system.attached",
 ];
+// DATA: die Sicherungen selbst. Löschen, Verschieben, Überschreiben greift;
+// eine neue Sicherung dazulegen (cp, install, mkdir) nicht.
+const DATA = [
+  "/media/RAID/backup_VServer", // das Repo, falls es je eingehängt ist; macht /media zum Vorfahren
+  "/var/backups",
+  "/var/opt/gitlab/backups",
+];
+// Nur Hinweis für den Türsteher: berührt den Rückweg, löscht aber keine Sicherung.
+const WATCH = ["/root/.cache/borg", "/root/.ssh"];
+const PROTECTED = [...CONFIG, ...DATA, ...WATCH];
+const BOLTED = [...CONFIG, ...DATA];
 const UNITS = ["borgmatic.timer", "borgmatic.service", "timers.target", "cockpit-borg-retention.timer", "cockpit-borg-retention.service"];
-const ANCESTORS = [...new Set(PROTECTED.flatMap((item) => {
+const ancestorsOf = (items) => [...new Set(items.flatMap((item) => {
   const parts = item.split("/").slice(1, -1);
   return ["/", ...parts.map((_, index) => `/${parts.slice(0, index + 1).join("/")}`)];
 }))];
+const ANCESTORS = ancestorsOf(PROTECTED);
+const BOLTED_ANCESTORS = ancestorsOf(BOLTED);
 const DEFAULT_CWD = "/"; // cockpit-host-run startet jeden Schritt mit cwd "/"
 
 // Befehle, die einen ganzen Baum treffen: für sie zählt auch ein Vorfahr eines
@@ -89,8 +129,9 @@ const READ_ONLY = new Set([
   "whereis", "type", "true", "false", "pgrep", "pidof", "ps", "id", "date", "hostname", "uptime", "free", "lsblk", "findmnt", "getent",
   "jq", "cut", "tr", "column", "nl", "tac", "strings", "zcat", "xzcat", "bzcat", "echo", "printf", "dpkg-query", "apt-cache", "sleep",
   "nproc", "uname", "whoami", "lsof", "ss", "find", "journalctl", "systemctl", "dpkg", "apt", "apt-mark", "command", "curl", "wget",
-  "borg", "borgmatic", "cockpit-borg-action", "cockpit-borg-retention", "sort", ":",
+  "borg", "borgmatic", "cockpit-borg-action", "cockpit-borg-retention", "sort", ":", "docker",
 ]);
+const DOCKER_READ = new Set(["ps", "images", "inspect", "logs", "stats", "version", "info", "top", "port", "diff", "history"]);
 const SYSTEMCTL_READ = new Set(["status", "is-active", "is-enabled", "is-failed", "show", "cat", "list-timers", "list-units", "list-unit-files", "list-dependencies", "help"]);
 const ROUTINE_UNITS = new Set(["borgmatic", "borgmatic.service", "borgmatic.timer", "cockpit-borg-retention", "cockpit-borg-retention.service", "cockpit-borg-retention.timer"]);
 const BORG_READ = new Set(["list", "info", "check", "create", "diff", "version", "repo-list", "repo-info"]);
@@ -118,6 +159,28 @@ const INLINE_CODE = /(\b(?:python[\d.]*|perl[\d.]*|ruby[\d.]*|node|nodejs|php[\d
 const INLINE_INTERPRETER = /\b(?:python[\d.]*|perl[\d.]*|ruby[\d.]*|node|nodejs|php[\d.]*|lua[\d.]*|tclsh|Rscript|pwsh)\s+(?:-[\w-]+\s+)*-(?:c|e|E|r|-eval|-command|Command)\b/;
 const CODE_PRIMITIVES = /\b(?:system|popen|exec[a-z]*|spawn[a-z]*|fork|subprocess|shutil|pathlib|open|unlink|rmtree|remove|rename|symlink|eval|compile|__import__|importlib|getattr|setattr|globals|chr|fromCharCode|atob|b64decode|decode|codecs|socket|paramiko|ctypes|pty|require|child_process|qx|glob|Buffer|os\s*\.\s*(?!path\b)\w+)\b|`/;
 const AWK_PRIMITIVES = /\bsystem\s*\(|\|\s*getline|\|&|\bprint[^;}]*[>|]/;
+
+// ── Was den Riegel auslöst ─────────────────────────────────────────────────
+// Im normalisierten Text eines Befehls (ohne Quotes), auch in sh -c '…', in
+// einem Skript, das der Lauf schreibt, oder in einer Cron-Zeile.
+const DELETE_PHRASE = /\bborg(?:matic)?\b(?:\s+\S+){0,8}?\s+(?:delete|prune|compact|recreate|break-lock|rdelete|repo-delete|key\s+(?:change-passphrase|import|migrate-to-repokey|change-location|change-algorithm))\b/i;
+const RETENTION_PHRASE = /\bkeep[_-](?:within|secondly|minutely|hourly|daily|weekly|monthly|yearly|last)\b|\bbackup_keep_time\b|\bkeep(?:Daily|Weekly|Monthly)\b/i;
+const SNAPSHOT_DELETE = /\bcockpit-vps-snapshot\s+delete\b|(?:\s-X|--request)\s*DELETE\b[^\n]*\/snapshots\b|\/snapshots\b[^\n]*(?:\s-X|--request)\s*DELETE\b/i;
+const BORG_DELETE = new Set(["delete", "prune", "compact", "recreate", "break-lock", "rdelete", "repo-delete"]);
+const BORG_KEY_CHANGE = new Set(["change-passphrase", "import", "migrate-to-repokey", "change-location", "change-algorithm"]);
+const BORGMATIC_DELETE = new Set([...BORG_DELETE, "borg", "key"]);
+const BORGMATIC_ALL_ACTIONS = new Set([...BORGMATIC_ACTIONS, ...BORGMATIC_DELETE, "extract", "restore", "mount", "umount", "export-tar", "config", "bootstrap", "generate", "validate", "spot", "transfer", "rcreate", "repo-create", "init", "export"]);
+// Diese Verben lassen eine Unit laufen oder lesen sie; alle anderen (stop,
+// disable, mask, kill, edit, revert, set-property, freeze …) halten sie an.
+const UNIT_KEEPS = new Set([...SYSTEMCTL_READ, "start", "restart", "reload", "try-restart", "reload-or-restart", "try-reload-or-restart", "enable", "reenable", "unmask", "reset-failed", "daemon-reload"]);
+// Löschen ganzer Bäume: für sie zählt auch ein Vorfahr (rm -rf /var).
+const DELETERS = new Set(["rm", "rmdir", "shred", "unlink", "wipe", "srm"]);
+// Schreiben, das eine vorhandene Datei überschreibt oder unbrauchbar macht.
+const OVERWRITERS = new Set(["truncate", "dd", "chattr"]);
+// Schreiben in eine Datei oder einen Baum (Konfiguration ändern).
+const WRITERS = new Set(["tee", "sed", "perl", "touch", "ln", "install", "cp", "mv", "rsync", "chmod", "chown", "chgrp", "setfacl", "tar", "unzip", "patch", "git", ...OVERWRITERS]);
+const CODE_DELETE = /\b(?:unlink|rmtree|remove|rmdir|rename|replace|truncate|move|rm_rf|rm_r|delete)\b/;
+const CODE_WRITE = /\b(?:open|write|write_text|write_bytes|writeFile|writeFileSync|copy|copyfile|symlink|chmod|chown)\b/;
 
 const OPAQUE = "\u0001";
 // Ein Trenner in Quotes (printf 'a;b', sh -c 'x; y'): er trennt weiter (sh -c
@@ -523,16 +586,21 @@ const within = (path, root) => path === root || path.startsWith(root === "/" ? "
 
 // Berührt dieser (aufgelöste) Pfad die Backups? bulk: der Befehl trifft ganze
 // Bäume, dann zählt auch ein Vorfahr.
-function pathTouches(path, bulk) {
+// list: welche Orte zählen (Vorgabe: alles, was den Rückweg berührt).
+function pathTouches(path, bulk, list = PROTECTED, ancestors = ANCESTORS) {
   if (GLOB.test(path)) {
     const regex = globRegex(path);
-    if ([...PROTECTED, ...(bulk ? ANCESTORS : [])].some((item) => regex.test(item))) return true;
+    if ([...list, ...(bulk ? ancestors : [])].some((item) => regex.test(item))) return true;
     const literal = path.slice(0, path.search(GLOB));
     const dir = literal.slice(0, literal.lastIndexOf("/")) || "/";
-    return PROTECTED.some((item) => within(dir, item)) || (bulk && PROTECTED.some((item) => within(item, dir)));
+    return list.some((item) => within(dir, item)) || (bulk && list.some((item) => within(item, dir)));
   }
-  return PROTECTED.some((item) => within(path, item) || (bulk && within(item, path)));
+  return list.some((item) => within(path, item) || (bulk && within(item, path)));
 }
+const touchesConfig = (path) => pathTouches(path, false, CONFIG, []);
+const DATA_ANCESTORS = ancestorsOf(DATA);
+const touchesData = (path, bulk) => pathTouches(path, bulk, DATA, DATA_ANCESTORS);
+const touchesBolted = (path) => pathTouches(path, true, BOLTED, BOLTED_ANCESTORS);
 
 // Die Wörter eines Befehls, die Pfade sein können, aufgelöst gegen jedes cwd.
 function pathWords(args, name) {
@@ -540,6 +608,7 @@ function pathWords(args, name) {
   let skipFirst = name === "chmod" || name === "chown" || name === "chgrp";
   for (const arg of args) {
     if (arg.startsWith("-") && !arg.includes("=")) continue;
+    if (arg.includes("{{")) continue; // Go-Vorlage (docker --format '{{.Names}}'), kein Pfad
     if (skipFirst) { skipFirst = false; continue; }
     for (const piece of arg.split(/[=:,]/)) if (piece) values.push(piece);
   }
@@ -602,6 +671,15 @@ function readOnlyForm(command, segmentText) {
     case "apt": return ["list", "show", "policy", "search"].includes(firstVerb(args).verb || "");
     case "apt-mark": return /^show/.test(firstVerb(args).verb || "");
     case "command": return args[0] === "-v" || args[0] === "-V";
+    case "docker": {
+      // Lesen am lokalen Daemon: ps, images, inspect, logs, stats, version, info …
+      if (args.some((arg) => arg === "-H" || arg.startsWith("--host"))) return false;
+      const { verb, rest } = firstVerb(args, new Set(["--context", "-c", "--config", "-l", "--log-level"]));
+      if (DOCKER_READ.has(verb)) return true;
+      const sub = firstVerb(rest, new Set(["-f", "--file", "-p", "--project-name", "--project-directory", "--profile", "--env-file"])).verb;
+      return (verb === "compose" && ["ps", "config", "logs", "ls", "images", "version", "top"].includes(sub))
+        || (["image", "container", "volume", "network", "context", "system"].includes(verb) && ["ls", "list", "inspect", "show", "df", "info"].includes(sub));
+    }
     default: return true;
   }
 }
@@ -630,22 +708,51 @@ function toleratesOpaque(command, segmentText) {
 
 // ── Prüfen ─────────────────────────────────────────────────────────────────
 
+// ── Riegel ─────────────────────────────────────────────────────────────────
+
+// Im normalisierten Text: ein Löschbefehl, eine Aufbewahrung, ein Snapshot-Löschen.
+function phraseBolt(text) {
+  if (DELETE_PHRASE.test(text)) return "deletes backups (borg/borgmatic delete, prune, compact, recreate, break-lock or a key change)";
+  if (RETENTION_PHRASE.test(text)) return "changes the retention of the backups";
+  if (SNAPSHOT_DELETE.test(text)) return "deletes a machine snapshot";
+  return null;
+}
+
+const pathTokens = (text) => (text.match(/(?:^|[\s=:'"(,])(\/[^\s;|&<>()`,:='"]*)/g) || []).map((token) => resolvePath(token.replace(/^[\s=:'"(,]/, ""), "/"));
+const namesUnit = (path) => UNITS.some((unit) => baseName(path) === unit || baseName(path) === `${unit}.d`);
+
+// Eine Zeile Code einer anderen Sprache (python <<EOF, perl -e '…') oder Daten,
+// die später laufen können (Cron-Zeile, Unit).
+function codeBolt(raw) {
+  const normalized = normalize(raw);
+  const phrase = phraseBolt(normalized);
+  if (phrase) return phrase;
+  const paths = pathTokens(normalized);
+  if (CODE_DELETE.test(raw) && paths.some((path) => touchesBolted(path) || namesUnit(path))) return "code that deletes or moves backups or their configuration";
+  if (CODE_WRITE.test(raw) && paths.some((path) => touchesConfig(path) || namesUnit(path))) return "code that writes the backup configuration, retention or timer";
+  return null;
+}
+
 function analyzeScript(prefix, text, context, hits, language = "shell") {
   const hit = (where, kind, reason, code) => hits.push({ where, kind, reason, code: clip(code.trim()) });
 
-  // Roh: Verschleierung, und jede Zeile, die ein Backup-Wort trägt, wird unten
-  // als Befehl geprüft; in Daten-Heredocs reicht das Wort selbst.
+  // Roh: Verschleierung ist ein Hinweis für den Türsteher.
   const rawCheck = (id, raw) => {
     for (const [pattern, reason] of OBFUSCATION) if (pattern.test(raw)) hit(id, "uncertain", reason, raw);
   };
+  const codeCheck = (id, raw, what) => {
+    const bolt = codeBolt(raw);
+    if (bolt) hit(id, "backup", bolt, raw);
+    else if (TOKEN.test(normalize(raw))) hit(id, "mention", `${what} that names the backups`, raw);
+  };
 
   if (language !== "shell") {
-    // Code einer anderen Sprache (python <<EOF, geschriebenes .py): nur Worte
-    // und Primitive; Prozesse, Dateien oder dynamischer Code machen es unsicher.
+    // Code einer anderen Sprache (python <<EOF, geschriebenes .py): Löschworte
+    // und Pfade binden; Prozesse, Dateien oder dynamischer Code sind Hinweise.
     text.split("\n").forEach((raw, index) => {
       const id = `${prefix}:L${index + 1}`;
       rawCheck(id, raw);
-      if (TOKEN.test(normalize(raw))) hit(id, "backup", "code that names the backups", raw);
+      codeCheck(id, raw, "code");
       if (CODE_PRIMITIVES.test(raw)) hit(id, "uncertain", `${language} code that starts processes, touches files or builds code at run time`, raw);
     });
     return;
@@ -657,9 +764,9 @@ function analyzeScript(prefix, text, context, hits, language = "shell") {
   const prepared = lines.map((line) => {
     rawCheck(line.id, line.raw);
     // Eingebetteter Code einer anderen Sprache ist kein Shell-Text: er wird auf
-    // Worte und Primitive geprüft (unten) und hier durch CODE ersetzt.
+    // Löschworte, Pfade und Primitive geprüft und hier durch CODE ersetzt.
     const shellCode = line.code.replace(INLINE_CODE, (_, flag, program) => {
-      if (TOKEN.test(normalize(program))) hit(line.id, "backup", "inline code that names the backups", line.raw);
+      codeCheck(line.id, program, "inline code");
       return `${flag}CODE`;
     });
     const inner = [];
@@ -687,7 +794,8 @@ function analyzeScript(prefix, text, context, hits, language = "shell") {
     if (/\b[gm]?awk\b/.test(line.code) && AWK_PRIMITIVES.test(line.code)) hit(line.id, "uncertain", "awk that runs commands or writes files", code);
     if (/\bsed\b[^|;]*\s(?:-[a-zA-Z]*e\s+)?\S*(?:\/[gpIiMm0-9]*e[gpIiMm0-9]*(?:\s|$)|(?:^|;)\s*e\b)/.test(normalize(line.code))) hit(line.id, "uncertain", "sed that executes its pattern space", code);
     // Was ein Backup-Befehl ausgibt, darf nicht in einen schreibenden Befehl
-    // fließen (crontab -l | grep -v borgmatic | crontab -).
+    // fließen. In crontab heißt das: der Eintrag der Sicherung wird gestrichen
+    // (crontab -l | grep -v borgmatic | crontab -); sonst ein Hinweis.
     let carry = false;
     for (const segment of segments) {
       const variants = expandText(segment.text, resolve);
@@ -695,7 +803,10 @@ function analyzeScript(prefix, text, context, hits, language = "shell") {
       let touching = false;
       for (const text of variants) {
         const result = checkSegment(text, segment, line, context, cwds, hit);
-        if (segment.piped && carry && !result.readOnly) hit(line.id, "backup", "output about the backups flows into a command that changes something", code);
+        if (segment.piped && carry && !result.readOnly) {
+          if (result.name === "crontab") hit(line.id, "backup", "rewrites the crontab from output about the backups: that drops or changes their schedule", code);
+          else hit(line.id, "mention", "output about the backups flows into a command that changes something", code);
+        }
         touching ||= result.touching;
       }
       carry = segment.piped ? carry || touching : touching;
@@ -703,8 +814,9 @@ function analyzeScript(prefix, text, context, hits, language = "shell") {
   }
 
   // Heredocs: ein Skript, das dieser Lauf schreibt und ausführt, wird wie
-  // seine Schritte geprüft; Daten (Konfiguration) auf Backup-Worte und
-  // Verschleierung, ExecStart=-Zeilen einer Unit als Befehle.
+  // seine Schritte geprüft; Daten (Konfiguration, Cron, Unit) auf Löschworte,
+  // Aufbewahrung und Pfade, ExecStart=-Zeilen einer Unit als Befehle. Wohin der
+  // Heredoc schreibt, prüft checkSegment an seiner Kopfzeile (Umleitung, tee).
   for (const heredoc of heredocs) {
     const normalized = extractSubstitutions(normalize(heredoc.line.code), []);
     const segment = splitSegments(normalized).find((item) => item.text.includes("<<")) || { text: normalized };
@@ -730,8 +842,9 @@ function analyzeScript(prefix, text, context, hits, language = "shell") {
     }
     for (const item of heredoc.body) {
       rawCheck(item.id, item.raw);
-      const normalizedBody = normalize(item.raw);
-      if (TOKEN.test(normalizedBody) || redirectOrPathTouches(normalizedBody)) hit(item.id, "backup", "a file this run writes names the backups", item.raw);
+      const bolt = codeBolt(item.raw);
+      if (bolt) hit(item.id, "backup", `a file this run writes: ${bolt.replace(/^code that /, "")}`, item.raw);
+      else if (TOKEN.test(normalize(item.raw)) || redirectOrPathTouches(normalize(item.raw))) hit(item.id, "mention", "a file this run writes names the backups", item.raw);
       const exec = item.raw.match(/^\s*Exec[A-Za-z]*\s*=\s*[-@:+!]*(.*)$/);
       if (exec) {
         const sub = [];
@@ -751,6 +864,117 @@ function shiftLine(where, offset) {
   return where.replace(/:L(\d+)$/, (_, line) => `:L${Number(line) + offset}`);
 }
 
+// Der Befehl, den ssh auf dem anderen Rechner ausführt, und wohin.
+const SSH_VALUED = new Set(["-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-p", "-Q", "-R", "-S", "-W", "-w", "-B"]);
+function remoteCommand(name, args) {
+  if (!/^(?:ssh|autossh|mosh)$/.test(name)) return null;
+  let i = 0;
+  while (i < args.length && args[i].startsWith("-")) { if (SSH_VALUED.has(args[i])) i += 1; i += 1; }
+  if (i >= args.length) return null;
+  return { host: args[i], command: args.slice(i + 1).join(" ") };
+}
+const LAB0_HOST = /\b10\.0\.0\.5\b|\blab0\b|^borg@/i;
+const REMOTE_DELETE = /(?:^|[\s;&|])(?:sudo\s+)?(?:rm|rmdir|mv|shred|unlink|truncate|dd|wipefs|mkfs\S*|lvremove|vgremove|zfs\s+destroy|btrfs\s+subvolume\s+delete)\s|\bfind\b[^\n]*\s-delete\b|\brsync\b[^\n]*\s--delete/;
+
+// Schlägt der Riegel bei diesem einfachen Befehl an? Liefert den Grund oder null.
+function segmentBolt(text, command, name, readOnly, cwds, context, line) {
+  const { args } = command;
+  // Lesen ist nie Löschen; echo/printf aber können einen Befehl in eine Datei
+  // oder eine Pipe schreiben.
+  if (!(readOnly && name !== "echo" && name !== "printf")) {
+    const phrase = phraseBolt(text);
+    if (phrase) return phrase;
+  }
+  if (readOnly) return null;
+
+  if (name === "borg") {
+    const key = args.indexOf("key");
+    if (args.some((arg) => BORG_DELETE.has(arg)) || (key >= 0 && BORG_KEY_CHANGE.has(args[key + 1]))) return "deletes backups (borg delete, prune, compact, recreate, break-lock or a key change)";
+    if (args.includes("--repair")) return "borg check --repair can delete archives";
+  }
+  if (name === "borgmatic") {
+    if (args.some((arg) => BORGMATIC_DELETE.has(arg))) return "deletes backups (borgmatic delete, prune, compact, recreate, break-lock, key or raw borg)";
+    if (args.includes("--repair")) return "borgmatic check --repair can delete archives";
+    const actions = args.filter((arg) => BORGMATIC_ALL_ACTIONS.has(arg));
+    if (actions.length === 0 && args.some((arg) => /^(?:-c|--config|--override)(?:=|$)/.test(arg))) return "a borgmatic run with another configuration or an override prunes with other retention";
+  }
+  if (name === "cockpit-borg-retention" && !retentionRoutine(args)) return "the retention service outside its routine (below its minimum, resumed after an anomaly, or another form)";
+  if (INTERPRETERS.test(name)) {
+    const index = args.findIndex((arg) => baseName(arg) === "cockpit-borg-retention.mjs");
+    if (index >= 0 && !retentionRoutine(args.slice(index + 1))) return "the retention service outside its routine";
+  }
+  if (name === "cockpit-borg-action" && !(args.length === 1 && (args[0] === "status" || args[0] === "check"))) return "the backup helper outside status and check (repair can delete archives)";
+
+  // Die Units der Sicherung und des Aufräum-Dienstes anhalten, abschalten, maskieren.
+  if (/^(?:systemctl|service|invoke-rc\.d|deb-systemd-invoke|update-rc\.d)$/.test(name)) {
+    const named = args.some((arg) => !arg.startsWith("-") && UNITS.some((unit) => arg === unit || `${arg}.service` === unit || (GLOB.test(arg) && globRegex(arg).test(unit))));
+    if (name === "systemctl") {
+      const { verb } = firstVerb(args, new Set(["-H", "--host", "-M", "--machine", "-t", "--type", "-p", "--property", "-o", "--output", "-n", "--lines", "--state", "--signal", "-s", "--kill-whom", "--root"]));
+      if (verb && /^(?:isolate|rescue|emergency)$/.test(verb)) return "switching the target stops every timer, borgmatic.timer too";
+      if (named && verb && !UNIT_KEEPS.has(verb)) return `systemctl ${verb} stops or switches off the backup or retention unit`;
+    } else if (named && args.some((arg) => /^(?:stop|disable|mask|remove|kill)$/.test(arg))) {
+      return `${name} stops or switches off the backup or retention unit`;
+    }
+  }
+  if (/^(?:init|telinit)$/.test(name) && args.length > 0) return "switching the runlevel stops every timer, borgmatic.timer too";
+
+  // Die Pakete der Sicherung entfernen.
+  if (/^(?:apt|apt-get|aptitude)$/.test(name) && /^(?:remove|purge|autoremove)$/.test(firstVerb(args, new Set(["-o", "-t", "-c"])).verb || "") && args.some((arg) => /borg/i.test(arg))) return "removes the backup software";
+  if (name === "dpkg" && args.some((arg) => /^(?:-r|-P|--remove|--purge)$/.test(arg)) && args.some((arg) => /borg/i.test(arg))) return "removes the backup software";
+
+  // Pfade: löschen, überschreiben, schreiben.
+  const resolveAll = (list) => list.filter((target) => !target.includes(OPAQUE)).flatMap((target) => [...cwds].map((cwd) => resolvePath(target, cwd)));
+  const words = pathWords(args, name);
+  const operands = args.filter((arg) => !arg.startsWith("-"));
+  let deleted = [];
+  let overwritten = [];
+  const written = resolveAll(redirectTargets(text));
+  if (DELETERS.has(name) || name === "mv" || (name === "git" && args.some((arg) => arg === "clean" || arg === "rm"))) deleted = resolveAll(words);
+  else if (name === "find") {
+    const exec = args.findIndex((arg) => /^-(?:exec|execdir|ok|okdir)$/.test(arg));
+    if (args.includes("-delete") || (exec >= 0 && /^(?:rm|rmdir|shred|unlink|mv)$/.test(baseName(args[exec + 1] || "")))) {
+      const start = args.findIndex((arg) => arg.startsWith("-") || arg === "(" || arg === "!");
+      deleted = resolveAll(start < 0 ? args : args.slice(0, start));
+    }
+  } else if (name === "rsync") {
+    const dest = operands.at(-1);
+    if (args.some((arg) => arg.startsWith("--remove-source-files"))) deleted = resolveAll(words);
+    else if (dest && args.some((arg) => /^--(?:delete|del\b)/.test(arg))) deleted = resolveAll(dest.split(/[=:,]/).filter(Boolean));
+    if (dest) written.push(...resolveAll(dest.split(/[=:,]/).filter(Boolean)));
+  } else if (OVERWRITERS.has(name)) {
+    overwritten = name === "dd" ? resolveAll(args.filter((arg) => arg.startsWith("of=")).map((arg) => arg.slice(3))) : resolveAll(words);
+  } else if (name === "cp" || name === "install" || name === "ln") {
+    const target = args.find((arg, index) => args[index - 1] === "-t" || args[index - 1] === "--target-directory") || args.find((arg) => arg.startsWith("--target-directory="))?.slice(19);
+    written.push(...resolveAll(name === "install" && args.includes("-d") ? operands : [target || operands.at(-1)].filter(Boolean)));
+  } else if ((name === "sed" || name === "perl") && !args.some((arg) => /^-[a-zA-Z]*i/.test(arg) || arg.startsWith("--in-place"))) {
+    // sed/perl ohne -i schreibt keine Datei.
+  } else if (WRITERS.has(name)) written.push(...resolveAll(words));
+
+  if (deleted.some((path) => touchesBolted(path) || namesUnit(path))) return `${name} deletes or moves backups or their configuration`;
+  if (overwritten.some((path) => touchesConfig(path) || touchesData(path, false) || namesUnit(path))) return `${name} overwrites backups or their configuration`;
+  if (written.some((path) => touchesConfig(path) || namesUnit(path))) return `${name} writes the backup configuration, retention, keys or timer`;
+
+  // Auf Lab0, dem Rechner mit dem borg-Repo: jedes Löschen.
+  const remote = remoteCommand(name, args);
+  if (remote && remote.command) {
+    const sub = [];
+    analyzeScript(`${line.id}>`, remote.command, context, sub);
+    const inner = sub.find((item) => item.kind === "backup");
+    if (inner) return `over ${name}: ${inner.reason}`;
+    if (LAB0_HOST.test(remote.host) && REMOTE_DELETE.test(` ${remote.command}`)) return `deletes on Lab0 (${remote.host}), the machine that holds the borg repository`;
+  }
+  return null;
+}
+
+// Paketpflege: borgbackup oder borgmatic unter den Paketen ist kein Hinweis.
+function packageRoutine(command) {
+  const name = command.word ? baseName(command.word) : "";
+  const verb = firstVerb(command.args, new Set(["-o", "-t", "-c"])).verb || "";
+  if (/^(?:apt|apt-get|aptitude)$/.test(name)) return /^(?:install|upgrade|update|dist-upgrade|full-upgrade|reinstall)$/.test(verb);
+  if (name === "dpkg") return command.args.some((arg) => /^(?:-i|--install|--configure|-l|-s|-L)$/.test(arg));
+  return false;
+}
+
 function checkSegment(text, { piped, quoted }, line, context, cwds, hit) {
   const code = line.raw;
   const words = text.split(/\s+/).filter(Boolean);
@@ -766,14 +990,19 @@ function checkSegment(text, { piped, quoted }, line, context, cwds, hit) {
   }
   if (command.problem) hit(line.id, "uncertain", command.problem, code);
   if (!word) {
-    if (TOKEN.test(text)) hit(line.id, "backup", "a value that names the backups", code);
-    return { touching: TOKEN.test(text), readOnly: true };
+    // Nur Zuweisungen, oder ein Vorsatz ohne erkennbaren Befehl (runuser -u borg -- …).
+    const bolt = phraseBolt(text);
+    if (bolt) hit(line.id, "backup", bolt, code);
+    else if (TOKEN.test(text)) hit(line.id, "mention", "a value that names the backups", code);
+    return { touching: TOKEN.test(text), readOnly: true, name };
   }
 
   // Wer läuft? Ein dynamischer Name ist unsicher.
   if (word.includes(OPAQUE) || word.startsWith("$") || !quoted && GLOB.test(word)) {
     hit(line.id, "uncertain", "the command name is built at run time", code);
-    return { touching: true, readOnly: false };
+    const bolt = phraseBolt(text);
+    if (bolt) hit(line.id, "backup", bolt, code);
+    return { touching: true, readOnly: false, name };
   }
   if (name === "alias" || name === "hash" && command.args.includes("-p") || name === "enable" && command.args.some((arg) => arg.startsWith("-f"))) {
     hit(line.id, "uncertain", `${name} changes what a command name runs`, code);
@@ -817,28 +1046,28 @@ function checkSegment(text, { piped, quoted }, line, context, cwds, hit) {
   }
 
   // Unbekannte Werte: nur dort frei, wo sie die Wirkung nicht auf die Backups
-  // lenken können.
-  // Ein Schleifenkopf tut selbst nichts; seine Variable ist dann unbekannt.
+  // lenken können. Ein Schleifenkopf tut selbst nichts.
   if (text.includes(OPAQUE) && !/^(?:for|select|case)$/.test(name) && !toleratesOpaque(command, text)) {
     hit(line.id, "uncertain", "a target or argument comes from a value this plan does not show", code);
   }
 
-  // Berührt der Befehl die Backups?
+  // Der Riegel: löscht oder verkürzt der Befehl Sicherungen, schaltet er sie ab?
+  const readOnly = readOnlyForm(strict, text);
+  const bolt = segmentBolt(text, command, name, readOnly, cwds, context, line);
+  if (bolt) hit(line.id, "backup", bolt, code);
+
+  // Sonst: nennt oder berührt er die Backups? Dann ist es ein Hinweis.
   const bulk = BULK.has(name) && (!/^(?:chmod|chown|chgrp|setfacl|cp)$/.test(name) || command.args.some((arg) => /^-[a-zA-Z]*[rRa]|^--recursive$|^--archive$/.test(arg)));
   const destructive = BULK.has(name) || /^(?:ln|install|truncate|dd|tee|sed|perl|cp|touch|unlink)$/.test(name);
   const targets = [...redirectTargets(text), ...pathWords(command.args, name).filter((piece) => piece.includes("/") || GLOB.test(piece) || piece.startsWith(".") || destructive)];
   const touchesPath = targets.some((target) => !target.includes(OPAQUE) && [...cwds].some((cwd) => pathTouches(resolvePath(target, cwd), bulk)));
   const unitGlob = /^(?:systemctl|service|invoke-rc\.d|deb-systemd-invoke|update-rc\.d)$/.test(name)
     && command.args.some((arg) => GLOB.test(arg) && UNITS.some((unit) => globRegex(arg).test(unit)));
-  // Ein Wechsel des Ziels hält alle Timer an, auch borgmatic.timer.
-  const isolate = (name === "systemctl" && command.args.some((arg) => /^(?:isolate|rescue|emergency)$/.test(arg)))
-    || (/^(?:init|telinit)$/.test(name) && command.args.length > 0);
-  const touching = TOKEN.test(text) || touchesPath || unitGlob || isolate;
-  const readOnly = readOnlyForm(strict, text);
-  if (touching && !readOnly) {
-    hit(line.id, "backup", `${name} touches the backups (borg repository, retention, borgmatic configuration or timer)`, code);
+  const touching = TOKEN.test(text) || touchesPath || unitGlob;
+  if (touching && !readOnly && !bolt && !packageRoutine(command)) {
+    hit(line.id, "mention", `${name} names or touches the backups without deleting them; the doorkeeper decides`, code);
   }
-  return { touching, readOnly };
+  return { touching, readOnly, name };
 }
 
 // Wohin der Lauf per Heredoc schreibt, und was er ausführt: ein geschriebenes
@@ -875,9 +1104,9 @@ function collectContext(scripts) {
   return { written, executed };
 }
 
-// Alle Stellen eines host-run-Manifests, die Jochens Freigabe brauchen.
-// Leer: der Riegel hat nichts gegen den Lauf.
-export function backupGuardHits(manifest) {
+// Alle Stellen eines host-run-Manifests, an denen der Riegel oder der
+// Türsteher hinsehen soll.
+function analyzeManifest(manifest) {
   const scripts = [
     ...(Array.isArray(manifest?.steps) ? manifest.steps : []).flatMap((step, index) => (step && typeof step.run === "string" ? [{ prefix: `S${index + 1}`, text: step.run }] : [])),
     ...(Array.isArray(manifest?.checks) ? manifest.checks : []).flatMap((check, index) => (check && typeof check.run === "string" ? [{ prefix: `C${index + 1}`, text: check.run }] : [])),
@@ -888,8 +1117,11 @@ export function backupGuardHits(manifest) {
     try {
       analyzeScript(prefix, text, context, hits);
     } catch (error) {
-      // Was der Riegel nicht lesen kann, ist unsicher.
+      // Was der Riegel nicht lesen kann, ist ein Hinweis; ein Löschwort im Text
+      // hält den Lauf trotzdem an.
       hits.push({ where: prefix, kind: "uncertain", reason: `the backup guard could not read this script (${String(error?.message || error).slice(0, 120)})`, code: clip(text) });
+      const bolt = phraseBolt(normalize(text));
+      if (bolt) hits.push({ where: prefix, kind: "backup", reason: bolt, code: clip(text) });
     }
   }
   const seen = new Set();
@@ -899,4 +1131,15 @@ export function backupGuardHits(manifest) {
     seen.add(key);
     return true;
   });
+}
+
+// Der Riegel: jeder Treffer braucht Jochens Freigabe. Leer: der Riegel hat
+// nichts gegen den Lauf.
+export function backupGuardHits(manifest) {
+  return analyzeManifest(manifest).filter((item) => item.kind === "backup");
+}
+
+// Hinweise für den Türsteher; sie halten den Lauf nicht an.
+export function backupGuardFocus(manifest) {
+  return analyzeManifest(manifest).filter((item) => item.kind !== "backup");
 }
