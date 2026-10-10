@@ -13,11 +13,14 @@ Environment=PATH=/opt/node-v20.19.1-linux-x64/bin:/usr/local/bin:/usr/bin:/bin
 Environment=COCKPIT_AGENT_BROKER_SOCKET=/run/cockpit-agent/agent.sock
 Environment=COCKPIT_AGENT_WORKSPACE_ROOT=/var/lib/wireguard-ops-agent/sessions
 Environment=COCKPIT_OPENCODE_CONFIG=/var/lib/wireguard-ops-agent/.config/opencode/opencode.jsonc
-# Engine: the Claude CLI on the subscription (doc/setup/agent-claude-cli.md).
-# The broker never falls back to another engine; without a usable Claude every
-# review answers "nicht verfuegbar" and nothing is approved. DeepSeek/opencode
-# only with COCKPIT_AGENT_ENGINE=opencode in agent.env (labelled in every verdict).
-Environment=COCKPIT_AGENT_ENGINE=claude
+# Engines (doc/setup/agent-claude-cli.md): planner/research/runner on the
+# Claude CLI (subscription); safety/verifier on another model family, today
+# DeepSeek/opencode (DEEPSEEK_API_KEY, COCKPIT_SAFETY_OPENCODE_MODEL in
+# agent.env), later Codex. Claude never reviews; the broker never falls back
+# to another engine: an unavailable engine answers "nicht verfuegbar" and
+# nothing is approved.
+Environment=COCKPIT_AGENT_ENGINE_WORK=claude
+Environment=COCKPIT_AGENT_ENGINE_REVIEW=opencode
 Environment=COCKPIT_AGENT_RUNS_ROOT=/var/lib/wireguard-ops-agent/runs
 Environment=COCKPIT_CLAUDE_EXECUTABLE=/usr/local/bin/claude
 Environment=COCKPIT_CLAUDE_CONFIG_DIR=/var/lib/wireguard-ops-agent/claude-config

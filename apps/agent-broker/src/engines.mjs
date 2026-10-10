@@ -1,15 +1,19 @@
-// Antriebe des Agenten-Brokers. Standard ist die Claude-CLI über das Abo
-// (eigenes langlebiges Token, eigener Konfig-Ordner). Codex ist als zweiter
-// Antrieb vorbereitet und erst nutzbar, wenn er ausdrücklich zugeschaltet ist.
-// DeepSeek über opencode gibt es nur noch per ausdrücklichem Schalter und dann
-// mit sichtbarem Etikett. Es gibt keinen stillen Rückfall: ist der gewählte
-// Antrieb nicht verfügbar, endet der Lauf mit "nicht_verfuegbar".
+// Antriebe des Agenten-Brokers, je Rolle gewählt. Die Arbeitsrollen
+// (planner/research/runner) laufen über die Claude-CLI auf dem Abo (eigenes
+// langlebiges Token, eigener Konfig-Ordner). Die Prüfer (safety/verifier) sind
+// bewusst eine andere Modellfamilie: heute DeepSeek über opencode, später
+// Codex (vorbereitet, erst nutzbar, wenn ausdrücklich zugeschaltet). Claude
+// prüft nie Claude-Arbeit, auch nicht als Rückfall. Es gibt keinen stillen
+// Rückfall: ist der gewählte Antrieb nicht verfügbar, endet der Lauf mit
+// "nicht_verfuegbar".
 import fs from "node:fs";
 import path from "node:path";
 import { execFile } from "node:child_process";
 
 export const ROLES = ["planner", "research", "runner", "safety", "verifier"];
 export const MODEL_ALIASES = new Set(["opus", "sonnet", "haiku", "fable"]);
+export const REVIEW_ROLES = new Set(["safety", "verifier"]);
+export const ENGINES = new Set(["claude", "codex", "opencode"]);
 const PREFLIGHT_TIMEOUT_MS = 15000;
 
 // Rechte je Rolle. Die Sperre ist allein `--tools` (verfügbare Werkzeuge) plus
@@ -31,7 +35,11 @@ const MUTATING = ["Bash", "Edit", "Write", "MultiEdit"];
 export function readEngineConfig(env = process.env) {
   const credentials = env.CREDENTIALS_DIRECTORY ? path.join(env.CREDENTIALS_DIRECTORY, "claude-oauth-token") : null;
   return {
-    engine: (env.COCKPIT_AGENT_ENGINE || "claude").trim(),
+    // Antrieb je Rollengruppe; Prüfer standardmäßig nicht Claude.
+    engines: {
+      work: (env.COCKPIT_AGENT_ENGINE_WORK || "claude").trim(),
+      review: (env.COCKPIT_AGENT_ENGINE_REVIEW || "opencode").trim(),
+    },
     runsRoot: env.COCKPIT_AGENT_RUNS_ROOT || "/var/lib/wireguard-ops-agent/runs",
     claude: {
       executable: env.COCKPIT_CLAUDE_EXECUTABLE || "claude",
@@ -60,8 +68,12 @@ export function readEngineConfig(env = process.env) {
   };
 }
 
+export function engineFor(role, config) {
+  return REVIEW_ROLES.has(role) ? config.engines.review : config.engines.work;
+}
+
 export function claudeModelFor(role, claude) {
-  return role === "safety" || role === "verifier" ? claude.reviewModel : claude.workModel;
+  return REVIEW_ROLES.has(role) ? claude.reviewModel : claude.workModel;
 }
 
 function denyRules(paths) {
@@ -251,28 +263,56 @@ export async function prepareCodex(role, prompt, context, config, { workspace, r
   };
 }
 
-// DeepSeek über opencode: nur per ausdrücklichem Schalter COCKPIT_AGENT_ENGINE=opencode.
+// DeepSeek über opencode: der Prüfer-Antrieb (andere Modellfamilie als
+// Claude), wie bisher mit `plan` für alles außer dem runner (`build`). Er läuft
+// unter demselben Aufseher wie Claude; die Vorabprüfung verlangt Binary,
+// Version und den API-Schlüssel, ein leeres Guthaben oder ein abgelehnter
+// Schlüssel enden als "nicht_verfuegbar", nie als Freigabe.
 export function opencodeArgs(role, prompt, { plannerModel, safetyModel }) {
-  const model = role === "planner" || role === "research" || role === "runner" ? plannerModel : safetyModel;
+  const model = REVIEW_ROLES.has(role) ? safetyModel : plannerModel;
   const agent = role === "runner" ? "build" : "plan";
   return { model, args: ["run", "--auto", "--pure", "--agent", agent, ...(model ? ["--model", model] : []), "--print-logs", prompt] };
+}
+
+// Kein Guthaben, abgelehnter Schlüssel, Zahlung verlangt: der Antrieb ist
+// nicht verfügbar (nicht: die Prüfung ist schiefgegangen).
+const OPENCODE_UNAVAILABLE = /insufficient[ _]balance|payment required|\b402\b|\b401\b|unauthori[sz]ed|invalid api key|authentication (?:error|failed)|api key (?:is )?(?:missing|invalid)/i;
+
+export function opencodeLabel(model) {
+  return `DeepSeek/opencode${model ? ` ${model}` : ""} (Prüfer, andere Modellfamilie als Claude)`;
 }
 
 export async function prepareOpencode(role, prompt, context, config) {
   const { opencode } = config;
   const { model, args } = opencodeArgs(role, prompt, opencode);
+  const label = opencodeLabel(model);
+  if (model && /^deepseek\//i.test(model) && !(opencode.deepseekKey || "").trim()) return { ok: false, grund: "DeepSeek-API-Schlüssel fehlt (DEEPSEEK_API_KEY)", label };
+  const env = { HOME: config.home, PATH: config.path, DEEPSEEK_API_KEY: opencode.deepseekKey, OPENCODE_CONFIG: opencode.config, NODE_ENV: "production" };
+  const version = await execText(opencode.executable, ["--version"], env);
+  if (version.error) return { ok: false, label, grund: version.error.code === "ENOENT" ? `opencode nicht gefunden (${opencode.executable})` : `opencode antwortet nicht (--version: ${version.error.code || version.error.message})` };
+  const match = version.stdout.match(/(\d+\.\d+\.\d+)/);
+  if (!match) return { ok: false, label, grund: "opencode-Version nicht lesbar" };
+  let cliVersionNew = false;
+  try { cliVersionNew = recordVersion(config.runsRoot, "opencode", match[1]); } catch { /* Protokoll ist Beiwerk */ }
   let output = "";
   return {
     ok: true,
     engine: {
-      name: "opencode", model: model || null, cliVersion: null, cliVersionNew: false,
-      label: `DeepSeek/opencode per Schalter COCKPIT_AGENT_ENGINE=opencode (nicht Claude${model ? `, ${model}` : ""})`,
-      executable: opencode.executable, args,
-      env: { HOME: config.home, PATH: config.path, DEEPSEEK_API_KEY: opencode.deepseekKey, OPENCODE_CONFIG: opencode.config, NODE_ENV: "production" },
+      name: "opencode", model: model || null, cliVersion: match[1], cliVersionNew, label,
+      executable: opencode.executable, args, env,
       stdin: "",
       onLine(line) { if (output.length < 2_000_000) output += `${line}\n`; return null; },
       finish({ exitCode, stderr }) {
-        if (exitCode !== 0) return { status: "fehler", grund: `Exit ${exitCode}: ${stderr.trim().slice(-300)}` };
+        const tail = stderr.trim().slice(-300);
+        if (exitCode !== 0) {
+          const unavailable = OPENCODE_UNAVAILABLE.test(stderr) || OPENCODE_UNAVAILABLE.test(output);
+          return { status: unavailable ? "nicht_verfuegbar" : "fehler", grund: `${unavailable ? "DeepSeek nicht verfügbar (Guthaben/Schlüssel)" : `Exit ${exitCode}`}: ${tail}` };
+        }
+        if (!output.trim()) {
+          // opencode endet bei Anbieterfehlern teils mit 0 und ohne Antwort.
+          if (OPENCODE_UNAVAILABLE.test(stderr)) return { status: "nicht_verfuegbar", grund: `DeepSeek nicht verfügbar (Guthaben/Schlüssel): ${tail}` };
+          return { status: "fehler", grund: `leere Antwort${tail ? `: ${tail}` : ""}` };
+        }
         return { status: "erfolg", grund: null, output };
       },
     },
@@ -280,8 +320,11 @@ export async function prepareOpencode(role, prompt, context, config) {
 }
 
 export async function prepareEngine(role, prompt, context, config, dirs) {
-  if (config.engine === "claude") return await prepareClaude(role, prompt, context, config);
-  if (config.engine === "codex") return await prepareCodex(role, prompt, context, config, dirs);
-  if (config.engine === "opencode") return await prepareOpencode(role, prompt, context, config);
-  return { ok: false, grund: `unbekannter Antrieb "${config.engine}"` };
+  const engine = engineFor(role, config);
+  // Unabhängigkeit: die Prüfer sind nie Claude, auch nicht per Schalter.
+  if (REVIEW_ROLES.has(role) && engine === "claude") return { ok: false, grund: "Claude prüft keine Claude-Arbeit: der Prüfer-Antrieb muss eine andere Modellfamilie sein (COCKPIT_AGENT_ENGINE_REVIEW=opencode oder codex)" };
+  if (engine === "claude") return await prepareClaude(role, prompt, context, config);
+  if (engine === "codex") return await prepareCodex(role, prompt, context, config, dirs);
+  if (engine === "opencode") return await prepareOpencode(role, prompt, context, config);
+  return { ok: false, grund: `unbekannter Antrieb "${engine}"` };
 }

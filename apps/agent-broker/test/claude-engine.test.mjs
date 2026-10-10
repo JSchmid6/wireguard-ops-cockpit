@@ -88,44 +88,44 @@ test("each role gets its hard tool set on the command line, never a bypass", () 
 
 test("models come from configuration as aliases: review roles opus, work roles sonnet", async () => {
   const defaults = readEngineConfig({});
-  assert.equal(defaults.engine, "claude");
+  assert.deepEqual(defaults.engines, { work: "claude", review: "opencode" }, "reviewers are another model family by default");
   assert.equal(defaults.claude.reviewModel, "opus");
   assert.equal(defaults.claude.workModel, "sonnet");
   assert.equal(readEngineConfig({ CREDENTIALS_DIRECTORY: "/run/credentials/u" }).claude.tokenFile, "/run/credentials/u/claude-oauth-token");
   assert.equal(defaults.claude.tokenFile, "/etc/wireguard-ops-agent/claude-oauth-token");
   // /proc stays denied for the file tools: the CLI's own environ holds the token.
   assert.deepEqual(defaults.claude.deniedPaths, ["/etc/wireguard-ops-cockpit", "/proc"]);
-  const s = setup("ok", { COCKPIT_CLAUDE_REVIEW_MODEL: "claude-opus-5-5" });
-  const result = await runAgent({ requestId: s.requestId, role: "safety", prompt: "review" }, { config: s.config });
+  const s = setup("ok", { COCKPIT_CLAUDE_WORK_MODEL: "claude-sonnet-5" });
+  const result = await runAgent({ requestId: s.requestId, role: "planner", prompt: "review" }, { config: s.config });
   assert.equal(result.ok, false);
   assert.match(result.error, /Alias/);
-  assert.equal(verdictOf(s.runDir("safety")).status, "nicht_verfuegbar");
+  assert.equal(verdictOf(s.runDir("planner")).status, "nicht_verfuegbar");
 });
 
 test("a supervised Claude run writes events line by line and a verdict, and passes prompt and token only where intended", async () => {
   const s = setup("ok");
-  const result = await runAgent({ requestId: s.requestId, role: "safety", prompt: "review this diff" }, { config: s.config });
+  const result = await runAgent({ requestId: s.requestId, role: "planner", prompt: "review this diff" }, { config: s.config });
   assert.equal(result.ok, true);
   assert.equal(result.output, "VERDICT: approve\nNOTES: 16 chars");
-  assert.deepEqual(result.engine, { antrieb: "claude", modell: "claude-opus-test", cliVersion: "9.9.9", etikett: null, lauf: `${s.requestId}-safety` });
-  const verdict = verdictOf(s.runDir("safety"));
+  assert.deepEqual(result.engine, { antrieb: "claude", modell: "claude-sonnet-test", cliVersion: "9.9.9", etikett: null, lauf: `${s.requestId}-planner` });
+  const verdict = verdictOf(s.runDir("planner"));
   assert.equal(verdict.status, "erfolg");
   assert.equal(verdict.cliVersion, "9.9.9");
   assert.equal(verdict.cliVersionNeu, true);
-  assert.deepEqual(verdict.werkzeuge, []);
+  assert.deepEqual(verdict.werkzeuge, ["Read", "Grep", "Glob"]);
   assert.equal(typeof verdict.dauerMs, "number");
-  assert.equal(fs.readFileSync(path.join(s.runDir("safety"), "events.jsonl"), "utf8").trim().split("\n").length, 3);
-  assert.equal(fs.existsSync(path.join(s.runDir("safety"), "engine.pid")), false);
-  assert.equal(fs.statSync(s.runDir("safety")).mode & 0o777, 0o700);
+  assert.equal(fs.readFileSync(path.join(s.runDir("planner"), "events.jsonl"), "utf8").trim().split("\n").length, 3);
+  assert.equal(fs.existsSync(path.join(s.runDir("planner"), "engine.pid")), false);
+  assert.equal(fs.statSync(s.runDir("planner")).mode & 0o777, 0o700);
   const call = JSON.parse(fs.readFileSync(path.join(s.configDir, "last-call.json"), "utf8"));
   assert.equal(call.stdin, "review this diff", "prompt goes through stdin");
   assert.ok(!call.args.includes("review this diff"), "prompt never in argv");
-  assert.match(after(call.args, "--append-system-prompt"), /Safety role/);
+  assert.match(after(call.args, "--append-system-prompt"), /Planner role/);
   assert.equal(call.tokenPresent, true);
-  assert.equal(call.runMarker, `${s.requestId}-safety`);
+  assert.equal(call.runMarker, `${s.requestId}-planner`);
   assert.deepEqual(call.envKeys.filter((key) => !["PWD", "SHLVL", "_"].includes(key)),
     ["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR", "COCKPIT_AGENT_RUN_ID", "DISABLE_AUTOUPDATER", "HOME", "PATH"]);
-  for (const file of ["events.jsonl", "lauf.json"]) assert.ok(!fs.readFileSync(path.join(s.runDir("safety"), file), "utf8").includes("test-token-value"), `${file} never holds the token`);
+  for (const file of ["events.jsonl", "lauf.json"]) assert.ok(!fs.readFileSync(path.join(s.runDir("planner"), file), "utf8").includes("test-token-value"), `${file} never holds the token`);
   // A second run on the same version is not a version change.
   const again = await runAgent({ requestId: `${s.requestId}ff`, role: "planner", prompt: "plan" }, { config: s.config });
   assert.equal(again.ok, true);
@@ -143,11 +143,11 @@ test("preflight: missing binary, token, login or version ends as nicht_verfuegba
   const open = setup("ok"); fs.chmodSync(open.tokenFile, 0o644); cases.push(["open token", open, /Gruppe\/andere lesbar/]);
   const empty = setup("ok"); fs.writeFileSync(empty.tokenFile, ""); cases.push(["empty token", empty, /leer/]);
   for (const [name, s, reason] of cases) {
-    const result = await runAgent({ requestId: s.requestId, role: "safety", prompt: "review" }, { config: s.config });
+    const result = await runAgent({ requestId: s.requestId, role: "planner", prompt: "review" }, { config: s.config });
     assert.equal(result.ok, false, name);
     assert.match(result.error, /not available/, name);
     assert.match(result.error, /nothing is approved/, name);
-    const verdict = verdictOf(s.runDir("safety"));
+    const verdict = verdictOf(s.runDir("planner"));
     assert.equal(verdict.status, "nicht_verfuegbar", name);
     assert.match(verdict.grund, reason, name);
     assert.equal(fs.existsSync(path.join(s.configDir, "last-call.json")), false, `${name}: no model call`);
@@ -158,7 +158,7 @@ test("preflight: missing binary, token, login or version ends as nicht_verfuegba
 
 test("an authentication error inside the run is nicht_verfuegbar, never a review", async () => {
   const s = setup("autherr");
-  const result = await runAgent({ requestId: s.requestId, role: "safety", prompt: "review" }, { config: s.config });
+  const result = await runAgent({ requestId: s.requestId, role: "planner", prompt: "review" }, { config: s.config });
   assert.equal(result.ok, false);
   assert.equal(result.output, undefined);
   assert.equal(result.verdict.status, "nicht_verfuegbar");
@@ -176,14 +176,14 @@ test("a run whose loaded tools differ from its role is stopped as fehler", async
 
 test("a run that never shows its loaded tools is fehler, even with a result", async () => {
   const s = setup("noinit");
-  const result = await runAgent({ requestId: s.requestId, role: "safety", prompt: "review" }, { config: s.config });
+  const result = await runAgent({ requestId: s.requestId, role: "planner", prompt: "review" }, { config: s.config });
   assert.equal(result.ok, false);
   assert.match(result.verdict.grund, /kein init-Ereignis/);
 });
 
 test("a grandchild left behind by a successful run is ended with its group", async () => {
   const s = setup("leftover");
-  const result = await runAgent({ requestId: s.requestId, role: "safety", prompt: "review" }, { config: s.config, graceMs: 300 });
+  const result = await runAgent({ requestId: s.requestId, role: "planner", prompt: "review" }, { config: s.config, graceMs: 300 });
   assert.equal(result.ok, true);
   const pids = JSON.parse(fs.readFileSync(path.join(s.configDir, "pids.json"), "utf8"));
   assert.ok(await waitFor(() => !isAlive(pids.grandchild)), "no process of the run keeps computing");
@@ -191,13 +191,13 @@ test("a grandchild left behind by a successful run is ended with its group", asy
 
 test("a failed login keeps the CLI version already read in the verdict", async () => {
   const s = setup("loggedout");
-  await runAgent({ requestId: s.requestId, role: "safety", prompt: "review" }, { config: s.config });
-  assert.equal(verdictOf(s.runDir("safety")).cliVersion, "9.9.9");
+  await runAgent({ requestId: s.requestId, role: "planner", prompt: "review" }, { config: s.config });
+  assert.equal(verdictOf(s.runDir("planner")).cliVersion, "9.9.9");
 });
 
 test("exit without a result event is fehler", async () => {
   const s = setup("exit2");
-  const result = await runAgent({ requestId: s.requestId, role: "verifier", prompt: "verify" }, { config: s.config });
+  const result = await runAgent({ requestId: s.requestId, role: "runner", prompt: "run" }, { config: s.config });
   assert.equal(result.ok, false);
   assert.equal(result.verdict.status, "fehler");
   assert.match(result.verdict.grund, /kein Ergebnis-Ereignis \(Exit 2\)/);
@@ -206,13 +206,13 @@ test("exit without a result event is fehler", async () => {
 
 test("the time limit kills the whole process group: SIGTERM, then SIGKILL after the grace period", async () => {
   const s = setup("hang");
-  const timeouts = { safety: 1500 };
-  const result = await runAgent({ requestId: s.requestId, role: "safety", prompt: "review" }, { config: s.config, timeouts, graceMs: 300 });
+  const timeouts = { planner: 1500 };
+  const result = await runAgent({ requestId: s.requestId, role: "planner", prompt: "review" }, { config: s.config, timeouts, graceMs: 300 });
   assert.equal(result.ok, false);
   assert.equal(result.verdict.status, "zeit");
   const pids = JSON.parse(fs.readFileSync(path.join(s.configDir, "pids.json"), "utf8"));
   assert.ok(await waitFor(() => !isAlive(pids.self) && !isAlive(pids.grandchild)), "engine and grandchild are gone");
-  const verdict = verdictOf(s.runDir("safety"));
+  const verdict = verdictOf(s.runDir("planner"));
   assert.equal(verdict.signal, "SIGKILL", "the engine ignored SIGTERM, so the escalation had to kill it");
   assert.equal(fs.readdirSync(process.env.COCKPIT_AGENT_WORKSPACE_ROOT).length, 0);
 });
@@ -264,19 +264,28 @@ test("orphaned runs are reaped only when the PID is still our own engine process
   assert.equal(fs.existsSync(path.join(runsRoot, "foreign0001-safety")), true);
 });
 
-test("no silent fallback: Codex stays off until switched on, unknown engines are refused, opencode carries its label", async () => {
-  const off = setup("ok", { COCKPIT_AGENT_ENGINE: "codex" });
+test("reviewers are never Claude; no silent fallback: Codex stays off until switched on, unknown engines are refused", async () => {
+  // Claude never reviews Claude's work, not even when switched on.
+  const self = setup("ok", { COCKPIT_AGENT_ENGINE_REVIEW: "claude" });
+  for (const role of ["safety", "verifier"]) {
+    const result = await runAgent({ requestId: `${self.requestId}${role === "safety" ? "a" : "b"}`, role, prompt: "review" }, { config: self.config });
+    assert.equal(result.ok, false, role);
+    assert.equal(result.verdict.status, "nicht_verfuegbar");
+    assert.match(result.error, /Claude prüft keine Claude-Arbeit/);
+  }
+  assert.equal(fs.existsSync(path.join(self.configDir, "last-call.json")), false, "Claude was never started as a reviewer");
+  const off = setup("ok", { COCKPIT_AGENT_ENGINE_REVIEW: "codex" });
   const codex = await runAgent({ requestId: off.requestId, role: "safety", prompt: "review" }, { config: off.config });
   assert.equal(codex.ok, false);
   assert.match(codex.error, /Codex ist nicht zugeschaltet/);
   assert.equal(fs.existsSync(path.join(off.configDir, "last-call.json")), false, "no Claude call as a fallback");
-  const unknown = setup("ok", { COCKPIT_AGENT_ENGINE: "deepseek" });
-  const refused = await runAgent({ requestId: unknown.requestId, role: "safety", prompt: "review" }, { config: unknown.config });
+  const unknown = setup("ok", { COCKPIT_AGENT_ENGINE_WORK: "deepseek" });
+  const refused = await runAgent({ requestId: unknown.requestId, role: "planner", prompt: "plan" }, { config: unknown.config });
   assert.equal(refused.ok, false);
   assert.match(refused.error, /unbekannter Antrieb/);
   // A Claude outage is never answered by another engine.
   const down = setup("ok", { COCKPIT_CLAUDE_EXECUTABLE: "/nonexistent/claude", COCKPIT_CODEX_ENABLED: "1", COCKPIT_OPENCODE_EXECUTABLE: "/bin/true" });
-  const outage = await runAgent({ requestId: down.requestId, role: "safety", prompt: "review" }, { config: down.config });
+  const outage = await runAgent({ requestId: down.requestId, role: "planner", prompt: "plan" }, { config: down.config });
   assert.equal(outage.ok, false);
   assert.equal(outage.engine.antrieb, "claude");
   assert.equal(outage.verdict.status, "nicht_verfuegbar");
@@ -289,4 +298,42 @@ test("no silent fallback: Codex stays off until switched on, unknown engines are
   }
   assert.deepEqual(opencodeArgs("runner", "p", { plannerModel: "m1", safetyModel: "m2" }).args.slice(0, 5), ["run", "--auto", "--pure", "--agent", "build"]);
   assert.equal(opencodeArgs("safety", "p", { plannerModel: "m1", safetyModel: "m2" }).model, "m2");
+  assert.equal(opencodeArgs("verifier", "p", { plannerModel: "m1", safetyModel: "m2" }).model, "m2");
+});
+
+// Stand-in for opencode: prints its version, or answers per $FAKE_OPENCODE_MODE (HOME/mode).
+function fakeOpencode(dir, script) {
+  const file = path.join(dir, "opencode");
+  fs.writeFileSync(file, `#!/bin/sh\nif [ "$1" = "--version" ]; then echo 1.2.3; exit 0; fi\n${script}\n`, { mode: 0o755 });
+  return file;
+}
+
+test("the DeepSeek reviewer runs supervised: preflight, label, and an empty balance is not available, never an approval", async () => {
+  const s = setup(null);
+  const base = { COCKPIT_AGENT_RUNS_ROOT: path.join(s.dir, "runs"), COCKPIT_SAFETY_OPENCODE_MODEL: "deepseek/deepseek-v4-pro", DEEPSEEK_API_KEY: "sk-test" };
+  const config = (script, extra = {}) => readEngineConfig({ PATH: process.env.PATH, HOME: s.dir, ...base, COCKPIT_OPENCODE_EXECUTABLE: fakeOpencode(s.dir, script), ...extra });
+  const ok = await runAgent({ requestId: "deadbe0001", role: "safety", prompt: "review" }, { config: config('echo "VERDICT: approve"') });
+  assert.equal(ok.ok, true);
+  assert.equal(ok.output.trim(), "VERDICT: approve");
+  assert.equal(ok.engine.antrieb, "opencode");
+  assert.equal(ok.engine.cliVersion, "1.2.3");
+  assert.equal(ok.engine.etikett, "DeepSeek/opencode deepseek/deepseek-v4-pro (Prüfer, andere Modellfamilie als Claude)");
+  assert.equal(verdictOf(path.join(s.dir, "runs", "deadbe0001-safety")).status, "erfolg");
+  const broke = await runAgent({ requestId: "deadbe0002", role: "verifier", prompt: "verify" }, { config: config('echo "Error: 402 Insufficient Balance" >&2; exit 1') });
+  assert.equal(broke.ok, false);
+  assert.equal(broke.verdict.status, "nicht_verfuegbar");
+  assert.match(broke.engine.etikett, /DeepSeek\/opencode/);
+  const silent = await runAgent({ requestId: "deadbe0003", role: "safety", prompt: "review" }, { config: config('echo "Insufficient Balance" >&2; exit 0') });
+  assert.equal(silent.ok, false, "exit 0 without an answer is no review");
+  assert.equal(silent.verdict.status, "nicht_verfuegbar");
+  const empty = await runAgent({ requestId: "deadbe0004", role: "safety", prompt: "review" }, { config: config("exit 0") });
+  assert.equal(empty.ok, false);
+  assert.equal(empty.verdict.status, "fehler");
+  const nokey = await runAgent({ requestId: "deadbe0005", role: "safety", prompt: "review" }, { config: config('echo "VERDICT: approve"', { DEEPSEEK_API_KEY: "" }) });
+  assert.equal(nokey.ok, false);
+  assert.equal(nokey.verdict.status, "nicht_verfuegbar");
+  assert.match(nokey.error, /DEEPSEEK_API_KEY/);
+  const missing = await runAgent({ requestId: "deadbe0006", role: "safety", prompt: "review" }, { config: readEngineConfig({ PATH: process.env.PATH, HOME: s.dir, ...base, COCKPIT_OPENCODE_EXECUTABLE: "/nonexistent/opencode" }) });
+  assert.equal(missing.verdict.status, "nicht_verfuegbar");
+  assert.match(missing.error, /opencode nicht gefunden/);
 });

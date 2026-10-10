@@ -3,7 +3,8 @@
 // dienste-review-cases.json and update-review-cases.json) against the agent
 // broker's real engine path (safety role) and scores each answer like the unit
 // tests do: verdict, guarantee of a finding, quotes found in the prompt, policy.
-// Used to validate an engine or a new CLI version (doc/setup/agent-claude-cli.md).
+// Used to validate the reviewer engine (COCKPIT_AGENT_ENGINE_REVIEW, default
+// DeepSeek/opencode) or a new CLI version (doc/setup/agent-claude-cli.md).
 //
 //   npm run build   # the script reads apps/api/dist
 //   COCKPIT_CLAUDE_TOKEN_FILE=… COCKPIT_AGENT_RUNS_ROOT=… COCKPIT_CLAUDE_CONFIG_DIR=… \

@@ -2,7 +2,7 @@ import net from "node:net";
 import fs from "node:fs";
 import path from "node:path";
 import { createRunDir, reapOrphanedRuns, superviseRun, writeVerdict } from "./supervisor.mjs";
-import { prepareEngine, readEngineConfig } from "./engines.mjs";
+import { engineFor, prepareEngine, readEngineConfig } from "./engines.mjs";
 
 const socketPath = process.env.COCKPIT_AGENT_BROKER_SOCKET || "/run/wireguard-ops-cockpit/agent.sock";
 const workspaceRoot = process.env.COCKPIT_AGENT_WORKSPACE_ROOT || "/var/lib/wireguard-ops-agent/sessions";
@@ -86,6 +86,7 @@ export async function runAgent(request, { config = readEngineConfig(), timeouts 
   const started = Date.now();
   const deadline = started + timeouts[request.role];
   const runId = `${request.requestId}-${request.role}`.slice(0, 96);
+  const engineName = engineFor(request.role, config);
   let runDir;
   let workspace;
   try {
@@ -101,12 +102,12 @@ export async function runAgent(request, { config = readEngineConfig(), timeouts 
     if (!prepared.ok) {
       const ende = Date.now();
       const verdict = {
-        lauf: runId, rolle: request.role, antrieb: config.engine, modell: null, etikett: null, status: "nicht_verfuegbar", grund: prepared.grund,
+        lauf: runId, rolle: request.role, antrieb: engineName, modell: null, etikett: prepared.label || null, status: "nicht_verfuegbar", grund: prepared.grund,
         exitCode: null, signal: null, start: new Date(started).toISOString(), ende: new Date(ende).toISOString(), dauerMs: ende - started, cliVersion: prepared.cliVersion || null,
       };
       writeVerdict(config.runsRoot, runDir, verdict);
       result = {
-        ok: false, error: `agent engine ${config.engine} not available: ${prepared.grund}; no review, nothing is approved`,
+        ok: false, error: `agent engine ${engineName} not available: ${prepared.grund}; no review, nothing is approved`,
         verdict: { status: verdict.status, grund: verdict.grund, dauerMs: verdict.dauerMs }, engine: publicEngine(verdict),
       };
     } else {
@@ -127,7 +128,7 @@ export async function runAgent(request, { config = readEngineConfig(), timeouts 
     result = { ok: false, error: `agent run failed: ${error.message}` };
     try {
       if (!fs.existsSync(path.join(runDir, "lauf.json"))) {
-        writeVerdict(config.runsRoot, runDir, { lauf: runId, rolle: request.role, antrieb: config.engine, status: "fehler", grund: `Broker-Fehler: ${error.message}`, start: new Date(started).toISOString(), ende: new Date().toISOString(), dauerMs: Date.now() - started, cliVersion: null });
+        writeVerdict(config.runsRoot, runDir, { lauf: runId, rolle: request.role, antrieb: engineName, status: "fehler", grund: `Broker-Fehler: ${error.message}`, start: new Date(started).toISOString(), ende: new Date().toISOString(), dauerMs: Date.now() - started, cliVersion: null });
       }
     } catch { /* the answer to the API already says fehler */ }
   }

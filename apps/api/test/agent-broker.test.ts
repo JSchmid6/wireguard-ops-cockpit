@@ -13,7 +13,7 @@ const SHA = "0123456789abcdef0123456789abcdef01234567";
 const BASE = "89abcdef0123456789abcdef0123456789abcdef";
 const HASH = "a".repeat(64);
 const CLAUDE = { antrieb: "claude", modell: "claude-opus-5-5", cliVersion: "2.1.283", etikett: null, lauf: "x-safety" };
-const OPENCODE = { antrieb: "opencode", modell: "deepseek/deepseek-v4-pro", cliVersion: null, etikett: "DeepSeek/opencode per Schalter COCKPIT_AGENT_ENGINE=opencode (nicht Claude, deepseek/deepseek-v4-pro)" };
+const OPENCODE = { antrieb: "opencode", modell: "deepseek/deepseek-v4-pro", cliVersion: null, etikett: "DeepSeek/opencode deepseek/deepseek-v4-pro (Prüfer, andere Modellfamilie als Claude)" };
 const UNAVAILABLE = { ok: false, error: "agent engine claude not available: Token-Datei fehlt (/run/credentials/x/claude-oauth-token); no review, nothing is approved", verdict: { status: "nicht_verfuegbar" }, engine: { ...CLAUDE, modell: null, cliVersion: null } };
 
 const servers: net.Server[] = [];

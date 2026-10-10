@@ -55,11 +55,16 @@ test("startup cleanup removes stale bounded workspaces but preserves unrelated d
 });
 
 test("agent process exit removes its complete session workspace", async () => {
-  // opencode only behind its explicit switch; /bin/true stands in for it.
-  process.env.COCKPIT_AGENT_ENGINE = "opencode";
+  // The verifier runs on DeepSeek/opencode by default; a stand-in answers.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-fake-opencode-"));
+  const fake = path.join(dir, "opencode");
+  fs.writeFileSync(fake, "#!/bin/sh\n[ \"$1\" = --version ] && echo 1.0.0 || echo done\n", { mode: 0o755 });
+  const before = process.env.COCKPIT_OPENCODE_EXECUTABLE;
+  process.env.COCKPIT_OPENCODE_EXECUTABLE = fake;
   const result = await runAgent({ requestId: "87654321", role: "verifier", prompt: "verify" });
-  delete process.env.COCKPIT_AGENT_ENGINE;
+  process.env.COCKPIT_OPENCODE_EXECUTABLE = before;
+  fs.rmSync(dir, { recursive: true, force: true });
   assert.equal(result.ok, true);
-  assert.match(result.engine.etikett, /DeepSeek\/opencode per Schalter COCKPIT_AGENT_ENGINE=opencode \(nicht Claude/);
+  assert.match(result.engine.etikett, /DeepSeek\/opencode .*andere Modellfamilie als Claude/);
   assert.deepEqual(fs.readdirSync(process.env.COCKPIT_AGENT_WORKSPACE_ROOT), []);
 });

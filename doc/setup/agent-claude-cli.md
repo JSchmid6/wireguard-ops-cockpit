@@ -1,19 +1,36 @@
-# Agent broker on the Claude CLI
+# Agent broker: Claude CLI for the work, another model family for the review
 
 The isolated agent broker (`apps/agent-broker`, service
-`wireguard-ops-cockpit-agent`) runs every role (planner, research, runner,
-safety, verifier) through the Claude CLI on the subscription. Reviews go over
-the subscription, never the API. DeepSeek through opencode remains only behind
-an explicit switch, and Codex is prepared as a second engine that stays off
-until it is switched on.
+`wireguard-ops-cockpit-agent`) chooses the engine per role group:
 
-## Engines and the switch
+- **Work roles** (planner, research, runner) run through the Claude CLI on the
+  subscription (`COCKPIT_AGENT_ENGINE_WORK=claude`).
+- **Review roles** (safety, verifier) are deliberately a different model
+  family than the Claude that does the work and that drives James: today
+  DeepSeek through opencode (`COCKPIT_AGENT_ENGINE_REVIEW=opencode`), later
+  Codex once it is switched on. **Claude never reviews Claude's work**, not
+  even as a fallback: `COCKPIT_AGENT_ENGINE_REVIEW=claude` is refused with
+  "nicht verfügbar". Reason (operator decision 10.10.2026): about 30 Cockpit
+  jobs in 30 days make the DeepSeek review cost small; the reviewer's
+  independence matters more.
 
-| `COCKPIT_AGENT_ENGINE` | Engine | Label in the verdict |
+Both engines run under the same supervisor (preflight, own process group,
+`events.jsonl`, verdict `lauf.json`, no silent fallback).
+
+## Engines and the switches
+
+| Engine | Allowed for | Label in the verdict |
 |---|---|---|
-| `claude` (default) | Claude CLI, `claude -p --output-format stream-json --verbose` | none (model and CLI version are recorded) |
-| `codex` | Codex CLI, only with `COCKPIT_CODEX_ENABLED=1`, otherwise "nicht verfügbar" | `Codex-CLI (zweiter Antrieb, nicht Claude)` |
-| `opencode` | opencode with DeepSeek (the previous engine) | `DeepSeek/opencode per Schalter COCKPIT_AGENT_ENGINE=opencode (nicht Claude, <model>)` |
+| `claude`: Claude CLI, `claude -p --output-format stream-json --verbose` | work roles only | none (model and CLI version are recorded) |
+| `opencode`: opencode with DeepSeek (`COCKPIT_SAFETY_OPENCODE_MODEL`, `DEEPSEEK_API_KEY`) | review roles (default); work roles only by switch | `DeepSeek/opencode <model> (Prüfer, andere Modellfamilie als Claude)` |
+| `codex`: Codex CLI, only with `COCKPIT_CODEX_ENABLED=1`, otherwise "nicht verfügbar" | review roles once switched on | `Codex-CLI (zweiter Antrieb, nicht Claude)` |
+
+The DeepSeek reviewer keeps exactly its previous rights (opencode `plan`
+agent with `--auto --pure`, `deploy/config/opencode-agent.jsonc`); only the
+supervision is new. Its preflight checks the binary, its version and that
+`DEEPSEEK_API_KEY` is set for a `deepseek/…` model. An empty balance, a
+rejected key or "payment required" in the run (also with exit 0 and no
+answer) ends as `nicht_verfuegbar`, never as a review.
 
 There is **no silent fallback**. If the chosen engine is not available
 (binary missing, token missing or too open, login invalid, unknown version, a
@@ -29,18 +46,22 @@ treats that as "no review":
   (`apps/api/src/host-run.ts`).
 
 The reason appears in the job ("Wartet auf dich"), for example
+`agent engine opencode not available: DeepSeek nicht verfügbar (Guthaben/Schlüssel): …; no review, nothing is approved` or
 `agent engine claude not available: Token-Datei fehlt (…); no review, nothing is approved`.
 
 The engine that wrote a review is recorded with the verdict. The plan review
-records it as `details.model` (for example `claude claude-opus-5-5 (CLI 2.1.283)`),
-and a label is put in front of the summary. The pre-install review and the
+records it as `details.model`, and the label (for example
+`DeepSeek/opencode deepseek/deepseek-v4-pro (Prüfer, andere Modellfamilie als Claude)`)
+is put in front of the summary. The pre-install review and the
 doorkeeper add it as the evidence line `reviewer: …`.
 
 ## Models
 
-Models are set only as aliases, in one place (the unit): the review roles
-(safety, verifier) use `COCKPIT_CLAUDE_REVIEW_MODEL=opus`, and the work roles
-(planner, research, runner) use `COCKPIT_CLAUDE_WORK_MODEL=sonnet`. Allowed
+Claude models are set only as aliases, in one place (the unit): the work
+roles (planner, research, runner) use `COCKPIT_CLAUDE_WORK_MODEL=sonnet`.
+`COCKPIT_CLAUDE_REVIEW_MODEL=opus` exists only for the rights tests and the
+measurements below; the broker never starts Claude for a review role. The
+DeepSeek reviewer model stays `COCKPIT_SAFETY_OPENCODE_MODEL` in `agent.env`. Allowed
 values are `opus`, `sonnet`, `haiku` and `fable`. A full model name is refused
 with "nicht verfügbar".
 
@@ -167,8 +188,11 @@ explores the host. The review cases do not measure those. The kill grace is
 (`apps/api/test/fixtures/dienste-review-cases.json`,
 `update-review-cases.json`) to the safety role through the real broker path,
 scores verdict, guarantee, quotes and policy, and writes every answer and a
-`summary.json`. Run it after a change of engine or CLI version. It costs one
-model call per case.
+`summary.json`. Run it after a change of the reviewer engine or its CLI
+version. It uses the configured review engine (`COCKPIT_AGENT_ENGINE_REVIEW`,
+default DeepSeek: API costs, one call per case). The Claude measurements in
+this document come from an earlier state of this branch in which Claude was
+the reviewer; they stay as a comparison only.
 
 ## Deployment: manual steps for the operator (once, BEFORE the rollout)
 
@@ -197,12 +221,13 @@ token.
    ```
 
 4. Roll out through the Cockpit's own `self.update` path (with the update
-   review), never by hand. The unit sets every path. The engine can be
-   overridden only in `/etc/wireguard-ops-cockpit/agent.env`. If
-   `COCKPIT_AGENT_ENGINE` is set there, it must be `claude`.
-5. Check: start a job; the first `lauf.json` below
-   `/var/lib/wireguard-ops-agent/runs/` must show `status: erfolg`,
-   `antrieb: claude`, and the CLI version.
+   review), never by hand. The unit sets every path and both engine switches.
+   `/etc/wireguard-ops-cockpit/agent.env` keeps `DEEPSEEK_API_KEY` and
+   `COCKPIT_SAFETY_OPENCODE_MODEL` for the reviewer, as before. The previous
+   single switch `COCKPIT_AGENT_ENGINE` is no longer read.
+5. Check: start a job; below `/var/lib/wireguard-ops-agent/runs/` the
+   planner's `lauf.json` must show `status: erfolg`, `antrieb: claude` and the
+   CLI version, the safety review's `antrieb: opencode` with its label.
 
 ## Security assumptions and limits
 
@@ -219,14 +244,19 @@ token.
   environment. The safeguards are the role prompt and the reviewed plan, and
   the runner never receives a free task. In a test, the runner refused an
   `env` probe for the token variable on its own.
-- **Label only on the review paths**: planner, runner, research and verifier
-  answers go to the API as plain text. With the opencode switch, the label is
-  then only in `lauf.json`, not in the job (open point).
+- **Label on the review paths**: the safety review (plan review, pre-install
+  review, doorkeeper) shows the DeepSeek label in the job. The verifier's
+  answer goes to the API as plain text; its engine and label are in
+  `lauf.json` only (open point).
 - **Planner and research** have no shell any more. Live probes such as
   `systemctl status` are no longer possible there. They read files only.
-- **Verifier** has no tools. It judges the raw output in the runner handoff
-  and reports an unmet condition as a verification limitation instead of
-  probing.
-- **Codex** has no mode without tools. `read-only` is its narrowest sandbox,
-  so it is weaker than Claude's `--tools ""` for safety and verifier. It
-  stays off until it is switched on.
+- **Reviewer rights** are unchanged from before this branch: safety and
+  verifier on opencode `plan` with `--auto` (shell and edit are derived from
+  the opencode docs, not measured live). Tightening them is a separate step;
+  Claude's `--tools ""` for these roles exists but is never used, because
+  Claude does not review.
+- **Without DeepSeek** (empty balance, key missing, opencode missing) every
+  review is `nicht_verfuegbar`: nothing is approved, the job waits for the
+  operator with the reason. There is no switch to Claude.
+- **Codex** has no mode without tools. `read-only` is its narrowest sandbox.
+  It stays off until it is switched on.
