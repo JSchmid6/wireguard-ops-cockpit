@@ -52,6 +52,8 @@ const free: Array<[string, string]> = [
   ["GitLab backup", "gitlab-backup create STRATEGY=copy\nls -l /var/opt/gitlab/backups"],
   ["snapshot with the tool's own rotation", "/usr/bin/python3 /usr/local/lib/wireguard-ops-cockpit/cockpit-vps-snapshot create cockpit-pre-update --wait 900\n/usr/local/lib/wireguard-ops-cockpit/cockpit-vps-snapshot list"],
   ["reading the configuration", "grep keep_daily /etc/borgmatic/config.yaml\ncp /etc/borgmatic/config.yaml /root/config.yaml.copy"],
+  ["mentions in text output", "echo \"borg prune läuft nachts\"\necho \"keep_daily bleibt 7\"\nlogger \"borgmatic prune fertig\"\necho 'borg delete' | grep -c delete"],
+  ["glob in another working directory", "cd /tmp/build && rm -f *.deb"],
 ];
 
 // Jede Form aus dem Auftrag, und Umwege, die der Text verdeckt.
@@ -153,7 +155,22 @@ const needsApproval: Array<[string, string]> = [
   ["snapshot deleted through the API", "curl -fsS -X DELETE https://api.contabo.com/v1/compute/instances/1/snapshots/abc"],
   ["timer stopped", "systemctl stop borgmatic.timer"],
   ["service stop by name", "service borgmatic stop"],
-  ["prune in python", "python3 - <<'EOF'\nimport subprocess\nsubprocess.run(['borg', 'prune', '--keep-daily', '1', '::'])\nEOF"],
+  ["delete in python as an argument list", "python3 - <<'EOF'\nimport subprocess\nsubprocess.run([\"borg\", \"delete\", \"::a\"])\nEOF"],
+  // Zweitprüfung 10.10.2026: Lücken, die der erste Entwurf durchließ.
+  ["cron file that deletes GitLab backups", "cat > /etc/cron.d/x <<'EOF'\n0 3 * * * root rm -rf /var/opt/gitlab/backups\nEOF"],
+  ["script written, run by its name", "cat > /usr/local/bin/wipe.sh <<'EOF'\n#!/bin/sh\nrm -rf /var/backups/*\nEOF\nchmod +x /usr/local/bin/wipe.sh\nwipe.sh"],
+  ["ssh heredoc to Lab0", "ssh lab0 bash -s <<'EOF'\nrm -rf /media/RAID/backup_VServer/borg\nEOF"],
+  ["ssh heredoc to Lab0, any path", "ssh borg@10.0.0.5 <<'EOF'\nrm -rf /srv/x\nEOF"],
+  ["borgmatic timer drop-in", "printf '[Timer]\\nOnCalendar=\\nOnCalendar=2099-01-01\\n' > /etc/systemd/system/borgmatic.timer.d/aus.conf\nsystemctl daemon-reload"],
+  ["borgmatic service drop-in in /run", "cat > /run/systemd/system/borgmatic.service.d/x.conf <<'EOF'\n[Service]\nExecStart=\nExecStart=/bin/true\nEOF"],
+  ["runuser without -c", "runuser -u root -- rm -rf /var/opt/gitlab/backups"],
+  ["find with an option before the path", "find -L /var/backups -mtime +7 -delete"],
+  ["find -H with a debug option", "find -D tree -H /var/backups -name '*.gz' -exec rm {} +"],
+  ["quoted option value moves the command", "systemd-run --description \"alte Sicherungen\" rm -rf /var/backups"],
+  ["sudo prompt in quotes", "sudo -p \"Passwort bitte\" rm -rf /var/opt/gitlab/backups"],
+  ["sed -i on a backup", "sed -i d /var/backups/apt.extended_states.0"],
+  ["snapshot deleted with bundled curl flags", "curl -fsSX DELETE https://api.contabo.com/v1/compute/instances/1/snapshots/abc"],
+  ["find piped into xargs rm", "find /var/backups -mtime +7 | xargs rm -f"],
   ["delete of a backup in python", "python3 -c 'import shutil; shutil.rmtree(\"/var/backups/hermes-umschalten\")'"],
 ];
 

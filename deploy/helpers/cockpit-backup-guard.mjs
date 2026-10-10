@@ -69,7 +69,7 @@ export const BACKUP_GUARD_VERSION = "cockpit-backup-guard/v3";
 
 // Was die Backups sind. TOKEN greift im normalisierten Text (ohne Quotes und
 // Backslashes), also auch in b"o"rg und bo\rg.
-const TOKEN = /borg|backup_vserver|\/media\/raid|\b10\.0\.0\.5\b|\blab0\b|timers\.target/i;
+const TOKEN = /borg|backup_vserver|\/media\/raid|\b10\.0\.0\.5\b|\blab0\b|timers\.target|api\.contabo\.com/i;
 // Was der Riegel schützt. CONFIG: jedes Schreiben dort ändert, was gesichert
 // und wie lange aufbewahrt wird, oder schaltet die Sicherung ab.
 const CONFIG = [
@@ -163,9 +163,9 @@ const AWK_PRIMITIVES = /\bsystem\s*\(|\|\s*getline|\|&|\bprint[^;}]*[>|]/;
 // ── Was den Riegel auslöst ─────────────────────────────────────────────────
 // Im normalisierten Text eines Befehls (ohne Quotes), auch in sh -c '…', in
 // einem Skript, das der Lauf schreibt, oder in einer Cron-Zeile.
-const DELETE_PHRASE = /\bborg(?:matic)?\b(?:\s+\S+){0,8}?\s+(?:delete|prune|compact|recreate|break-lock|rdelete|repo-delete|key\s+(?:change-passphrase|import|migrate-to-repokey|change-location|change-algorithm))\b/i;
+const DELETE_PHRASE = /\bborg(?:matic)?\b(?:[\s,[\]()]+[^\s,[\]()]+){0,8}?[\s,[\]()]+(?:delete|prune|compact|recreate|break-lock|rdelete|repo-delete|key[\s,[\]()]+(?:change-passphrase|import|migrate-to-repokey|change-location|change-algorithm))\b/i;
 const RETENTION_PHRASE = /\bkeep[_-](?:within|secondly|minutely|hourly|daily|weekly|monthly|yearly|last)\b|\bbackup_keep_time\b|\bkeep(?:Daily|Weekly|Monthly)\b/i;
-const SNAPSHOT_DELETE = /\bcockpit-vps-snapshot\s+delete\b|(?:\s-X|--request)\s*DELETE\b[^\n]*\/snapshots\b|\/snapshots\b[^\n]*(?:\s-X|--request)\s*DELETE\b/i;
+const SNAPSHOT_DELETE = /\bcockpit-vps-snapshot\s+delete\b|(?:\s-[a-zA-Z]*X|--request)[\s=]*DELETE\b[^\n]*\/snapshots\b|\/snapshots\b[^\n]*(?:\s-[a-zA-Z]*X|--request)[\s=]*DELETE\b/i;
 const BORG_DELETE = new Set(["delete", "prune", "compact", "recreate", "break-lock", "rdelete", "repo-delete"]);
 const BORG_KEY_CHANGE = new Set(["change-passphrase", "import", "migrate-to-repokey", "change-location", "change-algorithm"]);
 const BORGMATIC_DELETE = new Set([...BORG_DELETE, "borg", "key"]);
@@ -173,13 +173,14 @@ const BORGMATIC_ALL_ACTIONS = new Set([...BORGMATIC_ACTIONS, ...BORGMATIC_DELETE
 // Diese Verben lassen eine Unit laufen oder lesen sie; alle anderen (stop,
 // disable, mask, kill, edit, revert, set-property, freeze …) halten sie an.
 const UNIT_KEEPS = new Set([...SYSTEMCTL_READ, "start", "restart", "reload", "try-restart", "reload-or-restart", "try-reload-or-restart", "enable", "reenable", "unmask", "reset-failed", "daemon-reload"]);
+const ECHOES = new Set(["echo", "printf", "logger"]);
 // Löschen ganzer Bäume: für sie zählt auch ein Vorfahr (rm -rf /var).
 const DELETERS = new Set(["rm", "rmdir", "shred", "unlink", "wipe", "srm"]);
 // Schreiben, das eine vorhandene Datei überschreibt oder unbrauchbar macht.
 const OVERWRITERS = new Set(["truncate", "dd", "chattr"]);
 // Schreiben in eine Datei oder einen Baum (Konfiguration ändern).
 const WRITERS = new Set(["tee", "sed", "perl", "touch", "ln", "install", "cp", "mv", "rsync", "chmod", "chown", "chgrp", "setfacl", "tar", "unzip", "patch", "git", ...OVERWRITERS]);
-const CODE_DELETE = /\b(?:unlink|rmtree|remove|rmdir|rename|replace|truncate|move|rm_rf|rm_r|delete)\b/;
+const CODE_DELETE = /\b(?:unlink|rmtree|remove|rmdir|rename|replace|truncate|move|rm_rf|rm_r|delete|rm|mv|shred|dd|wipe)\b|\bfind\b[^\n]*\s-delete\b|\brsync\b[^\n]*\s--del/;
 const CODE_WRITE = /\b(?:open|write|write_text|write_bytes|writeFile|writeFileSync|copy|copyfile|symlink|chmod|chown)\b/;
 
 const OPAQUE = "\u0001";
@@ -529,8 +530,10 @@ function commandOf(words, strict) {
     if (name === "chroot") { prefixes.push(name); i += 1; skipOptions(new Set(["--userspec", "--groups"])); i += 1; continue; }
     if (name === "runuser" || name === "su") {
       prefixes.push(name); i += 1;
-      while (i < words.length && words[i] !== "-c" && words[i] !== "--command") i += 1;
-      i += 1;
+      const dashC = words.slice(i).findIndex((word) => word === "-c" || word === "--command");
+      if (dashC >= 0) { i += dashC + 1; continue; }
+      if (name === "su") { i = words.length; continue; } // su ohne -c startet nur eine Shell
+      skipOptions(new Set(["-u", "--user", "-g", "--group", "-G", "--supp-group", "-s", "--shell", "-w", "--whitelist-environment"])); // runuser -u borg -- borg compact
       continue;
     }
     if (SHELLS.has(name) && leadingOptions(words, i + 1).some((word) => /^-[a-zA-Z]*c[a-zA-Z]*$/.test(word))) {
@@ -576,6 +579,7 @@ function globRegex(glob) {
     if (char === "*") pattern += "[^/]*";
     else if (char === "?") pattern += "[^/]";
     else if (char === "[") { const end = glob.indexOf("]", i + 1); if (end < 0) pattern += "\\["; else { pattern += `[${glob.slice(i + 1, end).replace(/^!/, "^").replace(/\\/g, "\\\\")}]`; i = end; } }
+    else if (char === "{" && glob[i + 1] === "}") { pattern += "[^/]*"; i += 1; } // {} von xargs -I{} / find -exec: jeder Name
     else if (char === "{") { const end = glob.indexOf("}", i + 1); if (end < 0) pattern += "\\{"; else { pattern += `(?:${glob.slice(i + 1, end).split(",").map((alt) => alt.replace(/[.+^$()|\\]/g, "\\$&").replace(/\*/g, "[^/]*").replace(/\?/g, "[^/]")).join("|")})`; i = end; } }
     else pattern += char.replace(/[.+^$()|\\\]}]/g, "\\$&");
   }
@@ -589,11 +593,15 @@ const within = (path, root) => path === root || path.startsWith(root === "/" ? "
 // list: welche Orte zählen (Vorgabe: alles, was den Rückweg berührt).
 function pathTouches(path, bulk, list = PROTECTED, ancestors = ANCESTORS) {
   if (GLOB.test(path)) {
-    const regex = globRegex(path);
-    if ([...list, ...(bulk ? ancestors : [])].some((item) => regex.test(item))) return true;
-    const literal = path.slice(0, path.search(GLOB));
-    const dir = literal.slice(0, literal.lastIndexOf("/")) || "/";
-    return list.some((item) => within(dir, item)) || (bulk && list.some((item) => within(item, dir)));
+    // Ein Glob trifft einen geschützten Ort, wenn seine ersten Teile auf ihn
+    // passen (dann liegt jeder Treffer darin), oder — bei Bäumen — wenn er auf
+    // einen seiner Vorfahren passt.
+    const parts = path.split("/").slice(1);
+    return list.some((item) => {
+      const itemParts = item.split("/").slice(1);
+      if (parts.length >= itemParts.length) return globRegex(`/${parts.slice(0, itemParts.length).join("/")}`).test(item);
+      return bulk && globRegex(path).test(`/${itemParts.slice(0, parts.length).join("/")}`);
+    }) || (bulk && ancestors.some((item) => globRegex(path).test(item)));
   }
   return list.some((item) => within(path, item) || (bulk && within(item, path)));
 }
@@ -610,7 +618,8 @@ function pathWords(args, name) {
     if (arg.startsWith("-") && !arg.includes("=")) continue;
     if (arg.includes("{{")) continue; // Go-Vorlage (docker --format '{{.Names}}'), kein Pfad
     if (skipFirst) { skipFirst = false; continue; }
-    for (const piece of arg.split(/[=:,]/)) if (piece) values.push(piece);
+    // Kommas trennen Werte (--opt=a,b), aber nicht in {a,b} (Klammer-Expansion).
+    for (const piece of arg.split(arg.includes("{") ? /[=:]/ : /[=:,]/)) if (piece) values.push(piece);
   }
   return values;
 }
@@ -719,7 +728,7 @@ function phraseBolt(text) {
 }
 
 const pathTokens = (text) => (text.match(/(?:^|[\s=:'"(,])(\/[^\s;|&<>()`,:='"]*)/g) || []).map((token) => resolvePath(token.replace(/^[\s=:'"(,]/, ""), "/"));
-const namesUnit = (path) => UNITS.some((unit) => baseName(path) === unit || baseName(path) === `${unit}.d`);
+const namesUnit = (path) => path.split("/").some((part) => UNITS.some((unit) => part === unit || part === `${unit}.d`));
 
 // Eine Zeile Code einer anderen Sprache (python <<EOF, perl -e '…') oder Daten,
 // die später laufen können (Cron-Zeile, Unit).
@@ -796,20 +805,32 @@ function analyzeScript(prefix, text, context, hits, language = "shell") {
     // Was ein Backup-Befehl ausgibt, darf nicht in einen schreibenden Befehl
     // fließen. In crontab heißt das: der Eintrag der Sicherung wird gestrichen
     // (crontab -l | grep -v borgmatic | crontab -); sonst ein Hinweis.
+    // Ebenso: ein Löschwort, das echo/printf in eine Pipe gibt (echo 'borg
+    // delete' | tee s.sh), und Pfade aus find, die xargs löscht.
     let carry = false;
+    let echoed = null;
+    let found = [];
     for (const segment of segments) {
       const variants = expandText(segment.text, resolve);
       if (!variants) { hit(line.id, "uncertain", "too many values for the variables in this command", code); continue; }
       let touching = false;
+      let nextEchoed = null;
+      let nextFound = [];
       for (const text of variants) {
         const result = checkSegment(text, segment, line, context, cwds, hit);
         if (segment.piped && carry && !result.readOnly) {
           if (result.name === "crontab") hit(line.id, "backup", "rewrites the crontab from output about the backups: that drops or changes their schedule", code);
           else hit(line.id, "mention", "output about the backups flows into a command that changes something", code);
         }
+        if (segment.piped && echoed && !result.readOnly && !ECHOES.has(result.name)) hit(line.id, "backup", `${echoed} (text piped into ${result.name || "a command"})`, code);
+        if (segment.piped && result.deletesFromInput && found.some((path) => touchesBolted(path))) hit(line.id, "backup", `${result.name} deletes what find lists in the backups`, code);
         touching ||= result.touching;
+        nextEchoed ||= result.echoed;
+        nextFound.push(...result.found);
       }
       carry = segment.piped ? carry || touching : touching;
+      echoed = segment.piped ? echoed || nextEchoed : nextEchoed;
+      found = segment.piped ? [...found, ...nextFound] : nextFound;
     }
   }
 
@@ -831,13 +852,15 @@ function analyzeScript(prefix, text, context, hits, language = "shell") {
     const shebang = heredoc.body[0]?.raw.match(/^#!\s*\S*?(?:env\s+)?(\S+)\s*$/)?.[1];
     let language = null;
     if (!heredoc.closed) language = "shell";
-    else if (name === "source" || name === "." || SHELLS.has(name)) language = "shell";
+    else if (name === "source" || name === "." || SHELLS.has(name) || /^(?:ssh|autossh)$/.test(name)) language = "shell";
     else if (INTERPRETERS.test(name)) language = name;
     else if (targets.some((target) => context.executed.has(target))) language = shebang && INTERPRETERS.test(baseName(shebang)) ? baseName(shebang) : "shell";
     if (language) {
       const sub = [];
       analyzeScript(bodyPrefix, bodyText, context, sub, language);
       for (const item of sub) hits.push({ ...item, where: shiftLine(item.where, offset) });
+      const remote = remoteCommand(name, command.args.filter((arg) => !arg.startsWith("<<")));
+      if (remote && LAB0_HOST.test(remote.host) && REMOTE_DELETE.test(` ${bodyText}`)) hit(heredoc.line.id, "backup", `deletes on Lab0 (${remote.host}), the machine that holds the borg repository`, heredoc.line.raw);
       continue;
     }
     for (const item of heredoc.body) {
@@ -879,9 +902,11 @@ const REMOTE_DELETE = /(?:^|[\s;&|])(?:sudo\s+)?(?:rm|rmdir|mv|shred|unlink|trun
 // Schlägt der Riegel bei diesem einfachen Befehl an? Liefert den Grund oder null.
 function segmentBolt(text, command, name, readOnly, cwds, context, line) {
   const { args } = command;
-  // Lesen ist nie Löschen; echo/printf aber können einen Befehl in eine Datei
-  // oder eine Pipe schreiben.
-  if (!(readOnly && name !== "echo" && name !== "printf")) {
+  // Lesen ist nie Löschen. echo/printf/logger geben Text aus: ein Löschwort
+  // darin zählt erst, wenn es in eine Datei geht (hier) oder in eine Pipe
+  // (analyzeScript, am nächsten Befehl).
+  if (ECHOES.has(name) && redirectTargets(text).length === 0) return null;
+  if (!readOnly) {
     const phrase = phraseBolt(text);
     if (phrase) return phrase;
   }
@@ -932,10 +957,7 @@ function segmentBolt(text, command, name, readOnly, cwds, context, line) {
   if (DELETERS.has(name) || name === "mv" || (name === "git" && args.some((arg) => arg === "clean" || arg === "rm"))) deleted = resolveAll(words);
   else if (name === "find") {
     const exec = args.findIndex((arg) => /^-(?:exec|execdir|ok|okdir)$/.test(arg));
-    if (args.includes("-delete") || (exec >= 0 && /^(?:rm|rmdir|shred|unlink|mv)$/.test(baseName(args[exec + 1] || "")))) {
-      const start = args.findIndex((arg) => arg.startsWith("-") || arg === "(" || arg === "!");
-      deleted = resolveAll(start < 0 ? args : args.slice(0, start));
-    }
+    if (args.includes("-delete") || (exec >= 0 && /^(?:rm|rmdir|shred|unlink|mv)$/.test(baseName(args[exec + 1] || "")))) deleted = resolveAll(findStarts(args));
   } else if (name === "rsync") {
     const dest = operands.at(-1);
     if (args.some((arg) => arg.startsWith("--remove-source-files"))) deleted = resolveAll(words);
@@ -946,9 +968,16 @@ function segmentBolt(text, command, name, readOnly, cwds, context, line) {
   } else if (name === "cp" || name === "install" || name === "ln") {
     const target = args.find((arg, index) => args[index - 1] === "-t" || args[index - 1] === "--target-directory") || args.find((arg) => arg.startsWith("--target-directory="))?.slice(19);
     written.push(...resolveAll(name === "install" && args.includes("-d") ? operands : [target || operands.at(-1)].filter(Boolean)));
-  } else if ((name === "sed" || name === "perl") && !args.some((arg) => /^-[a-zA-Z]*i/.test(arg) || arg.startsWith("--in-place"))) {
-    // sed/perl ohne -i schreibt keine Datei.
+  } else if (name === "sed" || name === "perl") {
+    // Nur mit -i schreiben sie eine Datei, und dann überschreiben sie sie.
+    if (args.some((arg) => /^-[a-zA-Z]*i/.test(arg) || arg.startsWith("--in-place"))) { written.push(...resolveAll(words)); overwritten = resolveAll(words); }
   } else if (WRITERS.has(name)) written.push(...resolveAll(words));
+
+  // 5: Ein Optionswert aus mehreren Wörtern in Quotes (systemd-run --description
+  // "alte Sicherungen" rm …) verschiebt das Befehlswort. Darum zählt auch ein
+  // Löschbefehl weiter hinten in einem Befehl, der nicht nur liest.
+  const later = words.length === 0 ? -1 : command.args.findIndex((arg) => DELETERS.has(baseName(arg)) || baseName(arg) === "mv");
+  if (later >= 0 && !DELETERS.has(name) && name !== "mv") deleted.push(...resolveAll(pathWords(command.args.slice(later + 1), "rm")));
 
   if (deleted.some((path) => touchesBolted(path) || namesUnit(path))) return `${name} deletes or moves backups or their configuration`;
   if (overwritten.some((path) => touchesConfig(path) || touchesData(path, false) || namesUnit(path))) return `${name} overwrites backups or their configuration`;
@@ -964,6 +993,15 @@ function segmentBolt(text, command, name, readOnly, cwds, context, line) {
     if (LAB0_HOST.test(remote.host) && REMOTE_DELETE.test(` ${remote.command}`)) return `deletes on Lab0 (${remote.host}), the machine that holds the borg repository`;
   }
   return null;
+}
+
+// Die Startpfade von find: nach -H/-L/-P/-O3/-D <x>, bis zum ersten Ausdruck.
+function findStarts(args) {
+  let i = 0;
+  while (i < args.length && /^-(?:H|L|P|O\d*|D)$/.test(args[i])) i += args[i] === "-D" ? 2 : 1;
+  const starts = [];
+  for (; i < args.length && !args[i].startsWith("-") && args[i] !== "(" && args[i] !== "!"; i += 1) starts.push(args[i]);
+  return starts;
 }
 
 // Paketpflege: borgbackup oder borgmatic unter den Paketen ist kein Hinweis.
@@ -994,7 +1032,7 @@ function checkSegment(text, { piped, quoted }, line, context, cwds, hit) {
     const bolt = phraseBolt(text);
     if (bolt) hit(line.id, "backup", bolt, code);
     else if (TOKEN.test(text)) hit(line.id, "mention", "a value that names the backups", code);
-    return { touching: TOKEN.test(text), readOnly: true, name };
+    return { touching: TOKEN.test(text), readOnly: true, name, deletesFromInput: false, echoed: null, found: [] };
   }
 
   // Wer läuft? Ein dynamischer Name ist unsicher.
@@ -1002,7 +1040,7 @@ function checkSegment(text, { piped, quoted }, line, context, cwds, hit) {
     hit(line.id, "uncertain", "the command name is built at run time", code);
     const bolt = phraseBolt(text);
     if (bolt) hit(line.id, "backup", bolt, code);
-    return { touching: true, readOnly: false, name };
+    return { touching: true, readOnly: false, name, deletesFromInput: false, echoed: null, found: [] };
   }
   if (name === "alias" || name === "hash" && command.args.includes("-p") || name === "enable" && command.args.some((arg) => arg.startsWith("-f"))) {
     hit(line.id, "uncertain", `${name} changes what a command name runs`, code);
@@ -1067,7 +1105,12 @@ function checkSegment(text, { piped, quoted }, line, context, cwds, hit) {
   if (touching && !readOnly && !bolt && !packageRoutine(command)) {
     hit(line.id, "mention", `${name} names or touches the backups without deleting them; the doorkeeper decides`, code);
   }
-  return { touching, readOnly, name };
+  return {
+    touching, readOnly, name,
+    deletesFromInput: command.prefixes.includes("xargs") && (DELETERS.has(name) || name === "mv"),
+    echoed: ECHOES.has(name) ? phraseBolt(text) : null,
+    found: name === "find" ? findStarts(command.args).filter((start) => !start.includes(OPAQUE)).flatMap((start) => [...cwds].map((cwd) => resolvePath(start, cwd))) : [],
+  };
 }
 
 // Wohin der Lauf per Heredoc schreibt, und was er ausführt: ein geschriebenes
