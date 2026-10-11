@@ -301,6 +301,30 @@ describe("self-update pre-install review", () => {
     expect(coverage.map((item) => item.incomplete)).toEqual([[], []]);
   });
 
+  it("counts the fence against the budget when the material holds long backtick runs", () => {
+    const bomb = section("docs/fence.md", ["@@ -0,0 +1 @@", `+${"`".repeat(6_000)}`]);
+    const { prompt, coverage } = buildUpdateReviewPrompt([diff({ excerpt: [...diff().excerpt, bomb] })], { nonce: NONCE, limit: 24_000 });
+    expect(Buffer.byteLength(prompt)).toBeLessThanOrEqual(24_000);
+    // Docs only: left out or cut, never a stop.
+    expect(coverage[0].incomplete).toEqual([]);
+    const fits = buildUpdateReviewPrompt([diff({ excerpt: [...diff().excerpt, bomb] })], { nonce: NONCE, limit: 40_000 });
+    expect(Buffer.byteLength(fits.prompt)).toBeLessThanOrEqual(40_000);
+    expect(fits.prompt).toContain("`".repeat(6_001) + "diff");
+  });
+
+  it("clips a mass-change description inside the budget and stops for it", () => {
+    const deleted = Array.from({ length: 1_500 }, (_, index) => `test/deleted/suite-${index}.test.sh`);
+    const mass = diff({
+      files: [...diff().files, ...deleted.map((path) => ({ status: "D", path, added: 0, deleted: 10, class: "test-deleted" }))],
+      filesTotal: 1_502,
+      focusAreas: [...diff().focusAreas, area("tests-deleted", deleted, [])],
+    });
+    const { prompt, coverage } = buildUpdateReviewPrompt([mass, { ...mass, sha: "f".repeat(40) }], { nonce: NONCE, limit: 60_000 });
+    expect(Buffer.byteLength(prompt)).toBeLessThanOrEqual(60_000);
+    expect(prompt).toContain("[... update description clipped for the review budget ...]");
+    expect(coverage[0].incomplete).toContain("(the update description: focus areas or file list clipped)");
+  });
+
   it("stops when the runner did not list every changed file", () => {
     const { coverage } = buildUpdateReviewPrompt([diff({ filesTotal: 2005 })], { nonce: NONCE });
     expect(coverage[0].incomplete).toEqual(["(2003 changed file(s) the runner did not list)"]);

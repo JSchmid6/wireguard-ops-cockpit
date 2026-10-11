@@ -40,7 +40,7 @@ import {
 // safety-role bounds (100,000 characters, 120,000 bytes: one argv element).
 export const UPDATE_REVIEW_PROMPT_LIMIT = 96_000;
 const FILE_LIST_BUDGET = 8_000;
-const NAME_LIST_BUDGET = 1_000;
+const NAME_LIST_BUDGET = 500;
 const EVIDENCE_ITEM_LIMIT = 4_000;
 const SHA = /^[a-f0-9]{40}$/;
 const DIFF_HASH = /^[a-f0-9]{64}$/;
@@ -325,9 +325,20 @@ function nameList(names: string[]): string {
   return rest > 0 ? `${[...shown, `... (${rest} more)`].join(", ")}` : shown.join(", ");
 }
 
+function backtickRun(text: string): number {
+  let longest = 2;
+  for (const match of text.matchAll(/`+/g)) longest = Math.max(longest, match[0].length);
+  return longest;
+}
+
 function fence(text: string): string {
-  const longest = Math.max(2, ...[...text.matchAll(/`+/g)].map((match) => match[0].length));
-  return "`".repeat(longest + 1);
+  return "`".repeat(backtickRun(text) + 1);
+}
+
+function clipBytes(text: string, limit: number, note: string): string {
+  if (bytes(text) <= limit) return text;
+  const room = Buffer.from(text, "utf8").subarray(0, Math.max(0, limit - bytes(note) - 1)).toString("utf8").replace(/�+$/, "");
+  return `${room.slice(0, Math.max(0, room.lastIndexOf("\n")))}\n${note}`;
 }
 
 function describeUpdate(diff: UpdateDiff, index: number, total: number): string {
@@ -386,9 +397,15 @@ export function buildUpdateReviewPrompt(diffs: UpdateDiff[], options: { nonce?: 
   const spec = UPDATE_KINDS[kindOf(diffs[0]?.kind)];
   const head = [spec.instructions, "", updateReviewDataNotice(nonce), "", `BEGIN_REVIEW_DATA ${nonce}`].join("\n");
   const tail = [`END_REVIEW_DATA ${nonce}`, "", updateReviewClosingReminder(nonce)].join("\n");
-  const descriptions = diffs.map((diff, index) => describeUpdate(diff, index, diffs.length));
-  // Per update: its description, the block frame and the two name lists of the state line.
-  let remaining = limit - bytes(head) - bytes(tail) - descriptions.reduce((sum, text) => sum + bytes(text) + 400 + 2 * NAME_LIST_BUDGET, 0);
+  // Per update: the block frame and the two name lists of the state line, and
+  // at most its share of the rest for its description (a mass change of focus files
+  // or packages is clipped there, and the clip is incomplete coverage).
+  const frame = 400 + 2 * NAME_LIST_BUDGET;
+  const room = limit - bytes(head) - bytes(tail);
+  const descriptionLimit = Math.max(0, Math.floor(room / Math.max(1, diffs.length)) - frame);
+  const full = diffs.map((diff, index) => describeUpdate(diff, index, diffs.length));
+  const descriptions = full.map((text) => clipBytes(text, descriptionLimit, "[... update description clipped for the review budget ...]"));
+  let remaining = room - descriptions.reduce((sum, text) => sum + bytes(text) + frame, 0);
   const coverage: UpdateReviewCoverage[] = [];
   const blocks: string[] = [];
   diffs.forEach((diff, index) => {
@@ -400,15 +417,19 @@ export function buildUpdateReviewPrompt(diffs: UpdateDiff[], options: { nonce?: 
     const complete = new Set<string>();
     const shown = new Set<string>();
     const skipped: { path: string; text: string }[] = [];
+    // The excerpt's fence (twice in the block) outgrows any backtick run in it.
+    let fenceLength = 3;
+    const fenceCost = (text: string) => 2 * Math.max(0, backtickRun(text) + 1 - fenceLength);
     for (const section of materialOrder(diff.excerpt, supplementary)) {
       const text = redactSecrets(section.text.endsWith("\n") ? section.text : `${section.text}\n`);
-      const size = bytes(text);
+      const size = bytes(text) + fenceCost(text);
       if (size > remaining) {
         skipped.push({ path: section.path, text });
         continue;
       }
       included.push(text);
       remaining -= size;
+      fenceLength = Math.max(fenceLength, backtickRun(text) + 1);
       shown.add(section.path);
       if (diff.partialFiles.includes(section.path)) continue;
       // git shows a binary file only by name: complete for an ordinary file,
@@ -417,11 +438,14 @@ export function buildUpdateReviewPrompt(diffs: UpdateDiff[], options: { nonce?: 
     }
     for (const { path, text } of skipped) {
       const note = `\n[... ${path} truncated for the review budget ...]\n`;
-      if (remaining - bytes(note) > 1024) {
-        const room = Buffer.from(text, "utf8").subarray(0, remaining - bytes(note) - 200).toString("utf8").replace(/\uFFFD+$/, "");
-        const partial = `${room.slice(0, Math.max(0, room.lastIndexOf("\n")))}${note}`;
+      // The cut part's backtick runs are at most the whole section's.
+      const usable = remaining - bytes(note) - fenceCost(text);
+      if (usable > 1024) {
+        const kept = Buffer.from(text, "utf8").subarray(0, usable - 200).toString("utf8").replace(/\uFFFD+$/, "");
+        const partial = `${kept.slice(0, Math.max(0, kept.lastIndexOf("\n")))}${note}`;
         included.push(partial);
-        remaining -= bytes(partial);
+        remaining -= bytes(partial) + fenceCost(partial);
+        fenceLength = Math.max(fenceLength, backtickRun(partial) + 1);
         cut.push(path);
       } else {
         omitted.push(path);
@@ -434,6 +458,7 @@ export function buildUpdateReviewPrompt(diffs: UpdateDiff[], options: { nonce?: 
     const incomplete = required.filter((file) => !complete.has(file)).sort();
     const unlisted = Math.max(0, diff.filesTotal - diff.files.length);
     if (unlisted > 0) incomplete.push(`(${unlisted} changed file(s) the runner did not list)`);
+    if (descriptions[index] !== full[index]) incomplete.push("(the update description: focus areas or file list clipped)");
     // cut: partially in the prompt (by the runner or here); omitted: not at all.
     const cutFiles = [...new Set([...diff.partialFiles.filter((file) => shown.has(file)), ...cut])];
     const missing = required.filter((path) => !complete.has(path) && !cutFiles.includes(path));
