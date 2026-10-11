@@ -34,9 +34,11 @@
 //              Operator und wartet trotzdem weiter (cockpit-state-steps.mjs
 //              entscheidet, installiert neben diesem Helfer; im Zweifel
 //              unterbrechungssicher). Die Lauf-Unit hat dann kein
-//              RuntimeMaxSec. Scheitert ein Paketschritt, räumt der Helfer
-//              selbst auf: sshd zuerst, dann dpkg --configure -a und
-//              apt-get -f install, dann die Hauptdienste.
+//              RuntimeMaxSec. Scheitert in einem ändernden Lauf ein
+//              Paketschritt, räumt der Helfer selbst auf: sshd zuerst, dann
+//              dpkg --configure -a und apt-get -f install, dann die
+//              Hauptdienste. Ein lesender Lauf räumt nie auf (kein Netz davor);
+//              er meldet nur, was dpkg --audit sagt.
 //
 // Verben (gepinnte Grammatik; sudoers erlaubt nur `start` und `status *`):
 //   start             stdin: {"manifest", "envelope"} — prüfen, Laufverzeichnis
@@ -511,9 +513,27 @@ async function repairPackages(state, why) {
 }
 
 // dpkg --audit nennt halb installierte Pakete; leer = nichts aufzuräumen.
-function dpkgDirty() {
+function dpkgAudit() {
   const out = spawnSync("/bin/bash", ["--noprofile", "--norc", "-c", "dpkg --audit"], { encoding: "utf8", timeout: 120000, env: { PATH: STEP_PATH, LANG: "C.UTF-8" } });
-  return out.status !== 0 || (out.stdout || "").trim().length > 0;
+  return { dirty: out.status !== 0 || (out.stdout || "").trim().length > 0, code: out.status, text: (out.stdout || "").trim() };
+}
+function dpkgDirty() { return dpkgAudit().dirty; }
+
+// Nach einem gescheiterten Schritt eines lesenden Laufs (mutates false): kein
+// Aufräumen — kein dpkg --configure, kein apt-get -f, kein systemctl start;
+// davor lagen weder borg-Prüfung noch Snapshot. Nur dpkg --audit (liest) und
+// die Meldung: halb installierte Pakete gehören dem Operator.
+function auditPackagesReadOnly(state, why) {
+  const audit = dpkgAudit();
+  state.packageAudit = { at: now(), why, dirty: audit.dirty, exitCode: audit.code };
+  if (audit.dirty) {
+    state.attention = { level: "operator", step: "package-audit", name: "dpkg --audit", since: now(), message: `read-only run: dpkg --audit reports unfinished packages after ${why}; nothing was repaired — the operator must look at the host` };
+    log(`== ${now()} OPERATOR: ${state.attention.message}`);
+    if (audit.text) log(audit.text);
+  } else {
+    log(`== read-only run: no repair after ${why}; dpkg --audit is clean`);
+  }
+  saveState(state);
 }
 
 function finish(state, status, error = null) {
@@ -641,9 +661,15 @@ async function payload(jobId) {
     saveState(state);
     if (!ok) {
       const why = `step ${index + 1} (${step.name}) ${result.timedOut ? "hit its time limit" : `exited ${result.code}`}`;
-      // Aufräumen nach einem Paketschritt — und nach jedem gescheiterten Schritt
-      // eines ändernden Laufs, der dpkg halb fertig hinterlassen hat (fail safe).
-      if (guard.packageStep || (manifest.mutates && dpkgDirty())) await repairPackages(state, why);
+      // Aufräumen nur in einem ändernden Lauf (Netz davor: borg + Snapshot):
+      // nach einem Paketschritt — und nach jedem gescheiterten Schritt, der dpkg
+      // halb fertig hinterlassen hat (fail safe). Ein lesender Lauf ändert nie
+      // etwas, auch nicht zum Aufräumen: er meldet nur, was dpkg --audit sagt.
+      if (manifest.mutates) {
+        if (guard.packageStep || dpkgDirty()) await repairPackages(state, why);
+      } else {
+        auditPackagesReadOnly(state, why);
+      }
       return finish(state, "failed", `${why}; later steps did not run`);
     }
   }

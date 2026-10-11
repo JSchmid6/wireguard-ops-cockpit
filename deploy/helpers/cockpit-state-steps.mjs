@@ -26,7 +26,8 @@
 //                        unterbrechungssicher, auch wenn der Planer false sagt.
 //   packageStep          der Schritt fasst die Paketverwaltung an (apt, dpkg,
 //                        unattended-upgrade): nach einem Fehler räumt der Helfer
-//                        dpkg auf und prüft die Dienste.
+//                        dpkg auf und prüft die Dienste — nur in einem ändernden
+//                        Lauf (mutates); ein lesender meldet nur dpkg --audit.
 
 export const STATE_STEPS_VERSION = "cockpit-state-steps/v1";
 
