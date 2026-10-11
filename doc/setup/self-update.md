@@ -157,8 +157,17 @@ Flow of a Hermes change job whose plan contains `self.update <sha>` lines:
      approve with findings, anything else), or a reviewer failure/timeout →
      `blocked_user_approval`.
    - The single deterministic stop: the review input is unavailable
-     (`self.diff` failed) or incomplete — a focus-area file that is truncated,
-     left out or binary in what the reviewer saw → `blocked_user_approval`.
+     (`self.diff` failed) or incomplete → `blocked_user_approval`. Incomplete
+     means a file the reviewer must see completely did not reach it whole:
+     every focus-area file (a binary one counts as incomplete) and every other
+     changed file except tests, markdown and `package-lock.json` (for
+     `dienste.update` only markdown: its tests run on the host). The material
+     takes whole sections in review order — `deploy/` first, then the other
+     required files, tests and docs last — and skips a section that does not
+     fit instead of dropping everything behind it, so a small file such as
+     `Dockerfile.api` is never left out behind a big test file (review of
+     cba7628, 11.10.2026). A reviewer's `UNVERIFIABLE` is for what it saw and
+     cannot judge, never for material the Cockpit failed to collect.
    - Touching a focus area with an `approve` verdict does **not** stop.
 
    A plan that is already blocked for another reason keeps its status and
