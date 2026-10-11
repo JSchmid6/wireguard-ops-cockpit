@@ -107,6 +107,7 @@ beforeEach(() => {
     `echo "apt-get $*" >> "${dir}/order.log"`,
     "case \"$*\" in *upgrade*)",
     `  sleep "$(cat "${dir}/apt-sleep" 2>/dev/null || echo 0)"`,
+    `  [ -e "${dir}/lock-state" ] && chmod 500 "${dir}/runs/job-1"`,
     `  [ -e "${dir}/apt-fail" ] && { echo 'E: Sub-process /usr/bin/dpkg returned an error code (1)' >&2; exit 100; }`,
     "  echo 'Setting up openssh-server' ;;",
     "esac",
@@ -597,6 +598,29 @@ describe("cockpit-host-run: state steps are never ended", () => {
     expect(state.steps[0]).toMatchObject({ uninterruptible: false, timedOut: true });
     expect(readFileSync(path.join(dir, "runtime.log"), "utf8").trim()).toBe("RuntimeMaxSec=infinity");
   });
+
+  // Als root greift chmod nicht – dann fehlt der Schreibfehler, den der Test braucht.
+  it.skipIf(process.getuid?.() === 0)("still repairs when the run state can no longer be written (full disk)", () => {
+    writeFileSync(path.join(dir, "apt-fail"), "");
+    writeFileSync(path.join(dir, "lock-state"), "");
+    try {
+      const out = run(["start"], request(stateManifest({ steps: [{ name: "upgrade", run: "apt-get upgrade -y", timeoutSeconds: 60 }] })));
+      expect(out.code).toBe(0);
+      expect(order()).toContain("dpkg --configure -a --force-confdef --force-confold");
+      expect(order()).toContain("apt-get -f install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold");
+      expect(readFileSync(path.join(dir, "runs", "job-1", "output.log"), "utf8")).toContain("== state not saved:");
+    } finally {
+      chmodSync(path.join(dir, "runs", "job-1"), 0o700);
+    }
+  });
+
+  it("does not hang on an ended step whose child in its own session keeps the output open", () => {
+    run(["start"], request(stateManifest({ mutates: false, steps: [{ name: "stray", run: "setsid sleep 15 & sleep 20", timeoutSeconds: 1 }] })));
+    const { state, logTail } = status();
+    expect(state.status).toBe("failed");
+    expect(state.steps[0]).toMatchObject({ uninterruptible: false, timedOut: true });
+    expect(logTail).toContain("still holds its output; the run goes on without it");
+  }, 30_000);
 
   it("does not touch dpkg after a failed non-package step when dpkg is clean", () => {
     run(["start"], request(stateManifest({ steps: [{ name: "own script", run: "exit 4", timeoutSeconds: 30 }] })));

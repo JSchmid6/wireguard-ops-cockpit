@@ -220,7 +220,12 @@ function readState(jobId) {
   if (state.jobId !== jobId) throw new Error(`state of ${jobId} names another job`);
   return settleLostReboot(state);
 }
-function saveState(state) { state.updatedAt = now(); writeJson(`${runDir(state.jobId)}/state.json`, state); }
+// Wirft nie (z. B. ENOSPC nach einem Paketfehler): sonst fiele das Aufräumen
+// (sshd, dpkg) aus. Was nicht geschrieben werden konnte, steht im Protokoll.
+function saveState(state) {
+  state.updatedAt = now();
+  try { writeJson(`${runDir(state.jobId)}/state.json`, state); } catch (error) { log(`== state not saved: ${error?.message ?? error}`); }
+}
 // A reboot that was requested but never happened (same boot, long after the
 // request) would hold the door shut for good: such a run has failed.
 function settleLostReboot(state) {
@@ -403,7 +408,18 @@ function runScript(script, timeoutSeconds, { uninterruptible = false, onOverrun 
       timers.push(setTimeout(() => { overran = true; guarded(onOverrun)(); }, timeoutSeconds * 1000));
       timers.push(setTimeout(guarded(onHardCap), Math.max(HARD_CAP_SECONDS, timeoutSeconds) * 1000));
     } else {
-      timers.push(setTimeout(() => { timedOut = true; try { process.kill(-child.pid, "SIGKILL"); } catch { /* schon weg */ } }, timeoutSeconds * 1000));
+      timers.push(setTimeout(() => {
+        timedOut = true;
+        try { process.kill(-child.pid, "SIGKILL"); } catch { /* schon weg */ }
+        // Ein Kind in eigener Session (setsid, ssh -f) überlebt das und hält die
+        // Ausgabe offen: dann nach der Gnadenfrist ohne es weiter (die Unit ist
+        // bei ändernden Läufen unbegrenzt, RuntimeMaxSec fängt das nicht mehr).
+        timers.push(setTimeout(() => {
+          log("== a process of this ended step still holds its output; the run goes on without it");
+          child.stdout.destroy(); child.stderr.destroy();
+          done({ code: exitCode ?? 137, signal: "SIGKILL", timedOut: true });
+        }, OUTPUT_GRACE_MS));
+      }, timeoutSeconds * 1000));
     }
     for (const [stream, prefix] of [[child.stdout, ""], [child.stderr, "! "]]) {
       let pending = "";
@@ -459,7 +475,7 @@ async function repairPackages(state, why) {
   const wait = (name) => ({
     uninterruptible: true,
     onOverrun: () => {
-      state.attention = { level: "overrun", step: null, name, since: now(), limitSeconds: REPAIR_LIMIT_SECONDS, hardCapSeconds: Math.max(HARD_CAP_SECONDS, REPAIR_LIMIT_SECONDS), message: `repair (${name}) runs longer than planned (${REPAIR_LIMIT_SECONDS} s); it is not ended — waiting` };
+      state.attention = { level: "overrun", step: `repair:${name}`, name, since: now(), limitSeconds: REPAIR_LIMIT_SECONDS, hardCapSeconds: Math.max(HARD_CAP_SECONDS, REPAIR_LIMIT_SECONDS), message: `repair (${name}) runs longer than planned (${REPAIR_LIMIT_SECONDS} s); it is not ended — waiting` };
       saveState(state);
       log(`== ${now()} ${state.attention.message}`);
     },
@@ -470,6 +486,7 @@ async function repairPackages(state, why) {
     },
   });
   repair.dpkg = (await runScript("dpkg --configure -a --force-confdef --force-confold", REPAIR_LIMIT_SECONDS, wait("dpkg --configure -a"))).code;
+  state.attention = null;
   repair.apt = (await runScript("apt-get -f install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold", REPAIR_LIMIT_SECONDS, wait("apt-get -f install"))).code;
   state.attention = null;
   // dpkg kann sshd beim Konfigurieren neu gestartet haben (oder nicht): noch einmal.

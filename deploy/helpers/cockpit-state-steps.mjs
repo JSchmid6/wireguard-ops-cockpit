@@ -37,7 +37,7 @@ const KINDS = [
   ["gitlab", /(?:^|[^\w.-])(?:gitlab-ctl|gitlab-rake|gitlab-backup|gitlab-psql)(?![\w-])/],
   ["migration", /(?:^|[^\w.-])(?:occ|mysql_upgrade|mariadb-upgrade|pg_upgrade|pg_upgradecluster|pg_dropcluster|pg_createcluster)(?![\w-])|\bdb:migrate\b/],
   // auch mit Optionen dazwischen: docker --context x compose up, docker -H … compose pull
-  ["compose", /(?:^|[^\w.-])docker(?:-compose|[ \t][^\n;&|]*?\bcompose)(?![\w-])/],
+  ["compose", /(?:^|[^\w.-])docker(?:-compose|(?:[ \t]+-{1,2}[\w-]+(?:[ =](?!compose(?![\w-]))[^\s;&|]+)?)*[ \t]+compose)(?![\w-])/],
   ["update-helper", /(?:^|[^\w.-])(?:cockpit-self-update-action|cockpit-dienste-update-action|cockpit-self-update-run|homeserver-cockpit-deploy(?:\.sh)?|vps-cockpit-deploy(?:\.sh)?)(?![\w-])/],
   ["switch", /umschalt|switch-?over|cut-?over/i],
   ["disk", /(?:^|[^\w.-])(?:mkfs(?:\.\w+)?|parted|sgdisk|sfdisk|fdisk|resize2fs|xfs_growfs|lvextend|lvresize|lvreduce|pvmove|mdadm|cryptsetup|grub-install|update-grub|update-initramfs)(?![\w-])/],

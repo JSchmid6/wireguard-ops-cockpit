@@ -24,6 +24,7 @@ describe("cockpit-state-steps: detection", () => {
     ["docker-compose -f x.yml up -d", "compose"],
     ["docker --context werkstatt compose up -d", "compose"],
     ["docker -H unix:///run/docker.sock compose pull", "compose"],
+    ["docker --debug compose up -d", "compose"],
     ["/usr/local/sbin/cockpit-dienste-update-action 0123", "update-helper"],
     ["# Umschalten auf Lab0\nwg-quick up wg1", "switch"],
     ["update-initramfs -u", "disk"],
@@ -37,6 +38,8 @@ describe("cockpit-state-steps: detection", () => {
     "cockpit-vps-snapshot list",
     "echo adapt && cat /etc/aptly.conf",
     "docker ps --format '{{.Names}}'",
+    "docker ps --filter label=com.docker.compose.project=frigate",
+    "docker run --rm -v /opt/compose:/x alpine ls /x",
   ])("%s → nothing", (script) => {
     expect(stateStepKinds(script)).toEqual([]);
   });

@@ -280,7 +280,9 @@ sshd lief nicht mehr.
 - **Hintergrundprozesse**: endet bash, hält aber ein mit `&` gestarteter Prozess die Ausgabe
   offen, liest der Helfer noch 10 s und macht dann ohne Abbruch weiter; der Prozess verliert
   dabei seine Ausgabe (schreibt er weiter, endet er an SIGPIPE) und endet spätestens mit der
-  Lauf-Unit. Paketbefehle also nie mit `&` in den Hintergrund schicken.
+  Lauf-Unit. Paketbefehle also nie mit `&` in den Hintergrund schicken. Bei einem abbrechbaren
+  Schritt, den der Helfer am Zeitlimit beendet hat, gilt dieselbe Gnadenfrist für ein Kind in
+  eigener Session (`setsid`, `ssh -f`), das das Signal überlebt — der Lauf hängt nicht.
 - **API**: Solange der Helfer den Lauf als aktiv meldet, gibt die API ihn nie auf (jede solche
   Antwort schiebt ihre Frist). `attention` landet am Job (`output.hostRunAttention`), als Audit
   `hermes.host_run.attention` (einmal je Stufe) und in `GET /api/inbox` unter `attention` —
@@ -297,8 +299,8 @@ sshd lief nicht mehr.
   Läuft Schritt 2 oder 3 länger als geplant (1 h), gilt dieselbe Meldung wie bei einem Schritt:
   `attention` „repair (…) runs longer than planned“, an der harten Obergrenze `operator` — kein
   Signal.
-- **Robustheit des Helfers**: Schreibfehler im Protokoll (z. B. volle Platte) beenden den Helfer
-  nicht, und ein unerwarteter Fehler beendet ihn nicht, solange ein unterbrechungssicherer
+- **Robustheit des Helfers**: Schreibfehler im Protokoll oder im Laufzustand (z. B. volle Platte)
+  beenden den Helfer nicht – auch das Aufräumen läuft dann –, und ein unerwarteter Fehler beendet ihn nicht, solange ein unterbrechungssicherer
   Schritt läuft — sonst endete die Unit (`KillMode=control-group`) und systemd beendete apt/dpkg
   mit.
 - **Die anderen Wege**: Die Deploy-Unit des Selbst-Updates hat `TimeoutStartSec=infinity`, die
