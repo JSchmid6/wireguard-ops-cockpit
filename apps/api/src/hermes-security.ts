@@ -253,6 +253,18 @@ export function approveExecutionEnvelope(envelope: ExecutionEnvelope, signingSec
   return { ...unsigned, digest: signEnvelope(unsigned, signingSecret) };
 }
 
+// Reaktivieren (POST /api/hermes/jobs/:id/reactivate): derselbe Inhalt, nur
+// eine neue Frist. Ein freigegebener Envelope wird nie verlängert, und der
+// neue trägt nie operatorApproved — freigeben kann nur der Operator.
+export function renewExecutionEnvelope(envelope: ExecutionEnvelope, signingSecret: string, ttlMinutes: number, notAfter: Date, now = new Date()): ExecutionEnvelope {
+  if (!verifyExecutionEnvelopeSignature(envelope, signingSecret)) throw new Error("cannot renew an invalid execution envelope");
+  if (envelope.operatorApproved) throw new Error("cannot renew an approved execution envelope");
+  const { digest: _digest, operatorApproved: _approved, ...current } = envelope;
+  const expiresAt = Math.min(now.getTime() + ttlMinutes * 60_000, notAfter.getTime());
+  const unsigned = { ...current, issuedAt: now.toISOString(), expiresAt: new Date(expiresAt).toISOString() };
+  return { ...unsigned, digest: signEnvelope(unsigned, signingSecret) };
+}
+
 export function verifyExecutionEnvelopeSignature(envelope: ExecutionEnvelope, signingSecret: string): boolean {
   const { digest, ...unsigned } = envelope;
   const expected = signEnvelope(unsigned, signingSecret);
