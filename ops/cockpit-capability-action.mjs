@@ -246,7 +246,8 @@ for (const [index, target] of treeScopes.entries()) {
 if (vpsScope) {
   // Direkt als root, nicht im Sandkasten: der Helfer liest die Hoster-
   // Zugangsdaten selbst und gibt nur Kennung und Messwerte zurueck.
-  const name = `cockpit-job-${envelope.jobId}`.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 60);
+  // Der Hoster nimmt hoechstens 30 Zeichen fuer den Namen (wie cockpit-host-run).
+  const name = `cockpit-job-${envelope.jobId.slice(0, 8)}`.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 30);
   const made = spawnSync("/usr/bin/python3", [vpsSnapshotHelper, "create", name, "--wait", "900"], {
     encoding: "utf8", timeout: 1000000, maxBuffer: 1024 * 1024, env: { PATH: "/usr/sbin:/usr/bin:/sbin:/bin", LANG: "C.UTF-8" },
   });

@@ -53,6 +53,7 @@ AUTH_URL = "https://auth.contabo.com/auth/realms/contabo/protocol/openid-connect
 API = "https://api.contabo.com/v1"
 PREFIX = "cockpit-"
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,60}$")
+NAME_MAX = 30  # the hoster refuses longer names (HTTP 400), the prefix included
 PENDING = {"creating", "provisioning", "pending", "in_progress", "processing"}
 USER_AGENT = "wireguard-ops-cockpit vps-snapshot"
 
@@ -248,6 +249,8 @@ def act_create(api: Api, name: str, wait: int, observe: int = 20) -> dict:
         die("snapshot name: letters, digits, dot, underscore, dash; at most 60 characters", 64)
     if not name.startswith(PREFIX):
         name = PREFIX + name
+    if len(name) > NAME_MAX:
+        die(f"snapshot name: at most {NAME_MAX} characters including the {PREFIX} prefix (the hoster refuses longer names)", 64)
     inst = instance_of(api)
     instance_id = inst["instanceId"]
     before = snapshots_of(api, instance_id)

@@ -228,7 +228,7 @@ finding names a concrete way **past** one of its guards, or a weakening of it:
 | G6 Secrets | redaction of outputs, logs and prompts; the host-run log redacted line by line and 0600. The doorkeeper's unredacted material is intended. |
 | G7, G8 | unchanged (self-update path, dependencies). |
 | G9 Doorkeeper | isolated safety review; a pass only with complete material; incomplete or unreadable review and findings without evidence stop without a pass; its finding classes (secrets/egress, authority, exposure, loss of the way back, false read-only claim, hidden code, injection) do not narrow. |
-| G10 Backup bolt | deleting backups or shortening retention only with `operatorApproved`, even on a pass; one deterministic source asked at three places (API policy, `runHostRun`, root helper incl. resume); detection does not narrow. |
+| G10 Backup bolt | deleting backups, changing their retention or switching them off only with `operatorApproved`, even on a pass; one deterministic source asked at three places (API policy, `runHostRun`, root helper incl. resume); no deleting form becomes free. Unreadable text is the doorkeeper's focus (`backup-focus`), not a bolt hit (operator, 10.10.2026). |
 
 The runner marks changes to the door's files as focus area `host-door`
 (G2/G5/G6/G9/G10). Like every focus area it only steers the reviewer.

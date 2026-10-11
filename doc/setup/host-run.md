@@ -112,84 +112,118 @@ GitLab-Stufen, Dienst-Neustarts.
 ## 2a. Backup-Riegel: Backups löschen nur mit Freigabe
 
 Jochen, 30.09.2026: „Ein Admin muss auch die Backups löschen können. Aber halt mit Freigabe.“
-Das ist die eine Ausnahme von „keine Freigabe als Regel“. Ein Lauf, der Backups löscht oder
-ihre Aufbewahrung verkürzt, startet nur mit `operatorApproved`, **auch wenn der Türsteher
-`pass` sagt**. Append-only gibt es nicht; nach der Freigabe kann Jochen alles davon tun.
+Geschärft am 10.10.2026: „Ich bin eh der Meinung, dass Updates nicht freigegeben werden
+müssten.“ Das ist die eine Ausnahme von „keine Freigabe als Regel“, und sie gilt **nur für echtes
+Löschen**: ein Lauf, der Sicherungen löscht, ihre Aufbewahrung ändert oder sie abschaltet,
+startet nur mit `operatorApproved`, **auch wenn der Türsteher `pass` sagt**. Alles andere —
+auch was der Riegel nicht lesen kann — entscheidet der Türsteher mit Belegpflicht. Append-only
+gibt es nicht; nach der Freigabe kann Jochen alles davon tun.
 
 Die Erkennung ist deterministisch und hat genau eine Quelle:
 `deploy/helpers/cockpit-backup-guard.mjs` (installiert neben dem Helfer als
-`/usr/local/lib/wireguard-ops-cockpit/cockpit-backup-guard.mjs`). Drei Stellen fragen sie:
+`/usr/local/lib/wireguard-ops-cockpit/cockpit-backup-guard.mjs`, Version
+`cockpit-backup-guard/v3`). Sie liefert zwei Listen:
 
-1. die Policy der API (`hostRunPolicy`): ein Treffer macht aus `pass` ein `blocked_user_approval`
-   (bei einem belegten Befund kommen die Treffer dazu; eine unvollständige Prüfung bleibt
-   `blocked_prerequisite`). Der Envelope trägt dann kein `gatePassed`;
-2. `runHostRun` in der API vor dem Aufruf des Executors;
-3. der Root-Helfer selbst (`verifyRequest`), beim Start und bei jeder Fortsetzung nach einem
-   Neustart: ohne `operatorApproved` Abbruch mit Code 77, bevor irgendetwas angelegt wird.
-
-Der Türsteher sieht die Treffer als Fokus `backup-approval:*` und soll sie trotzdem als X4
-melden.
+- `backupGuardHits` — der Riegel (Art `backup`). Drei Stellen fragen ihn:
+  1. die Policy der API (`hostRunPolicy`): ein Treffer macht aus `pass` ein
+     `blocked_user_approval` (bei einem belegten Befund kommen die Treffer dazu; eine
+     unvollständige Prüfung bleibt `blocked_prerequisite`). Der Envelope trägt dann kein
+     `gatePassed`;
+  2. `runHostRun` in der API vor dem Aufruf des Executors;
+  3. der Root-Helfer selbst (`verifyRequest`), beim Start und bei jeder Fortsetzung nach einem
+     Neustart: ohne `operatorApproved` Abbruch mit Code 77, bevor irgendetwas angelegt wird.
+- `backupGuardFocus` — Hinweise für den Türsteher (Art `mention` oder `uncertain`). Sie halten
+  den Lauf **nicht** an. Der Türsteher sieht sie als Fokus `backup-focus:*`, die Riegel-Treffer
+  als `backup-approval:*`; seine Anweisung (X4) verlangt weiterhin, jeden Löschbefehl und jede
+  Verschleierung eines Löschbefehls als belegten Befund zu melden.
 
 Gelesen wird jede Zeile, die läuft: alle Schritte und Prüfschritte, dazu die Skripte, die der
-Lauf per Heredoc schreibt und ausführt (und `ExecStart=`-Zeilen von Units, die er schreibt).
-Quotes und Backslashes zählen nicht (`b"o"rg` ist `borg`), bekannte Variablen werden eingesetzt,
-Globs und `{a,b}` gegen die geschützten Pfade geprüft, relative Pfade gegen `/` (das cwd des
-Helfers) und jedes `cd`-Ziel aufgelöst.
+Lauf per Heredoc schreibt und ausführt (und `ExecStart=`-Zeilen von Units, die er schreibt),
+Inline-Code (`python -c`, `perl -e`) und der Befehl hinter `ssh <host> …`. Quotes und
+Backslashes zählen nicht (`b"o"rg` ist `borg`), bekannte Variablen werden eingesetzt, Globs und
+`{a,b}` gegen die geschützten Pfade geprüft, relative Pfade gegen `/` (das cwd des Helfers) und
+jedes `cd`-Ziel aufgelöst. Kommentare zählen nicht.
 
-**Freigabe nötig (`backup`)** — ein Befehl berührt die Backups und ist keine freie Form:
+**Riegel (`backup`, Freigabe nötig):**
 
-- `borg`/`borgmatic` `delete`, `prune`, `compact`, `recreate`, `--override`, eine andere
-  Konfiguration (`-c`), `check --repair`, `cockpit-borg-action repair`,
-- Schreiben, Löschen, Verschieben in `/etc/borgmatic`, `/etc/borgmatic.d`, `/root/.config/borg`,
-  `/root/.cache/borg`, `/root/.ssh`, den borgmatic-Units, `/usr/bin/borg*` — auch über einen
-  Vorfahren bei Befehlen, die ganze Bäume treffen (`rm -rf /etc/b*`, `cd /etc && rm -rf *`,
-  `docker run -v /:/host`, `git clean -fdx /etc`, `rm -rf /media` als Vorfahr des Repo-Pfads),
-- jede Zeile, die den Repo-Pfad (`/media/RAID`, `backup_VServer`), Lab0 (`10.0.0.5`, `lab0`)
-  oder `timers.target` nennt und nicht nur liest,
-- `systemctl stop|disable|mask|edit …` an `borgmatic.timer`/`.service` (auch per Glob wie
-  `*.timer`), `systemctl isolate|rescue|emergency` und `init`/`telinit` (halten alle Timer an),
-  Paket entfernen, Cron-Eintrag herausfiltern (die Ausgabe eines Backup-Befehls
-  fließt in einen schreibenden Befehl).
+- `borg`/`borgmatic` `delete`, `prune`, `compact`, `recreate`, `break-lock`, eine
+  Schlüsseländerung (`key change-passphrase|import|migrate-to-repokey …`), `check --repair`,
+  `borgmatic borg …`, ein `borgmatic`-Lauf mit anderer Konfiguration (`-c`) oder `--override`,
+  `cockpit-borg-action` außer `status|check` — auch als Text in `sh -c '…'`, in einem Skript,
+  das der Lauf schreibt, in einer Cron-Zeile oder in `echo/printf`;
+- jede Änderung der Aufbewahrung: `keep_*`/`--keep-*`, `keepDaily|Weekly|Monthly`,
+  `backup_keep_time` (GitLab), außerhalb eines reinen Lesebefehls;
+- Schreiben in die Konfiguration: `/etc/borgmatic`, `/etc/borgmatic.d`, `/root/.config/borg`
+  (Schlüssel), `/root/.borgmatic`, die borgmatic-Units samt `timers.target.wants`-Link,
+  `/usr/bin/borg*`, `cockpit-borg-action`, den Aufräum-Dienst (unten), die Drop-in- und
+  Generator-Verzeichnisse, über die systemd die Units still abschalten könnte
+  (`cockpit-.service.d`, `service.d`, `system-generators`, `system.attached` …), jede Datei mit
+  dem Namen einer dieser Units;
+- Löschen, Verschieben, Überschreiben in Backup-Zielen — borg-Repo (`/media/RAID/backup_VServer`),
+  `/var/backups`, `/var/opt/gitlab/backups`: `rm`, `rmdir`, `mv`, `shred`, `unlink`,
+  `find … -delete` (oder `-exec rm`), `rsync --delete` ins Ziel, `git clean|rm`, `truncate`,
+  `dd of=`, `chattr`; bei Löschbefehlen auch über einen Vorfahren (`rm -rf /var`,
+  `cd /etc && rm -rf *`, `rm -rf /media`);
+- auf Lab0 (`ssh borg@10.0.0.5 …`, `ssh lab0 …`): jeder Löschbefehl (`rm`, `mv`, `find -delete`,
+  `zfs destroy` …), und jeder Riegel-Treffer im Befehl hinter einem beliebigen `ssh <host>`;
+- Abschalten: `systemctl` mit einem Verb, das eine Unit nicht laufen lässt (`stop`, `disable`,
+  `mask`, `kill`, `edit`, `revert`, `set-property`, `freeze` …) an `borgmatic.timer|.service`,
+  `cockpit-borg-retention.*` oder `timers.target` (auch per Glob wie `*.timer`), `service …
+  stop`, `systemctl isolate|rescue|emergency`, `init`/`telinit`, die borg-Pakete entfernen
+  (`apt-get remove|purge|autoremove`, `dpkg -r|-P`), die crontab aus der Ausgabe eines
+  Backup-Befehls neu schreiben (`crontab -l | grep -v borgmatic | crontab -`);
+- einen Maschinen-Snapshot löschen: `cockpit-vps-snapshot delete`, `DELETE …/snapshots/…`. Die
+  Rotation des Werkzeugs selbst (`create` räumt den ältesten cockpit-eigenen Snapshot, Jochen
+  28.09.2026) bleibt frei.
 
-**Freigabe nötig (`uncertain`)** — der Text, der läuft, ist nicht der Text im Plan:
+**Hinweis für den Türsteher (hält nicht an):**
 
-- `ssh`/`scp`/`sftp`/`sshfs`/`rsync` zu einem anderen Rechner (ob es Lab0 ist, sagt der Text
-  nicht: `~/.ssh/config`-Aliase),
-- `eval`, Dekodieren (`base64 -d`, `xxd -r`, `openssl enc -d`), `$'\x..'`, Code aus einer Pipe
-  (`… | bash`), `alias`, `hash -p`, `env -S`, Namensreferenzen, `PATH`/`BASH_ENV`/`LD_PRELOAD`/
-  `BORG_*`,
-- ein Skript, das der Lauf nicht selbst per Heredoc schreibt (`bash /root/x.sh`, `./install.sh`),
-- ein Befehlsname oder ein Ziel aus einem Wert, der nicht im Plan steht (`$CMD`,
-  `rm -rf $(cat liste)`, `xargs rm`), `cd` an einen Ort, den der Plan nicht nennt,
-- Inline-Code (`python -c`, `perl -e`, awk mit `system`), der Prozesse startet, Dateien anfasst
-  oder Code zur Laufzeit baut.
+- `mention` — ein Befehl nennt oder berührt die Backups, ohne zu löschen: eine neue Sicherung
+  nach `/var/backups` legen (`cp`, `install`, `mkdir`), `docker run -v /var/backups:/b`,
+  `systemctl restart borgmatic.timer`, `apt-mark hold borgbackup`, ein Schreiben in einen Baum,
+  der die Backups enthält;
+- `uncertain` — der Text, der läuft, ist nicht der Text im Plan: `ssh`/`scp`/`rsync` zu einem
+  anderen Rechner, `eval`, Dekodieren, `$'\x..'`, Code aus einer Pipe, `alias`, `PATH`/
+  `BASH_ENV`/`LD_PRELOAD`/`BORG_*`, ein Skript, das der Lauf nicht selbst schreibt, ein
+  Befehlsname oder Ziel aus einem unbekannten Wert (`$CMD`, `rm -rf "$X"`, `xargs`), Inline-Code
+  mit Prozessen oder Dateizugriffen.
 
-**Frei** bleiben die Routine und das Lesen: `systemctl start borgmatic.service`, ein nacktes
-`borgmatic` (konfigurierte Aufbewahrung), `borg list|info|check|create|diff`,
-`borgmatic list|info|check|create`, `cockpit-borg-action status|check`,
-`systemctl status|show|list-timers …`, `journalctl -u borgmatic`, Lesebefehle wie `ls`, `cat`,
-`grep`, `test`, und `curl` ohne Upload an die Statusdatei auf Lab0. Werte aus `date`, `uname`,
-`seq`, `mktemp` und gewöhnliche Paketpflege lösen nichts aus.
+**Frei** (weder Riegel noch Hinweis) bleiben die Routine und das Lesen: `systemctl start
+borgmatic.service`, ein nacktes `borgmatic` (konfigurierte Aufbewahrung),
+`borg list|info|check|create|diff`, `borgmatic list|info|check|create`,
+`cockpit-borg-action status|check`, `systemctl status|is-active|show|list-timers …`,
+`journalctl -u borgmatic`, lesende docker-Befehle (`ps`, `images`, `inspect`, `logs`, `stats`,
+`version`, `info`, `compose ps|config|logs`), Paket-Updates — auch wenn `borgbackup` oder
+`borgmatic` darunter sind —, `gitlab-backup create`, Lesebefehle (`ls`, `cat`, `grep`, `test`)
+und `curl` ohne Upload an die Statusdatei auf Lab0.
 
 **Aufräum-Dienst auf Lab0** (`doc/setup/borg-retention.md`): frei ist seine Routine —
 `/usr/local/sbin/cockpit-borg-retention status|run`, `set <d> <w> <m> <HH:MM>` innerhalb der festen
 Grenzen (`deploy/helpers/cockpit-borg-retention-rules.mjs`, dieselbe Datei wie in API und Helfer)
-und `systemctl start cockpit-borg-retention.service`. Freigabe braucht: `set` unter der Untergrenze
-oder mit `--freigabe`, `freigeben` (Fortsetzen nach einer Anomalie), jede andere Form des Helfers,
-`systemctl stop|disable|mask|edit` an seinem Timer oder seiner Unit, und jedes Schreiben in
-`/etc/cockpit-borg-retention`, `/var/lib/cockpit-borg-retention`, seine Units samt `.d`-Verzeichnissen,
-die Drop-ins, die systemd ohne „borg“ im Namen auf sie anwendet (`cockpit-.service.d`,
-`cockpit-.timer.d`, `service.d`, `timer.d` in `/etc`, `/run`, `/usr/lib/systemd/system`), und seinen Code. Der Riegel heißt seitdem `cockpit-backup-guard/v2`.
+und `systemctl start cockpit-borg-retention.service`. Der Riegel greift bei `set` unter der
+Untergrenze oder mit `--freigabe`, `freigeben` (Fortsetzen nach einer Anomalie), jeder anderen
+Form des Helfers, `systemctl stop|disable|mask|edit` an seinem Timer oder seiner Unit, und jedem
+Schreiben in `/etc/cockpit-borg-retention`, `/var/lib/cockpit-borg-retention`, seine Units samt
+`.d`-Verzeichnissen und seinen Code.
+
+Was jetzt ohne Klick läuft, das vorher einen brauchte (Sicherheitsannahme, 10.10.2026): Text,
+den der Riegel nicht lesen kann (Verschleierung, unbekannte Ziele, fremde Skripte, `ssh` zu einem
+unbekannten Rechner), und Befehle, die die Backups nur nennen oder neue Sicherungen anlegen. Ein
+Löschbefehl, der sich so versteckt, ist dann nur noch durch den Türsteher gesperrt: seine
+Anweisung macht ihn zum X4-Befund mit Beleg, und ein belegter Befund geht an Jochen. Eine
+Plan-Erzeugung, die den Türsteher täuscht UND den Löschbefehl vor dem Riegel versteckt, wäre der
+verbleibende Weg; die Abwägung hat Jochen getroffen (eine Tür, keine Klick-Freigaben).
 
 Ehrliche Grenze: Programme, die schon auf dem Host liegen und über ihren Namen oder aus den
 System-Verzeichnissen (`/usr`, `/opt/gitlab`) aufgerufen werden, nimmt der Riegel für das, was ihr
-Name sagt; ihren Inhalt sieht er nicht. Ein Interpreter-Programm ohne die genannten Primitive
-wird nicht weiter zerlegt. Dort bleibt der Türsteher (X4) die Sicherung. Der Riegel irrt lieber
-zur Freigabe hin: im Zweifel fragt er Jochen.
+Name sagt; ihren Inhalt sieht er nicht. Ein Interpreter-Programm ohne Löschwort und ohne
+geschützten Pfad wird nicht weiter zerlegt. Dort bleibt der Türsteher (X4) die Sicherung.
 
-Tests: `apps/api/test/backup-guard.test.ts` (Korpus frei/gesperrt, Policy),
-`host-run-helper.test.ts` (Helfer beim Start und nach dem Neustart), `host-run-flow.test.ts`
-(API: `pass` plus `borg delete` wartet auf Jochen, läuft nach der Freigabe).
+Tests: `apps/api/test/backup-guard.test.ts` (Korpus frei / Riegel / nur Hinweis, die echten Pläne
+vom 10.10.2026 aus `fixtures/host-run-plans-2026-10-10.json`, Policy),
+`host-run-helper.test.ts` (Helfer beim Start und nach dem Neustart, Snapshot-Name ≤ 30 Zeichen),
+`host-run-flow.test.ts` (API: `pass` plus `borg delete` wartet auf Jochen, läuft nach der
+Freigabe).
 
 ## 3. Tür
 

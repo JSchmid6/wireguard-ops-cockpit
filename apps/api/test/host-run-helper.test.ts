@@ -148,6 +148,16 @@ describe("cockpit-host-run: lock", () => {
     expect(logTail).toContain("ordered by hermes-automation");
   });
 
+  it("names the machine snapshot within the hoster's 30 characters for a full job UUID", () => {
+    const jobId = "ba8336e0-cc4a-4b82-9d92-6f0a5826fcf4";
+    const out = run(["start"], request(manifest(), {}, jobId));
+    expect(out.code).toBe(0);
+    expect(status(jobId).state.status).toBe("success");
+    const name = readFileSync(path.join(dir, "snapshot.log"), "utf8").trim().split(" ")[1];
+    expect(name).toBe("cockpit-run-ba8336e0");
+    expect(name.length).toBeLessThanOrEqual(30);
+  });
+
   it("runs a manifest exactly as the API normalizes and hashes it", () => {
     const normalized = parseHostRunManifest(["```host-run", JSON.stringify({
       version: "cockpit-host-run/v1", name: "from the API", purpose: "harness",
@@ -183,9 +193,10 @@ describe("cockpit-host-run: lock", () => {
   });
 
   // The steps really run here: they only write marker files whose names the
-  // backup bolt recognizes, never a real borg or systemctl command.
+  // backup bolt recognizes (a deleting command as text), never a real borg or
+  // systemctl command.
   it("keeps a run that touches the backups shut without the operator's approval, even with a passed doorkeeper", () => {
-    const prune = manifest({ steps: [{ name: "prune", run: `echo prune > ${dir}/borgmatic-prune.txt`, timeoutSeconds: 30 }] });
+    const prune = manifest({ steps: [{ name: "prune", run: `echo 'borgmatic prune --keep-daily 1' > ${dir}/borgmatic-prune.txt`, timeoutSeconds: 30 }] });
     const out = run(["start"], request(prune));
     expect(out.code).toBe(77);
     expect(out.stderr).toContain("touches the backups");
@@ -202,7 +213,7 @@ describe("cockpit-host-run: lock", () => {
 
   it("asks the backup bolt again when a run continues after the boot", () => {
     // A request.json that lost its approval (or was forged) does not continue.
-    const prune = manifest({ steps: [{ name: "reboot", reboot: true }, { name: "delete", run: `echo delete > ${dir}/borg-delete.txt`, timeoutSeconds: 30 }] });
+    const prune = manifest({ steps: [{ name: "reboot", reboot: true }, { name: "delete", run: `echo 'borg delete ::a' > ${dir}/borg-delete.txt`, timeoutSeconds: 30 }] });
     expect(run(["start"], request(prune, { gatePassed: undefined, operatorApproved: true })).code).toBe(0);
     expect(status().state.phase).toBe("rebooting");
     const file = path.join(dir, "runs", "job-1", "request.json");

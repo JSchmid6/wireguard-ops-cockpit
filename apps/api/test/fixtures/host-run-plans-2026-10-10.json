@@ -1,0 +1,155 @@
+{
+  "stage-a-ba8336e0": {
+    "job": "ba8336e0-cc4a-4b82-9d92-6f0a5826fcf4",
+    "backupGuardHitsBefore": 1,
+    "manifest": {
+      "version": "cockpit-host-run/v1",
+      "name": "stage-a-vps-full-apt-upgrade",
+      "purpose": "Full non-interactive apt-get upgrade on Ubuntu 24.04 (noble-security, noble-updates, third-party sury-PHP). Holds a literal exclude list with apt-mark hold and releases it at the end (also on error, via EXIT trap with the same literal list). Passes dpkg config options in apt syntax (--force-confdef/--force-confold) to both 'install needrestart' and 'upgrade'. No reboot, no dist-upgrade, no new kernel, no docker commands. Records package versions to /var/tmp/cockpit-stageA before and after.",
+      "mutates": true,
+      "steps": [
+        {
+          "name": "record-versions-and-update",
+          "run": "export DEBIAN_FRONTEND=noninteractive\nexport NEEDRESTART_MODE=l\nmkdir -p /var/tmp/cockpit-stageA\ndpkg-query -W > /var/tmp/cockpit-stageA/packages-before.txt\napt-get update",
+          "timeoutSeconds": 1800
+        },
+        {
+          "name": "hold-upgrade-unhold",
+          "run": "export DEBIAN_FRONTEND=noninteractive\nexport NEEDRESTART_MODE=l\napt-mark hold gitlab-ee gitlab-runner gitlab-runner-helper-images docker-ce docker-ce-cli docker-ce-rootless-extras docker-buildx-plugin docker-compose-plugin containerd.io linux-generic linux-image-generic linux-headers-generic linux-firmware linux-libc-dev linux-tools-common\ntrap 'apt-mark unhold gitlab-ee gitlab-runner gitlab-runner-helper-images docker-ce docker-ce-cli docker-ce-rootless-extras docker-buildx-plugin docker-compose-plugin containerd.io linux-generic linux-image-generic linux-headers-generic linux-firmware linux-libc-dev linux-tools-common' EXIT\napt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold install needrestart\napt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade\napt-mark unhold gitlab-ee gitlab-runner gitlab-runner-helper-images docker-ce docker-ce-cli docker-ce-rootless-extras docker-buildx-plugin docker-compose-plugin containerd.io linux-generic linux-image-generic linux-headers-generic linux-firmware linux-libc-dev linux-tools-common\ntrap - EXIT\ndpkg-query -W > /var/tmp/cockpit-stageA/packages-after.txt",
+          "timeoutSeconds": 3600
+        }
+      ],
+      "checks": [
+        {
+          "name": "services-active",
+          "run": "for s in ssh apache2 php8.3-fpm hermes-supervisor; do systemctl is-active --quiet \"$s\" || { echo \"inactive: $s\"; exit 1; }; done\nsystemctl is-active --quiet borgmatic.timer || { echo \"inactive: borgmatic.timer\"; exit 1; }\nif systemctl list-units --type=service --state=failed --no-legend 'wireguard-ops-cockpit-*' | grep -q .; then echo \"failed wireguard-ops-cockpit service\"; exit 1; fi",
+          "timeoutSeconds": 300
+        },
+        {
+          "name": "nextcloud-installed-true",
+          "run": "curl -fsSk --max-time 30 https://nextcloud.wejos.de/status.php | grep -q '\"installed\":true' || { echo \"Nextcloud not installed:true\"; exit 1; }",
+          "timeoutSeconds": 300
+        },
+        {
+          "name": "unhold-and-report",
+          "run": "export NEEDRESTART_MODE=l\nif apt-mark showhold | grep -Eq '^(gitlab-ee|gitlab-runner|gitlab-runner-helper-images|docker-ce|docker-ce-cli|docker-ce-rootless-extras|docker-buildx-plugin|docker-compose-plugin|containerd.io|linux-generic|linux-image-generic|linux-headers-generic|linux-firmware|linux-libc-dev|linux-tools-common)$'; then echo \"excluded package still held\"; exit 1; fi\necho '=== needrestart -b ==='\nneedrestart -b || true\necho '=== /var/run/reboot-required ==='\nif test -f /var/run/reboot-required; then echo 'present'; else echo 'absent'; fi\necho '=== upgraded packages (before -> after) ==='\ndiff /var/tmp/cockpit-stageA/packages-before.txt /var/tmp/cockpit-stageA/packages-after.txt || true\necho '=== currently held ==='\napt-mark showhold\necho '=== wireguard-ops-cockpit services ==='\nsystemctl list-units --type=service --all --no-legend 'wireguard-ops-cockpit-*'",
+          "timeoutSeconds": 300
+        }
+      ],
+      "rollback": [
+        "Restore the runner automatic machine snapshot taken before the first step (mutates=true); report the snapshot name in the job result.",
+        "Reinstall a previous version for any regressed package using the recorded /var/tmp/cockpit-stageA/packages-before.txt (apt-get install package=version)."
+      ],
+      "risk": [
+        "contained"
+      ]
+    }
+  },
+  "stage-a-7d7ec286": {
+    "job": "7d7ec286-7cee-4ca1-8c34-ccad1420f84d",
+    "backupGuardHitsBefore": 14,
+    "manifest": {
+      "version": "cockpit-host-run/v1",
+      "name": "stageA-noble-security-update",
+      "purpose": "Stage A security update on Ubuntu 24.04 (noble): record pre-upgrade package versions and running Docker containers; apt-mark hold the exceptions (gitlab-ee, gitlab-runner, gitlab-runner-helper-images, docker-ce, docker-ce-cli, docker-ce-rootless-extras, docker-buildx-plugin, docker-compose-plugin, containerd.io, and every installed linux-* kernel package); apt-get update; install needrestart; apt-get upgrade non-interactively with DEBIAN_FRONTEND=noninteractive, NEEDRESTART_MODE=l and --force-confdef/--force-confold (list mode, no automatic service restarts beyond those the packages themselves trigger, no reboot); release the holds at the end and on any error via EXIT trap; write state files under /var/tmp/cockpit-security-stageA. The runner's automatic pre-change machine snapshot is the return path (id reported in run output).",
+      "mutates": true,
+      "steps": [
+        {
+          "name": "record-pre-upgrade-state",
+          "run": "set -euo pipefail\nD=/var/tmp/cockpit-security-stageA\nmkdir -p \"$D\"\ndpkg-query -W -f='${binary:Package} ${Version}\\n' > \"$D/pre-upgrade-packages.tsv\"\ndocker ps --format '{{.Names}}' > \"$D/pre-upgrade-running-containers.txt\" 2>/dev/null || true\necho \"pre-upgrade state recorded to $D\"",
+          "timeoutSeconds": 300
+        },
+        {
+          "name": "hold-exceptions-install-needrestart-and-upgrade",
+          "run": "set -euo pipefail\nD=/var/tmp/cockpit-security-stageA\nHOLD_NAMES=\"gitlab-ee gitlab-runner gitlab-runner-helper-images docker-ce docker-ce-cli docker-ce-rootless-extras docker-buildx-plugin docker-compose-plugin containerd.io\"\nHOLDS=\"\"\nfor p in $HOLD_NAMES; do if dpkg-query -W -f='${Status}' \"$p\" >/dev/null 2>&1; then HOLDS=\"$HOLDS $p\"; fi; done\nHOLDS=\"$HOLDS $(dpkg-query -W -f='${Package}\\n' 2>/dev/null | grep -E '^linux-' | tr '\\n' ' ')\"\nHOLDS=$(printf '%s\\n' $HOLDS | sort -u | sed '/^$/d' | tr '\\n' ' ')\nrelease() { if [ -n \"$HOLDS\" ]; then apt-mark unhold $HOLDS >/dev/null 2>&1 || true; fi; }\ntrap release EXIT\nif [ -n \"$HOLDS\" ]; then apt-mark hold $HOLDS; printf '%s\\n' $HOLDS > \"$D/held-exceptions.txt\"; fi\nDEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get -y update\nDEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get -y install needrestart\nDEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade\nrelease\ntrap - EXIT\necho \"security upgrade complete; holds released\"",
+          "timeoutSeconds": 3600
+        },
+        {
+          "name": "record-post-state-and-report",
+          "run": "set +e\nD=/var/tmp/cockpit-security-stageA\ndpkg-query -W -f='${binary:Package} ${Version}\\n' > \"$D/post-upgrade-packages.tsv\"\necho '=== UPGRADED PACKAGES ==='\njoin -1 1 -2 1 <(sort \"$D/pre-upgrade-packages.tsv\") <(sort \"$D/post-upgrade-packages.tsv\") 2>/dev/null | awk '$2!=$3{print $1\": \"$2\" -> \"$3}'\necho '=== NEWLY INSTALLED PACKAGES ==='\ncomm -13 <(awk '{print $1}' \"$D/pre-upgrade-packages.tsv\" | sort) <(awk '{print $1}' \"$D/post-upgrade-packages.tsv\" | sort) | sed 's/^/NEW: /'\necho '=== REMAINING UPGRADABLE (open) ==='\napt-mark showhold 2>/dev/null || true\nDEBIAN_FRONTEND=noninteractive apt-get -s upgrade 2>/dev/null | grep -E '^Inst ' || true\necho '=== HELD EXCEPTIONS THIS RUN ==='\ncat \"$D/held-exceptions.txt\" 2>/dev/null || true\necho '=== REBOOT REQUIRED ==='\nif [ -f /var/run/reboot-required ]; then echo \"yes: $(cat /var/run/reboot-required)\"; else echo \"no\"; fi\necho '=== NEEDRESTART ==='\nneedrestart -b 2>&1 || true\nexit 0",
+          "timeoutSeconds": 300
+        }
+      ],
+      "checks": [
+        {
+          "name": "ssh-active",
+          "run": "systemctl is-active --quiet ssh",
+          "timeoutSeconds": 120
+        },
+        {
+          "name": "apache2-active",
+          "run": "systemctl is-active --quiet apache2",
+          "timeoutSeconds": 120
+        },
+        {
+          "name": "php83-fpm-active",
+          "run": "systemctl is-active --quiet php8.3-fpm",
+          "timeoutSeconds": 120
+        },
+        {
+          "name": "nextcloud-status-responds",
+          "run": "curl -fsSk --resolve nextcloud.wejos.de:443:127.0.0.1 https://nextcloud.wejos.de/status.php | grep -q '\"installed\":true'",
+          "timeoutSeconds": 120
+        },
+        {
+          "name": "cockpit-services-active",
+          "run": "for u in wireguard-ops-cockpit-agent wireguard-ops-cockpit-api wireguard-ops-cockpit-web wireguard-ops-cockpit-ttyd wireguard-ops-cockpit-executor; do systemctl is-active --quiet \"$u.service\" || { echo \"cockpit service not active: $u\"; exit 1; }; done\nif systemctl list-units --type=service --state=failed --no-legend 'wireguard-ops-cockpit-*' 2>/dev/null | grep -q .; then echo \"failed cockpit units present\"; exit 1; fi",
+          "timeoutSeconds": 120
+        },
+        {
+          "name": "hermes-supervisor-active",
+          "run": "systemctl is-active --quiet hermes-supervisor",
+          "timeoutSeconds": 120
+        },
+        {
+          "name": "borgmatic-timer-active",
+          "run": "systemctl is-active --quiet borgmatic.timer",
+          "timeoutSeconds": 120
+        },
+        {
+          "name": "docker-containers-still-running",
+          "run": "D=/var/tmp/cockpit-security-stageA\n[ -s \"$D/pre-upgrade-running-containers.txt\" ] || { echo \"no pre-upgrade container list\"; exit 1; }\nwhile read -r c; do docker ps --format '{{.Names}}' | grep -qxF \"$c\" || { echo \"container not running: $c\"; exit 1; }; done < \"$D/pre-upgrade-running-containers.txt\"\ndocker ps --format '{{.Names}}' | grep -qi hermes || { echo \"hermes container not running\"; exit 1; }",
+          "timeoutSeconds": 120
+        }
+      ],
+      "rollback": [
+        "Revert the runner's pre-change machine snapshot (id reported in the run output): operator-approved full-machine restore that discards everything written since the snapshot.",
+        "Downgrade changed packages to the recorded versions in /var/tmp/cockpit-security-stageA/pre-upgrade-packages.tsv via apt-get install <pkg>=<version> where the archive still holds them; restore prior conffiles from the borg backup if a package changed one.",
+        "If the run was interrupted leaving holds set: apt-mark unhold every name listed in /var/tmp/cockpit-security-stageA/held-exceptions.txt."
+      ],
+      "risk": [
+        "contained"
+      ]
+    }
+  },
+  "tuer-umschalten-39772337": {
+    "job": "39772337-43a5-487e-8e6e-2628ef31834d",
+    "backupGuardHitsBefore": 0,
+    "manifest": {
+      "version": "cockpit-host-run/v1",
+      "name": "hermes-umschalten-probe-tuer-trocken-20261010-trocken",
+      "purpose": "James (Hermes-Gateway, Container 'hermes') von hermes-agent:neu-20261008 (sha256:de128fcf15df) auf hermes-agent:neu-20261008 (sha256:de128fcf15df) umschalten. Anlass: Probe der Tuer (t_69165977): trocken, dasselbe Abbild. TROCKENLAUF: das Skript setzt TROCKEN=1 und endet nach den Vorbedingungen mit exit 0, bevor es etwas sichert oder aendert; es liest nur (sha256, docker image/container inspect, hermes kanban list) und schreibt nur Pruefmaterial nach /run. Pruefmaterial im Schritt: Abnahme aus der Werkstatt (abnahme.json, gruen fuer genau NEU_ID). Skript = hermes-deployment@f9587dff479c (sha256 und cmp vor dem Start).",
+      "mutates": false,
+      "steps": [
+        {
+          "name": "umschalten (trocken)",
+          "run": "install -d -m 0700 /run/hermes-umschalten-probe-tuer-trocken-20261010\ncat > /run/hermes-umschalten-probe-tuer-trocken-20261010/umschalten.sh <<'UMSCHALTEN_EOF'\n#!/bin/bash\n# hermes-umschalten (Cockpit-Tuer), Begruendung: hermes-deployment host/tuer/LIESMICH.md\nset -uo pipefail\nANLASS=probe-tuer-trocken-20261010\nNEU=hermes-agent:neu-20261008\nNEU_ID=sha256:de128fcf15df17d39dbc6a60833b8efc104d5eff36a40589d7877f3f35c9d6eb\nALT=hermes-agent:neu-20261008\nALT_ID=sha256:de128fcf15df17d39dbc6a60833b8efc104d5eff36a40589d7877f3f35c9d6eb\nTROCKEN=1\nH=/home/hermes/.hermes\nDEP=$H/hermes-deployment\nV=/var/backups/hermes-umschalten\nSICHER=$V/$ANLASS\nK=$H/backups/umschalten-$ANLASS\nA=/run/hermes-umschalten-$ANLASS\nP=$A/protokoll.txt\nLOG=$H/logs/agent.log\nELOG=$H/logs/errors.log\nU=\"--reuid=1007 --regid=1007 --clear-groups\"\nzaehlen() { VORHER=$(timeout -k 5 20 setpriv $U wc -l $LOG | cut -d\" \" -f1 || echo 999999999); VORHER_E=$(timeout -k 5 20 setpriv $U wc -l $ELOG | cut -d\" \" -f1 || echo 999999999); }\nneu() { timeout -k 5 20 setpriv $U tail -n +\"$((VORHER + 1))\" $LOG | head -c 16M; }\nneue() { timeout -k 5 20 setpriv $U tail -n +\"$((VORHER_E + 1))\" $ELOG | head -c 16M; }\nheil() { test ! -L $H/home -a ! -L $H/hermes-compose.env; }\nC_NEU=\"\\\"Image\\\": \\\"$NEU_ID\\\"\"\nC_ALT=\"\\\"Image\\\": \\\"$ALT_ID\\\"\"\ninstall -d -m 0700 $A\n: > $P\necho \"Umschalten $ANLASS: $NEU -- Rueckweg $ALT, trocken=$TROCKEN\" | tee -a $P\ncat > $A/abnahme.json <<'ABNAHME_EOF'\n{\"version\": \"hermes-umschalt-abnahme/v1\", \"image_id\": \"sha256:de128fcf15df17d39dbc6a60833b8efc104d5eff36a40589d7877f3f35c9d6eb\", \"ergebnis\": \"GRUEN\", \"beleg\": \"hermes-deployment ops/chat-verfuegbar-20261008 (94a5b6c)\", \"datum\": \"2026-10-10\", \"hinweis\": \"Probe der Tuer: dasselbe Abbild\", \"pruefungen\": [{\"name\": \"abnahme-20261008 nachreichen/bewertung\", \"ergebnis\": \"GRUEN\"}, {\"name\": \"abnahme-20261008-rueckfall\", \"ergebnis\": \"GRUEN\"}, {\"name\": \"Umschaltlauf 15/15\", \"ergebnis\": \"GRUEN\"}], \"quelle\": \"Werkstatt-Abnahme neu-20261008 (t_b95d0c60, Zweitpruefung t_1b832d61), Umschaltlauf 10.10. 07:02 15/15\"}\nABNAHME_EOF\ngrep -F \"{\\\"version\\\": \\\"hermes-umschalt-abnahme/v1\\\", \\\"image_id\\\": \\\"$NEU_ID\\\", \\\"ergebnis\\\": \\\"GRUEN\\\",\" $A/abnahme.json >/dev/null \\\n  || { echo \"Abbruch: Abnahme nicht gruen fuer $NEU_ID\"; exit 1; }\ntest -L $H/config.yaml -o -e $SICHER -o -L $SICHER -o -e $K -o -L $K && { echo \"Abbruch: Symlink/Sicherung da\"; exit 1; }\ntest \"$(timeout -k 10 60 docker image ls -q --no-trunc $ALT)\" = \"$ALT_ID\" || { echo \"Abbruch: Rueckweg $ALT ist nicht $ALT_ID\"; exit 1; }\nif test $TROCKEN = 0 || timeout -k 10 60 docker image inspect $NEU >/dev/null 2>&1; then\n  test \"$(timeout -k 10 60 docker image ls -q --no-trunc $NEU)\" = \"$NEU_ID\" || { echo \"Abbruch: $NEU ist nicht $NEU_ID\"; exit 1; }\nfi\ntimeout -k 10 60 docker inspect --type container hermes > $A/c.json\ngrep -qF \"$C_ALT\" $A/c.json || { echo \"Abbruch: laufender Container ist nicht $ALT_ID\"; exit 1; }\ngit -c safe.directory=$DEP -C $DEP show 7951e9a16cae8e26bdf8a62030802920ef7b830b:docker-compose.yml > $A/compose.yml\ntimeout -k 10 120 docker compose -f $A/compose.yml --project-directory $DEP up --dry-run --no-deps -d gateway > $A/probe.txt 2>&1\ngrep -qE 'Container hermes +Running' $A/probe.txt && test \"$(grep -ciE 'creat|start|pull' $A/probe.txt)\" = 0 || { echo \"Abbruch: compose.yml ist nicht die des Containers\"; cat $A/probe.txt; exit 1; }\nlaufend=1\nfor i in $(seq 1 30); do\n  timeout -k 10 20 docker exec -u hermes -e HERMES_HOME=/opt/data -w /tmp hermes /opt/hermes/bin/hermes kanban list > $A/karten.txt \\\n    || { echo \"Abbruch: Kartenliste nicht lesbar\"; exit 1; }\n  laufend=$(grep -c \" running \" $A/karten.txt || true)\n  if test $TROCKEN = 1; then echo \"laufende Karten jetzt: $laufend\"; laufend=0; fi\n  test $laufend = 0 && break\n  echo \"warte: $laufend Karte(n) laufen, Versuch $i von 30\"; sleep 30\ndone\ntest $laufend = 0 || { echo \"Abbruch: es laufen noch Karten\"; exit 1; }\nif test $TROCKEN = 1; then echo \"TROCKENLAUF FERTIG, nichts veraendert (UMSCHALT_ERGEBNIS=trocken-ok)\"; exit 0; fi\n\ninstall -d -m 0700 $V && mkdir -m 0700 $SICHER || { echo \"Abbruch: Sicherung $SICHER\"; exit 1; }\ncp $A/c.json $SICHER/container-hermes.json\ntimeout -k 5 20 setpriv $U head -c 1M $H/config.yaml > $SICHER/config.yaml\nsetpriv $U mkdir -p $K\ngrep \" scheduled \" $A/karten.txt | setpriv $U tee $K/geplant-vorher.txt >/dev/null\ntest -s $SICHER/container-hermes.json && test -s $SICHER/config.yaml && test -f $K/geplant-vorher.txt || { echo \"Abbruch: Sicherung unvollstaendig\"; exit 1; }\nzaehlen\nablegen() { cp $P $SICHER/; setpriv $U tee $K/protokoll.txt < $P >/dev/null; }\nzurueck() {\n  trap '' HUP INT TERM PIPE\n  echo \"RUECKFALL: $1\" | tee -a $P\n  timeout -k 10 60 docker tag $ALT hermes-agent:latest\n  timeout -k 10 120 docker stop -t 30 hermes >/dev/null 2>&1\n  timeout -k 5 20 setpriv $U tee $H/config.yaml < $SICHER/config.yaml >/dev/null\n  timeout -k 5 20 setpriv $U cat $H/config.yaml | cmp -s - $SICHER/config.yaml && KF= || KF=\" config.yaml nicht zurueck,\"\n  zaehlen\n  heil && timeout -k 10 300 docker compose -f $A/compose.yml --project-directory $DEP up -d --no-deps --force-recreate gateway \\\n    || { echo \"Hand-Rueckweg: $SICHER, Snapshot der Tuer (UMSCHALT_ERGEBNIS=rueckfall-gescheitert)\" | tee -a $P; ablegen; exit 2; }\n  for i in $(seq 1 36); do\n    timeout -k 10 10 docker inspect --type container hermes > $A/c.json\n    { neu; neue; } > $A/r.log\n    if test -z \"$KF\" && grep -qF \"$C_ALT\" $A/c.json && grep -q \"menschen: Rechteprüfung\" $A/r.log && grep -q \"Connected to Telegram\" $A/r.log; then\n      echo \"alter Stand laeuft (UMSCHALT_ERGEBNIS=rueckfall-ok)\" | tee -a $P\n      ablegen; exit 1\n    fi\n    sleep 5\n  done\n  echo \"Hand-Rueckweg:$KF $SICHER, Snapshot der Tuer (UMSCHALT_ERGEBNIS=rueckfall-unvollstaendig)\" | tee -a $P; ablegen; exit 2\n}\ntrap 'zurueck \"Signal\"' HUP INT TERM\ntimeout -k 10 120 docker stop -t 60 hermes >/dev/null || zurueck \"stop\"\ntimeout -k 10 60 docker tag $NEU hermes-agent:latest || zurueck \"tag\"\nheil || zurueck \"Symlink an home/env\"\ntimeout -k 10 300 docker compose -f $A/compose.yml --project-directory $DEP up -d --no-deps --force-recreate gateway || zurueck \"compose\"\nfor i in $(seq 1 60); do neu > $A/neu.log; grep -q \"zwischenstand: Takt angemeldet\" $A/neu.log && break; sleep 5; done\nsleep 15\nfehler=0\nok() { echo \"OK   $1\" | tee -a $P; }\nfehl() { echo \"FEHL $1\" | tee -a $P; fehler=$((fehler + 1)); }\ntimeout -k 10 30 docker inspect --type container hermes > $A/c.json\nif grep -qF \"$C_NEU\" $A/c.json; then ok \"Abbild\"; else fehl \"Abbild\"; fi\nif grep -q docker.sock $A/c.json; then fehl \"Docker-Socket\"; else ok \"kein Docker-Socket\"; fi\nif timeout -k 10 30 docker exec hermes /command/s6-svstat /run/service/gateway-default | grep \"^up\" >/dev/null; then ok \"s6\"; else fehl \"s6\"; fi\nif timeout -k 10 30 docker exec hermes sh -c \"cd /tmp && claude --version\" >/dev/null 2>&1; then ok \"Claude-CLI\"; else fehl \"Claude-CLI\"; fi\nneu > $A/neu.log\nfor pl in \"menschen: Rechteprüfung\" \"grenzen:\" \"dienste: 2 Werkzeuge\" \"zerleger: Bedarfs\" \"zwischenstand: Takt angemeldet\"; do\n  if grep -qF \"$pl\" $A/neu.log; then ok \"Plugin $pl\"; else fehl \"Plugin $pl\"; fi\ndone\nt=0\nfor i in $(seq 1 12); do\n  { neu; neue; } > $A/neu.log\n  if grep -q \"Connected to Telegram\" $A/neu.log; then t=1; break; fi\n  sleep 5\ndone\nif test $t = 1; then ok \"Telegram\"; else fehl \"Telegram\"; fi\nif timeout -k 10 60 docker exec -i -u hermes -w /tmp hermes /opt/hermes/.venv/bin/python - <<'PYEOF'\nimport json, socket\ns = socket.socket(socket.AF_UNIX); s.settimeout(30); s.connect(\"/opt/data/supervisor/supervisor.sock\")\ns.sendall(b'{\"aktion\": \"liste\"}\\n'); r = b\"\"\nwhile not r.endswith(b\"\\n\"): r += s.recv(65536)\nassert json.loads(r)[\"ok\"]\nPYEOF\nthen ok \"Supervisor\"; else fehl \"Supervisor\"; fi\nif timeout -k 10 60 docker exec -u hermes hermes docker --context werkstatt ps >/dev/null 2>&1; then ok \"Werkstatt\"; else fehl \"Werkstatt\"; fi\ntimeout -k 10 320 docker exec -u hermes -e HERMES_HOME=/opt/data -e HERMES_SESSION_PLATFORM=telegram -e HERMES_SESSION_USER_ID=1000000001 -e HERMES_SESSION_USER_NAME=Operator -w /tmp hermes timeout 300 /opt/hermes/bin/hermes chat -Q --oneshot -q \"Umschaltprobe: Antworte nur mit dem Wort BIRKENHOLZ.\" > $A/chat.txt 2>/dev/null || true\nif grep -q BIRKENHOLZ $A/chat.txt && ! grep -q Notbetrieb $A/chat.txt; then ok \"Chat als Jochen\"; else fehl \"Chat als Jochen\"; fi\nneu > $A/neu.log\nif grep \"Hermes tools bridged\" $A/neu.log | tail -1 | grep haus_suche >/dev/null; then ok \"Bruecke\"; else fehl \"Bruecke\"; fi\nif timeout -k 10 90 docker exec -i -u hermes -e HERMES_HOME=/opt/data -w /tmp hermes /opt/hermes/.venv/bin/python - <<'PYEOF'\nfrom hermes_cli.plugins import discover_plugins; discover_plugins()\nfrom hermes_cli.runtime_provider import resolve_runtime_provider; resolve_runtime_provider()\nfrom agent.auxiliary_client import call_llm\nr = call_llm(task=\"uebergabe\", messages=[{\"role\": \"user\", \"content\": \"Sag nur: ok\"}], max_tokens=50, timeout=22, reasoning_config={\"enabled\": False})\nassert r.model == \"haiku\", r.model\nPYEOF\nthen ok \"Hilfsaufruf Claude\"; else fehl \"Hilfsaufruf Claude\"; fi\ntest $fehler = 0 || zurueck \"Pruefung(en) rot\"\ntrap - HUP INT TERM\necho \"$NEU laeuft, alle Pruefungen gruen (UMSCHALT_ERGEBNIS=umgeschaltet)\" | tee -a $P\nablegen\nUMSCHALTEN_EOF\n# Treue: genau das Skript aus dem gepinnten Commit, sonst kein Lauf.\necho '0b7add243e259c1dddde20ba3f8e28ec8c53a00736976ea1ed941a47b16a18ff  /run/hermes-umschalten-probe-tuer-trocken-20261010/umschalten.sh' | sha256sum -c -\ngit -c safe.directory=/home/hermes/.hermes/hermes-deployment -C /home/hermes/.hermes/hermes-deployment show f9587dff479cc5676e7efa93bd2605eec22d38b3:ops/probe-tuer-trocken-20261010/tuer/umschalten.sh > /run/hermes-umschalten-probe-tuer-trocken-20261010/aus-commit.sh\ncmp /run/hermes-umschalten-probe-tuer-trocken-20261010/aus-commit.sh /run/hermes-umschalten-probe-tuer-trocken-20261010/umschalten.sh\nbash /run/hermes-umschalten-probe-tuer-trocken-20261010/umschalten.sh",
+          "timeoutSeconds": 7200
+        }
+      ],
+      "checks": [
+        {
+          "name": "Container hermes laeuft mit dem alten Abbild",
+          "run": "docker inspect --type container hermes | grep -q '\"Image\": \"sha256:de128fcf15df17d39dbc6a60833b8efc104d5eff36a40589d7877f3f35c9d6eb\"'",
+          "timeoutSeconds": 60
+        }
+      ],
+      "rollback": [
+        "Trockenlauf: nichts veraendert, nichts zurueckzunehmen."
+      ],
+      "risk": [
+        "contained"
+      ]
+    }
+  }
+}

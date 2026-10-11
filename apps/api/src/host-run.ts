@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 
 import type { ExecutionReview } from "@wireguard-ops-cockpit/domain";
 
-import { backupGuardHits, type BackupGuardHit } from "../../../deploy/helpers/cockpit-backup-guard.mjs";
+import { backupGuardFocus, backupGuardHits, type BackupGuardHit } from "../../../deploy/helpers/cockpit-backup-guard.mjs";
 
 import { READABLE_PROTECTED_PATH } from "./capability-manifest.js";
 import { hashCanonical } from "./hermes-security.js";
@@ -28,12 +28,15 @@ import { redactSecrets } from "./update-review.js";
 //   safety net  the helper: borg backup younger than 24 h and a machine
 //               snapshot before any run that changes the system.
 //   backup bolt the one exception to "no approval as a rule" (Jochen,
-//               30.09.2026): a run that deletes backups or shortens their
-//               retention needs the operator's approval, even when the
-//               doorkeeper passes. deploy/helpers/cockpit-backup-guard.mjs
-//               decides deterministically; the helper asks it again.
+//               30.09.2026, narrowed 10.10.2026): a run that deletes backups,
+//               changes their retention or switches them off needs the
+//               operator's approval, even when the doorkeeper passes.
+//               deploy/helpers/cockpit-backup-guard.mjs decides
+//               deterministically; the helper asks it again. What the bolt
+//               cannot read or what only names the backups is focus for the
+//               doorkeeper (backup-focus), never an automatic stop.
 
-export { backupGuardHits, type BackupGuardHit };
+export { backupGuardFocus, backupGuardHits, type BackupGuardHit };
 
 export type HostRunRisk = "contained" | "exposure" | "data_loss" | "identity_or_secret";
 
@@ -210,6 +213,9 @@ export function classifyHostRunFocus(manifest: HostRunManifest): HostRunFocus[] 
   }
   for (const hit of backupGuardHits(manifest)) {
     focus.push({ where: hit.where, kind: `backup-approval:${hit.kind}`, reason: `${hit.reason}; this run goes to the operator whatever the verdict` });
+  }
+  for (const hit of backupGuardFocus(manifest)) {
+    focus.push({ where: hit.where, kind: `backup-focus:${hit.kind}`, reason: `${hit.reason}; does it delete backups, change their retention or switch them off? Then it is X4` });
   }
   if (!manifest.mutates) {
     const writes = lines.filter((line) => line.id.startsWith("S") && MUTATION_HINT.test(line.text)).map((line) => line.id);
@@ -574,7 +580,7 @@ export function hostRunPlannerContract(): string {
     "A reboot is an ordinary step ({\"name\":\"reboot\",\"reboot\":true}); the run continues with the next step after the host is back and reports its result then. Put the checks that prove the new state after the reboot.",
     "checks are mandatory and must be able to fail (exit non-zero when the target state is missing). rollback is mandatory: the concrete way back for this plan (for example: downgrade or reinstall the previous version, restore the saved config copy); the machine snapshot is the last resort and needs the operator.",
     "Split big work into stages with a check each (for GitLab: the official upgrade stops, gitlab-backup before each stage, gitlab-ctl reconfigure and a health check after). Use apt-get with -y and noninteractive defaults; hold packages explicitly when a stage must not touch them (apt-mark hold).",
-    "Deleting backups or shortening their retention always waits for the operator's approval, whatever the doorkeeper says: borg/borgmatic delete, prune, compact, recreate, retention edits in /etc/borgmatic, deleting or moving in the repository path, ssh to another machine (Lab0 is 10.0.0.5), stopping, disabling or bypassing borgmatic.timer or Lab0's retention service (cockpit-borg-retention set below its minimum or with --freigabe, freigeben, stopping/disabling its timer, editing its files). Free are only the reading and routine forms: borg list/info/check/create, borgmatic list/info/check/create or plain borgmatic, cockpit-borg-action status|check, systemctl status/start borgmatic.service, journalctl -u borgmatic, and on Lab0 /usr/local/sbin/cockpit-borg-retention status|run or set <keep_daily> <keep_weekly> <keep_monthly> <HH:MM> inside the fixed bounds (doc/setup/borg-retention.md). Code the plan does not show (eval, decoding, piping into a shell, running a script the run did not write in a heredoc, commands or targets from values the plan does not show) also waits for the operator.",
+    "Deleting backups, changing their retention or switching them off always waits for the operator's approval, whatever the doorkeeper says: borg/borgmatic delete, prune, compact, recreate, break-lock, key changes, retention edits (/etc/borgmatic, keep_*, GitLab backup_keep_time), deleting, moving or overwriting in the repository path, /var/backups or /var/opt/gitlab/backups (also over ssh on Lab0, 10.0.0.5), stopping, disabling or masking borgmatic.timer or Lab0's retention service (cockpit-borg-retention set below its minimum or with --freigabe, freigeben, stopping/disabling its timer, editing its files), deleting a machine snapshot. Package updates, reading (borg list/info/check/create, docker ps/inspect/logs, systemctl status), plain borgmatic, cockpit-borg-action status|check, systemctl start borgmatic.service, new backup copies and on Lab0 /usr/local/sbin/cockpit-borg-retention status|run or set <keep_daily> <keep_weekly> <keep_monthly> <HH:MM> inside the fixed bounds (doc/setup/borg-retention.md) do not. Code the plan does not show (eval, decoding, piping into a shell, running a script the run did not write in a heredoc, commands or targets from values the plan does not show, ssh to another machine) makes the doorkeeper look hard: write the literal commands instead.",
     "Never read, print or send secrets (Cockpit configuration in /etc/wireguard-ops-cockpit, agent credentials, private keys, /etc/shadow, borg keys, database passwords), never send host data off the host, and never change users, sudoers, SSH keys, firewall rules or the Cockpit's own code: the doorkeeper stops those for the operator.",
   ].join("\n");
 }
