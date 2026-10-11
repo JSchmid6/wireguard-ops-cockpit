@@ -73,14 +73,14 @@ Terminal statuses include `completed`, `blocked_user_approval`, `blocked_policy`
 - Red proposals stop at `blocked_user_approval`.
 - Hard boundaries include destructive commands, identity or network changes, new public exposure, direct Nextcloud database access, and sudo-policy changes.
 
-For a red job, explain the reason and evidence to the operator. After the operator decides, call:
+For a red job, explain the reason and evidence to the operator and forward the job's `operatorLink`. The operator decides in the cockpit session via
 
 ```json
 POST /api/hermes/jobs/<jobId>/approval
 {"decision":"approved","reason":"operator rationale"}
 ```
 
-or use `"rejected"`. Approval is audited but never creates privilege: execution still runs as the bounded `wgops` service account and can use only static, administrator-installed helpers.
+or `"rejected"`. This route refuses every automation token (403) — Hermes never approves. If the approval window expired before the operator decided, Hermes may call `POST /api/hermes/jobs/<jobId>/reactivate` (scope required): it renews only the deadline of the unchanged, never-decided job (at most 3 times, never beyond 72 h after creation) and never approves; then forward the `operatorLink` again. Approval is audited but never creates privilege: execution still runs as the bounded `wgops` service account and can use only static, administrator-installed helpers.
 
 ## Security invariants
 
