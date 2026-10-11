@@ -100,6 +100,7 @@ beforeEach(() => {
     "#!/bin/bash",
     `echo "dpkg $*" >> "${dir}/order.log"`,
     `if [ "$1" = --audit ]; then [ -e "${dir}/dpkg-dirty" ] && echo 'The following packages are only half configured'; exit 0; fi`,
+    `if [ "$1" = --configure ]; then sleep "$(cat "${dir}/dpkg-sleep" 2>/dev/null || echo 0)"; fi`,
   ].join("\n"));
   write(path.join(dir, "bin", "apt-get"), [
     "#!/bin/bash",
@@ -575,6 +576,26 @@ describe("cockpit-host-run: state steps are never ended", () => {
     expect(state.status).toBe("failed");
     expect(state.repair?.dpkg).toBe(0);
     expect(order()).toContain("dpkg --configure -a --force-confdef --force-confold");
+  });
+
+  it("reports a repair that runs longer than planned, without ending it", () => {
+    writeFileSync(path.join(dir, "apt-fail"), "");
+    writeFileSync(path.join(dir, "dpkg-sleep"), "3");
+    const out = run(["start"], request(stateManifest({ steps: [{ name: "upgrade", run: "apt-get upgrade -y", timeoutSeconds: 60 }] })), { HOST_RUN_REPAIR_LIMIT_SECONDS: "1" });
+    expect(out.code).toBe(0);
+    const { state, logTail } = status();
+    expect(state.status).toBe("failed");
+    expect(state.repair?.dpkg).toBe(0);
+    expect(logTail).toContain("repair (dpkg --configure -a) runs longer than planned (1 s); it is not ended");
+    expect(state.attention).toBeNull();
+  }, 20_000);
+
+  it("gives every mutating run an unbounded unit, so a repair after a failure is never cut off", () => {
+    run(["start"], request(stateManifest({ steps: [{ name: "slow", run: "sleep 20", timeoutSeconds: 1, uninterruptible: false }] })));
+    const { state } = status();
+    expect(state.status).toBe("failed");
+    expect(state.steps[0]).toMatchObject({ uninterruptible: false, timedOut: true });
+    expect(readFileSync(path.join(dir, "runtime.log"), "utf8").trim()).toBe("RuntimeMaxSec=infinity");
   });
 
   it("does not touch dpkg after a failed non-package step when dpkg is clean", () => {

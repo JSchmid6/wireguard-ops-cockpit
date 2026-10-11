@@ -289,4 +289,14 @@ describe("host door: uninterruptible steps through the API", () => {
     expect(job.status).not.toBe("completed");
     expect(JSON.stringify(job.output)).toContain("state steps (package)");
   });
+
+  it("finds state steps anywhere in the plan the runner would get, not only in the first script block", async () => {
+    // Der erste Block ist harmlos (grün, ohne Klick); apt steht erst im zweiten.
+    const flow = await setup({ plan: "## Plan\n```bash\nuptime\n```\nDanach:\n```shell\napt-get -y upgrade\n```\n## Intent\nKeep the host's packages current.", doorkeeper: "VERDICT: pass" });
+    const submitted = await flow.submit();
+    const job = await flow.settled(submitted.id);
+    expect(flow.agentCalls.some((call) => call.role === "runner")).toBe(false);
+    expect(job.status).not.toBe("completed");
+    expect(JSON.stringify(job.output)).toContain("state steps (package)");
+  });
 });

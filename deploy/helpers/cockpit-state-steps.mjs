@@ -33,10 +33,11 @@ export const STATE_STEPS_VERSION = "cockpit-state-steps/v1";
 // Art → Muster. \b vor und (?![\w-]) hinter dem Wort: "apt" trifft auch
 // "apt-get" (eigenes Muster), aber nicht "aptly" oder "adapt".
 const KINDS = [
-  ["package", /(?:^|[^\w.-])(?:apt|apt-get|aptitude|dpkg|dpkg-reconfigure|unattended-upgrades?|do-release-upgrade|needrestart|snap)(?![\w-])/],
+  ["package", /(?:^|[^\w.-])(?:apt|apt-get|aptitude|dpkg|dpkg-reconfigure|unattended-upgrades?|do-release-upgrade|needrestart|snap|nala|pkcon|aptdcon|ubuntu-drivers)(?![\w-])/],
   ["gitlab", /(?:^|[^\w.-])(?:gitlab-ctl|gitlab-rake|gitlab-backup|gitlab-psql)(?![\w-])/],
   ["migration", /(?:^|[^\w.-])(?:occ|mysql_upgrade|mariadb-upgrade|pg_upgrade|pg_upgradecluster|pg_dropcluster|pg_createcluster)(?![\w-])|\bdb:migrate\b/],
-  ["compose", /(?:^|[^\w.-])docker(?:\s+compose|-compose)(?![\w-])/],
+  // auch mit Optionen dazwischen: docker --context x compose up, docker -H … compose pull
+  ["compose", /(?:^|[^\w.-])docker(?:-compose|[ \t][^\n;&|]*?\bcompose)(?![\w-])/],
   ["update-helper", /(?:^|[^\w.-])(?:cockpit-self-update-action|cockpit-dienste-update-action|cockpit-self-update-run|homeserver-cockpit-deploy(?:\.sh)?|vps-cockpit-deploy(?:\.sh)?)(?![\w-])/],
   ["switch", /umschalt|switch-?over|cut-?over/i],
   ["disk", /(?:^|[^\w.-])(?:mkfs(?:\.\w+)?|parted|sgdisk|sfdisk|fdisk|resize2fs|xfs_growfs|lvextend|lvresize|lvreduce|pvmove|mdadm|cryptsetup|grub-install|update-grub|update-initramfs)(?![\w-])/],

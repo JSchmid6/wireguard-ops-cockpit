@@ -232,8 +232,9 @@ Freigabe).
 
 - eigene transiente Unit `cockpit-host-run-<job>` (`systemd-run --collect`, ohne Warten):
   außerhalb der Executor-Sandbox, übersteht einen Neustart des Executors,
-  `RuntimeMaxSec` aus den Zeitlimits der Schritte plus Reserve — außer der Lauf hat einen
-  unterbrechungssicheren Schritt (3a), dann `RuntimeMaxSec=infinity`,
+  `RuntimeMaxSec` aus den Zeitlimits der Schritte plus Reserve — außer der Lauf ändert
+  (`mutates`) oder hat einen unterbrechungssicheren Schritt (3a), dann `RuntimeMaxSec=infinity`
+  (auch das Aufräumen nach einem Fehler darf nie abgeschnitten werden),
 - jeder Schritt: `bash -eo pipefail -c <run>` als root, `DEBIAN_FRONTEND=noninteractive`,
   eigenes Zeitlimit (Standard 1800 s, höchstens 10 800 s; ein abbrechbarer Schritt, der es reißt,
   wird beendet und ist gescheitert, auch mit Exit 0 — ein unterbrechungssicherer nie, 3a), der
@@ -257,16 +258,19 @@ sshd lief nicht mehr.
 
 - **Erkennung** (`deploy/helpers/cockpit-state-steps.mjs`, eine Quelle für API und Helfer,
   installiert neben dem Helfer): Paketverwaltung (apt, apt-get, aptitude, dpkg,
-  unattended-upgrade, snap, do-release-upgrade), GitLab (gitlab-ctl, gitlab-rake, gitlab-backup),
+  unattended-upgrade, snap, do-release-upgrade, nala, pkcon, aptdcon, ubuntu-drivers), GitLab (gitlab-ctl, gitlab-rake, gitlab-backup),
   Migrationen (occ, `db:migrate`, mysql_upgrade/mariadb-upgrade, pg_upgrade…), `docker compose`/
-  `docker-compose`, die Update-Helfer des Cockpits, Umschalten (`umschalt…`, switchover, cutover)
+  `docker-compose` (auch mit Optionen dazwischen, `docker --context x compose`), die Update-Helfer des Cockpits, Umschalten (`umschalt…`, switchover, cutover)
   und Platten/Boot (mkfs, parted, mdadm, update-grub, update-initramfs …). Gelesen wird der rohe
   Text von Name und Skript — ein Fehltreffer kostet nur Warten.
 - **Wer unterbrechungssicher ist** (fail safe): ein erkannter Schritt; ein Schritt, den der
   Planer mit `"uninterruptible": true` kennzeichnet; und jeder Schritt eines ändernden Laufs
   (`mutates`), den der Planer nicht ausdrücklich mit `"uninterruptible": false` als abbrechbar
   kennzeichnet. Die Erkennung schlägt die Kennzeichnung: ein apt-Schritt bleibt
-  unterbrechungssicher, auch mit `false`. Abbrechbar bleibt damit nur, was nichts ändert.
+  unterbrechungssicher, auch mit `false`. Abbrechbar bleibt in einem ändernden Lauf nur, was der
+  Planer ausdrücklich mit `false` kennzeichnet und die Erkennung nicht trifft — ruft ein solcher
+  Schritt verdeckt Paketbefehle auf (eigenes Skript), sieht die Erkennung das nicht; also `false`
+  nur für Schritte, die nichts installieren.
   Prüfschritte sind abbrechbar, außer die Erkennung trifft.
 - **Am Zeitlimit**: kein Signal. Der Helfer schreibt „runs longer than planned … it is not
   ended — waiting“ ins Protokoll und `attention` (`level: "overrun"`) in den Laufzustand.
@@ -274,8 +278,9 @@ sshd lief nicht mehr.
   `attention.level: "operator"` und „OPERATOR: … still runs after … h“ im Protokoll. Der Lauf
   wartet weiter, bis bash selbst endet.
 - **Hintergrundprozesse**: endet bash, hält aber ein mit `&` gestarteter Prozess die Ausgabe
-  offen, liest der Helfer noch 10 s und macht dann ohne Abbruch weiter (der Prozess endet mit der
-  Lauf-Unit).
+  offen, liest der Helfer noch 10 s und macht dann ohne Abbruch weiter; der Prozess verliert
+  dabei seine Ausgabe (schreibt er weiter, endet er an SIGPIPE) und endet spätestens mit der
+  Lauf-Unit. Paketbefehle also nie mit `&` in den Hintergrund schicken.
 - **API**: Solange der Helfer den Lauf als aktiv meldet, gibt die API ihn nie auf (jede solche
   Antwort schiebt ihre Frist). `attention` landet am Job (`output.hostRunAttention`), als Audit
   `hermes.host_run.attention` (einmal je Stufe) und in `GET /api/inbox` unter `attention` —
@@ -289,11 +294,19 @@ sshd lief nicht mehr.
   4. sshd noch einmal und ob er lauscht (`ss -ltnp`);
   5. apache2, php*-fpm, mariadb, docker und die drei Cockpit-Dienste: ist einer aktiviert, aber
      nicht aktiv, wird er gestartet; was danach noch steht, nennt das Protokoll.
+  Läuft Schritt 2 oder 3 länger als geplant (1 h), gilt dieselbe Meldung wie bei einem Schritt:
+  `attention` „repair (…) runs longer than planned“, an der harten Obergrenze `operator` — kein
+  Signal.
+- **Robustheit des Helfers**: Schreibfehler im Protokoll (z. B. volle Platte) beenden den Helfer
+  nicht, und ein unerwarteter Fehler beendet ihn nicht, solange ein unterbrechungssicherer
+  Schritt läuft — sonst endete die Unit (`KillMode=control-group`) und systemd beendete apt/dpkg
+  mit.
 - **Die anderen Wege**: Die Deploy-Unit des Selbst-Updates hat `TimeoutStartSec=infinity`, die
   `einspielen`-Unit von `dienste.update` (docker compose) kein `RuntimeMaxSec` mehr. Die
   Runner-Rolle des Agent-Brokers (der sie nach ihrem Budget mit SIGTERM→SIGKILL beendet) läuft
   ohnehin als `cockpit-agent` ohne root, sudo und Docker-Socket; die API gibt ihr zusätzlich
-  keinen Plan, dessen Skript einen Zustandsschritt nennt — der gehört durch die Tür.
+  keinen Plan, dessen Text (nicht nur der erste Skriptblock) einen Zustandsschritt nennt — der
+  gehört durch die Tür.
 
 ## 4. Netz darunter
 

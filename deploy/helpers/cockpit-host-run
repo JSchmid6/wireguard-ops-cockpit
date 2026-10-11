@@ -76,6 +76,7 @@ const STEP_PATH = `${env.HOST_RUN_STEP_PATH ? `${env.HOST_RUN_STEP_PATH}:` : ""}
 // Harte Obergrenze für unterbrechungssichere Schritte: danach Operator-Meldung,
 // aber weiterhin kein Abbruch (Vorgabe Jochen, 11.10.2026).
 const HARD_CAP_SECONDS = Number.parseInt(env.HOST_RUN_HARD_CAP_SECONDS || "", 10) > 0 ? Number.parseInt(env.HOST_RUN_HARD_CAP_SECONDS, 10) : 6 * 3600;
+const REPAIR_LIMIT_SECONDS = Number.parseInt(env.HOST_RUN_REPAIR_LIMIT_SECONDS || "", 10) > 0 ? Number.parseInt(env.HOST_RUN_REPAIR_LIMIT_SECONDS, 10) : 3600;
 // Hat bash eines unterbrechungssicheren Schritts geendet, ein Hintergrundprozess
 // hält aber die Ausgabe offen: so lange noch lesen, dann ohne Abbruch weiter.
 const OUTPUT_GRACE_MS = 10_000;
@@ -245,8 +246,10 @@ function printable(line) {
 function log(text) {
   const lines = String(text).split("\n").map((line) => redact(printable(line))).join("\n");
   const stamped = `${lines}\n`;
-  if (logPath) appendFileSync(logPath, stamped, { mode: 0o600 });
-  process.stdout.write(stamped);
+  // Nie werfen (z. B. ENOSPC): stirbt der Helfer, beendet systemd mit der
+  // Unit (KillMode=control-group) auch einen laufenden apt/dpkg.
+  try { if (logPath) appendFileSync(logPath, stamped, { mode: 0o600 }); } catch { /* Protokoll verloren, Lauf geht weiter */ }
+  try { process.stdout.write(stamped); } catch { /* dito */ }
 }
 
 function startUnit(jobId, runtimeSeconds) {
@@ -262,6 +265,7 @@ function startUnit(jobId, runtimeSeconds) {
 // null = keine Obergrenze für die Unit: ein unterbrechungssicherer Schritt darf
 // nicht über RuntimeMaxSec doch noch beendet werden.
 function runtimeBudget(manifest, fromStep = 0) {
+  if (manifest.mutates) return null; // das Aufräumen nach einem Fehler (dpkg) darf nie begrenzt sein
   if (manifest.steps.slice(fromStep).some((step) => !step.reboot && stepUninterruptible(manifest, step).uninterruptible)) return null;
   const steps = manifest.steps.slice(fromStep).reduce((sum, step) => sum + (step.reboot ? 0 : step.timeoutSeconds), 0);
   const checks = manifest.checks.reduce((sum, check) => sum + check.timeoutSeconds, 0);
@@ -374,6 +378,8 @@ function resume() {
 // Ein abbrechbarer Schritt endet am Zeitlimit (SIGKILL an die Prozessgruppe).
 // Ein unterbrechungssicherer nie: am Zeitlimit ruft er onOverrun, an der harten
 // Obergrenze onHardCap, und wartet weiter, bis bash selbst endet.
+let uninterruptibleRunning = 0;
+function guarded(callback) { return () => { try { callback(); } catch (error) { log(`== notice failed: ${error?.message ?? error}`); } }; }
 function runScript(script, timeoutSeconds, { uninterruptible = false, onOverrun = () => {}, onHardCap = () => {} } = {}) {
   return new Promise((resolve) => {
     const child = spawn("/bin/bash", ["--noprofile", "--norc", "-eo", "pipefail", "-c", script], {
@@ -385,15 +391,17 @@ function runScript(script, timeoutSeconds, { uninterruptible = false, onOverrun 
     let settled = false;
     let exitCode = null;
     const timers = [];
+    if (uninterruptible) uninterruptibleRunning += 1;
     const done = (result) => {
       if (settled) return;
       settled = true;
+      if (uninterruptible) uninterruptibleRunning -= 1;
       for (const timer of timers) clearTimeout(timer);
       resolve({ ...result, overran });
     };
     if (uninterruptible) {
-      timers.push(setTimeout(() => { overran = true; onOverrun(); }, timeoutSeconds * 1000));
-      timers.push(setTimeout(() => onHardCap(), Math.max(HARD_CAP_SECONDS, timeoutSeconds) * 1000));
+      timers.push(setTimeout(() => { overran = true; guarded(onOverrun)(); }, timeoutSeconds * 1000));
+      timers.push(setTimeout(guarded(onHardCap), Math.max(HARD_CAP_SECONDS, timeoutSeconds) * 1000));
     } else {
       timers.push(setTimeout(() => { timedOut = true; try { process.kill(-child.pid, "SIGKILL"); } catch { /* schon weg */ } }, timeoutSeconds * 1000));
     }
@@ -448,9 +456,22 @@ async function repairPackages(state, why) {
   const repair = { startedAt: now(), why, sshd: ensureSshd(), dpkg: null, apt: null, sshdListening: null, services: [], finishedAt: null };
   state.repair = repair;
   saveState(state);
-  const wait = { uninterruptible: true, onOverrun: () => log("== repair step runs longer than planned; not ended") };
-  repair.dpkg = (await runScript("dpkg --configure -a --force-confdef --force-confold", 3600, wait)).code;
-  repair.apt = (await runScript("apt-get -f install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold", 3600, wait)).code;
+  const wait = (name) => ({
+    uninterruptible: true,
+    onOverrun: () => {
+      state.attention = { level: "overrun", step: null, name, since: now(), limitSeconds: REPAIR_LIMIT_SECONDS, hardCapSeconds: Math.max(HARD_CAP_SECONDS, REPAIR_LIMIT_SECONDS), message: `repair (${name}) runs longer than planned (${REPAIR_LIMIT_SECONDS} s); it is not ended — waiting` };
+      saveState(state);
+      log(`== ${now()} ${state.attention.message}`);
+    },
+    onHardCap: () => {
+      state.attention = { ...(state.attention || {}), level: "operator", name, hardCapAt: now(), message: `repair (${name}) still runs at the hard cap; it is NOT ended — the operator must look at the host` };
+      saveState(state);
+      log(`== ${now()} OPERATOR: ${state.attention.message}`);
+    },
+  });
+  repair.dpkg = (await runScript("dpkg --configure -a --force-confdef --force-confold", REPAIR_LIMIT_SECONDS, wait("dpkg --configure -a"))).code;
+  repair.apt = (await runScript("apt-get -f install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold", REPAIR_LIMIT_SECONDS, wait("apt-get -f install"))).code;
+  state.attention = null;
   // dpkg kann sshd beim Konfigurieren neu gestartet haben (oder nicht): noch einmal.
   repair.sshd = ensureSshd();
   repair.sshdListening = (await runScript("ss -Hltnp | grep -q '\"sshd\"'", 60)).code === 0;
@@ -626,5 +647,14 @@ const [verb, argument] = process.argv.slice(2);
 if (verb === "start" && process.argv.length === 3) await start();
 else if (verb === "status" && process.argv.length === 4) status(argument);
 else if (verb === "resume" && process.argv.length === 3) resume();
-else if (verb === "--payload" && process.argv.length === 4) await payload(argument);
+else if (verb === "--payload" && process.argv.length === 4) {
+  // Ein unerwarteter Fehler darf den Helfer nicht beenden, solange ein
+  // unterbrechungssicherer Schritt läuft: Mit dem Helfer endet die Unit, und
+  // systemd beendet dann auch apt/dpkg. Er wartet weiter auf bash.
+  process.on("uncaughtException", (error) => {
+    try { process.stderr.write(`cockpit-host-run: ${error?.stack ?? error}\n`); } catch { /* nichts mehr zu tun */ }
+    if (uninterruptibleRunning === 0) process.exit(70);
+  });
+  await payload(argument);
+}
 else fail("usage: cockpit-host-run start | status <jobId> | resume");

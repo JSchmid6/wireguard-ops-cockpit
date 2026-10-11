@@ -1887,7 +1887,8 @@ export async function createApp(options: AppOptions = {}) {
   // cockpit-state-steps.mjs): those run only through the host door, which never
   // ends them. A plan whose script names one is refused before the runner starts.
   async function runIsolatedRunner(actor: UserSummary, session: { id: string }, planner: AgentManifest, proposalPath: string, planText: string): Promise<string> {
-    const kinds = stateStepKinds(typedPlanScript(planText));
+    // Der ganze Plantext, nicht nur der erste Skriptblock: der Runner bekommt ihn ganz.
+    const kinds = stateStepKinds(planText);
     if (kinds.length > 0) {
       throw new Error(`the plan's script contains state steps (${kinds.join(", ")}) that the runner role could be ended in; such steps run only through the host door (a host-run manifest), which never ends them`);
     }
