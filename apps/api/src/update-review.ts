@@ -40,6 +40,7 @@ import {
 // safety-role bounds (100,000 characters, 120,000 bytes: one argv element).
 export const UPDATE_REVIEW_PROMPT_LIMIT = 96_000;
 const FILE_LIST_BUDGET = 8_000;
+const NAME_LIST_BUDGET = 1_000;
 const EVIDENCE_ITEM_LIMIT = 4_000;
 const SHA = /^[a-f0-9]{40}$/;
 const DIFF_HASH = /^[a-f0-9]{64}$/;
@@ -59,8 +60,10 @@ export interface UpdateKindSpec {
 }
 
 // Documentation and agent instructions (markdown) and the npm lockfile, whose
-// package changes the runner summarizes as the G8 package list.
-const DOCS_AND_LOCKFILES = /\.(?:md|markdown)$|(?:^|\/)package-lock\.json$/i;
+// package changes the runner summarizes as the G8 package list. Markdown under
+// bin/ is not documentation: the runbook plans there (bin/gen-*.md) are read
+// at runtime (safety-review.ts).
+const DOCS_AND_LOCKFILES = /^(?!bin\/)(?:.*\.(?:md|markdown)$|(?:.*\/)?package-lock\.json$)/i;
 // The runner's test path rule (cockpit-self-update-run: TEST_PATH_RE).
 const TEST_FILES = /(?:^|\/)tests?\/|\.(?:test|spec)\.[A-Za-z0-9]+$/;
 
@@ -308,6 +311,20 @@ function bytes(text: string): number {
   return Buffer.byteLength(text, "utf8");
 }
 
+// A file list of the excerpt's state line inside NAME_LIST_BUDGET bytes.
+function nameList(names: string[]): string {
+  if (names.length === 0) return "none";
+  const shown: string[] = [];
+  let used = 0;
+  for (const name of names) {
+    if (used + bytes(name) + 2 > NAME_LIST_BUDGET - 40) break;
+    shown.push(name);
+    used += bytes(name) + 2;
+  }
+  const rest = names.length - shown.length;
+  return rest > 0 ? `${[...shown, `... (${rest} more)`].join(", ")}` : shown.join(", ");
+}
+
 function fence(text: string): string {
   const longest = Math.max(2, ...[...text.matchAll(/`+/g)].map((match) => match[0].length));
   return "`".repeat(longest + 1);
@@ -370,7 +387,8 @@ export function buildUpdateReviewPrompt(diffs: UpdateDiff[], options: { nonce?: 
   const head = [spec.instructions, "", updateReviewDataNotice(nonce), "", `BEGIN_REVIEW_DATA ${nonce}`].join("\n");
   const tail = [`END_REVIEW_DATA ${nonce}`, "", updateReviewClosingReminder(nonce)].join("\n");
   const descriptions = diffs.map((diff, index) => describeUpdate(diff, index, diffs.length));
-  let remaining = limit - bytes(head) - bytes(tail) - descriptions.reduce((sum, text) => sum + bytes(text) + 400, 0);
+  // Per update: its description, the block frame and the two name lists of the state line.
+  let remaining = limit - bytes(head) - bytes(tail) - descriptions.reduce((sum, text) => sum + bytes(text) + 400 + 2 * NAME_LIST_BUDGET, 0);
   const coverage: UpdateReviewCoverage[] = [];
   const blocks: string[] = [];
   diffs.forEach((diff, index) => {
@@ -398,9 +416,10 @@ export function buildUpdateReviewPrompt(diffs: UpdateDiff[], options: { nonce?: 
       if (!focus.has(section.path) || !/^Binary files /m.test(text)) complete.add(section.path);
     }
     for (const { path, text } of skipped) {
-      if (remaining > 1024) {
-        const room = Buffer.from(text, "utf8").subarray(0, remaining - 200).toString("utf8").replace(/\uFFFD+$/, "");
-        const partial = `${room.slice(0, Math.max(0, room.lastIndexOf("\n")))}\n[... ${path} truncated for the review budget ...]\n`;
+      const note = `\n[... ${path} truncated for the review budget ...]\n`;
+      if (remaining - bytes(note) > 1024) {
+        const room = Buffer.from(text, "utf8").subarray(0, remaining - bytes(note) - 200).toString("utf8").replace(/\uFFFD+$/, "");
+        const partial = `${room.slice(0, Math.max(0, room.lastIndexOf("\n")))}${note}`;
         included.push(partial);
         remaining -= bytes(partial);
         cut.push(path);
@@ -421,8 +440,10 @@ export function buildUpdateReviewPrompt(diffs: UpdateDiff[], options: { nonce?: 
     const omittedFiles = [...new Set([...omitted, ...missing])];
     coverage.push({ sha: diff.sha, incomplete, cut: cutFiles, omitted: omittedFiles });
     const excerpt = included.join("");
+    // Required files are named first; the full lists stay in the coverage.
+    const named = [...missing, ...omittedFiles.filter((path) => !missing.includes(path))];
     const state = cutFiles.length || omittedFiles.length
-      ? `The excerpt is INCOMPLETE. Cut: ${cutFiles.join(", ") || "none"}. Left out: ${omittedFiles.join(", ") || "none"}.`
+      ? `The excerpt is INCOMPLETE. Cut: ${nameList(cutFiles)}. Left out: ${nameList(named)}.`
       : "The excerpt is complete (every changed file's diff section is included; lockfiles are summarized above).";
     const marker = fence(excerpt);
     blocks.push([descriptions[index], "", "## Diff excerpt", state, `${marker}diff`, excerpt.trimEnd(), marker].join("\n"));

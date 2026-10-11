@@ -285,6 +285,22 @@ describe("self-update pre-install review", () => {
     expect(policy.evidence).toContain(`not fully reviewed (${SHA.slice(0, 12)}): Dockerfile.api`);
   });
 
+  it("stays inside the limit when many files are cut or left out, also over two updates", () => {
+    const tests = Array.from({ length: 120 }, (_, index) => `apps/api/test/generated/very/long/path/number-${index}-of-many.test.ts`);
+    const one = (sha: string) => diff({
+      sha,
+      files: [...diff().files, ...tests.map((path) => ({ status: "M", path, added: 50, deleted: 0, class: "test" }))],
+      filesTotal: 122,
+      excerpt: [...diff().excerpt, ...tests.map((path) => section(path, ["@@ -0,0 +1,50 @@", ...Array.from({ length: 50 }, (_, index) => `+${index} ${"q".repeat(60)}`)]))],
+    });
+    const { prompt, coverage } = buildUpdateReviewPrompt([one(SHA), one("f".repeat(40))], { nonce: NONCE, limit: 40_000 });
+    expect(Buffer.byteLength(prompt)).toBeLessThanOrEqual(40_000);
+    expect(prompt).toMatch(/Left out: [^\n]*\.\.\. \(\d+ more\)\./);
+    // The coverage keeps every name; only tests are missing, so no stop.
+    expect(coverage[1].omitted.length + coverage[1].cut.length).toBeGreaterThan(100);
+    expect(coverage.map((item) => item.incomplete)).toEqual([[], []]);
+  });
+
   it("stops when the runner did not list every changed file", () => {
     const { coverage } = buildUpdateReviewPrompt([diff({ filesTotal: 2005 })], { nonce: NONCE });
     expect(coverage[0].incomplete).toEqual(["(2003 changed file(s) the runner did not list)"]);
@@ -293,7 +309,8 @@ describe("self-update pre-install review", () => {
   it("supplementary files: tests, markdown and the lockfile for self; only markdown for dienste", () => {
     const self = UPDATE_KINDS.self.supplementary;
     expect(["apps/api/test/a.test.ts", "test/x.sh", "doc/setup/a.md", "AGENTS.md", "package-lock.json", "apps/web/src/x.spec.tsx"].every(self)).toBe(true);
-    expect(["Dockerfile.api", "deploy/vps/vps-cockpit-deploy.sh", "package.json", "apps/api/src/app.ts", ".github/workflows/ci.yml", "doc/setup/x.sh", "requirements.txt"].some(self)).toBe(false);
+    // bin/gen-*.md are runbook plans read at runtime, not documentation.
+    expect(["Dockerfile.api", "deploy/vps/vps-cockpit-deploy.sh", "package.json", "apps/api/src/app.ts", ".github/workflows/ci.yml", "doc/setup/x.sh", "requirements.txt", "bin/gen-weekly.md"].some(self)).toBe(false);
     const dienste = UPDATE_KINDS.dienste.supplementary;
     expect(dienste("README.md")).toBe(true);
     // bin/uebernehmen runs the new stand's tests on the host before activation.
