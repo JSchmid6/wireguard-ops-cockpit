@@ -3959,11 +3959,30 @@ Follow these rules:
     const attention = database.listJobsByStatus("hermes-change", "running")
       .filter((job) => visible(job.id) && job.output?.hostRunAttention && typeof job.output.hostRunAttention === "object")
       .map((job) => ({ jobId: job.id, intent: String((job.output?.explanation as Record<string, unknown> | undefined)?.intent ?? ""), ...(job.output?.hostRunAttention as Record<string, unknown>) }));
+    // A real review finding over a plan that was blocked anyway (prerequisite
+    // or policy): nothing to approve — an approval never lifts that block —
+    // but the operator must know, and a revised plan whose new review passes
+    // must not bury it. Listed for seven days; James forwards it.
+    const reviewFindings = (["blocked_prerequisite", "blocked_policy"] as const)
+      .flatMap((status) => database.listJobsByStatus("hermes-change", status))
+      .filter((job) => visible(job.id) && Date.parse(job.updatedAt) >= now - 7 * 24 * 3_600_000)
+      .flatMap((job) => {
+        const review = job.output?.updateReview as Record<string, unknown> | undefined;
+        if (!review || review.result !== "finding") return [];
+        const findings = Array.isArray(review.findings) ? review.findings as Array<Record<string, unknown>> : [];
+        return [{
+          jobId: job.id, status: job.status, at: job.updatedAt,
+          intent: String((job.output?.explanation as Record<string, unknown> | undefined)?.intent ?? ""),
+          findings: findings.filter((finding) => !/^UNVERIFIABLE\b/.test(String(finding.guarantee ?? "")))
+            .map((finding) => ({ title: String(finding.title ?? ""), guarantee: String(finding.guarantee ?? ""), file: String(finding.file ?? "") })),
+        }];
+      });
     return {
       generatedAt: new Date(now).toISOString(),
       cards: sortCards(cards),
       reorders,
       attention,
+      reviewFindings,
       status: {
         lastRuns: database.listRecentJobs("hermes-change", 20).filter((job) => visible(job.id)).slice(0, 3).map((job) => ({ id: job.id, status: job.status, at: job.updatedAt })),
         backup: borg.borg ? { lastRunEnd: borg.borg.lastRun.end, lastRunResult: borg.borg.lastRun.result, measuredAt: borg.measuredAt } : null,

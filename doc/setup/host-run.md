@@ -421,11 +421,19 @@ hebt. Der Normalfall ist Durchlaufen. Das gilt für beide Prüfungen: den Türst
 | Prüfergebnis | ohne Backup-Riegel / harten Blocker | mit Backup-Riegel-Treffer (nur `host.run`) oder hartem Plan-Blocker |
 |---|---|---|
 | **PASS** — Freigabe auf vollständigem Material | läuft ohne Jochen (`ready`) | Jochen entscheidet (`blocked_user_approval`) |
-| **FINDING** — mindestens ein echter Befund (Türsteher: mit Beleg; Selbstupdate: `GUARANTEE` nicht `UNVERIFIABLE`) | Jochen entscheidet, mit Befund und zitiertem Code (`blocked_user_approval`) | Jochen entscheidet, Befund und Riegel/Blocker zusammen |
+| **FINDING** — mindestens ein echter Befund (Türsteher: mit Beleg; Selbstupdate: `GUARANTEE` nicht `UNVERIFIABLE`) | Jochen entscheidet, mit Befund und zitiertem Code (`blocked_user_approval`) | Jochen entscheidet, Befund und Riegel/Blocker zusammen (`blocked_user_approval`); ist der Plan schon `blocked_prerequisite`/`blocked_policy`, bleibt diese Sperre, und der Befund steht in `GET /api/inbox` unter `reviewFindings` |
 | **INCOMPLETE** — Material fehlt oder zu groß, Prüfer antwortet nicht, Antwort unlesbar, nur `UNVERIFIABLE` bzw. Befunde ohne Beleg | Stopp ohne Freigabe-Angebot (`blocked_prerequisite`): technischer Fehler für James, keine Frage an Jochen | ebenso `blocked_prerequisite` — ungeprüft wird nie zur Freigabe angeboten (nur `blocked_policy` bleibt) |
 
 - Ein echter Befund landet immer bei Jochen, ohne Ausnahme — auch wenn die Prüfung zusätzlich
-  unvollständig war.
+  unvollständig war. Ist der Plan ohnehin schon `blocked_prerequisite` oder `blocked_policy`, wird
+  daraus kein Freigabe-Angebot, denn eine Freigabe darf diese Sperren nie aufheben. Der Job
+  speichert dann aber `output.updateReview.result: "finding"`, und `GET /api/inbox` listet ihn
+  sieben Tage lang unter `reviewFindings` (Job-Id, Status, Absicht, Befunde ohne `UNVERIFIABLE`).
+  James meldet ihn Jochen. Ein überarbeiteter Plan, dessen neue Prüfung durchgeht, lässt den
+  Befund deshalb nicht verschwinden.
+- PASS ist nie der Restfall: Nur `VERDICT: approve` auf vollständigem Material ist PASS. Ein
+  Ergebnis ohne Prüferantwort (auch ohne Fehlermeldung) ist INCOMPLETE („the review produced no
+  verdict“).
 - INCOMPLETE ist nie ein Durchlass. James klärt die Ursache (Einsammeln reparieren, Lauf
   wiederholen) und reicht neu ein; kommt er nicht weiter, fragt er Jochen selbst.
 - Harte Blocker, die unabhängig vom Prüfergebnis zu Jochen gehen: Backup-Riegel (Abschnitt 2a,

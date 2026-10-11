@@ -17,6 +17,7 @@ import {
   summarizeUpdateReview,
   updateBindings,
   updateReviewEvidence,
+  updateReviewFindings,
   updateTargets,
   verifyQuotes,
   type UpdateDiff,
@@ -515,6 +516,29 @@ describe("self-update pre-install review", () => {
       const policy = applyUpdateReviewPolicy(blocked, outcome({ answer: parseUpdateReviewAnswer("VERDICT: approve") }));
       expect(policy).toMatchObject({ allowed: false, status: "blocked_user_approval", reason: blocked.reason });
       expect(policy.evidence).toContain("pre-install review result: pass");
+    });
+
+    it("INCOMPLETE, never PASS: an outcome without any reviewer answer does not run", () => {
+      const result = updateReviewFindings(outcome({}));
+      expect(result.result).toBe("incomplete");
+      expect(result.gaps).toContain("the review produced no verdict");
+      const policy = applyUpdateReviewPolicy(readyPolicy, outcome({}));
+      expect(policy).toMatchObject({ allowed: false, zone: "red", status: "blocked_prerequisite" });
+      expect(policy.reason).toContain("the review produced no verdict");
+    });
+
+    it("FINDING over a plan blocked anyway keeps the block, but is recorded for the operator", () => {
+      const flagged = outcome({ answer: parseUpdateReviewAnswer(["VERDICT: flag", ...real].join("\n")) });
+      for (const status of ["blocked_prerequisite", "blocked_policy"] as const) {
+        const policy = applyUpdateReviewPolicy({ ...readyPolicy, allowed: false, status, reason: "Plan blocked.", neededToContinue: [] }, flagged);
+        // An approval never lifts a prerequisite or policy block ...
+        expect(policy.status).toBe(status);
+        expect(policy.reason).toContain("stopped for the operator: the reviewer flagged 1 finding(s): repair runs on read-only runs");
+        // ... but the operator still learns of the finding.
+        expect(policy.neededToContinue.join(" ")).toContain("reviewFindings");
+      }
+      expect(summarizeUpdateReview([], flagged, null)).toMatchObject({ result: "finding" });
+      expect(summarizeUpdateReview([], outcome({ answer: parseUpdateReviewAnswer("VERDICT: approve") }), null)).toMatchObject({ result: "pass" });
     });
 
     it("dienste.update follows the same matrix", () => {

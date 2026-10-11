@@ -177,9 +177,14 @@ Flow of a Hermes change job whose plan contains `self.update <sha>` lines:
      is not `UNVERIFIABLE` (a guarantee, `INJECTION`, or no or an unknown label)
      → `blocked_user_approval` with the findings. A finding always reaches the
      operator, also when the input was incomplete as well (the reason then
-     names both).
-   - **incomplete** — no judgement on complete material and no finding: the
-     input is unavailable (`self.diff` failed) or incomplete, the reviewer
+     names both). Over a plan that is already `blocked_prerequisite` or
+     `blocked_policy` the block stays (an approval never lifts it); the job
+     records `output.updateReview.result: "finding"` and `GET /api/inbox`
+     lists it under `reviewFindings` for seven days, which James forwards —
+     a revised plan whose new review passes does not bury the finding.
+   - **incomplete** — no judgement on complete material and no finding (pass
+     is never the remainder: no reviewer answer at all is incomplete, „the
+     review produced no verdict“): the input is unavailable (`self.diff` failed) or incomplete, the reviewer
      failed or timed out, its answer does not parse (not exactly one `VERDICT`
      line, approve with findings, anything else), or it flagged only
      `UNVERIFIABLE` points (or no finding block at all) →

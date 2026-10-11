@@ -641,7 +641,14 @@ export function updateReviewFindings(outcome: UpdateReviewOutcome): {
   }
   if (answer) evidence.push(`pre-install review verdict: ${answer.verdict}`);
   if (answer && answer.verdict !== "approve") evidence.push(...answer.findings.slice(0, 8).map(describeFinding));
-  const result: UpdateReviewResult = findings.length > 0 ? "finding" : gaps.length > 0 ? "incomplete" : "pass";
+  // Pass is never the remainder: only VERDICT approve on complete material
+  // passes. Anything else without a finding (no answer at all, too) is a gap.
+  const approved = answer?.verdict === "approve" && gaps.length === 0;
+  if (!approved && findings.length === 0 && gaps.length === 0) {
+    gaps.push("the review produced no verdict");
+    needed.push("Submit the update again.");
+  }
+  const result: UpdateReviewResult = findings.length > 0 ? "finding" : approved ? "pass" : "incomplete";
   evidence.push(`pre-install review result: ${result}`);
   return { result, findings, gaps, evidence, needed };
 }
@@ -649,7 +656,10 @@ export function updateReviewFindings(outcome: UpdateReviewOutcome): {
 // Folds the review into the plan policy, after every plan check:
 // - pass: the plan keeps its status (a plan block still stops).
 // - finding: an allowed plan becomes blocked_user_approval; a blocked plan
-//   keeps its status and gains the finding.
+//   keeps its status (an approval must never lift a prerequisite or policy
+//   block) and gains the finding. The operator still learns of it: the job
+//   records the result (summarizeUpdateReview) and GET /api/inbox lists it
+//   under `reviewFindings`, which James forwards.
 // - incomplete: blocked_prerequisite (zone red) — also over a plan that would
 //   otherwise ask the operator, because an unreviewed update is never offered
 //   for approval. Only blocked_policy, which nobody can approve either, stays.
@@ -663,7 +673,9 @@ export function applyUpdateReviewPolicy<P extends ReviewedPolicy>(policy: P, out
     : { ...merged, status, reason: `${policy.reason} ${reason}`, neededToContinue: [...policy.neededToContinue, ...needed] };
   if (result === "finding") {
     const reason = `The pre-install review of ${subject} stopped for the operator: ${[...findings, ...gaps].join("; ")}.`;
-    return stillBlocked(reason, policy.allowed ? "blocked_user_approval" : policy.status);
+    if (policy.allowed) return stillBlocked(reason, "blocked_user_approval");
+    const blocked = stillBlocked(reason, policy.status);
+    return { ...blocked, neededToContinue: [...blocked.neededToContinue, "Tell the operator about the review finding (GET /api/inbox lists it under reviewFindings); fixing the plan does not clear it."] };
   }
   const reason = `The pre-install review of ${subject} is incomplete, so nothing is installed and nothing is offered for approval: ${gaps.join("; ")}.`;
   return { ...stillBlocked(reason, policy.status === "blocked_policy" ? "blocked_policy" : "blocked_prerequisite"), zone: "red" };
@@ -717,6 +729,7 @@ export function reviewedDiffFor(target: string, envelope: ExecutionEnvelope, bin
 export function summarizeUpdateReview(diffs: UpdateDiff[], outcome: UpdateReviewOutcome, reviewPath: string | null): Record<string, unknown> {
   return {
     kind: kindOf(outcome.kind),
+    result: updateReviewFindings(outcome).result,
     reviewPath,
     bindings: outcome.bindings,
     updates: diffs.map((diff) => ({

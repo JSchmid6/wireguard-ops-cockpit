@@ -102,6 +102,13 @@ Oberfläche, nicht von James) lässt sich nicht neu bestellen: Die Karte sagt, d
 
 ## Hinweis an Jochen über James (Telegram)
 
+**Befunde über ohnehin gesperrten Plänen** (`reviewFindings`, seit 11.10.2026,
+`doc/setup/host-run.md` „Freigabe-Matrix“): Meldet die Prüfung vor einem Selbstupdate oder
+`dienste.update` einen echten Befund, ist der Plan aber schon `blocked_prerequisite` oder
+`blocked_policy`, gibt es nichts freizugeben. Trotzdem listet `GET /api/inbox` den Job sieben Tage
+lang unter `reviewFindings` (Job-Id, Status, Zeit, Absicht, Befunde mit Titel, Garantie, Datei).
+James meldet ihn Jochen. Auch hier sieht ein Automation-Token nur Jobs seines eigenen Kontos.
+
 **Gewählt: James holt, das Cockpit schickt nichts.** Das Cockpit bekommt keinen Telegram-Bot-Token
 und keinen Webhook — es braucht damit kein neues Geheimnis und keine ausgehende Verbindung.
 
@@ -111,7 +118,7 @@ und keinen Webhook — es braucht damit kein neues Geheimnis und keine ausgehend
    `https://<cockpit>/#karte-job-<id>`. James sieht diese Antwort ohnehin (`cockpit_auftrag`,
    `cockpit_einblick was=job`) und schickt den Link per Telegram an Jochen. Dafür ist **kein**
    neuer Scope und kein neuer Schlüssel nötig.
-2. **Alles andere** (Freigaben aus `approvals`, Anomalie des Aufräum-Dienstes, `reorders`, `attention`): James
+2. **Alles andere** (Freigaben aus `approvals`, Anomalie des Aufräum-Dienstes, `reorders`, `attention`, `reviewFindings`): James
    liest `GET /api/inbox` mit seinem bestehenden Automation-Token, sobald Jochen diesem Token den
    Scope `GET /api/inbox` gibt (bei der nächsten Rotation über `plugins/cockpit/schluessel.py`).
    Das ist eine Berechtigung, kein neues Geheimnis. Ein Automation-Token sieht dort nur die Jobs
@@ -144,7 +151,7 @@ bleiben unverändert: Der Envelope wird genauso geprüft wie vorher.
 
 | Route | Wer | Was |
 |---|---|---|
-| `GET /api/inbox` | Sitzung; Automation nur mit Scope | `cards`, `status` (`lastRuns`, `backup`, `disk`), `reorders`, `attention`, `generatedAt` |
+| `GET /api/inbox` | Sitzung; Automation nur mit Scope | `cards`, `status` (`lastRuns`, `backup`, `disk`), `reorders`, `attention`, `reviewFindings`, `generatedAt` |
 | `POST /api/hermes/jobs/:jobId/reactivate` | James' Token mit Scope, oder Sitzung | abgelaufenen, nie entschiedenen Job mit neuer Frist versehen (keine Freigabe; max. 3×, max. 72 h) |
 | `POST /api/inbox/jobs/:jobId/reorder` | Sitzung (nicht Automation) | abgelaufenen Job schließen, Neubestellung anmelden; Body `{ note? }` |
 | `POST /api/inbox/retention/:anomalyId/keep` | Admin-Sitzung | Anomalie ablehnen = angehalten lassen; Body `{ reason }` |
