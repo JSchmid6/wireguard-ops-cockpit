@@ -24,11 +24,14 @@ import {
 // the execution envelope and to the broker request. The runner recomputes the
 // hash right before the deploy script and refuses a mismatch.
 //
-// Deterministic stops (operator approval): the review input is unavailable or
+// The operator is asked only for a finding (VERDICT flag with a finding that
+// is not UNVERIFIABLE). Everything else that keeps the review from a judgement
+// on complete material stops the job without an approval offer
+// (blocked_prerequisite, for the agent): the review input is unavailable or
 // incomplete (a focus-area file or any changed file that is not a test or
 // documentation did not reach the reviewer completely), the reviewer failed,
-// its answer does not parse, or it answered VERDICT flag. Touching a focus area is never a stop by
-// itself.
+// its answer does not parse, or it flagged only UNVERIFIABLE points. Touching a
+// focus area is never a stop by itself. See applyUpdateReviewPolicy.
 //
 // The same review guards a second repository: `dienste.update <sha>` installs a
 // merged commit of server-dienste (the root supervisor that runs James' Docker
@@ -570,59 +573,100 @@ function describeFinding(finding: UpdateReviewFinding): string {
   ].join("\n"), EVIDENCE_ITEM_LIMIT);
 }
 
-// Operator-facing stop reasons and evidence of one review. An empty `reasons`
-// list means the review let the update through.
-export function updateReviewFindings(outcome: UpdateReviewOutcome): { reasons: string[]; evidence: string[]; needed: string[] } {
-  const reasons: string[] = [];
+// What a review comes to (operator decision of 11.10.2026: the operator is
+// asked only when a reviewer raises its hand):
+// - pass: VERDICT approve on complete material. The update runs.
+// - finding: the reviewer flagged at least one finding that is not
+//   UNVERIFIABLE (a guarantee, INJECTION, or anything it did not label). It
+//   always goes to the operator, also when the material was incomplete too.
+// - incomplete: no judgement on complete material and no finding: the input
+//   was unavailable or incomplete, the reviewer failed, its answer does not
+//   parse, or it flagged nothing but UNVERIFIABLE (or no finding at all). That
+//   is a fault of the tool chain for the agent to clear, never an approval
+//   request: nothing is installed and nothing is offered for approval.
+export type UpdateReviewResult = "pass" | "finding" | "incomplete";
+
+function unverifiable(finding: UpdateReviewFinding): boolean {
+  return /^UNVERIFIABLE\b/.test(finding.guarantee);
+}
+
+// Reasons, evidence and next steps of one review, split by what stops: a
+// finding (for the operator) or a gap (for the agent).
+export function updateReviewFindings(outcome: UpdateReviewOutcome): {
+  result: UpdateReviewResult; findings: string[]; gaps: string[]; evidence: string[]; needed: string[];
+} {
+  const findings: string[] = [];
+  const gaps: string[] = [];
   const needed: string[] = [];
   const evidence = outcome.bindings.map((binding) =>
     `pre-install review of ${binding.sha.slice(0, 12)}: base ${binding.base.slice(0, 12)}, diff sha256 ${binding.diffSha256}`);
   if (outcome.unavailable) {
-    reasons.push(`the review input is unavailable (${outcome.unavailable.slice(0, 300)})`);
+    gaps.push(`the review input is unavailable (${outcome.unavailable.slice(0, 300)})`);
     evidence.push(`review input unavailable: ${outcome.unavailable.slice(0, 600)}`);
-    needed.push(`Inspect the commit yourself (or retry once ${UPDATE_KINDS[kindOf(outcome.kind)].diffAction} works); approving installs it without a completed code review.`);
+    needed.push(`Make ${UPDATE_KINDS[kindOf(outcome.kind)].diffAction} work again and submit the update again.`);
   }
   const incomplete = outcome.coverage.filter((item) => item.incomplete.length > 0);
   if (incomplete.length > 0) {
     const count = incomplete.reduce((sum, item) => sum + item.incomplete.length, 0);
-    reasons.push(`the review input is incomplete: ${count} file(s) the reviewer must see completely were not fully visible to it`);
+    gaps.push(`the review input is incomplete: ${count} file(s) the reviewer must see completely were not fully visible to it`);
     for (const item of incomplete) {
       evidence.push(`not fully reviewed (${item.sha.slice(0, 12)}): ${item.incomplete.slice(0, 30).join(", ")}${item.incomplete.length > 30 ? ", ..." : ""}`);
     }
-    needed.push("Review the listed files of the diff yourself before approving.");
+    needed.push("Fix the collection of the review material (or split the update) so that every listed file reaches the reviewer completely, then submit it again.");
   }
   if (outcome.reviewerError) {
-    reasons.push(`the reviewer did not answer (${outcome.reviewerError.slice(0, 300)})`);
+    gaps.push(`the reviewer did not answer (${outcome.reviewerError.slice(0, 300)})`);
     evidence.push(`reviewer failure: ${outcome.reviewerError.slice(0, 600)}`);
-    needed.push("Review the diff yourself or retry the job once the reviewer is available.");
+    needed.push("Submit the update again once the reviewer is available.");
   }
   const answer = outcome.answer;
   if (answer?.verdict === "invalid") {
-    reasons.push(`the reviewer's answer could not be parsed (${answer.problem})`);
+    gaps.push(`the reviewer's answer could not be parsed (${answer.problem})`);
     evidence.push(`reviewer answer unparseable: ${answer.problem}`);
-    needed.push("Review the diff yourself or retry the job.");
+    needed.push("Submit the update again.");
   }
   if (answer?.verdict === "flag") {
-    reasons.push(`the reviewer flagged ${answer.findings.length || "an unspecified"} finding(s)${answer.findings.length ? `: ${answer.findings.map((finding) => finding.title || "(untitled)").join("; ").slice(0, 400)}` : ""}`);
+    const real = answer.findings.filter((finding) => !unverifiable(finding));
+    const open = answer.findings.filter(unverifiable);
+    if (real.length > 0) {
+      findings.push(`the reviewer flagged ${real.length} finding(s): ${real.map((finding) => finding.title || "(untitled)").join("; ").slice(0, 400)}`);
+      needed.push("Read each finding with its quoted code against the reviewed diff, then approve or reject this update.");
+    } else {
+      gaps.push(open.length > 0
+        ? `the reviewer could not verify ${open.length} point(s) and found nothing else: ${open.map((finding) => finding.title || "(untitled)").join("; ").slice(0, 400)}`
+        : "the reviewer flagged without a finding");
+      needed.push("Clear why the reviewer could not judge the update (missing material is a fault of the collection, not a question for the operator), then submit it again.");
+    }
     if (answer.problem) evidence.push(`reviewer answer: ${answer.problem}`);
-    needed.push("Read each finding with its quoted code against the reviewed diff, then approve or reject this update.");
   }
   if (answer) evidence.push(`pre-install review verdict: ${answer.verdict}`);
   if (answer && answer.verdict !== "approve") evidence.push(...answer.findings.slice(0, 8).map(describeFinding));
-  return { reasons, evidence, needed };
+  const result: UpdateReviewResult = findings.length > 0 ? "finding" : gaps.length > 0 ? "incomplete" : "pass";
+  evidence.push(`pre-install review result: ${result}`);
+  return { result, findings, gaps, evidence, needed };
 }
 
-// Folds the review into the plan policy. A stop turns an allowed plan into
-// blocked_user_approval; a plan that is already blocked keeps its status and
-// gains the review's reasons and evidence.
+// Folds the review into the plan policy, after every plan check:
+// - pass: the plan keeps its status (a plan block still stops).
+// - finding: an allowed plan becomes blocked_user_approval; a blocked plan
+//   keeps its status and gains the finding.
+// - incomplete: blocked_prerequisite (zone red) — also over a plan that would
+//   otherwise ask the operator, because an unreviewed update is never offered
+//   for approval. Only blocked_policy, which nobody can approve either, stays.
 export function applyUpdateReviewPolicy<P extends ReviewedPolicy>(policy: P, outcome: UpdateReviewOutcome): P {
-  const { reasons, evidence, needed } = updateReviewFindings(outcome);
-  if (reasons.length === 0) return { ...policy, evidence: [...policy.evidence, ...evidence] };
-  const reason = `The pre-install review of ${UPDATE_KINDS[kindOf(outcome.kind)].subject} stopped for the operator: ${reasons.join("; ")}.`;
-  if (policy.allowed) {
-    return { ...policy, zone: "red", allowed: false, status: "blocked_user_approval", reason, evidence: [...policy.evidence, ...evidence], neededToContinue: needed };
+  const { result, findings, gaps, evidence, needed } = updateReviewFindings(outcome);
+  const merged = { ...policy, evidence: [...policy.evidence, ...evidence] };
+  if (result === "pass") return merged;
+  const subject = UPDATE_KINDS[kindOf(outcome.kind)].subject;
+  const stillBlocked = (reason: string, status: P["status"]): P => policy.allowed
+    ? { ...merged, zone: "red", allowed: false, status, reason, neededToContinue: needed }
+    : { ...merged, status, reason: `${policy.reason} ${reason}`, neededToContinue: [...policy.neededToContinue, ...needed] };
+  if (result === "finding") {
+    const reason = `The pre-install review of ${subject} stopped for the operator: ${[...findings, ...gaps].join("; ")}.`;
+    return stillBlocked(reason, policy.allowed ? "blocked_user_approval" : policy.status);
   }
-  return { ...policy, reason: `${policy.reason} ${reason}`, evidence: [...policy.evidence, ...evidence], neededToContinue: [...policy.neededToContinue, ...needed] };
+  const reason = `The pre-install review of ${subject} is incomplete, so nothing is installed and nothing is offered for approval: ${gaps.join("; ")}.`;
+  return { ...stillBlocked(reason, policy.status === "blocked_policy" ? "blocked_policy" : "blocked_prerequisite"), zone: "red" };
 }
 
 export function updateBindings(diffs: UpdateDiff[]): UpdateBinding[] {

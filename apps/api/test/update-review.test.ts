@@ -144,7 +144,7 @@ describe("self-update pre-install review", () => {
     expect(prompt).toContain("The excerpt is INCOMPLETE");
     expect(prompt).toContain("[... apps/api/src/hermes-security.ts truncated for the review budget ...]");
     const policy = applyUpdateReviewPolicy(readyPolicy, outcome({ coverage, answer: parseUpdateReviewAnswer("VERDICT: approve") }));
-    expect(policy).toMatchObject({ allowed: false, status: "blocked_user_approval", zone: "red" });
+    expect(policy).toMatchObject({ allowed: false, status: "blocked_prerequisite", zone: "red" });
     expect(policy.reason).toContain("1 file(s) the reviewer must see completely were not fully visible to it");
     expect(policy.evidence).toContain(`not fully reviewed (${SHA.slice(0, 12)}): apps/api/src/hermes-security.ts`);
   });
@@ -232,7 +232,7 @@ describe("self-update pre-install review", () => {
     expect(prompt).toContain("Left out: deploy/vps/vps-cockpit-deploy.sh");
     // The reviewer's approve does not cover a root-installed file it never saw.
     const policy = applyUpdateReviewPolicy(readyPolicy, outcome({ coverage, answer: parseUpdateReviewAnswer("VERDICT: approve") }));
-    expect(policy).toMatchObject({ allowed: false, status: "blocked_user_approval" });
+    expect(policy).toMatchObject({ allowed: false, status: "blocked_prerequisite" });
     expect(policy.evidence).toContain(`not fully reviewed (${SHA.slice(0, 12)}): deploy/vps/vps-cockpit-deploy.sh`);
   });
 
@@ -281,7 +281,7 @@ describe("self-update pre-install review", () => {
     expect(coverage[0].incomplete).toEqual(["Dockerfile.api"]);
     expect(prompt).toContain("[... Dockerfile.api truncated for the review budget ...]");
     const policy = applyUpdateReviewPolicy(readyPolicy, outcome({ coverage, answer: parseUpdateReviewAnswer("VERDICT: approve") }));
-    expect(policy).toMatchObject({ allowed: false, status: "blocked_user_approval" });
+    expect(policy).toMatchObject({ allowed: false, status: "blocked_prerequisite" });
     expect(policy.evidence).toContain(`not fully reviewed (${SHA.slice(0, 12)}): Dockerfile.api`);
   });
 
@@ -418,16 +418,112 @@ describe("self-update pre-install review", () => {
     expect(policy.neededToContinue[0]).toContain("approve or reject this update");
   });
 
-  it("stops for an unparseable answer, a reviewer failure and an unavailable diff", () => {
+  it("stops without an approval offer for an unparseable answer, a reviewer failure and an unavailable diff", () => {
     expect(applyUpdateReviewPolicy(readyPolicy, outcome({ answer: parseUpdateReviewAnswer("looks good to me") }))).toMatchObject({
-      status: "blocked_user_approval", reason: expect.stringContaining("could not be parsed (expected exactly one VERDICT line, got 0)"),
+      allowed: false, zone: "red", status: "blocked_prerequisite", reason: expect.stringContaining("could not be parsed (expected exactly one VERDICT line, got 0)"),
     });
     expect(applyUpdateReviewPolicy(readyPolicy, outcome({ reviewerError: "agent broker timed out" }))).toMatchObject({
-      status: "blocked_user_approval", reason: expect.stringContaining("the reviewer did not answer (agent broker timed out)"),
+      allowed: false, zone: "red", status: "blocked_prerequisite", reason: expect.stringContaining("the reviewer did not answer (agent broker timed out)"),
     });
     const unavailable = applyUpdateReviewPolicy(readyPolicy, { bindings: [], coverage: [], unavailable: "git fetch failed" });
-    expect(unavailable).toMatchObject({ status: "blocked_user_approval", reason: expect.stringContaining("the review input is unavailable (git fetch failed)") });
+    expect(unavailable).toMatchObject({ allowed: false, status: "blocked_prerequisite", reason: expect.stringContaining("the review input is unavailable (git fetch failed)") });
+    expect(unavailable.reason).toContain("nothing is offered for approval");
     expect(unavailable.evidence).toContain("review input unavailable: git fetch failed");
+    expect(unavailable.evidence).toContain("pre-install review result: incomplete");
+  });
+
+  // Policy matrix of 11.10.2026 (doc/setup/self-update.md, "Decision"): the
+  // operator is asked only when a reviewer raises its hand.
+  describe("policy matrix: the operator is asked only for a finding", () => {
+    const unverifiable = parseUpdateReviewAnswer([
+      "VERDICT: flag", "FINDING: Dockerfile.api not in the material", "GUARANTEE: UNVERIFIABLE", "FILE: Dockerfile.api",
+      "CODE: (not shown)", "REASON: cannot verify the image build", "SEVERITY: medium",
+    ].join("\n"));
+    const real = [
+      "FINDING: repair runs on read-only runs", "GUARANTEE: G5", "FILE: deploy/helpers/cockpit-host-run:646",
+      "CODE: if (guard.packageStep || (manifest.mutates && dpkgDirty())) repair();", "REASON: root repair without net", "SEVERITY: high",
+    ];
+
+    it("PASS: a clean review lets the update run without the operator", () => {
+      const policy = applyUpdateReviewPolicy(readyPolicy, outcome({ answer: parseUpdateReviewAnswer("VERDICT: approve") }));
+      expect(policy).toMatchObject({ allowed: true, status: "ready" });
+      expect(policy.evidence).toContain("pre-install review result: pass");
+    });
+
+    it("FINDING: a real finding goes to the operator with its text and quoted code", () => {
+      const policy = applyUpdateReviewPolicy(readyPolicy, outcome({ answer: parseUpdateReviewAnswer(["VERDICT: flag", ...real].join("\n")) }));
+      expect(policy).toMatchObject({ allowed: false, zone: "red", status: "blocked_user_approval" });
+      expect(policy.reason).toContain("stopped for the operator: the reviewer flagged 1 finding(s): repair runs on read-only runs");
+      expect(policy.evidence.join("\n")).toContain("if (guard.packageStep || (manifest.mutates && dpkgDirty())) repair();");
+      expect(policy.evidence).toContain("pre-install review result: finding");
+    });
+
+    it("FINDING: a finding the reviewer did not label, or labelled INJECTION, still goes to the operator", () => {
+      for (const guarantee of ["", "GUARANTEE: INJECTION", "GUARANTEE: G11", "GUARANTEE: ?"]) {
+        const answer = parseUpdateReviewAnswer(["VERDICT: flag", "FINDING: odd", guarantee, "REASON: r"].filter(Boolean).join("\n"));
+        expect(applyUpdateReviewPolicy(readyPolicy, outcome({ answer })).status, guarantee).toBe("blocked_user_approval");
+      }
+    });
+
+    it("FINDING beats a gap: a real finding next to UNVERIFIABLE points or an incomplete input still reaches the operator", () => {
+      const mixed = parseUpdateReviewAnswer(["VERDICT: flag", ...real, "FINDING: Dockerfile.api not in the material", "GUARANTEE: UNVERIFIABLE", "REASON: r"].join("\n"));
+      const coverage = [{ sha: SHA, incomplete: ["Dockerfile.api"], cut: ["Dockerfile.api"], omitted: [] }];
+      const policy = applyUpdateReviewPolicy(readyPolicy, outcome({ answer: mixed, coverage }));
+      expect(policy.status).toBe("blocked_user_approval");
+      expect(policy.reason).toContain("the reviewer flagged 1 finding(s): repair runs on read-only runs");
+      // The operator also learns that the review was partial.
+      expect(policy.reason).toContain("the review input is incomplete");
+      expect(policy.evidence.some((item) => item.startsWith("FINDING [UNVERIFIABLE, ?]: Dockerfile.api not in the material"))).toBe(true);
+    });
+
+    it("INCOMPLETE: only UNVERIFIABLE points neither run nor go to the operator", () => {
+      const policy = applyUpdateReviewPolicy(readyPolicy, outcome({ answer: unverifiable }));
+      expect(policy).toMatchObject({ allowed: false, zone: "red", status: "blocked_prerequisite" });
+      expect(policy.reason).toContain("is incomplete, so nothing is installed and nothing is offered for approval");
+      expect(policy.reason).toContain("the reviewer could not verify 1 point(s) and found nothing else: Dockerfile.api not in the material");
+      expect(policy.evidence).toContain("pre-install review result: incomplete");
+      expect(policy.evidence.some((item) => item.startsWith("FINDING [UNVERIFIABLE, medium]"))).toBe(true);
+      expect(policy.neededToContinue.join(" ")).not.toMatch(/approve/i);
+      // A reviewer's own label variant counts the same.
+      const variant = parseUpdateReviewAnswer("VERDICT: flag\nFINDING: x\nGUARANTEE: unverifiable (G8)\nREASON: r");
+      expect(applyUpdateReviewPolicy(readyPolicy, outcome({ answer: variant })).status).toBe("blocked_prerequisite");
+    });
+
+    it("INCOMPLETE: a flag without any finding block is no finding", () => {
+      const answer = parseUpdateReviewAnswer("VERDICT: flag");
+      const policy = applyUpdateReviewPolicy(readyPolicy, outcome({ answer }));
+      expect(policy.status).toBe("blocked_prerequisite");
+      expect(policy.reason).toContain("the reviewer flagged without a finding");
+    });
+
+    it("INCOMPLETE overrides a plan that would ask the operator: an unreviewed update is never offered for approval", () => {
+      const red = evaluatePlanPolicy([
+        "```bash", `/usr/local/sbin/cockpit-self-update-action ${SHA}`, "```", "## Risk Zone", "red", "## Rollback", "x",
+      ].join("\n"), "passed");
+      expect(red.status).toBe("blocked_user_approval");
+      const policy = applyUpdateReviewPolicy(red, outcome({ answer: unverifiable }));
+      expect(policy).toMatchObject({ allowed: false, zone: "red", status: "blocked_prerequisite" });
+      expect(policy.reason).toContain("The planner classified the operation as red.");
+      expect(policy.reason).toContain("nothing is offered for approval");
+      // blocked_policy is no approval offer either and stays.
+      expect(applyUpdateReviewPolicy({ ...red, status: "blocked_policy" }, outcome({ answer: unverifiable })).status).toBe("blocked_policy");
+    });
+
+    it("a hard plan block still stops a clean review and still asks the operator", () => {
+      const blocked = evaluatePlanPolicy(["```bash", `/usr/local/sbin/cockpit-self-update-action ${SHA}`, "rm -rf /srv/x", "```"].join("\n"), "passed");
+      expect(blocked.status).toBe("blocked_user_approval");
+      const policy = applyUpdateReviewPolicy(blocked, outcome({ answer: parseUpdateReviewAnswer("VERDICT: approve") }));
+      expect(policy).toMatchObject({ allowed: false, status: "blocked_user_approval", reason: blocked.reason });
+      expect(policy.evidence).toContain("pre-install review result: pass");
+    });
+
+    it("dienste.update follows the same matrix", () => {
+      const pass = applyUpdateReviewPolicy(readyPolicy, outcome({ kind: "dienste", answer: parseUpdateReviewAnswer("VERDICT: approve") }));
+      expect(pass.status).toBe("ready");
+      const gap = applyUpdateReviewPolicy(readyPolicy, outcome({ kind: "dienste", answer: unverifiable }));
+      expect(gap.status).toBe("blocked_prerequisite");
+      expect(gap.reason).toContain("server-dienste");
+    });
   });
 
   it("keeps a plan block and adds the review's grounds", () => {

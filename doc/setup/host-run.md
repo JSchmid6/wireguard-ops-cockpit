@@ -408,6 +408,29 @@ Sandkasten ausführt und der Türsteher ohne Jochen freigibt, ist gewollt und ke
 Befund ist ein Weg am Schloss (G2), am Türsteher (G9), am Backup-Riegel (G10) oder am Netz (G5)
 vorbei. Der Runner markiert die Dateien der Tür als Fokus `host-door`.
 
+## Freigabe-Matrix: wann Jochen gefragt wird (11.10.2026)
+
+Grundsatz (Jochen, 11.10.2026): Cockpit-Änderungen landen nur bei ihm, wenn ein Prüfer die Hand
+hebt. Der Normalfall ist Durchlaufen. Das gilt für beide Prüfungen: den Türsteher eines Host-Laufs
+(Abschnitt 2, `hostRunPolicy`) und die Prüfung vor dem Selbstupdate und vor `dienste.update`
+(`applyUpdateReviewPolicy`, `doc/setup/self-update.md`, „Decision“).
+
+| Prüfergebnis | ohne Backup-Riegel / harten Blocker | mit Backup-Riegel-Treffer (nur `host.run`) oder hartem Plan-Blocker |
+|---|---|---|
+| **PASS** — Freigabe auf vollständigem Material | läuft ohne Jochen (`ready`) | Jochen entscheidet (`blocked_user_approval`) |
+| **FINDING** — mindestens ein echter Befund (Türsteher: mit Beleg; Selbstupdate: `GUARANTEE` nicht `UNVERIFIABLE`) | Jochen entscheidet, mit Befund und zitiertem Code (`blocked_user_approval`) | Jochen entscheidet, Befund und Riegel/Blocker zusammen |
+| **INCOMPLETE** — Material fehlt oder zu groß, Prüfer antwortet nicht, Antwort unlesbar, nur `UNVERIFIABLE` bzw. Befunde ohne Beleg | Stopp ohne Freigabe-Angebot (`blocked_prerequisite`): technischer Fehler für James, keine Frage an Jochen | ebenso `blocked_prerequisite` — ungeprüft wird nie zur Freigabe angeboten (nur `blocked_policy` bleibt) |
+
+- Ein echter Befund landet immer bei Jochen, ohne Ausnahme — auch wenn die Prüfung zusätzlich
+  unvollständig war.
+- INCOMPLETE ist nie ein Durchlass. James klärt die Ursache (Einsammeln reparieren, Lauf
+  wiederholen) und reicht neu ein; kommt er nicht weiter, fragt er Jochen selbst.
+- Harte Blocker, die unabhängig vom Prüfergebnis zu Jochen gehen: Backup-Riegel (Abschnitt 2a,
+  nur `host.run`); für die typisierten Türen die Plan-Policy (`evaluatePlanPolicy`: geschützte
+  Grenze, Risikozone rot, nicht autorisierte Capability, `shell.exception`, `borg.repair`).
+- Die Sicherungskette vor einem verändernden Lauf (borg-Prüfung, Snapshot) hängt nicht an dieser
+  Matrix und bleibt unverändert.
+
 ## Tests
 
 - `apps/api/test/host-run-helper.test.ts`: der echte Helfer mit Stubs für systemd-run,
