@@ -4,6 +4,23 @@ This document records the typed self-update module: how a merged cockpit stand
 reaches the host as a reviewed job instead of a manual root session, and the
 exact lines the deploy script must carry so the next manual rollout installs it.
 
+## Before you change this door
+
+Changing `deploy/helpers/cockpit-host-run`, `cockpit-backup-guard.*`,
+`cockpit-borg-retention-rules.*`, `cockpit-state-steps.*`, `cockpit-self-update-*`,
+`cockpit-dienste-update-action`, `apps/api/src/update-review.ts`,
+`update-review-prompt.ts`, `host-run.ts`, `hermes-security.ts` or this file:
+
+1. Read this file completely, in particular
+   [The guarantees and the one door](#the-guarantees-and-the-one-door) (G1–G10), and the approval
+   matrix in `doc/setup/host-run.md` („Freigabe-Matrix“). Principle (Jochen, 30.09. and
+   11.10.2026): the operator is asked only when a reviewer raises an evidenced finding or the
+   backup bolt / a hard plan blocker hits; an incomplete review never runs and never becomes an
+   approval offer.
+2. Go through G1–G10 and decide which ones the change touches.
+3. Put the line `G-Garantien berührt: <G… or keine> — <why each still holds>` into the PR
+   description. CI (`.github/workflows/pr-guarantees.yml`) fails without it.
+
 ## Scope
 
 The module rolls out one commit of the allowlisted repository
@@ -150,14 +167,33 @@ Flow of a Hermes change job whose plan contains `self.update <sha>` lines:
    role (`updateReviewRunner`, default: agent broker). The budget is 96,000
    bytes; the agent broker accepts up to 100,000 characters / 120,000 bytes
    for the safety role (one argv element), other roles keep 30,000.
-4. **Decision** (`applyUpdateReviewPolicy`, after all plan checks):
-   - `VERDICT: approve` → the job continues autonomously as before; `NOTES`
-     are kept in `job.output.updateReview`.
-   - `VERDICT: flag`, an unparseable answer (not exactly one `VERDICT` line,
-     approve with findings, anything else), or a reviewer failure/timeout →
-     `blocked_user_approval`.
-   - The single deterministic stop: the review input is unavailable
-     (`self.diff` failed) or incomplete → `blocked_user_approval`. Incomplete
+4. **Decision** (`applyUpdateReviewPolicy`, after all plan checks). Operator
+   decision of 11.10.2026: the operator is asked **only when a reviewer raises
+   its hand**. The review comes to one of three results (`job.output` evidence
+   line `pre-install review result: pass|finding|incomplete`):
+   - **pass** — `VERDICT: approve` on complete material → the job continues
+     autonomously; `NOTES` are kept in `job.output.updateReview`.
+   - **finding** — `VERDICT: flag` with at least one finding whose `GUARANTEE`
+     is not `UNVERIFIABLE` (a guarantee, `INJECTION`, or no or an unknown label)
+     → `blocked_user_approval` with the findings. A finding always reaches the
+     operator, also when the input was incomplete as well (the reason then
+     names both). Over a plan that is already `blocked_prerequisite` or
+     `blocked_policy` the block stays (an approval never lifts it); the job
+     records `output.updateReview.result: "finding"` and `GET /api/inbox`
+     lists it under `reviewFindings` for seven days, which James forwards —
+     a revised plan whose new review passes does not bury the finding.
+   - **incomplete** — no judgement on complete material and no finding (pass
+     is never the remainder: no reviewer answer at all is incomplete, „the
+     review produced no verdict“): the input is unavailable (`self.diff` failed) or incomplete, the reviewer
+     failed or timed out, its answer does not parse (not exactly one `VERDICT`
+     line, approve with findings, anything else), or it flagged only
+     `UNVERIFIABLE` points (or no finding block at all) →
+     `blocked_prerequisite`, zone red. Nothing is installed and nothing is
+     offered for approval: this is a fault of the tool chain for the agent to
+     clear (fix the collection, retry), not a question for the operator. It
+     even replaces a `blocked_user_approval` of the plan policy, because an
+     unreviewed update is never offered for approval; only `blocked_policy`
+     (no approval offer either) stays. Incomplete input
      means a file the reviewer must see completely did not reach it whole:
      every focus-area file (a binary one counts as incomplete) and every other
      changed file except tests, markdown and `package-lock.json` (for
@@ -171,11 +207,15 @@ Flow of a Hermes change job whose plan contains `self.update <sha>` lines:
    - Touching a focus area with an `approve` verdict does **not** stop.
 
    A plan that is already blocked for another reason keeps its status and
-   gains the review's reasons and evidence.
+   gains the review's reasons and evidence — a hard plan block (protected
+   boundary, red zone, capability escalation, `shell.exception`) still asks
+   the operator after a pass. The full matrix is in
+   `doc/setup/host-run.md`, "Freigabe-Matrix".
 
-**What the owner sees — only when it stops.** The job explanation's `reason`
-names why (unavailable/incomplete input, reviewer failure, parse failure,
-flagged findings) and `evidence` lists, per finding, `GUARANTEE`, `SEVERITY`,
+**What the owner sees — only for a finding.** The job explanation's `reason`
+names why (the flagged findings; for `blocked_prerequisite` the agent reads the
+same fields: unavailable/incomplete input, reviewer failure, parse failure,
+only `UNVERIFIABLE` points) and `evidence` lists, per finding, `GUARANTEE`, `SEVERITY`,
 `FILE`, `REASON` and the quoted `CODE` (bounded), marked whether the quote was
 actually found in the reviewed diff, plus the reviewed `base..sha` and diff
 hash. `job.output.updateReview` keeps the focus areas, coverage, verdict,
@@ -189,9 +229,12 @@ covered by the broker HMAC, required for `self.update` and rejected on every
 other action). The helper passes it in the unit instance; the runner recomputes
 `git diff base sha` right before the deploy script and refuses with 65
 (`phase: review`, "reviewed diff mismatch") when the base moved or the code
-changed since the review — the job must then be reviewed again. When the review
-input was unavailable, only an operator-approved envelope may continue; the
-hash is then taken at execution and still pins exactly that diff.
+changed since the review — the job must then be reviewed again. A job without
+a binding (review input unavailable) is `blocked_prerequisite` since
+11.10.2026 and never runs; the executor's fallback for an operator-approved
+envelope without a binding (hash taken at execution) only serves jobs approved
+before that. If the review itself is broken in the running Cockpit, the way
+out is the host deploy (`deploy/vps/vps-cockpit-deploy.sh`), not an approval.
 
 **The old one-argument form** (`cockpit-self-update-action <sha>`, runner
 `deploy <sha>`) is refused with 65: every self-update must come from a job

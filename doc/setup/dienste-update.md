@@ -20,9 +20,12 @@ machinery as the self-update, with the supervisor's own guarantees.
    material: base (installed HEAD), diff sha256, changed files, focus areas,
    excerpt, and the commit messages (the author's reasons, as data).
 3. The reviewer judges the diff against `DIENSTE_REVIEW_INSTRUCTIONS`
-   (`apps/api/src/update-review-prompt.ts`, D1-D8). approve → the job runs;
-   flag, an unparseable answer, a reviewer failure or an incomplete focus area
-   → the job stops for the operator with the findings and the quoted code.
+   (`apps/api/src/update-review-prompt.ts`, D1-D8). Same decision as the
+   self-update (`doc/setup/self-update.md`, "Decision"): approve → the job
+   runs; a flag with a finding that is not `UNVERIFIABLE` → the job stops for
+   the operator with the findings and the quoted code; incomplete input, a
+   reviewer failure, an unparseable answer or only `UNVERIFIABLE` points →
+   `blocked_prerequisite` for the agent, no approval offer.
 4. The executor calls `cockpit-dienste-update-action <sha> <diff-sha256>`. The
    runner re-fetches, re-verifies (allowlisted origin, merged into
    `origin/main`, fast-forward from HEAD, identical diff hash), runs the new

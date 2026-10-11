@@ -175,6 +175,7 @@ describe("GET /api/inbox", () => {
     expect(body.status).toHaveProperty("backup");
     expect(body.status.disk === null || body.status.disk.totalBytes > 0).toBe(true);
     expect(body.reorders).toEqual([]);
+    expect(body.reviewFindings).toEqual([]);
   });
 
   it("shows James only his own jobs, and only with the scope", async () => {
@@ -190,6 +191,28 @@ describe("GET /api/inbox", () => {
     expect((await app.inject({ method: "POST", url: `/api/inbox/jobs/${foreignStale.id}/reorder`, headers: admin, payload: {} })).statusCode).toBe(200);
     expect((await app.inject({ method: "GET", url: "/api/inbox", headers: automation })).json().reorders).toEqual([]);
     expect((await app.inject({ method: "GET", url: "/api/inbox", headers: admin })).json().reorders).toEqual([expect.objectContaining({ jobId: foreignStale.id })]);
+  });
+
+  it("lists a review finding over a plan blocked anyway, so it still reaches Jochen", async () => {
+    const { app, admin, automation, fresh, inspect } = await setup();
+    const db = inspect();
+    const sessionId = db.getJob(fresh.id)!.sessionId!;
+    const reviewed = (status: "blocked_prerequisite" | "blocked_policy", result: string) => db.createJob({
+      sessionId, kind: "runbook", subjectId: "hermes-change", status, requiresApproval: false,
+      output: { explanation: { intent: "update the cockpit" }, updateReview: { result, findings: [
+        { title: "repair runs on read-only runs", guarantee: "G5", file: "deploy/helpers/cockpit-host-run" },
+        { title: "Dockerfile.api not in the material", guarantee: "UNVERIFIABLE", file: "Dockerfile.api" },
+      ] } },
+    });
+    const prerequisite = reviewed("blocked_prerequisite", "finding");
+    const policy = reviewed("blocked_policy", "finding");
+    reviewed("blocked_prerequisite", "incomplete");
+    db.close();
+    for (const headers of [admin, automation]) {
+      const listed = (await app.inject({ method: "GET", url: "/api/inbox", headers })).json().reviewFindings;
+      expect(listed.map((item: { jobId: string }) => item.jobId).sort()).toEqual([prerequisite.id, policy.id].sort());
+      expect(listed[0]).toMatchObject({ intent: "update the cockpit", findings: [{ title: "repair runs on read-only runs", guarantee: "G5", file: "deploy/helpers/cockpit-host-run" }] });
+    }
   });
 
   it("hands James the direct link with a blocked job", async () => {

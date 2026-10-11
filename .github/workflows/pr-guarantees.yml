@@ -1,0 +1,24 @@
+name: PR guarantees
+
+# Separate from CI so that editing the PR description re-runs only this check.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+jobs:
+  guarantee-line:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # The PR text goes through env, never into the script text (no injection).
+      - name: Require the guarantee line for changes at the door
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: bash .github/scripts/check-guarantee-line.sh "${{ github.event.pull_request.base.sha }}"

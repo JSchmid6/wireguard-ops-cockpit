@@ -3,8 +3,10 @@
 // This is the one place to read and tune what the independent reviewer is
 // asked. update-review.ts puts it in front of the review material (focus areas,
 // file list, diff excerpt) and parses the answer format defined at its end
-// deterministically: VERDICT flag, an unparseable answer or a reviewer failure
-// stop the job for the operator; VERDICT approve lets the update run.
+// deterministically: VERDICT approve lets the update run; VERDICT flag with a
+// finding that is not UNVERIFIABLE stops it for the operator; a flag with only
+// UNVERIFIABLE points, an unparseable answer or a reviewer failure stop it for
+// the agent without an approval offer (applyUpdateReviewPolicy).
 //
 // Changes to this file are themselves a focus area of the next update review
 // (update-mechanism, G7): the running Cockpit judges a new prompt before it is
