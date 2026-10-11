@@ -407,6 +407,9 @@ Garantien bilden seit 02.10.2026 dieses Modell ab: dass `host.run` Plantext als 
 Sandkasten ausführt und der Türsteher ohne Jochen freigibt, ist gewollt und kein Befund. Ein
 Befund ist ein Weg am Schloss (G2), am Türsteher (G9), am Backup-Riegel (G10) oder am Netz (G5)
 vorbei. Der Runner markiert die Dateien der Tür als Fokus `host-door`.
+Wer an der Tür ändert, liest vorher `doc/setup/self-update.md` „Before you change this door“ und
+schreibt `G-Garantien berührt: …` in die PR-Beschreibung; ohne diese Zeile ist die CI rot
+(`.github/workflows/pr-guarantees.yml`).
 
 ## Freigabe-Matrix: wann Jochen gefragt wird (11.10.2026)
 

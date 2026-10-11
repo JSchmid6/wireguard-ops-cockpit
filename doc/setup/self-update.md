@@ -4,6 +4,23 @@ This document records the typed self-update module: how a merged cockpit stand
 reaches the host as a reviewed job instead of a manual root session, and the
 exact lines the deploy script must carry so the next manual rollout installs it.
 
+## Before you change this door
+
+Changing `deploy/helpers/cockpit-host-run`, `cockpit-backup-guard.*`,
+`cockpit-borg-retention-rules.*`, `cockpit-state-steps.*`, `cockpit-self-update-*`,
+`cockpit-dienste-update-action`, `apps/api/src/update-review.ts`,
+`update-review-prompt.ts`, `host-run.ts`, `hermes-security.ts` or this file:
+
+1. Read this file completely, in particular
+   [The guarantees and the one door](#the-guarantees-and-the-one-door) (G1–G10), and the approval
+   matrix in `doc/setup/host-run.md` („Freigabe-Matrix“). Principle (Jochen, 30.09. and
+   11.10.2026): the operator is asked only when a reviewer raises an evidenced finding or the
+   backup bolt / a hard plan blocker hits; an incomplete review never runs and never becomes an
+   approval offer.
+2. Go through G1–G10 and decide which ones the change touches.
+3. Put the line `G-Garantien berührt: <G… or keine> — <why each still holds>` into the PR
+   description. CI (`.github/workflows/pr-guarantees.yml`) fails without it.
+
 ## Scope
 
 The module rolls out one commit of the allowlisted repository
