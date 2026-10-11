@@ -52,6 +52,7 @@ import {
 } from "./capability-manifest.js";
 import {
   approveExecutionEnvelope,
+  renewExecutionEnvelope,
   buildAgentTask,
   classifyCapabilities,
   parseTypedDiskActions,
@@ -133,6 +134,13 @@ interface LoginAttemptState {
   windowStartedAt: number;
   blockedUntil: number;
 }
+
+// Reaktivieren abgelaufener Freigabe-Jobs (POST /api/hermes/jobs/:id/reactivate):
+// höchstens 3 neue Fristen und nie über 72 h seit Anlage. Mit der Live-Frist
+// von 24 h reicht das über ein Wochenende; danach ist der Host-Stand, gegen den
+// Türsteher und Riegel geprüft haben, zu alt — dann wird neu bestellt.
+export const REACTIVATION_MAX_COUNT = 3;
+export const REACTIVATION_MAX_AGE_HOURS = 72;
 
 const MAX_LOGIN_ATTEMPTS = 5;
 const LOGIN_WINDOW_MS = 10 * 60 * 1000;
@@ -2299,9 +2307,31 @@ export async function createApp(options: AppOptions = {}) {
     return { job: withOperatorLink(job) };
   });
 
+  // Prüft einen gespeicherten Envelope gegen den Job: Signatur, Bindung und
+  // jeder geprüfte Inhalt. Die Frist prüft nur, wer sie prüfen will.
+  function envelopeErrorsFor(job: JobRecord, envelope: ExecutionEnvelope | undefined, jobOwnerId: string, intent: string, checkExpiry: boolean): string[] {
+    if (!envelope || typeof envelope !== "object") return ["execution envelope missing"];
+    const errors: string[] = [];
+    const manifest = job.output?.manifest as CapabilityManifest | null | undefined;
+    const hostRun = job.output?.hostRun as HostRunManifest | null | undefined;
+    if (!verifyExecutionEnvelopeSignature(envelope, config.executionEnvelopeSecret)) errors.push("execution envelope signature mismatch");
+    if (checkExpiry && Date.now() > Date.parse(envelope.expiresAt)) errors.push("execution envelope expired");
+    if (envelope.jobId !== job.id || envelope.actorId !== jobOwnerId || envelope.sessionId !== job.sessionId) errors.push("execution envelope binding mismatch");
+    if (envelope.intentHash !== hashCanonical(intent)) errors.push("trusted intent drift");
+    if (envelope.planHash !== hashCanonical(job.output?.plan)) errors.push("reviewed plan drift");
+    if (envelope.safetyHash !== hashCanonical(job.output?.safety)) errors.push("safety review drift");
+    if (envelope.policyHash !== hashCanonical(job.output?.policy)) errors.push("policy decision drift");
+    if (JSON.stringify(envelope.capabilities) !== JSON.stringify(job.output?.capabilities)) errors.push("capability drift");
+    if (envelope.manifestHash !== (manifest ? capabilityManifestHash(manifest) : hostRun ? hostRunManifestHash(hostRun) : undefined)) errors.push("capability manifest drift");
+    return errors;
+  }
+
   app.post("/api/hermes/jobs/:jobId/approval", async (request, reply) => {
     const actor = await requireActor(request, reply, database);
     if (!actor) return;
+    // Freigeben und Ablehnen ist Jochens Entscheidung: nie ein Automation-Token,
+    // auch nicht, wenn jemand ihm den Scope gibt (Vier-Augen-Prinzip).
+    if (actor.role === "automation") return reply.code(403).send({ message: "only the operator's session decides about a change job" });
     const { jobId } = request.params as { jobId: string };
     const body = (request.body || {}) as { decision?: "approved" | "rejected"; reason?: string };
     const job = actor.role === "admin"
@@ -2324,27 +2354,7 @@ export async function createApp(options: AppOptions = {}) {
       ? String((job.output.explanation as Record<string, unknown>).intent || "Approved Hermes change")
       : "Approved Hermes change";
     if (body.decision === "approved") {
-      const envelope = job.output?.envelope as ExecutionEnvelope | undefined;
-      const plan = job.output?.plan;
-      const safety = job.output?.safety;
-      const policy = job.output?.policy;
-      const capabilities = job.output?.capabilities;
-      const manifest = job.output?.manifest as CapabilityManifest | null | undefined;
-      const hostRun = job.output?.hostRun as HostRunManifest | null | undefined;
-      const envelopeErrors: string[] = [];
-      if (!envelope || typeof envelope !== "object") {
-        envelopeErrors.push("execution envelope missing");
-      } else {
-        if (!verifyExecutionEnvelopeSignature(envelope, config.executionEnvelopeSecret)) envelopeErrors.push("execution envelope signature mismatch");
-        if (Date.now() > Date.parse(envelope.expiresAt)) envelopeErrors.push("execution envelope expired");
-        if (envelope.jobId !== job.id || envelope.actorId !== jobOwnerId || envelope.sessionId !== job.sessionId) envelopeErrors.push("execution envelope binding mismatch");
-        if (envelope.intentHash !== hashCanonical(intent)) envelopeErrors.push("trusted intent drift");
-        if (envelope.planHash !== hashCanonical(plan)) envelopeErrors.push("reviewed plan drift");
-        if (envelope.safetyHash !== hashCanonical(safety)) envelopeErrors.push("safety review drift");
-        if (envelope.policyHash !== hashCanonical(policy)) envelopeErrors.push("policy decision drift");
-        if (JSON.stringify(envelope.capabilities) !== JSON.stringify(capabilities)) envelopeErrors.push("capability drift");
-        if (envelope.manifestHash !== (manifest ? capabilityManifestHash(manifest) : hostRun ? hostRunManifestHash(hostRun) : undefined)) envelopeErrors.push("capability manifest drift");
-      }
+      const envelopeErrors = envelopeErrorsFor(job, job.output?.envelope as ExecutionEnvelope | undefined, jobOwnerId, intent, true);
       if (envelopeErrors.length > 0) {
         const blocked = updateHermesJob(job.id, "blocked_policy", explanation({
           phase: "finished", intent, reason: "The approved execution envelope is expired or no longer matches the reviewed action.",
@@ -2441,6 +2451,63 @@ export async function createApp(options: AppOptions = {}) {
       }
     })();
     return reply.code(202).send({ job: running, message: "Approval recorded; execution started. Poll the job endpoint." });
+  });
+
+  // Reaktivieren: Ein Job, der nur abgelaufen ist, bekommt eine neue Frist —
+  // derselbe Plan, dieselbe Prüfung, derselbe Envelope-Inhalt, kein Freigeben.
+  // James darf das mit seinem Token (Scope nötig); Jochen bleibt der Einzige,
+  // der freigibt. Grenze: REACTIVATION_MAX_COUNT Mal und nie über
+  // REACTIVATION_MAX_AGE_HOURS seit Anlage des Jobs — danach Neubestellung.
+  app.post("/api/hermes/jobs/:jobId/reactivate", async (request, reply) => {
+    const actor = await requireActor(request, reply, database);
+    if (!actor) return;
+    const { jobId } = request.params as { jobId: string };
+    const job = actor.role === "admin" ? database.getJob(jobId) : database.getJobForActor(jobId, actor.id);
+    if (!job) return reply.code(404).send({ message: "job not found" });
+    const jobOwnerId = database.getJobOwnerId(jobId);
+    if (!jobOwnerId) return reply.code(409).send({ message: "job owner is unavailable" });
+    if (job.subjectId !== "hermes-change" || job.status !== "blocked_user_approval" || job.output?.approval || job.output?.reorder) {
+      return reply.code(409).send({ message: "only an expired job that still awaits operator approval can be reactivated" });
+    }
+    const envelope = job.output?.envelope as ExecutionEnvelope | undefined;
+    if (!envelope || typeof envelope !== "object" || typeof envelope.expiresAt !== "string") {
+      return reply.code(409).send({ message: "job has no execution envelope to reactivate" });
+    }
+    if (envelope.operatorApproved) return reply.code(409).send({ message: "an approved envelope is never reactivated" });
+    const now = Date.now();
+    if (now <= Date.parse(envelope.expiresAt)) {
+      return reply.code(409).send({ message: "the execution envelope is still valid; nothing to reactivate" });
+    }
+    const history = Array.isArray(job.output?.reactivations) ? job.output.reactivations as Array<Record<string, unknown>> : [];
+    const notAfter = Date.parse(job.createdAt) + REACTIVATION_MAX_AGE_HOURS * 3_600_000;
+    if (history.length >= REACTIVATION_MAX_COUNT || now >= notAfter) {
+      return reply.code(409).send({
+        message: "reactivation limit reached; submit a new change job",
+        limit: { maxCount: REACTIVATION_MAX_COUNT, count: history.length, notAfter: new Date(notAfter).toISOString() },
+      });
+    }
+    const intent = String((job.output?.explanation as Record<string, unknown> | undefined)?.intent || "Approved Hermes change");
+    const envelopeErrors = envelopeErrorsFor(job, envelope, jobOwnerId, intent, false);
+    if (envelopeErrors.length > 0) {
+      database.createAudit({ actorId: actor.id, action: "hermes.change.reactivate_refused", targetType: "job", targetId: job.id, details: { envelopeErrors } });
+      return reply.code(409).send({ message: "the stored envelope no longer matches the reviewed job; submit a new change job", envelopeErrors });
+    }
+    const renewed = renewExecutionEnvelope(envelope, config.executionEnvelopeSecret, config.approvalTtlMinutes, new Date(notAfter), new Date(now));
+    const entry = { at: new Date(now).toISOString(), actorId: actor.id, previousExpiresAt: envelope.expiresAt, expiresAt: renewed.expiresAt };
+    const count = history.length + 1;
+    // Nur Envelope und Historie ändern sich; Status bleibt "wartet auf Jochen".
+    const updated = database.updateJob(job.id, {
+      status: "blocked_user_approval",
+      output: { ...job.output, envelope: renewed, reactivations: [...history, entry] },
+    });
+    database.createAudit({
+      actorId: actor.id, action: "hermes.change.reactivated", targetType: "job", targetId: job.id,
+      details: { count, maxCount: REACTIVATION_MAX_COUNT, previousExpiresAt: envelope.expiresAt, expiresAt: renewed.expiresAt, notAfter: new Date(notAfter).toISOString() },
+    });
+    return {
+      job: withOperatorLink(updated),
+      reactivation: { count, remaining: REACTIVATION_MAX_COUNT - count, expiresAt: renewed.expiresAt, notAfter: new Date(notAfter).toISOString() },
+    };
   });
 
   app.get("/api/pipeline/health", async (request, reply) => {

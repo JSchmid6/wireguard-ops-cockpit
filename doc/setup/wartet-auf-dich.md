@@ -63,6 +63,39 @@ die Freigabe-Route den Job wie bisher mit „execution envelope expired". Die Ka
 stehen und bietet „Neu bestellen lassen"; die Route nimmt auch einen so geschlossenen Job an
 (einmal).
 
+## Abgelaufene Frist: James reaktiviert (Frist neu, keine Freigabe)
+
+Verpasst Jochen nur das Zeitfenster, muss der Plan nicht neu bestellt werden:
+`POST /api/hermes/jobs/:id/reactivate` (James' Token mit genau diesem Scope, oder Jochens Sitzung)
+gibt einem abgelaufenen Job eine neue Frist. **Reaktivieren ist kein Freigeben:**
+
+- Es wirkt nur auf einen `hermes-change`-Job in `blocked_user_approval`, dessen Envelope
+  abgelaufen ist, der nie entschieden (`approval`) und nie zur Neubestellung geschlossen
+  (`reorder`) wurde. Läuft die Frist noch, ist er freigegeben, abgelehnt, gelaufen oder
+  geschlossen: 409.
+- Der Envelope wird vollständig gegen den Job geprüft (Signatur, Bindung, Intent, Plan,
+  Türsteher-Urteil, Policy, Capabilities, Manifest) — nur die Frist nicht. Weicht etwas ab: 409
+  mit `envelopeErrors`, Audit `hermes.change.reactivate_refused`, nichts ändert sich.
+- Neu signiert wird **derselbe Inhalt** mit neuer Frist (`COCKPIT_APPROVAL_TTL_MINUTES`). Der
+  neue Envelope trägt nie `operatorApproved` (`renewExecutionEnvelope` verweigert einen
+  freigegebenen), `gatePassed` bleibt, wie er war (bei einem wartenden Job: nicht gesetzt). Der
+  Job bleibt in `blocked_user_approval`; freigeben kann weiter nur Jochen über
+  `POST /api/hermes/jobs/:id/approval`. Diese Route weist jedes Automation-Token mit 403 ab —
+  auch eines, dem jemand ihren Scope gegeben hat.
+- Türsteher und Riegel laufen **nicht** erneut: Sie haben genau diesen Plan geprüft, und der
+  Envelope bindet ihr Urteil per Hash. Was sie nicht sehen können, ist ein Host, der sich seit der
+  Prüfung verändert hat. Deshalb die Grenze: höchstens **3** Reaktivierungen und nie über **72 h**
+  seit Anlage des Jobs (die letzte Frist wird an dieser Grenze abgeschnitten). Mit der Live-Frist
+  von 24 h reicht das über ein Wochenende; danach ist der geprüfte Stand zu alt — dann
+  „Neu bestellen" bzw. James bestellt neu.
+- Jede Reaktivierung steht im Job (`output.reactivations`: wann, wer, alte und neue Frist) und im
+  Audit `hermes.change.reactivated` (`count`, `maxCount`, alte/neue Frist, `notAfter`) — im
+  selben Audit-Pfad wie `hermes.change.approved`/`rejected`. Die Antwort enthält `operatorLink`,
+  damit James Jochen den Link erneut schickt.
+
+Eine Freigabe, die knapp zu spät kam, hat den Job schon geschlossen (`blocked_policy`); der lässt
+sich nicht reaktivieren, nur neu bestellen.
+
 Eine abgelaufene **Plan-Freigabe** aus `approvals` (Runbook- oder Agentenplan aus der
 Oberfläche, nicht von James) lässt sich nicht neu bestellen: Die Karte sagt, den Lauf unter
 „Mehr" neu zu planen, und erlaubt nur noch Ablehnen.
@@ -112,6 +145,7 @@ bleiben unverändert: Der Envelope wird genauso geprüft wie vorher.
 | Route | Wer | Was |
 |---|---|---|
 | `GET /api/inbox` | Sitzung; Automation nur mit Scope | `cards`, `status` (`lastRuns`, `backup`, `disk`), `reorders`, `attention`, `generatedAt` |
+| `POST /api/hermes/jobs/:jobId/reactivate` | James' Token mit Scope, oder Sitzung | abgelaufenen, nie entschiedenen Job mit neuer Frist versehen (keine Freigabe; max. 3×, max. 72 h) |
 | `POST /api/inbox/jobs/:jobId/reorder` | Sitzung (nicht Automation) | abgelaufenen Job schließen, Neubestellung anmelden; Body `{ note? }` |
 | `POST /api/inbox/retention/:anomalyId/keep` | Admin-Sitzung | Anomalie ablehnen = angehalten lassen; Body `{ reason }` |
 
@@ -120,6 +154,9 @@ bleiben unverändert: Der Envelope wird genauso geprüft wie vorher.
 - `apps/api/test/inbox.test.ts` — Karten aus Job, Freigabe und Anomalie; Befunde (nur belegte);
   Frist und Sortierung; Sichtbarkeit je Rolle; `operatorLink`; Neubestellen nur abgelaufen und
   nicht per Token; Pflichtgrund.
+- `apps/api/test/reactivate.test.ts` — Reaktivieren nur abgelaufen und unentschieden, gleicher
+  Envelope-Inhalt, nie `operatorApproved`, Obergrenzen (Anzahl, 72 h), Drift stoppt, keine
+  Selbstfreigabe per Token.
 - `apps/api/test/host-run-flow.test.ts` — James bestellt mit seinem Token, Jochen gibt als Admin
   frei, der Lauf startet in James' Sitzung (vorher: `blocked_prerequisite`).
 - `apps/web/src/Inbox.test.tsx` — Countdown, Zustandszeile, Knöpfe erst mit Grund, Befunde

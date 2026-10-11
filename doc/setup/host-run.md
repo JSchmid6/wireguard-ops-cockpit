@@ -53,6 +53,11 @@ selbst, zeitkonstant:
   (er wartet auf die Freigabe); der öffnet die Tür nicht,
 - die Job-Kennung.
 
+Läuft die Frist eines wartenden Jobs ab, bevor Jochen entscheidet, kann James sie mit
+`POST /api/hermes/jobs/:id/reactivate` neu aufziehen: derselbe Envelope-Inhalt, neue Frist,
+nie `operatorApproved` — das Schloss öffnet danach genauso wenig wie vorher. Höchstens 3× und
+nie über 72 h seit Anlage; Details in `doc/setup/wartet-auf-dich.md`.
+
 Wer bestellt hat, steht als `actorId` im Envelope, im Laufzustand (`state.json`), in der ersten
 Protokollzeile und im Audit (`hermes.host_run.started`). Der Envelope bindet außerdem Intent,
 Plan, Türsteher-Urteil und Policy (wie bei den anderen Türen).
