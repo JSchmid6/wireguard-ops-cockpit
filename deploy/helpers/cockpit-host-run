@@ -222,6 +222,8 @@ function readState(jobId) {
 }
 // Wirft nie (z. B. ENOSPC nach einem Paketfehler): sonst fiele das Aufräumen
 // (sshd, dpkg) aus. Was nicht geschrieben werden konnte, steht im Protokoll.
+// Streng (wirft): wo ohne geschriebenen Zustand nichts anfangen darf — Start, Neustart.
+function saveStateStrict(state) { state.updatedAt = now(); writeJson(`${runDir(state.jobId)}/state.json`, state); }
 function saveState(state) {
   state.updatedAt = now();
   try { writeJson(`${runDir(state.jobId)}/state.json`, state); } catch (error) { log(`== state not saved: ${error?.message ?? error}`); }
@@ -328,7 +330,7 @@ function startLocked(manifest, envelope) {
     checks: manifest.checks.map((check, index) => ({ index: index + 1, name: check.name, status: "pending" })),
     borg: null, snapshot: null, error: null, startedAt: now(), updatedAt: now(), finishedAt: null,
   };
-  saveState(state);
+  saveStateStrict(state);
   const problem = startUnit(envelope.jobId, runtimeBudget(manifest));
   if (problem) {
     Object.assign(state, { phase: "finished", status: "failed", error: `the run unit did not start: ${problem}`, finishedAt: now() });
@@ -487,6 +489,7 @@ async function repairPackages(state, why) {
   });
   repair.dpkg = (await runScript("dpkg --configure -a --force-confdef --force-confold", REPAIR_LIMIT_SECONDS, wait("dpkg --configure -a"))).code;
   state.attention = null;
+  saveState(state);
   repair.apt = (await runScript("apt-get -f install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold", REPAIR_LIMIT_SECONDS, wait("apt-get -f install"))).code;
   state.attention = null;
   // dpkg kann sshd beim Konfigurieren neu gestartet haben (oder nicht): noch einmal.
@@ -594,7 +597,7 @@ async function payload(jobId) {
     if (step.reboot === true) {
       Object.assign(record, { status: "rebooting", startedAt: now() });
       Object.assign(state, { phase: "rebooting", nextStep: index + 1, rebootRequestedAt: now() });
-      saveState(state);
+      saveStateStrict(state); // ohne Phase "rebooting" auf der Platte setzt resume nicht fort: dann nicht neu starten
       log(`== ${now()} step ${index + 1}/${manifest.steps.length}: ${step.name} — reboot requested`);
       const out = spawnSync(SYSTEMCTL, ["reboot"], { encoding: "utf8", timeout: 60000 });
       if (out.status !== 0) {
