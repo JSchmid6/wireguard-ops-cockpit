@@ -8,6 +8,7 @@ import {
   buildUpdateReviewPrompt,
   materialOrder,
   normalizeUpdateBindings,
+  UPDATE_KINDS,
   parseUpdateDiff,
   parseUpdateReviewAnswer,
   redactSecrets,
@@ -144,7 +145,7 @@ describe("self-update pre-install review", () => {
     expect(prompt).toContain("[... apps/api/src/hermes-security.ts truncated for the review budget ...]");
     const policy = applyUpdateReviewPolicy(readyPolicy, outcome({ coverage, answer: parseUpdateReviewAnswer("VERDICT: approve") }));
     expect(policy).toMatchObject({ allowed: false, status: "blocked_user_approval", zone: "red" });
-    expect(policy.reason).toContain("1 focus-area file(s) were not fully visible to the reviewer");
+    expect(policy.reason).toContain("1 file(s) the reviewer must see completely were not fully visible to it");
     expect(policy.evidence).toContain(`not fully reviewed (${SHA.slice(0, 12)}): apps/api/src/hermes-security.ts`);
   });
 
@@ -152,10 +153,11 @@ describe("self-update pre-install review", () => {
     const big = section("README.md", ["@@ -1 +1,400 @@", ...Array.from({ length: 400 }, (_, index) => `+docs ${index} ${"y".repeat(60)}`)]);
     const small = diff().excerpt[0];
     const { coverage } = buildUpdateReviewPrompt([diff({ excerpt: [small, big, section("docs/other.md", ["@@ -1 +1 @@", "-a", "+b"])] })], { nonce: NONCE, limit: 15_000 });
-    expect(coverage[0]).toEqual({ sha: SHA, incomplete: [], cut: ["README.md"], omitted: ["docs/other.md"] });
-    // Cut by the runner and then left out here: listed as omitted only.
+    // The big README is skipped and cut with what is left; the small doc behind it still fits.
+    expect(coverage[0]).toEqual({ sha: SHA, incomplete: [], cut: ["README.md"], omitted: [] });
+    // Cut by the runner: named as cut, also when it fits here.
     const runnerCut = buildUpdateReviewPrompt([diff({ excerpt: [small, big, section("docs/other.md", ["@@ -1 +1 @@", "-a", "+b"])], partialFiles: ["docs/other.md"] })], { nonce: NONCE, limit: 15_000 });
-    expect(runnerCut.coverage[0]).toEqual({ sha: SHA, incomplete: [], cut: ["README.md"], omitted: ["docs/other.md"] });
+    expect(runnerCut.coverage[0]).toEqual({ sha: SHA, incomplete: [], cut: ["docs/other.md", "README.md"], omitted: [] });
   });
 
   it("treats runner-truncated, omitted and binary focus files as incomplete", () => {
@@ -208,15 +210,16 @@ describe("self-update pre-install review", () => {
     expect(prompt).toContain("+install -m 0755 deploy/helpers/cockpit-borg-action /usr/local/sbin/");
     expect(prompt).toContain("+test 0 ");
     expect(prompt).not.toContain("+test 299 ");
-    expect(coverage[0].cut).toContain("apps/api/test/app.test.ts");
-    expect(coverage[0].omitted).toContain("doc/setup/borg-maintenance.md");
-    expect(prompt).toContain("Cut: apps/api/test/app.test.ts");
-    expect(prompt).toContain("Left out: doc/setup/borg-maintenance.md");
-    // Deploy material is not a focus area: naming it never stops the update by itself.
+    expect(coverage[0].cut).toEqual(["apps/api/test/app.test.ts"]);
+    // The small doc behind the big test file is no longer dropped with it.
+    expect(prompt).toContain("+repair needs the operator");
+    expect(coverage[0].omitted).toEqual([]);
+    expect(prompt).toContain("Cut: apps/api/test/app.test.ts. Left out: none.");
+    // Only a test file is cut: no stop.
     expect(coverage[0].incomplete).toEqual([]);
   });
 
-  it("names deploy material the runner never excerpted", () => {
+  it("names and stops on deploy material the runner never excerpted", () => {
     const { prompt, coverage } = buildUpdateReviewPrompt([diff({
       files: [
         { status: "M", path: "deploy/vps/vps-cockpit-deploy.sh", added: 10, deleted: 3, class: "other" },
@@ -225,10 +228,124 @@ describe("self-update pre-install review", () => {
       filesTotal: 3,
     })], { nonce: NONCE });
     expect(coverage[0].omitted).toContain("deploy/vps/vps-cockpit-deploy.sh");
-    expect(coverage[0].incomplete).toEqual([]);
+    expect(coverage[0].incomplete).toEqual(["deploy/vps/vps-cockpit-deploy.sh"]);
     expect(prompt).toContain("Left out: deploy/vps/vps-cockpit-deploy.sh");
+    // The reviewer's approve does not cover a root-installed file it never saw.
+    const policy = applyUpdateReviewPolicy(readyPolicy, outcome({ coverage, answer: parseUpdateReviewAnswer("VERDICT: approve") }));
+    expect(policy).toMatchObject({ allowed: false, status: "blocked_user_approval" });
+    expect(policy.evidence).toContain(`not fully reviewed (${SHA.slice(0, 12)}): deploy/vps/vps-cockpit-deploy.sh`);
+  });
+
+  // 11.10.2026, self.update cba7628 (ad82dbf..cba7628, 130 KB diff, 96 KB budget):
+  // the runner ordered Dockerfile.api (class other, repository root) behind four
+  // test files; the first test that did not fit was cut and every section behind
+  // it left out, so the reviewer answered UNVERIFIABLE (G8) for a file it never got.
+  it("keeps a small build file behind big test files in the material (Dockerfile.api, cba7628)", () => {
+    const dockerfile = section("Dockerfile.api", ["@@ -30,7 +30,8 @@", " COPY --from=build /workspace/deploy/helpers/cockpit-backup-guard.mjs ./deploy/helpers/cockpit-backup-guard.mjs", "+COPY --from=build /workspace/deploy/helpers/cockpit-state-steps.mjs ./deploy/helpers/cockpit-state-steps.mjs"]);
+    const big = (path: string) => section(path, ["@@ -1,200 +1,200 @@", ...Array.from({ length: 200 }, (_, index) => `+${path} ${index} ${"t".repeat(60)}`)]);
+    const tests = ["apps/api/test/host-run-flow.test.ts", "apps/api/test/host-run-helper.test.ts", "apps/api/test/reactivate.test.ts"];
+    const docs = section("doc/setup/host-run.md", ["@@ -1 +1,2 @@", " door", "+state steps are never killed"]);
+    const shape = diff({
+      files: [
+        { status: "M", path: "Dockerfile.api", added: 1, deleted: 0, class: "other" },
+        ...diff().files.slice(0, 1),
+        ...tests.map((path) => ({ status: "M", path, added: 200, deleted: 200, class: "test" })),
+        { status: "M", path: "doc/setup/host-run.md", added: 1, deleted: 0, class: "other" },
+      ],
+      filesTotal: 6,
+      // The runner's order: focus first, then tests (class 4), then other (class 5).
+      excerpt: [diff().excerpt[0], ...tests.map(big), dockerfile, docs],
+    });
+    const { prompt, coverage } = buildUpdateReviewPrompt([shape], { nonce: NONCE, limit: 26_000 });
+    expect(Buffer.byteLength(prompt)).toBeLessThanOrEqual(26_000);
+    // Before this fix: Left out: ..., Dockerfile.api, doc/setup/host-run.md.
+    expect(prompt).toContain("+COPY --from=build /workspace/deploy/helpers/cockpit-state-steps.mjs ./deploy/helpers/cockpit-state-steps.mjs");
+    expect(prompt.indexOf("diff --git a/Dockerfile.api")).toBeLessThan(prompt.indexOf("diff --git a/apps/api/test/"));
+    expect(coverage[0].omitted).not.toContain("Dockerfile.api");
+    expect(coverage[0].cut).not.toContain("Dockerfile.api");
+    expect(coverage[0].incomplete).toEqual([]);
+    // Only tests were cut or left out; the review is not stopped for them.
+    expect([...coverage[0].cut, ...coverage[0].omitted].every((path) => tests.includes(path))).toBe(true);
+    expect(coverage[0].cut.length + coverage[0].omitted.length).toBeGreaterThan(0);
     const policy = applyUpdateReviewPolicy(readyPolicy, outcome({ coverage, answer: parseUpdateReviewAnswer("VERDICT: approve") }));
     expect(policy).toMatchObject({ allowed: true, status: "ready" });
+  });
+
+  it("stops instead of leaving a gap when a required file does not fit at all", () => {
+    const huge = section("Dockerfile.api", ["@@ -1,400 +1,400 @@", ...Array.from({ length: 400 }, (_, index) => `+RUN step ${index} ${"d".repeat(60)}`)]);
+    const { prompt, coverage } = buildUpdateReviewPrompt([diff({
+      files: [...diff().files, { status: "M", path: "Dockerfile.api", added: 400, deleted: 400, class: "other" }],
+      filesTotal: 3, excerpt: [...diff().excerpt, huge],
+    })], { nonce: NONCE, limit: 15_000 });
+    expect(coverage[0].cut).toEqual(["Dockerfile.api"]);
+    expect(coverage[0].incomplete).toEqual(["Dockerfile.api"]);
+    expect(prompt).toContain("[... Dockerfile.api truncated for the review budget ...]");
+    const policy = applyUpdateReviewPolicy(readyPolicy, outcome({ coverage, answer: parseUpdateReviewAnswer("VERDICT: approve") }));
+    expect(policy).toMatchObject({ allowed: false, status: "blocked_user_approval" });
+    expect(policy.evidence).toContain(`not fully reviewed (${SHA.slice(0, 12)}): Dockerfile.api`);
+  });
+
+  it("stays inside the limit when many files are cut or left out, also over two updates", () => {
+    const tests = Array.from({ length: 120 }, (_, index) => `apps/api/test/generated/very/long/path/number-${index}-of-many.test.ts`);
+    const one = (sha: string) => diff({
+      sha,
+      files: [...diff().files, ...tests.map((path) => ({ status: "M", path, added: 50, deleted: 0, class: "test" }))],
+      filesTotal: 122,
+      excerpt: [...diff().excerpt, ...tests.map((path) => section(path, ["@@ -0,0 +1,50 @@", ...Array.from({ length: 50 }, (_, index) => `+${index} ${"q".repeat(60)}`)]))],
+    });
+    const { prompt, coverage } = buildUpdateReviewPrompt([one(SHA), one("f".repeat(40))], { nonce: NONCE, limit: 40_000 });
+    expect(Buffer.byteLength(prompt)).toBeLessThanOrEqual(40_000);
+    expect(prompt).toMatch(/Left out: [^\n]*\.\.\. \(\d+ more\)\./);
+    // The coverage keeps every name; only tests are missing, so no stop.
+    expect(coverage[1].omitted.length + coverage[1].cut.length).toBeGreaterThan(100);
+    expect(coverage.map((item) => item.incomplete)).toEqual([[], []]);
+  });
+
+  it("counts the fence against the budget when the material holds long backtick runs", () => {
+    const bomb = section("docs/fence.md", ["@@ -0,0 +1 @@", `+${"`".repeat(6_000)}`]);
+    const { prompt, coverage } = buildUpdateReviewPrompt([diff({ excerpt: [...diff().excerpt, bomb] })], { nonce: NONCE, limit: 24_000 });
+    expect(Buffer.byteLength(prompt)).toBeLessThanOrEqual(24_000);
+    // Docs only: left out or cut, never a stop.
+    expect(coverage[0].incomplete).toEqual([]);
+    const fits = buildUpdateReviewPrompt([diff({ excerpt: [...diff().excerpt, bomb] })], { nonce: NONCE, limit: 40_000 });
+    expect(Buffer.byteLength(fits.prompt)).toBeLessThanOrEqual(40_000);
+    expect(fits.prompt).toContain("`".repeat(6_001) + "diff");
+  });
+
+  it("clips a mass-change description inside the budget and stops for it", () => {
+    const deleted = Array.from({ length: 1_500 }, (_, index) => `test/deleted/suite-${index}.test.sh`);
+    const mass = diff({
+      files: [...diff().files, ...deleted.map((path) => ({ status: "D", path, added: 0, deleted: 10, class: "test-deleted" }))],
+      filesTotal: 1_502,
+      focusAreas: [...diff().focusAreas, area("tests-deleted", deleted, [])],
+    });
+    const { prompt, coverage } = buildUpdateReviewPrompt([mass, { ...mass, sha: "f".repeat(40) }], { nonce: NONCE, limit: 60_000 });
+    expect(Buffer.byteLength(prompt)).toBeLessThanOrEqual(60_000);
+    expect(prompt).toContain("[... update description clipped for the review budget ...]");
+    expect(coverage[0].incomplete).toContain("(the update description: focus areas or file list clipped)");
+  });
+
+  it("stops when the runner did not list every changed file", () => {
+    const { coverage } = buildUpdateReviewPrompt([diff({ filesTotal: 2005 })], { nonce: NONCE });
+    expect(coverage[0].incomplete).toEqual(["(2003 changed file(s) the runner did not list)"]);
+  });
+
+  it("supplementary files: tests, markdown and the lockfile for self; only markdown for dienste", () => {
+    const self = UPDATE_KINDS.self.supplementary;
+    expect(["apps/api/test/a.test.ts", "test/x.sh", "doc/setup/a.md", "AGENTS.md", "package-lock.json", "apps/web/src/x.spec.tsx"].every(self)).toBe(true);
+    // bin/gen-*.md are runbook plans read at runtime, not documentation.
+    expect(["Dockerfile.api", "deploy/vps/vps-cockpit-deploy.sh", "package.json", "apps/api/src/app.ts", ".github/workflows/ci.yml", "doc/setup/x.sh", "requirements.txt", "bin/gen-weekly.md"].some(self)).toBe(false);
+    const dienste = UPDATE_KINDS.dienste.supplementary;
+    expect(dienste("README.md")).toBe(true);
+    // bin/uebernehmen runs the new stand's tests on the host before activation.
+    expect(dienste("tests/test_runner.py")).toBe(false);
+    // A focus-area file is never supplementary, even a test.
+    const deleted = buildUpdateReviewPrompt([diff({
+      files: [{ status: "D", path: "test/example.test.sh", added: 0, deleted: 400, class: "test-deleted" }], filesTotal: 1,
+      focusAreas: [area("tests-deleted", ["test/example.test.sh"], [])],
+      excerpt: [section("test/example.test.sh", ["@@ -1,400 +0,0 @@", ...Array.from({ length: 400 }, (_, index) => `-check ${index} ${"z".repeat(60)}`)])],
+    })], { nonce: NONCE, limit: 15_000 });
+    expect(deleted.coverage[0].incomplete).toEqual(["test/example.test.sh"]);
   });
 
   it("parses approve, flag and garbage deterministically", () => {
