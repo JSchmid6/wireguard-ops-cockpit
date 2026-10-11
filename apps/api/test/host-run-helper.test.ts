@@ -579,6 +579,43 @@ describe("cockpit-host-run: state steps are never ended", () => {
     expect(order()).toContain("dpkg --configure -a --force-confdef --force-confold");
   });
 
+  // Befund B1 (Zweitprüfung t_ac12b2bc): ein lesender Lauf hat kein Netz davor
+  // (keine borg-Prüfung, kein Snapshot) — er darf auch zum Aufräumen nichts ändern.
+  it("never repairs after a failed apt step of a read-only run: no dpkg/apt repair, no systemctl start", () => {
+    writeFileSync(path.join(dir, "apt-fail"), "");
+    writeFileSync(path.join(dir, "down-ssh"), "");
+    writeFileSync(path.join(dir, "down-sshd"), "");
+    writeFileSync(path.join(dir, "down-apache2"), "");
+    run(["start"], request(stateManifest({ mutates: false, steps: [{ name: "simulate", run: "apt-get -s upgrade", timeoutSeconds: 60 }] })));
+    const { state, logTail } = status();
+    expect(state.status).toBe("failed");
+    expect(state.error).toContain("step 1 (simulate) exited 100");
+    expect(state.repair).toBeUndefined();
+    expect(order()).toEqual(["apt-get -s upgrade", "dpkg --audit"]);
+    expect(state.packageAudit).toMatchObject({ dirty: false, exitCode: 0 });
+    expect(existsSync(path.join(dir, "borg.log"))).toBe(false);
+    expect(existsSync(path.join(dir, "snapshot.log"))).toBe(false);
+    expect(logTail).toContain("read-only run: no repair after step 1 (simulate) exited 100; dpkg --audit is clean");
+  });
+
+  it("only reports unfinished packages after a failed apt step of a read-only run", () => {
+    writeFileSync(path.join(dir, "apt-fail"), "");
+    writeFileSync(path.join(dir, "dpkg-dirty"), "");
+    writeFileSync(path.join(dir, "down-ssh"), "");
+    writeFileSync(path.join(dir, "down-sshd"), "");
+    writeFileSync(path.join(dir, "down-apache2"), "");
+    run(["start"], request(stateManifest({ mutates: false, steps: [{ name: "probe", run: "apt-get -s upgrade | grep -q foo", timeoutSeconds: 60 }] })));
+    const { state, logTail } = status();
+    expect(state.status).toBe("failed");
+    expect(state.repair).toBeUndefined();
+    expect(order().filter((line) => /^dpkg (?!--audit$)|^apt-get -f|^systemctl start/.test(line))).toEqual([]);
+    expect(order()).toContain("dpkg --audit");
+    expect(state.packageAudit).toMatchObject({ dirty: true });
+    expect(state.attention).toMatchObject({ level: "operator", step: "package-audit" });
+    expect(logTail).toContain("OPERATOR: read-only run: dpkg --audit reports unfinished packages");
+    expect(logTail).toContain("The following packages are only half configured");
+  });
+
   it("reports a repair that runs longer than planned, without ending it", () => {
     writeFileSync(path.join(dir, "apt-fail"), "");
     writeFileSync(path.join(dir, "dpkg-sleep"), "3");

@@ -292,9 +292,9 @@ sshd lief nicht mehr.
   Antwort schiebt ihre Frist). `attention` landet am Job (`output.hostRunAttention`), als Audit
   `hermes.host_run.attention` (einmal je Stufe) und in `GET /api/inbox` unter `attention` —
   James holt es dort ab und meldet es Jochen.
-- **Aufräumen nach einem Fehler**: scheitert ein Paketschritt — oder irgendein Schritt eines
-  ändernden Laufs, nach dem `dpkg --audit` halb installierte Pakete meldet —, räumt der Helfer
-  vor dem Ende selbst auf (unterbrechungssicher, Ergebnis in `state.repair` und im Protokoll):
+- **Aufräumen nach einem Fehler** (nur in einem ändernden Lauf, `mutates: true`): scheitert ein
+  Paketschritt — oder irgendein Schritt, nach dem `dpkg --audit` halb installierte Pakete
+  meldet —, räumt der Helfer vor dem Ende selbst auf (unterbrechungssicher, Ergebnis in `state.repair` und im Protokoll):
   1. sshd zuerst: läuft weder `ssh` noch `sshd`, wird er gestartet;
   2. `dpkg --configure -a --force-confdef --force-confold` (noninteractive);
   3. `apt-get -f install -y` mit denselben conffile-Optionen;
@@ -304,6 +304,17 @@ sshd lief nicht mehr.
   Läuft Schritt 2 oder 3 länger als geplant (1 h), gilt dieselbe Meldung wie bei einem Schritt:
   `attention` „repair (…) runs longer than planned“, an der harten Obergrenze `operator` — kein
   Signal.
+- **Lesender Lauf** (`mutates: false`): kein Aufräumen, auch nicht nach einem gescheiterten
+  Paketschritt (`apt list --upgradable | grep -q …`, `apt-get -s upgrade`) — davor lagen weder
+  borg-Prüfung noch Snapshot. Kein `dpkg --configure`, kein `apt-get -f install`, kein
+  `systemctl start`. Der Helfer ruft nur `dpkg --audit` (liest), schreibt das Ergebnis nach
+  `state.packageAudit` und meldet halb installierte Pakete im Protokoll („OPERATOR: read-only
+  run: dpkg --audit reports unfinished packages …“) und als `attention` (`level: "operator"`).
+- **Operator-Handgriff bei einem hängenden ändernden Lauf**: der Helfer beendet einen
+  unterbrechungssicheren Schritt nie selbst. Hängt er nachweislich (Protokoll, `ps`), beendet
+  der Operator den Lauf von Hand: `systemctl stop cockpit-host-run-<jobId>` — das beendet die
+  ganze Unit (`KillMode=control-group`), also auch apt/dpkg darin; danach `dpkg --audit` und bei
+  Bedarf `dpkg --configure -a` von Hand. `status` meldet den Lauf dann als gescheitert.
 - **Robustheit des Helfers**: Schreibfehler im Protokoll oder im Laufzustand (z. B. volle Platte)
   beenden den Helfer nicht – auch das Aufräumen läuft dann –, und ein unerwarteter Fehler beendet ihn nicht, solange ein unterbrechungssicherer
   Schritt läuft — sonst endete die Unit (`KillMode=control-group`) und systemd beendete apt/dpkg
@@ -404,7 +415,8 @@ vorbei. Der Runner markiert die Dateien der Tür als Fokus `host-door`.
   alt/gescheitert, Snapshot scheitert, lesender Lauf), Tür (Fehler, Zeitlimit, Prüfschritte,
   Schwärzung, Neustart mit Fortsetzung, ein Lauf zur Zeit), unterbrechungssichere Schritte mit
   Attrappen für dpkg/apt-get/ss (langsamer apt überzieht ohne Abbruch, Meldung, harte Obergrenze
-  mit Operator-Meldung, Erkennung schlägt `false`, Aufräumen sshd → dpkg → apt-get -f → Dienste).
+  mit Operator-Meldung, Erkennung schlägt `false`, Aufräumen sshd → dpkg → apt-get -f → Dienste;
+  ein lesender Lauf räumt nach einem gescheiterten apt-Schritt nicht auf, meldet nur `dpkg --audit`).
 - `apps/api/test/state-steps.test.ts`: die Erkennung und die Kennzeichnung im Manifest.
 - `apps/api/test/host-run.test.ts`: Manifest, Fokus (der `/etc/apt`-Fall stoppt nicht mehr),
   Prompt, Belegprüfung, Entscheidung, Ergebnis.
