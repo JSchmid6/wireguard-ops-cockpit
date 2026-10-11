@@ -100,6 +100,7 @@ import {
   parseHostRunManifest,
   parseHostRunReviewAnswer,
   parseHostRunStatus,
+  stateStepKinds,
   verifyHostRunFindings,
   type HostRunManifest,
   type HostRunReviewOutcome,
@@ -1888,6 +1889,20 @@ export async function createApp(options: AppOptions = {}) {
       : "VERIFICATION_STATUS: failed\nREASON: verifier timeout";
   }
 
+  // The bounded runner role is ended by its broker at its time budget
+  // (SIGTERM, then SIGKILL). It must therefore never carry a state step
+  // (packages, GitLab, migrations, docker compose, switching over —
+  // cockpit-state-steps.mjs): those run only through the host door, which never
+  // ends them. A plan whose script names one is refused before the runner starts.
+  async function runIsolatedRunner(actor: UserSummary, session: { id: string }, planner: AgentManifest, proposalPath: string, planText: string): Promise<string> {
+    // Der ganze Plantext, nicht nur der erste Skriptblock: der Runner bekommt ihn ganz.
+    const kinds = stateStepKinds(planText);
+    if (kinds.length > 0) {
+      throw new Error(`the plan's script contains state steps (${kinds.join(", ")}) that the runner role could be ended in; such steps run only through the host door (a host-run manifest), which never ends them`);
+    }
+    return await runIsolatedAgent(actor, session, planner, "runner", isolatedRunnerPrompt(proposalPath, planText), "-runner", 10 * 60_000);
+  }
+
   function isolatedRunnerPrompt(proposalPath: string, planText: string): string {
     return [
       buildRunnerPrompt(proposalPath),
@@ -2026,15 +2041,38 @@ export async function createApp(options: AppOptions = {}) {
     }));
   }
 
+  // What the helper reports about a step that runs past its time limit
+  // (cockpit-state-steps.mjs: such steps are never ended). Recorded on the job
+  // and audited once per change; GET /api/inbox lists it under `attention`,
+  // where James picks it up and tells the operator.
+  function noteHostRunAttention(jobId: string, attention: unknown): void {
+    const value = attention && typeof attention === "object" ? attention as Record<string, unknown> : null;
+    const current = database.getJob(jobId);
+    if (!current) return;
+    const previous = current.output?.hostRunAttention as Record<string, unknown> | null | undefined;
+    const key = (item: Record<string, unknown> | null | undefined) => (item ? `${String(item.level)}:${String(item.step)}` : "");
+    if (key(previous) === key(value)) return;
+    database.updateJob(jobId, { status: current.status, output: { ...current.output, hostRunAttention: value ? { ...value, seenAt: new Date().toISOString() } : null } });
+    if (value) database.createAudit({ actorId: null, action: "hermes.host_run.attention", targetType: "job", targetId: jobId, details: { level: value.level, step: value.step, name: value.name, message: value.message } });
+  }
+
   // Follows a started run until it reports a result. Poll failures are
-  // expected while the host reboots; only the deadline ends the wait.
+  // expected while the host reboots; only the deadline ends the wait. A run
+  // the helper still reports as active is never given up on: every such
+  // answer moves the deadline (an uninterruptible step may run for hours, and
+  // a reboot after it still needs its allowance).
   async function awaitHostRun(jobId: string, manifest: HostRunManifest, startedAt: number): Promise<string> {
-    const deadline = hostRunDeadline(manifest, startedAt);
+    let deadline = hostRunDeadline(manifest, startedAt);
     let lastError = "";
     while (Date.now() < deadline) {
       try {
         const current = await hostRunStatus(jobId);
-        if (current.finished) return hostRunResultText(manifest, current);
+        if (current.finished) {
+          noteHostRunAttention(jobId, null);
+          return hostRunResultText(manifest, current);
+        }
+        deadline = Math.max(deadline, hostRunDeadline(manifest, Date.now()));
+        noteHostRunAttention(jobId, current.state.attention);
       } catch (error) {
         lastError = error instanceof Error ? error.message : String(error);
       }
@@ -2388,7 +2426,7 @@ export async function createApp(options: AppOptions = {}) {
         const reviewedUpdates = normalizeUpdateBindings((running.output?.updateReview as Record<string, unknown> | undefined)?.bindings);
         const hostRun = running.output?.hostRun as HostRunManifest | null | undefined;
         const typedResult = await executeTypedCapabilities(reviewedPlan, envelope, manifest, reviewedUpdates, hostRun);
-        const raw = typedResult || await runIsolatedAgent(actor, session, planner, "runner", isolatedRunnerPrompt(proposalPath, reviewedPlan), "-runner", 10 * 60_000);
+        const raw = typedResult || await runIsolatedRunner(actor, session, planner, proposalPath, reviewedPlan);
         const result = typedResult || filterSensitiveContent(extractRunnerHandoff(raw));
         const runnerSuccess = /STATUS:\s*success/i.test(result);
         const verification = runnerSuccess
@@ -3087,7 +3125,7 @@ Follow these rules:
           evidence: [review.summary, ...policy.evidence], rollbackAvailable: policy.rollbackAvailable,
         }), { plan: planText, safety: review, policy, capabilities, manifest, hostRun, envelope, provenance, proposalPath, ...reviewRecord });
         const typedResult = await executeTypedCapabilities(planText, envelope, manifest, updateReview?.outcome.bindings ?? [], hostRun);
-        const runnerRaw = typedResult || await runIsolatedAgent(actor, session, planner, "runner", isolatedRunnerPrompt(proposalPath, planText), "-runner", 10 * 60_000);
+        const runnerRaw = typedResult || await runIsolatedRunner(actor, session, planner, proposalPath, planText);
         const result = typedResult || filterSensitiveContent(extractRunnerHandoff(runnerRaw));
         if (!result) throw new Error("runner produced no structured execution result");
         const runnerSuccess = /STATUS:\s*success/i.test(result);
@@ -3915,10 +3953,17 @@ Follow these rules:
     const reorders = database.listAuditsSince("hermes.change.reorder_requested", new Date(now - 24 * 3_600_000).toISOString())
       .filter((audit) => visible(audit.targetId))
       .map((audit) => ({ jobId: audit.targetId, requestedAt: audit.createdAt, intent: String(audit.details.intent ?? ""), note: audit.details.note ?? null }));
+    // Host runs whose uninterruptible step runs past its limit ("overrun") or
+    // past the hard cap ("operator"): nothing to decide, but the operator must
+    // know — the step is never ended. James forwards these.
+    const attention = database.listJobsByStatus("hermes-change", "running")
+      .filter((job) => visible(job.id) && job.output?.hostRunAttention && typeof job.output.hostRunAttention === "object")
+      .map((job) => ({ jobId: job.id, intent: String((job.output?.explanation as Record<string, unknown> | undefined)?.intent ?? ""), ...(job.output?.hostRunAttention as Record<string, unknown>) }));
     return {
       generatedAt: new Date(now).toISOString(),
       cards: sortCards(cards),
       reorders,
+      attention,
       status: {
         lastRuns: database.listRecentJobs("hermes-change", 20).filter((job) => visible(job.id)).slice(0, 3).map((job) => ({ id: job.id, status: job.status, at: job.updatedAt })),
         backup: borg.borg ? { lastRunEnd: borg.borg.lastRun.end, lastRunResult: borg.borg.lastRun.result, measuredAt: borg.measuredAt } : null,

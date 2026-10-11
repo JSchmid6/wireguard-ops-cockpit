@@ -118,6 +118,7 @@ HOST_DOOR_FILES = (
     "deploy/helpers/cockpit-host-run",
     "deploy/helpers/cockpit-backup-guard.mjs",
     "deploy/helpers/cockpit-borg-retention-rules.mjs",
+    "deploy/helpers/cockpit-state-steps.mjs",
     "deploy/systemd/wireguard-ops-cockpit-host-run-resume.service",
 )
 # File-level focus: (kind, guarantees, reason, matcher).
@@ -198,8 +199,9 @@ IP = env("COCKPIT_SELF_UPDATE_IP", "/usr/sbin/ip")
 DOCKER = env("COCKPIT_SELF_UPDATE_DOCKER", "/usr/bin/docker")
 ALLOWED_REMOTE = env("COCKPIT_SELF_UPDATE_ALLOWED_REMOTE", "https://github.com/JSchmid6/wireguard-ops-cockpit.git")
 ACTIVATION_DELAY = int(env("COCKPIT_SELF_UPDATE_ACTIVATION_DELAY", "600"))
-# How long the activation waits for the run lock (a deployment holds it up to its
-# TimeoutStartSec=1800, a review diff up to 420 s) before it gives up loudly.
+# How long the activation waits for the run lock (a deployment usually holds it
+# well below this — its unit has no time limit since 11.10.2026 —, a review diff
+# up to 420 s) before it gives up loudly; the deployment itself is never ended.
 ACTIVATION_LOCK_WAIT = int(env("COCKPIT_SELF_UPDATE_ACTIVATION_LOCK_WAIT", "1900"))
 VERIFY_RETRIES = int(env("COCKPIT_SELF_UPDATE_VERIFY_RETRIES", "12"))
 VERIFY_DELAY = int(env("COCKPIT_SELF_UPDATE_VERIFY_DELAY", "5"))

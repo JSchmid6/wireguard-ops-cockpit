@@ -92,7 +92,9 @@ elif [ "$#" -eq 2 ]; then
   ACTION="dienste.update"
   [[ "$1" =~ ^[a-f0-9]{40}$ ]] || fail 65 "commit must be a full lowercase 40-hex sha"
   [[ "$2" =~ ^[a-f0-9]{64}$ ]] || fail 65 "reviewed diff hash must be a full lowercase 64-hex sha256"
-  run_runner 900 einspielen "$1" "$2"
+  # einspielen zieht Images und startet docker compose: nie am Zeitlimit beenden
+  # (cockpit-state-steps.mjs, Vorgabe 11.10.2026) — die Unit hat keine Obergrenze.
+  run_runner infinity einspielen "$1" "$2"
 elif [ "$#" -eq 1 ] && [[ "$1" =~ ^[a-f0-9]{40}$ ]]; then
   ACTION="dienste.update"
   fail 65 "an install needs the reviewed diff hash; run it as a Cockpit job"

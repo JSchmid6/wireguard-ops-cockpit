@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import type { ExecutionReview } from "@wireguard-ops-cockpit/domain";
 
 import { backupGuardFocus, backupGuardHits, type BackupGuardHit } from "../../../deploy/helpers/cockpit-backup-guard.mjs";
+import { stateStepKinds, stepUninterruptible, type StepUninterruptible } from "../../../deploy/helpers/cockpit-state-steps.mjs";
 
 import { READABLE_PROTECTED_PATH } from "./capability-manifest.js";
 import { hashCanonical } from "./hermes-security.js";
@@ -35,8 +36,15 @@ import { redactSecrets } from "./update-review.js";
 //               deterministically; the helper asks it again. What the bolt
 //               cannot read or what only names the backups is focus for the
 //               doorkeeper (backup-focus), never an automatic stop.
+//   no kill     a step that touches state (packages, GitLab, migrations,
+//               docker compose, switching over) is never ended at its time
+//               limit: the helper only reports the overrun and waits
+//               (deploy/helpers/cockpit-state-steps.mjs decides; fail safe:
+//               every step of a mutating run unless the planner marks it
+//               "uninterruptible": false and nothing is detected).
 
 export { backupGuardFocus, backupGuardHits, type BackupGuardHit };
+export { stateStepKinds, stepUninterruptible, type StepUninterruptible };
 
 export type HostRunRisk = "contained" | "exposure" | "data_loss" | "identity_or_secret";
 
@@ -45,6 +53,10 @@ export interface HostRunStep {
   run?: string;
   reboot?: true;
   timeoutSeconds?: number;
+  // The planner's mark: true = never end it at the time limit; false = may be
+  // ended (only honoured when the deterministic detection finds nothing).
+  // Absent = the default of cockpit-state-steps.mjs.
+  uninterruptible?: boolean;
 }
 
 export interface HostRunCheck {
@@ -117,7 +129,12 @@ export function parseHostRunManifest(plan: string): HostRunManifest | null {
       if (step.run !== undefined) throw new Error(`host-run step ${index + 1} is a reboot and takes no script`);
       return { name: stepName, reboot: true };
     }
-    return { name: stepName, run: script(step.run, `host-run step ${index + 1}`), timeoutSeconds: timeout(step.timeoutSeconds, STEP_TIMEOUT_DEFAULT, STEP_TIMEOUT_MAX) };
+    if (step.uninterruptible !== undefined && typeof step.uninterruptible !== "boolean") throw new Error(`host-run step ${index + 1}: uninterruptible must be true or false`);
+    // Only present when the planner set it, so manifests without the mark hash as before.
+    return {
+      name: stepName, run: script(step.run, `host-run step ${index + 1}`), timeoutSeconds: timeout(step.timeoutSeconds, STEP_TIMEOUT_DEFAULT, STEP_TIMEOUT_MAX),
+      ...(typeof step.uninterruptible === "boolean" ? { uninterruptible: step.uninterruptible } : {}),
+    };
   });
   const reboots = steps.filter((step) => step.reboot).length;
   if (reboots > MAX_REBOOTS) throw new Error(`host-run manifest allows at most ${MAX_REBOOTS} reboots`);
@@ -282,7 +299,11 @@ function describeManifest(manifest: HostRunManifest): string {
   ];
   manifest.steps.forEach((step, index) => {
     if (step.reboot) { lines.push(`S${index + 1} "${redactSecrets(step.name)}": REBOOT of the host; the run continues with the next step after boot`); return; }
-    lines.push(`S${index + 1} "${redactSecrets(step.name)}" (time limit ${step.timeoutSeconds} s)`);
+    const guard = stepUninterruptible(manifest, step);
+    const limit = guard.uninterruptible
+      ? `time limit ${step.timeoutSeconds} s, uninterruptible: never ended at the limit, only reported (${guard.reasons.join(", ")})`
+      : `time limit ${step.timeoutSeconds} s, ended at the limit`;
+    lines.push(`S${index + 1} "${redactSecrets(step.name)}" (${limit})`);
     for (const line of scriptLines(`S${index + 1}`, step.run || "")) lines.push(`${line.id}  ${line.text}`);
   });
   lines.push("", "## Checks (run after the last step; any failure marks the run failed)");
@@ -577,6 +598,7 @@ export function hostRunPlannerContract(): string {
     "For work on the host itself — package updates, Docker, kernel updates with a reboot, GitLab upgrades in stages, service configuration, anything no typed helper below covers — include exactly one fenced `host-run` JSON manifest with version cockpit-host-run/v1 instead of a capability manifest. Its steps run as root on the host with bash -eo pipefail, each in order, after the isolated doorkeeper has read them. There is no sandbox: write the real commands you would type as root. Do not add sudo.",
     "Shape (render it on ONE physical line between the fences, like the capability manifest): {\"version\":\"cockpit-host-run/v1\",\"name\":\"...\",\"purpose\":\"what and why, including every effect\",\"mutates\":true,\"steps\":[{\"name\":\"...\",\"run\":\"shell script\",\"timeoutSeconds\":1800},{\"name\":\"reboot\",\"reboot\":true}],\"checks\":[{\"name\":\"...\",\"run\":\"shell script that fails when the target state is not reached\",\"timeoutSeconds\":300}],\"rollback\":[\"concrete way back\"],\"risk\":[\"contained\"]}",
     "mutates: true (the default) whenever the run changes anything; the runner then checks that the last borg backup is younger than 24 h and takes a machine snapshot before the first step. Only a strictly read-only run may say false.",
+    "Steps that change state are never ended at their time limit: package management (apt, apt-get, dpkg, unattended-upgrade, snap), gitlab-ctl/gitlab-rake, database migrations (occ upgrade, gitlab-rake db:migrate), docker compose and switching over. Mark them \"uninterruptible\": true; the runner detects them itself as well, and in a mutating run every step is uninterruptible unless you mark it \"uninterruptible\": false (only for steps that merely read or wait and may be killed). An uninterruptible step that overruns its timeoutSeconds is only reported; set timeoutSeconds to the realistic duration. After a failed package step the runner repairs dpkg (dpkg --configure -a, apt-get -f install) and checks sshd and the main services by itself.",
     "A reboot is an ordinary step ({\"name\":\"reboot\",\"reboot\":true}); the run continues with the next step after the host is back and reports its result then. Put the checks that prove the new state after the reboot.",
     "checks are mandatory and must be able to fail (exit non-zero when the target state is missing). rollback is mandatory: the concrete way back for this plan (for example: downgrade or reinstall the previous version, restore the saved config copy); the machine snapshot is the last resort and needs the operator.",
     "Split big work into stages with a check each (for GitLab: the official upgrade stops, gitlab-backup before each stage, gitlab-ctl reconfigure and a health check after). Use apt-get with -y and noninteractive defaults; hold packages explicitly when a stage must not touch them (apt-mark hold).",

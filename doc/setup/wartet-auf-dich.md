@@ -50,6 +50,14 @@ dieselbe Absicht neu; die neue Bestellung wird frisch geplant, geprüft und sign
 Freigabe wird nie wiederverwendet. `reorders` zeigt einem Automation-Token nur Jobs seines eigenen
 Kontos — die Absicht eines anderen Kontos wird nie zu James' Bestellung.
 
+**Überziehende Tür-Läufe** (`attention`, seit 11.10.2026, `doc/setup/host-run.md` 3a): Ein
+Schritt, der Zustand ändert (Pakete, GitLab, Migrationen, docker compose, Umschalten), wird am
+Zeitlimit nie beendet. Überzieht er, listet `GET /api/inbox` den laufenden Job unter `attention`
+(Job-Id, Absicht, `level`, Schritt, Meldung): `overrun` = läuft länger als geplant, `operator` =
+harte Obergrenze (6 h) erreicht, jemand muss auf den Host sehen — beendet wird er trotzdem nicht.
+Zu entscheiden gibt es nichts; James meldet es Jochen. Auch hier sieht ein Automation-Token nur
+Jobs seines eigenen Kontos.
+
 Kommt eine Freigabe knapp zu spät (letzte Sekunden des Countdowns, Handyuhr geht nach), schließt
 die Freigabe-Route den Job wie bisher mit „execution envelope expired". Die Karte bleibt dann
 stehen und bietet „Neu bestellen lassen"; die Route nimmt auch einen so geschlossenen Job an
@@ -103,7 +111,7 @@ und keinen Webhook — es braucht damit kein neues Geheimnis und keine ausgehend
    `https://<cockpit>/#karte-job-<id>`. James sieht diese Antwort ohnehin (`cockpit_auftrag`,
    `cockpit_einblick was=job`) und schickt den Link per Telegram an Jochen. Dafür ist **kein**
    neuer Scope und kein neuer Schlüssel nötig.
-2. **Alles andere** (Freigaben aus `approvals`, Anomalie des Aufräum-Dienstes, `reorders`): James
+2. **Alles andere** (Freigaben aus `approvals`, Anomalie des Aufräum-Dienstes, `reorders`, `attention`): James
    liest `GET /api/inbox` mit seinem bestehenden Automation-Token, sobald Jochen diesem Token den
    Scope `GET /api/inbox` gibt (bei der nächsten Rotation über `plugins/cockpit/schluessel.py`).
    Das ist eine Berechtigung, kein neues Geheimnis. Ein Automation-Token sieht dort nur die Jobs
@@ -136,7 +144,7 @@ bleiben unverändert: Der Envelope wird genauso geprüft wie vorher.
 
 | Route | Wer | Was |
 |---|---|---|
-| `GET /api/inbox` | Sitzung; Automation nur mit Scope | `cards`, `status` (`lastRuns`, `backup`, `disk`), `reorders`, `generatedAt` |
+| `GET /api/inbox` | Sitzung; Automation nur mit Scope | `cards`, `status` (`lastRuns`, `backup`, `disk`), `reorders`, `attention`, `generatedAt` |
 | `POST /api/hermes/jobs/:jobId/reactivate` | James' Token mit Scope, oder Sitzung | abgelaufenen, nie entschiedenen Job mit neuer Frist versehen (keine Freigabe; max. 3×, max. 72 h) |
 | `POST /api/inbox/jobs/:jobId/reorder` | Sitzung (nicht Automation) | abgelaufenen Job schließen, Neubestellung anmelden; Body `{ note? }` |
 | `POST /api/inbox/retention/:anomalyId/keep` | Admin-Sitzung | Anomalie ablehnen = angehalten lassen; Body `{ reason }` |
