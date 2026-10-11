@@ -232,10 +232,12 @@ Freigabe).
 
 - eigene transiente Unit `cockpit-host-run-<job>` (`systemd-run --collect`, ohne Warten):
   außerhalb der Executor-Sandbox, übersteht einen Neustart des Executors,
-  `RuntimeMaxSec` aus den Zeitlimits der Schritte plus Reserve,
+  `RuntimeMaxSec` aus den Zeitlimits der Schritte plus Reserve — außer der Lauf hat einen
+  unterbrechungssicheren Schritt (3a), dann `RuntimeMaxSec=infinity`,
 - jeder Schritt: `bash -eo pipefail -c <run>` als root, `DEBIAN_FRONTEND=noninteractive`,
-  eigenes Zeitlimit (Standard 1800 s, höchstens 10 800 s; wer es reißt, ist gescheitert, auch mit
-  Exit 0), der erste Fehler beendet den Lauf,
+  eigenes Zeitlimit (Standard 1800 s, höchstens 10 800 s; ein abbrechbarer Schritt, der es reißt,
+  wird beendet und ist gescheitert, auch mit Exit 0 — ein unterbrechungssicherer nie, 3a), der
+  erste Fehler beendet den Lauf,
 - danach die Prüfschritte (Pflicht, jeder muss scheitern können),
 - volle Ausgabe in `/var/lib/wireguard-ops-cockpit/host-runs/<job>/output.log` (0600) und ins
   Journal der Unit, ohne Steuerzeichen, **zeilenweise geschwärzt**: Token-Muster, `password=`/`token=`/`secret=`-
@@ -245,6 +247,53 @@ Freigabe).
 
 `status <job>` liefert Zustand und Protokollende. Endet eine Unit ohne Ergebnis (Zeitlimit,
 Absturz), meldet `status` den Lauf als gescheitert.
+
+## 3a. Unterbrechungssichere Schritte: nie mittendrin abbrechen
+
+Vorgabe Jochen, 11.10.2026: „Das mit den Zeitlimits ist brandgefährlich.“ Anlass: Job
+`e9b7faf1` (Stufe A) — die Tür hat `apt-get upgrade` am Zeitlimit des Schritts per SIGKILL
+beendet; 148 Pakete blieben „unpacked but not configured“ (u. a. openssh-server, apache2, php),
+sshd lief nicht mehr.
+
+- **Erkennung** (`deploy/helpers/cockpit-state-steps.mjs`, eine Quelle für API und Helfer,
+  installiert neben dem Helfer): Paketverwaltung (apt, apt-get, aptitude, dpkg,
+  unattended-upgrade, snap, do-release-upgrade), GitLab (gitlab-ctl, gitlab-rake, gitlab-backup),
+  Migrationen (occ, `db:migrate`, mysql_upgrade/mariadb-upgrade, pg_upgrade…), `docker compose`/
+  `docker-compose`, die Update-Helfer des Cockpits, Umschalten (`umschalt…`, switchover, cutover)
+  und Platten/Boot (mkfs, parted, mdadm, update-grub, update-initramfs …). Gelesen wird der rohe
+  Text von Name und Skript — ein Fehltreffer kostet nur Warten.
+- **Wer unterbrechungssicher ist** (fail safe): ein erkannter Schritt; ein Schritt, den der
+  Planer mit `"uninterruptible": true` kennzeichnet; und jeder Schritt eines ändernden Laufs
+  (`mutates`), den der Planer nicht ausdrücklich mit `"uninterruptible": false` als abbrechbar
+  kennzeichnet. Die Erkennung schlägt die Kennzeichnung: ein apt-Schritt bleibt
+  unterbrechungssicher, auch mit `false`. Abbrechbar bleibt damit nur, was nichts ändert.
+  Prüfschritte sind abbrechbar, außer die Erkennung trifft.
+- **Am Zeitlimit**: kein Signal. Der Helfer schreibt „runs longer than planned … it is not
+  ended — waiting“ ins Protokoll und `attention` (`level: "overrun"`) in den Laufzustand.
+- **Harte Obergrenze** 6 h (oder das Zeitlimit, wenn größer): wieder kein Signal, sondern
+  `attention.level: "operator"` und „OPERATOR: … still runs after … h“ im Protokoll. Der Lauf
+  wartet weiter, bis bash selbst endet.
+- **Hintergrundprozesse**: endet bash, hält aber ein mit `&` gestarteter Prozess die Ausgabe
+  offen, liest der Helfer noch 10 s und macht dann ohne Abbruch weiter (der Prozess endet mit der
+  Lauf-Unit).
+- **API**: Solange der Helfer den Lauf als aktiv meldet, gibt die API ihn nie auf (jede solche
+  Antwort schiebt ihre Frist). `attention` landet am Job (`output.hostRunAttention`), als Audit
+  `hermes.host_run.attention` (einmal je Stufe) und in `GET /api/inbox` unter `attention` —
+  James holt es dort ab und meldet es Jochen.
+- **Aufräumen nach einem Fehler**: scheitert ein Paketschritt — oder irgendein Schritt eines
+  ändernden Laufs, nach dem `dpkg --audit` halb installierte Pakete meldet —, räumt der Helfer
+  vor dem Ende selbst auf (unterbrechungssicher, Ergebnis in `state.repair` und im Protokoll):
+  1. sshd zuerst: läuft weder `ssh` noch `sshd`, wird er gestartet;
+  2. `dpkg --configure -a --force-confdef --force-confold` (noninteractive);
+  3. `apt-get -f install -y` mit denselben conffile-Optionen;
+  4. sshd noch einmal und ob er lauscht (`ss -ltnp`);
+  5. apache2, php*-fpm, mariadb, docker und die drei Cockpit-Dienste: ist einer aktiviert, aber
+     nicht aktiv, wird er gestartet; was danach noch steht, nennt das Protokoll.
+- **Die anderen Wege**: Die Deploy-Unit des Selbst-Updates hat `TimeoutStartSec=infinity`, die
+  `einspielen`-Unit von `dienste.update` (docker compose) kein `RuntimeMaxSec` mehr. Die
+  Runner-Rolle des Agent-Brokers (der sie nach ihrem Budget mit SIGTERM→SIGKILL beendet) läuft
+  ohnehin als `cockpit-agent` ohne root, sudo und Docker-Socket; die API gibt ihr zusätzlich
+  keinen Plan, dessen Skript einen Zustandsschritt nennt — der gehört durch die Tür.
 
 ## 4. Netz darunter
 
@@ -333,14 +382,18 @@ vorbei. Der Runner markiert die Dateien der Tür als Fokus `host-door`.
 - `apps/api/test/host-run-helper.test.ts`: der echte Helfer mit Stubs für systemd-run,
   systemctl, borg und Snapshot — Schloss (Signatur, Ablauf, Drift, Capability), Netz (borg zu
   alt/gescheitert, Snapshot scheitert, lesender Lauf), Tür (Fehler, Zeitlimit, Prüfschritte,
-  Schwärzung, Neustart mit Fortsetzung, ein Lauf zur Zeit).
+  Schwärzung, Neustart mit Fortsetzung, ein Lauf zur Zeit), unterbrechungssichere Schritte mit
+  Attrappen für dpkg/apt-get/ss (langsamer apt überzieht ohne Abbruch, Meldung, harte Obergrenze
+  mit Operator-Meldung, Erkennung schlägt `false`, Aufräumen sshd → dpkg → apt-get -f → Dienste).
+- `apps/api/test/state-steps.test.ts`: die Erkennung und die Kennzeichnung im Manifest.
 - `apps/api/test/host-run.test.ts`: Manifest, Fokus (der `/etc/apt`-Fall stoppt nicht mehr),
   Prompt, Belegprüfung, Entscheidung, Ergebnis.
 - `apps/api/test/host-run-flow.test.ts`: der Weg durch die API mit Brokern als Fakes — `pass`
   startet trotz `*.save`-Pfad und borg-Repair-Zeile (kein Regel-Stopp), ein belegter Befund geht
   an Jochen (`gatePassed` fehlt) und nach der Freigabe läuft genau dieser Plan (`operatorApproved`,
   gleicher Hash), ein Befund ohne Beleg stoppt ohne Freigabe-Angebot, zwei Manifeste werden
-  abgelehnt.
+  abgelehnt; Überziehung am Job, im Audit und in `GET /api/inbox`; kein Zustandsschritt an den
+  Runner.
 - `apps/api/test/host-run-resume.test.ts`: API-Neustart während eines Laufs (Broker als Fakes),
   auch wenn die API zwischen Start und Startmarke starb (`hostRunRequestedAt`).
 - `apps/executor-broker/test/index.test.mjs`: `host.run`/`host.status`.

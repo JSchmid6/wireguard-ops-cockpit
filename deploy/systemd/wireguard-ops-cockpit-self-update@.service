@@ -23,7 +23,10 @@ After=network-online.target
 # effect: the runner refuses any input that is not one merged commit of the
 # allowlisted repo together with the hash of its reviewed diff.
 Type=oneshot
-TimeoutStartSec=1800
+# Never ended at a time limit: the deploy runs npm, docker build and docker
+# compose, and a kill in the middle leaves a half-switched stand (operator
+# decision 11.10.2026, deploy/helpers/cockpit-state-steps.mjs).
+TimeoutStartSec=infinity
 # Collect one-shot instances once they are inactive so retries and future
 # commits do not accumulate loaded units.
 CollectMode=inactive-or-failed

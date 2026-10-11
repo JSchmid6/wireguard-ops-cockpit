@@ -134,7 +134,7 @@ Flow of a Hermes change job whose plan contains `self.update <sha>` lines:
    | `update-mechanism` | G7 | the self-update helper, runner, unit, `update-review.ts`, `update-review-prompt.ts` |
    | `envelope-signing` | G2 | hunks touching `signEnvelope`, `verifyExecutionEnvelopeSignature`, `approveExecutionEnvelope`, `createExecutionEnvelope`, `validateExecutionEnvelope`, and `verifyEnvelope` in the capability helper |
    | `broker-validation` | G3 | hunks touching `validateRequest`/`signature` in the executor broker |
-   | `host-door` | G2/G5/G6/G9/G10 | the general door: `apps/api/src/host-run.ts`, `deploy/helpers/cockpit-host-run`, `cockpit-backup-guard.mjs`, `cockpit-borg-retention-rules.mjs`, the host-run resume unit |
+   | `host-door` | G2/G5/G6/G9/G10 | the general door: `apps/api/src/host-run.ts`, `deploy/helpers/cockpit-host-run`, `cockpit-backup-guard.mjs`, `cockpit-borg-retention-rules.mjs`, `cockpit-state-steps.mjs`, the host-run resume unit |
    | `approval-and-auth`, `brokers-and-agents`, `capability-sandbox`, `root-helpers`, `ci` | G1/G6, G3/G6, G5, G4/G5, G7 | file-level areas |
    | `dependencies` | G8 | `package.json` hunks; lockfiles are summarized as a package list with install scripts and non-registry sources first |
    | `tests-deleted` | — | deleted test files |

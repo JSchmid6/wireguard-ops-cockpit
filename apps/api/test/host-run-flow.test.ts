@@ -73,7 +73,7 @@ const planWith = (...manifests: Array<{ version: string }>) => [
   "## Intent", "Keep the host's packages current.",
 ].join("\n");
 
-async function setup(options: { plan: string; doorkeeper: string; ownedByAutomation?: boolean }) {
+async function setup(options: { plan: string; doorkeeper: string; ownedByAutomation?: boolean; hostState?: () => Record<string, unknown> | null }) {
   const dir = mkdtempSync(path.join(tmpdir(), "host-run-flow-"));
   cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
   const seed = new CockpitDatabase(path.join(dir, "cockpit.sqlite"));
@@ -91,6 +91,8 @@ async function setup(options: { plan: string; doorkeeper: string; ownedByAutomat
     const expected = createHmac("sha256", BROKER_SECRET).update(JSON.stringify(request.payload)).digest("hex");
     if (request.signature !== expected) return { ok: false, error: "invalid request signature" };
     if (request.payload.action === "host.run") return { ok: true, output: JSON.stringify({ status: "started", jobId: request.payload.envelope.jobId }) };
+    const live = options.hostState?.();
+    if (live) return { ok: true, output: JSON.stringify({ ok: true, logTail: "running", state: live }) };
     return { ok: true, output: JSON.stringify({ ok: true, logTail: "upgraded", state: {
       phase: "finished", status: "success", error: null, snapshot: { snapshotId: "snap-1" },
       steps: [{ index: 1, name: "sources", status: "success" }], checks: [{ index: 1, name: "nothing pending", status: "passed" }],
@@ -121,7 +123,12 @@ async function setup(options: { plan: string; doorkeeper: string; ownedByAutomat
     expect(created.statusCode).toBe(202);
     return settled(created.json().jobId as string);
   };
-  return { app, cookie, executorCalls, agentCalls, doorkeeperPrompts, submit, settled };
+  const submitted = async () => {
+    const created = await app.inject({ method: "POST", url: "/api/hermes/runbook", headers: bearer ? { authorization: `Bearer ${bearer}` } : { cookie }, payload: { intent: "Keep the host's packages current", sessionId: session.id, timeoutMs: 0 } });
+    expect(created.statusCode).toBe(202);
+    return created.json().jobId as string;
+  };
+  return { app, cookie, executorCalls, agentCalls, doorkeeperPrompts, submit, submitted, settled, inspect };
 }
 
 describe("host door through the API", () => {
@@ -225,5 +232,61 @@ describe("host door through the API", () => {
     expect(JSON.stringify(job.output)).toContain("one door per job");
     expect(flow.doorkeeperPrompts).toHaveLength(0);
     expect(flow.executorCalls).toHaveLength(0);
+  });
+});
+
+// Vorfall 11.10.2026: ein Zustandsschritt wird nie beendet. Die API gibt einen
+// Lauf, den der Helfer noch als aktiv meldet, nicht auf, und meldet die
+// Überziehung dem Operator über GET /api/inbox (attention), den James weiterreicht.
+describe("host door: uninterruptible steps through the API", () => {
+  it("shows the doorkeeper which steps are never ended", async () => {
+    const flow = await setup({ plan: planWith(hostRun), doorkeeper: "VERDICT: pass\nNOTES: routine" });
+    await flow.submit();
+    const prompt = flow.doorkeeperPrompts[0];
+    expect(prompt).toContain('S2 "upgrade" (time limit 1800 s, uninterruptible: never ended at the limit, only reported (detected:package, mutating-run))');
+  });
+
+  it("records an overrun on the job, lists it in the inbox and finishes normally afterwards", async () => {
+    let phase: "overrun" | "operator" | "done" = "overrun";
+    const running = (level: string) => ({
+      phase: "running", status: "running", error: null, snapshot: { snapshotId: "snap-1" },
+      steps: [{ index: 1, name: "sources", status: "success" }, { index: 2, name: "upgrade", status: "running", uninterruptible: true }], checks: [],
+      attention: { level, step: 2, name: "upgrade", since: "2026-10-11T14:00:00Z", message: `step 2 (upgrade) ${level}` },
+    });
+    const flow = await setup({ plan: planWith(hostRun), doorkeeper: "VERDICT: pass", hostState: () => (phase === "done" ? null : running(phase)) });
+    const jobId = await flow.submitted();
+    const until = async (check: () => boolean) => {
+      const deadline = Date.now() + 10_000;
+      while (!check() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(check()).toBe(true);
+    };
+    await until(() => (flow.inspect.getJob(jobId)?.output?.hostRunAttention as { level?: string } | undefined)?.level === "overrun");
+    let inbox = (await flow.app.inject({ method: "GET", url: "/api/inbox", headers: { cookie: flow.cookie } })).json();
+    expect(inbox.attention).toEqual([expect.objectContaining({ jobId, level: "overrun", step: 2, name: "upgrade" })]);
+    phase = "operator";
+    await until(() => (flow.inspect.getJob(jobId)?.output?.hostRunAttention as { level?: string } | undefined)?.level === "operator");
+    inbox = (await flow.app.inject({ method: "GET", url: "/api/inbox", headers: { cookie: flow.cookie } })).json();
+    expect(inbox.attention[0]).toMatchObject({ jobId, level: "operator" });
+    expect(flow.inspect.getJob(jobId)!.status).toBe("running");
+    phase = "done";
+    const job = await flow.settled(jobId);
+    expect(job.status).toBe("completed");
+    const attention = flow.inspect.listAuditsSince("hermes.host_run.attention", "2000-01-01T00:00:00.000Z").filter((audit) => audit.targetId === jobId);
+    expect(attention.map((audit) => audit.details.level).sort()).toEqual(["operator", "overrun"]);
+    inbox = (await flow.app.inject({ method: "GET", url: "/api/inbox", headers: { cookie: flow.cookie } })).json();
+    expect(inbox.attention).toEqual([]);
+  });
+
+  it("refuses to hand state steps to the runner role, which its broker can end", async () => {
+    const flow = await setup({ plan: "## Plan\n```bash\napt-get update && apt-get -y upgrade\n```\n## Intent\nKeep the host's packages current.", doorkeeper: "VERDICT: pass" });
+    const blocked = await flow.submit();
+    // Ein Shell-Plan wartet auf Jochen; erst nach seiner Freigabe käme der Runner.
+    expect(blocked.status).toBe("blocked_user_approval");
+    const approved = await flow.app.inject({ method: "POST", url: `/api/hermes/jobs/${blocked.id}/approval`, headers: { cookie: flow.cookie }, payload: { decision: "approved", reason: "test" } });
+    expect(approved.statusCode).toBeLessThan(300);
+    const job = await flow.settled(blocked.id);
+    expect(flow.agentCalls.some((call) => call.role === "runner")).toBe(false);
+    expect(job.status).not.toBe("completed");
+    expect(JSON.stringify(job.output)).toContain("state steps (package)");
   });
 });

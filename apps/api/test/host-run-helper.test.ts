@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash, createHmac } from "node:crypto";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -18,6 +18,7 @@ const HELPER = fileURLToPath(new URL("../../../deploy/helpers/cockpit-host-run",
 const GUARD = fileURLToPath(new URL("../../../deploy/helpers/cockpit-backup-guard.mjs", import.meta.url));
 // Der Riegel importiert die Grenzen des Aufräum-Diensts; installiert liegen beide nebeneinander.
 const RETENTION_RULES = fileURLToPath(new URL("../../../deploy/helpers/cockpit-borg-retention-rules.mjs", import.meta.url));
+const STATE_STEPS = fileURLToPath(new URL("../../../deploy/helpers/cockpit-state-steps.mjs", import.meta.url));
 const SECRET = "test-envelope-secret-0123456789";
 const HOSTER_SECRET = "hoster-client-secret-abcdef";
 
@@ -39,6 +40,9 @@ function hookEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
     HOST_RUN_BORG_STATUS: path.join(dir, "borg-status"),
     HOST_RUN_SNAPSHOT: path.join(dir, "snapshot"),
     HOST_RUN_BOOT_ID_FILE: path.join(dir, "boot_id"),
+    // Paketwerkzeuge der Schritte (dpkg, apt-get, ss) sind Attrappen: kein Test
+    // fasst die echte Paketverwaltung an, auch nicht der Aufräumweg.
+    HOST_RUN_STEP_PATH: path.join(dir, "bin"),
     STUB_DIR: dir,
     ...extra,
   };
@@ -51,7 +55,7 @@ function run(args: string[], input = "", extra: Record<string, string> = {}) {
 
 interface Manifest {
   version: string; name: string; purpose: string; mutates: boolean;
-  steps: Array<{ name: string; run?: string; reboot?: boolean; timeoutSeconds?: number }>;
+  steps: Array<{ name: string; run?: string; reboot?: boolean; timeoutSeconds?: number; uninterruptible?: boolean }>;
   checks: Array<{ name: string; run: string; timeoutSeconds: number }>;
   rollback: string[]; risk: string[];
 }
@@ -89,6 +93,27 @@ beforeEach(() => {
   copyFileSync(HELPER, helper);
   copyFileSync(GUARD, path.join(dir, "cockpit-backup-guard.mjs"));
   copyFileSync(RETENTION_RULES, path.join(dir, "cockpit-borg-retention-rules.mjs"));
+  copyFileSync(STATE_STEPS, path.join(dir, "cockpit-state-steps.mjs"));
+  // Steps run with a clean environment: the stubs carry their directory in their text.
+  mkdirSync(path.join(dir, "bin"));
+  write(path.join(dir, "bin", "dpkg"), [
+    "#!/bin/bash",
+    `echo "dpkg $*" >> "${dir}/order.log"`,
+    `if [ "$1" = --audit ]; then [ -e "${dir}/dpkg-dirty" ] && echo 'The following packages are only half configured'; exit 0; fi`,
+  ].join("\n"));
+  write(path.join(dir, "bin", "apt-get"), [
+    "#!/bin/bash",
+    `echo "apt-get $*" >> "${dir}/order.log"`,
+    "case \"$*\" in *upgrade*)",
+    `  sleep "$(cat "${dir}/apt-sleep" 2>/dev/null || echo 0)"`,
+    `  [ -e "${dir}/apt-fail" ] && { echo 'E: Sub-process /usr/bin/dpkg returned an error code (1)' >&2; exit 100; }`,
+    "  echo 'Setting up openssh-server' ;;",
+    "esac",
+  ].join("\n"));
+  write(path.join(dir, "bin", "ss"), [
+    "#!/bin/bash",
+    `[ -e "${dir}/down-ssh" ] || echo 'LISTEN 0 128 0.0.0.0:50867 0.0.0.0:* users:(("sshd",pid=1,fd=3))'`,
+  ].join("\n"));
   mkdirSync(path.join(dir, "etc"));
   write(path.join(dir, "etc", "api.env"), `COCKPIT_EXECUTION_ENVELOPE_SECRET=${SECRET}\n`, 0o600);
   write(path.join(dir, "etc", "contabo.env"), `CONTABO_CLIENT_SECRET=${HOSTER_SECRET}\n`, 0o600);
@@ -97,14 +122,18 @@ beforeEach(() => {
   write(path.join(dir, "systemd-run"), [
     "#!/bin/bash",
     "[ -n \"${STUB_SYSTEMD_RUN_FAIL:-}\" ] && { echo 'Failed to start transient service' >&2; exit 1; }",
-    "for a in \"$@\"; do case \"$a\" in --unit=*) echo \"${a#--unit=}\" >> \"$STUB_DIR/units.log\";; esac; done",
+    "for a in \"$@\"; do case \"$a\" in --unit=*) echo \"${a#--unit=}\" >> \"$STUB_DIR/units.log\";; --property=RuntimeMaxSec=*) echo \"${a#--property=}\" >> \"$STUB_DIR/runtime.log\";; esac; done",
     "while [ \"$1\" != -- ]; do shift; done; shift",
     "COCKPIT_HOST_RUN_IN_UNIT=1 \"$@\"",
   ].join("\n"));
   write(path.join(dir, "systemctl"), [
     "#!/bin/bash",
     "case \"$1\" in",
-    "  is-active) echo \"${STUB_UNIT_STATE:-inactive}\";;",
+    // Der Lauf selbst: STUB_UNIT_STATE; Dienste (Aufräumweg): aktiv, ausser down-<unit> liegt da.
+    "  is-active) case \"$2\" in cockpit-host-run-*) echo \"${STUB_UNIT_STATE:-inactive}\";; *) if [ -e \"$STUB_DIR/down-$2\" ]; then echo inactive; exit 3; else echo active; fi;; esac;;",
+    "  start) echo \"systemctl start $2\" >> \"$STUB_DIR/order.log\"; rm -f \"$STUB_DIR/down-$2\";;",
+    "  is-enabled) if [ -e \"$STUB_DIR/absent-$2\" ]; then echo not-found; exit 1; else echo enabled; fi;;",
+    "  list-unit-files) echo 'php8.3-fpm.service enabled enabled';;",
     "  reboot) echo reboot >> \"$STUB_DIR/reboot.log\"; exit \"${STUB_REBOOT_RC:-0}\";;",
     "  is-system-running) echo running;;",
     "esac",
@@ -308,7 +337,7 @@ describe("cockpit-host-run: door", () => {
   });
 
   it("kills a step at its time limit", () => {
-    run(["start"], request(manifest({ steps: [{ name: "slow", run: "sleep 20", timeoutSeconds: 1 }] })));
+    run(["start"], request(manifest({ steps: [{ name: "slow", run: "sleep 20", timeoutSeconds: 1, uninterruptible: false }] })));
     const { state } = status();
     expect(state.status).toBe("failed");
     expect(state.steps[0].timedOut).toBe(true);
@@ -316,7 +345,7 @@ describe("cockpit-host-run: door", () => {
   });
 
   it("fails a step that exits 0 but held its output open past the limit", () => {
-    run(["start"], request(manifest({ steps: [{ name: "daemon", run: "sleep 20 &", timeoutSeconds: 1 }, { name: "never", run: `touch ${dir}/never`, timeoutSeconds: 30 }] })));
+    run(["start"], request(manifest({ steps: [{ name: "daemon", run: "sleep 20 &", timeoutSeconds: 1, uninterruptible: false }, { name: "never", run: `touch ${dir}/never`, timeoutSeconds: 30 }] })));
     const { state } = status();
     expect(state.status).toBe("failed");
     expect(state.steps[0]).toMatchObject({ status: "failed", timedOut: true });
@@ -441,5 +470,134 @@ describe("cockpit-host-run: door", () => {
     const out = run(["start"], request(manifest()), { STUB_SYSTEMD_RUN_FAIL: "1" });
     expect(out.code).toBe(70);
     expect(status().state.status).toBe("failed");
+  });
+});
+
+// Vorfall 11.10.2026 (Job e9b7faf1): apt-get upgrade am Zeitlimit per SIGKILL
+// beendet, 148 Pakete halb konfiguriert, sshd aus. Zustandsschritte laufen
+// seitdem nie in einen Abbruch; scheitert ein Paketschritt, räumt der Helfer auf.
+describe("cockpit-host-run: state steps are never ended", () => {
+  const stateManifest = (partial: Partial<Manifest>) => manifest({ checks: [{ name: "done", run: "true", timeoutSeconds: 30 }], ...partial });
+  const order = () => (existsSync(path.join(dir, "order.log")) ? readFileSync(path.join(dir, "order.log"), "utf8").trim().split("\n") : []);
+
+  it("lets a slow apt-get upgrade overrun its limit: no kill, a report, success", () => {
+    writeFileSync(path.join(dir, "apt-sleep"), "3");
+    run(["start"], request(stateManifest({ steps: [{ name: "apt-update-hold-upgrade", run: "apt-get update && apt-get upgrade -y", timeoutSeconds: 1 }] })));
+    const { state, logTail } = status();
+    expect(state.status).toBe("success");
+    expect(state.steps[0]).toMatchObject({ status: "success", uninterruptible: true, timedOut: false, overrun: true, exitCode: 0 });
+    expect(state.steps[0].stateKinds).toContain("package");
+    expect(state.attention).toBeNull();
+    expect(logTail).toContain("runs longer than planned (1 s); it is not ended");
+    expect(logTail).toContain("Setting up openssh-server");
+    // Kein RuntimeMaxSec, das den Lauf doch noch beenden könnte.
+    expect(readFileSync(path.join(dir, "runtime.log"), "utf8").trim()).toBe("RuntimeMaxSec=infinity");
+    expect(state.repair).toBeUndefined();
+  }, 20_000);
+
+  it("detection beats the planner's mark: an apt step marked interruptible is still not ended", () => {
+    writeFileSync(path.join(dir, "apt-sleep"), "3");
+    run(["start"], request(stateManifest({ mutates: false, steps: [{ name: "upgrade", run: "apt-get upgrade -y", timeoutSeconds: 1, uninterruptible: false }] })));
+    const { state } = status();
+    expect(state.status).toBe("success");
+    expect(state.steps[0]).toMatchObject({ uninterruptible: true, timedOut: false, overrun: true });
+  }, 20_000);
+
+  it("every step of a mutating run is uninterruptible by default (fail safe)", () => {
+    run(["start"], request(stateManifest({ steps: [{ name: "wait", run: "sleep 3", timeoutSeconds: 1 }] })));
+    const { state } = status();
+    expect(state.status).toBe("success");
+    expect(state.steps[0]).toMatchObject({ uninterruptible: true, overrun: true, timedOut: false });
+  }, 20_000);
+
+  it("still ends a plain step of a read-only run at its limit, with a bounded unit", () => {
+    run(["start"], request(stateManifest({ mutates: false, steps: [{ name: "slow read", run: "sleep 20", timeoutSeconds: 1 }] })));
+    const { state } = status();
+    expect(state.status).toBe("failed");
+    expect(state.steps[0]).toMatchObject({ uninterruptible: false, timedOut: true });
+    expect(readFileSync(path.join(dir, "runtime.log"), "utf8").trim()).toMatch(/^RuntimeMaxSec=\d+$/);
+  });
+
+  it("reports the overrun while running and calls the operator at the hard cap — still without a kill", async () => {
+    writeFileSync(path.join(dir, "apt-sleep"), "6");
+    const child = spawn(process.execPath, [helper, "start"], { env: hookEnv({ HOST_RUN_HARD_CAP_SECONDS: "3" }), stdio: ["pipe", "ignore", "ignore"] });
+    child.stdin.end(request(stateManifest({ steps: [{ name: "upgrade", run: "apt-get upgrade -y", timeoutSeconds: 1 }] })));
+    const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+    const live = () => JSON.parse(run(["status", "job-1"], "", { STUB_UNIT_STATE: "active" }).stdout).state;
+    await sleep(2000);
+    expect(live().attention).toMatchObject({ level: "overrun", step: 1, limitSeconds: 1, hardCapSeconds: 3 });
+    await sleep(2500);
+    const capped = live();
+    expect(capped.status).toBe("running");
+    expect(capped.attention).toMatchObject({ level: "operator", step: 1 });
+    expect(capped.attention.message).toContain("NOT ended");
+    await new Promise((resolve) => child.on("close", resolve));
+    const { state, logTail } = status();
+    expect(state.status).toBe("success");
+    expect(state.steps[0]).toMatchObject({ status: "success", overrun: true, timedOut: false });
+    expect(state.attention).toBeNull();
+    expect(logTail).toContain("OPERATOR: step 1 (upgrade) still runs after");
+  }, 30_000);
+
+  it("repairs after a failed package step: sshd first, then dpkg --configure -a, apt-get -f install, services", () => {
+    writeFileSync(path.join(dir, "apt-fail"), "");
+    writeFileSync(path.join(dir, "down-ssh"), "");
+    writeFileSync(path.join(dir, "down-sshd"), "");
+    writeFileSync(path.join(dir, "down-apache2"), "");
+    writeFileSync(path.join(dir, "absent-mariadb"), "");
+    run(["start"], request(stateManifest({ steps: [{ name: "upgrade", run: "apt-get upgrade -y", timeoutSeconds: 60 }, { name: "never", run: `touch ${dir}/never`, timeoutSeconds: 30 }] })));
+    const { state, logTail } = status();
+    expect(state.status).toBe("failed");
+    expect(state.error).toContain("step 1 (upgrade) exited 100");
+    expect(existsSync(path.join(dir, "never"))).toBe(false);
+    const steps = order();
+    const at = (prefix: string) => steps.findIndex((line) => line.startsWith(prefix));
+    expect(at("systemctl start ssh")).toBeGreaterThanOrEqual(0);
+    expect(at("systemctl start ssh")).toBeLessThan(at("dpkg --configure -a"));
+    expect(steps).toContain("dpkg --configure -a --force-confdef --force-confold");
+    expect(steps).toContain("apt-get -f install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold");
+    expect(at("dpkg --configure -a")).toBeLessThan(at("apt-get -f install"));
+    expect(at("apt-get -f install")).toBeLessThan(at("systemctl start apache2"));
+    expect(state.repair).toMatchObject({ dpkg: 0, apt: 0, sshdListening: true, sshd: { unit: "ssh", after: "active" } });
+    const services = Object.fromEntries((state.repair.services as Array<{ unit: string }>).map((item) => [item.unit, item]));
+    expect(services.apache2).toMatchObject({ before: "inactive", after: "active" });
+    expect(services["php8.3-fpm"]).toMatchObject({ before: "active", after: "active" });
+    expect(services.mariadb).toMatchObject({ enabled: "not-found", before: null });
+    expect(services["wireguard-ops-cockpit-api"]).toMatchObject({ after: "active" });
+    expect(logTail).toContain("sshd is not running — starting it first");
+    expect(logTail).toContain("repair done: dpkg exit 0, apt-get -f exit 0, sshd active (listening)");
+  });
+
+  it("repairs after any failed step of a mutating run that left dpkg half done", () => {
+    writeFileSync(path.join(dir, "dpkg-dirty"), "");
+    run(["start"], request(stateManifest({ steps: [{ name: "own script", run: "exit 4", timeoutSeconds: 30 }] })));
+    const { state } = status();
+    expect(state.status).toBe("failed");
+    expect(state.repair?.dpkg).toBe(0);
+    expect(order()).toContain("dpkg --configure -a --force-confdef --force-confold");
+  });
+
+  it("does not touch dpkg after a failed non-package step when dpkg is clean", () => {
+    run(["start"], request(stateManifest({ steps: [{ name: "own script", run: "exit 4", timeoutSeconds: 30 }] })));
+    const { state } = status();
+    expect(state.status).toBe("failed");
+    expect(state.repair).toBeUndefined();
+    expect(order()).toEqual(["dpkg --audit"]);
+  });
+
+  it("does not wait forever on a background child of an uninterruptible step", () => {
+    run(["start"], request(stateManifest({ steps: [{ name: "daemon", run: "sleep 30 &", timeoutSeconds: 1 }, { name: "next", run: `touch ${dir}/next`, timeoutSeconds: 30 }] })));
+    const { state, logTail } = status();
+    expect(state.status).toBe("success");
+    expect(state.steps[0]).toMatchObject({ status: "success", timedOut: false });
+    expect(existsSync(path.join(dir, "next"))).toBe(true);
+    expect(logTail).toContain("background processes of this step still hold its output");
+  }, 30_000);
+
+  it("refuses a non-boolean uninterruptible mark", () => {
+    const bad = stateManifest({ steps: [{ name: "x", run: "true", timeoutSeconds: 30, uninterruptible: "yes" as unknown as boolean }] });
+    const out = run(["start"], request(bad));
+    expect(out.code).toBe(64);
+    expect(out.stderr).toContain("uninterruptible of x");
   });
 });

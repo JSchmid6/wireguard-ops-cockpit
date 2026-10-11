@@ -101,6 +101,8 @@ readonly TABLE=(
   # …und die festen Grenzen des Aufräum-Diensts auf Lab0, die der Riegel importiert
   # (der Dienst selbst läuft nur auf Lab0, doc/setup/borg-retention.md).
   "deploy/helpers/cockpit-borg-retention-rules.mjs|$LIB/cockpit-borg-retention-rules.mjs|644"
+  # Zustandsschritte nie mittendrin abbrechen: die eine Erkennung, die der Helfer importiert.
+  "deploy/helpers/cockpit-state-steps.mjs|$LIB/cockpit-state-steps.mjs|644"
   "deploy/systemd/wireguard-ops-cockpit-host-run-resume.service|$UNITS/wireguard-ops-cockpit-host-run-resume.service|644"
 )
 
