@@ -183,7 +183,10 @@ function Card({ card, now, highlighted, onDone }: { card: InboxCard; now: number
       await onDone(`${labels[kind]}: ${card.title}`);
     } catch (nextError) {
       const message = nextError instanceof Error ? nextError.message : "Die Entscheidung ging nicht durch.";
-      if (kind === "approve" && /expired|envelope validation failed/i.test(message)) setRefusedAsExpired(true);
+      // Nur ein Ablauf macht die Karte zu "abgelaufen"; eine andere Ablehnung
+      // (Signatur, Drift) zeigt der Server mit eigenem Grund — sonst stünde
+      // "Frist abgelaufen" da, obwohl der Countdown noch läuft.
+      if (kind === "approve" && /\bexpired\b/i.test(message)) setRefusedAsExpired(true);
       setError(message);
     } finally {
       setBusy(false);

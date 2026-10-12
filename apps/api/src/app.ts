@@ -2361,7 +2361,11 @@ export async function createApp(options: AppOptions = {}) {
           recommendedAction: "Submit a new change job for the same trusted intent.",
         }), { ...job.output, envelopeErrors });
         database.createAudit({ actorId: actor.id, action: "hermes.change.approval_invalid", targetType: "job", targetId: job.id, details: { envelopeErrors } });
-        return reply.code(409).send({ message: "execution envelope validation failed", job: blocked });
+        // Nur eine echte Fristüberschreitung heißt "expired": die Karte zeigt
+        // dann "abgelaufen" und bietet "Neu bestellen lassen". Jede andere
+        // Abweichung (Signatur, Drift) ist kein Ablauf und wird nicht so genannt.
+        const expired = envelopeErrors.includes("execution envelope expired");
+        return reply.code(409).send({ message: expired ? "execution envelope expired" : "execution envelope validation failed", envelopeErrors, job: blocked });
       }
     }
     database.createAudit({
