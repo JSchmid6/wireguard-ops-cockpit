@@ -27,6 +27,8 @@ export interface InboxCard {
   kind: InboxKind;
   // Die Absicht in einem Satz.
   title: string;
+  // Die ganze Absicht für die Detailansicht, wo sie länger ist als der Satz.
+  intent?: string;
   // Warum gestoppt wurde.
   reason: string;
   findings: InboxFinding[];
@@ -104,6 +106,12 @@ export function jobFindings(output: Record<string, unknown>): InboxFinding[] {
   return findings;
 }
 
+/** Die ganze Absicht, nur wenn der eine Satz sie nicht schon vollständig trägt. */
+function fullIntent(text: string, title: string): { intent?: string } {
+  const flat = text.trim();
+  return flat && flat.replace(/\s+/g, " ") !== title ? { intent: clip(flat, 4000) } : {};
+}
+
 export function hermesJobCard(job: JobRecord, now: number, webUrl: string | null): InboxCard {
   const output = record(job.output);
   const explanation = record(output.explanation);
@@ -112,10 +120,12 @@ export function hermesJobCard(job: JobRecord, now: number, webUrl: string | null
   const findings = jobFindings(output);
   const expiresAt = str(envelope.expiresAt) || null;
   const id = `job-${job.id}`;
+  const title = oneSentence(str(explanation.intent) || "Änderung von James");
   return {
     id,
     kind: findings.some((finding) => finding.source === "backup-bolt") ? "backup-bolt" : "hermes-change",
-    title: oneSentence(str(explanation.intent) || "Änderung von James"),
+    title,
+    ...fullIntent(str(explanation.intent), title),
     reason: clip(str(policy.reason) || str(explanation.reason) || "Kein Grund gespeichert.", 1200),
     findings,
     createdAt: job.createdAt,
@@ -132,10 +142,12 @@ export function approvalCard(approval: ApprovalRecord, job: JobRecord | null, tt
   const expiresAt = new Date(Date.parse(approval.createdAt) + ttlMinutes * 60_000).toISOString();
   const id = `approval-${approval.id}`;
   const summary = str(output.summary) || str(record(output.explanation).intent) || (job ? `${job.kind} ${job.subjectId ?? ""}`.trim() : "Freigabe");
+  const title = oneSentence(summary);
   return {
     id,
     kind: "approval",
-    title: oneSentence(summary),
+    title,
+    ...fullIntent(summary, title),
     reason: clip(approval.reason || "Der Plan verlangt eine Freigabe.", 1200),
     findings: [],
     createdAt: approval.createdAt,

@@ -77,6 +77,9 @@ describe("inbox cards", () => {
       reason: "The doorkeeper found 1 evidenced finding(s): S3:L1 borg repair.",
       expiresAt: "2026-10-02T12:20:00.000Z", expired: false, link: "/#karte-job-job-1",
     });
+    // Die ganze Absicht für die Detailansicht, wenn der eine Satz sie nicht trägt.
+    expect(card.intent).toBe("Selbstupdate auf PR #25 einspielen. Danach die Dienste prüfen.");
+    expect(hermesJobCard(job({ explanation: { intent: "Nur ein Satz." } }), NOW, null).intent).toBeUndefined();
     expect(hermesJobCard(job(hostRunOutput), Date.parse("2026-10-02T12:21:00.000Z"), null).expired).toBe(true);
     // Ohne Envelope gibt es nichts freizugeben.
     const bare = hermesJobCard(job({ explanation: { reason: "why" } }), NOW, null);
@@ -88,6 +91,8 @@ describe("inbox cards", () => {
     const card = approvalCard(approval, job({ summary: "Restart Apache. Then check." }, { id: "j1", kind: "execution.plan" }), 30, NOW, null);
     expect(card).toMatchObject({ id: "approval-a1", kind: "approval", title: "Restart Apache.", reason: "risky", expiresAt: "2026-10-02T12:15:00.000Z", expired: false, approvalId: "a1" });
     expect(approvalCard(approval, null, 30, NOW, null).title).toBe("Freigabe");
+    expect(card.intent).toBe("Restart Apache. Then check.");
+    expect(approvalCard(approval, null, 30, NOW, null).intent).toBeUndefined();
 
     const anomaly = retentionAnomalyCard({ id: "0123456789abcdef", detectedAt: "2026-10-02T04:00:05.000Z", phase: "before-prune", count: 1, missing: [{ id: "a", name: "vmd61162-2026-09-30T00:37:11" }] }, NOW, null);
     expect(anomaly).toMatchObject({ id: "retention-0123456789abcdef", kind: "retention-anomaly", expiresAt: null, expired: false, anomalyId: "0123456789abcdef" });

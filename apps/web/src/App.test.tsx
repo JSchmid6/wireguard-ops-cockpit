@@ -874,6 +874,9 @@ describe("App", () => {
     expect(await screen.findByRole("heading", { name: /Wartet auf dich/ })).toBeTruthy();
     expect(await screen.findByText("Human review required", { selector: "h3" })).toBeTruthy();
     expect(screen.queryByText("Recent audit trail")).toBeNull();
+    // Auf der Startseite nur die Aufgabe mit "Details" — keine Knöpfe zum Entscheiden.
+    expect(screen.getAllByRole("button", { name: "Details" }).length).toBeGreaterThan(0);
+    expect(screen.queryByRole("button", { name: "Freigeben" })).toBeNull();
     await user.click(screen.getByRole("button", { name: /Mehr/ }));
 
     expect(await screen.findByText("Recent audit trail")).toBeTruthy();
@@ -1009,6 +1012,7 @@ describe("App", () => {
 
     // Freigeben geht nur über die Karte und nur mit Grund.
     await screen.findByText("Supervised repair agent requires operator approval before it starts.", { selector: "h3" });
+    await clickWhenReady(user, "Details");
     expect((screen.getAllByRole("button", { name: "Freigeben" })[0] as HTMLButtonElement).disabled).toBe(true);
     await user.type(screen.getAllByLabelText(/Grund \(Pflicht/)[0], "observed launch is fine");
     await clickWhenReady(user, "Freigeben");
@@ -1016,6 +1020,7 @@ describe("App", () => {
     await clickWhenReady(user, "Mark checkpoint reviewed");
     expect(await screen.findByText(/waiting at checkpoint Choose the next bounded follow-up/i)).toBeTruthy();
 
+    await clickWhenReady(user, "Details");
     await user.type(screen.getAllByLabelText(/Grund \(Pflicht/)[0], "reviewed");
     await clickWhenReady(user, "Freigeben");
     expect(await screen.findByText("No pending approvals.")).toBeTruthy();

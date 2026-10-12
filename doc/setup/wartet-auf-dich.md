@@ -1,11 +1,13 @@
 # Wartet auf dich — die Startseite des Cockpits
 
-Stand 02.10.2026 (t_432807ea). Gilt für das VPS- und das Lab0-Cockpit (gleicher Code).
+Stand 12.10.2026 (t_432807ea, verschlankt mit t_74f5f6e1). Gilt für das VPS- und das
+Lab0-Cockpit (gleicher Code).
 
-Nach dem Login zeigt das Cockpit zuerst eine einzige Liste: alles, was Jochen entscheiden muss.
-Terminals, Sitzungen, Runbooks, Zeitpläne, Borg-Zustand, Aufbewahrung und Audits liegen
-eingeklappt hinter dem Knopf **Mehr**. Die Seite ist für das Handy gebaut: eine Spalte,
-Knöpfe über die volle Breite und mindestens 52 px hoch, Befunde zum Aufklappen.
+Nach dem Login zeigt das Cockpit nur eine Liste: Jochens Aufgaben, also alles, was er entscheiden
+muss — und sonst nichts. Terminals, Sitzungen, Runbooks, Zeitpläne, Borg-Zustand, Aufbewahrung und
+Audits liegen hinter dem Knopf **Mehr** in der Kopfzeile; unter den Aufgaben steht nichts
+Eingeklapptes mehr. Die Seite ist für das Handy gebaut: eine Spalte, Knöpfe über die volle Breite
+und mindestens 52 px hoch.
 
 ## Was dort erscheint
 
@@ -20,15 +22,21 @@ Eine Einstellung unter der Untergrenze, die Jochen selbst im Bereich „Backup r
 fragt dort direkt nach seiner Freigabe — sie wartet auf niemanden und erscheint deshalb nicht als
 Karte.
 
-Jede Karte zeigt:
+Auf der Startseite zeigt jede Karte nur **die Art** (Änderung von James, Backup-Riegel, Freigabe,
+Aufräum-Dienst), **die Frist** als Countdown, **die Absicht in einem Satz** und einen Knopf
+**Details**. Erst „Details" öffnet einen Dialog (auf dem Handy bildschirmfüllend und selbst
+scrollend, ab 40rem Breite ein Fenster in der Mitte; „✕", Escape oder ein Tipp daneben schließen
+ihn). Der Dialog zeigt alles, was vorher direkt auf der Karte stand, und mehr:
 
-- **die Absicht in einem Satz** (der erste Satz der vertrauenswürdigen Absicht des Jobs),
+- **die Absicht in einem Satz**, darunter **die ganze Absicht** (`intent`, bis 4000 Zeichen), wo
+  der eine Satz sie nicht schon trägt (der erste Satz der vertrauenswürdigen Absicht des Jobs),
 - **warum gestoppt wurde** (`policy.reason`),
 - **die Befunde**: Titel, Garantie oder Klasse, Datei und Zeile (Update-Prüfer) bzw. Schritt und
   Zeile (Türsteher, `S3:L1`), Schwere; aufgeklappt die Begründung mit dem zitierten Code. Vom
   Türsteher nur die belegten Befunde — unbelegte verwirft er selbst, sie stoppen nichts.
-- **die Frist** als Countdown bis zum Ablauf des Envelopes (`envelope.expiresAt`, Vorgabe
-  `COCKPIT_APPROVAL_TTL_MINUTES=30`) bzw. der Freigabe,
+- **die Zeiten**: angelegt, Frist als Uhrzeit und Countdown bis zum Ablauf des Envelopes
+  (`envelope.expiresAt`, Vorgabe `COCKPIT_APPROVAL_TTL_MINUTES=30`) bzw. der Freigabe,
+- **die Kennung** (Job-, Freigabe- oder Anomalie-Id),
 - **Freigeben** und **Ablehnen**, beide erst mit einem Grund bedienbar.
 
 **Der Grund ist Pflicht** — nicht nur in der Oberfläche: `POST /api/hermes/jobs/:id/approval` und
@@ -131,7 +139,8 @@ auf dem Host, und Telegram läuft bei James ohnehin schon. Home Assistant hätte
 Die Basisadresse für den Link setzt `COCKPIT_WEB_URL` (kein Geheimnis, z. B.
 `http://10.0.0.1:5173`). Ohne sie ist der Link relativ (`/#karte-job-<id>`).
 
-Der Direktlink öffnet das Cockpit; nach dem Login springt die Seite zur Karte und hebt sie hervor.
+Der Direktlink öffnet das Cockpit; nach dem Login springt die Seite zur Karte, hebt sie hervor und
+öffnet gleich ihre Details.
 Ist sie schon entschieden, steht dort „Die verlinkte Karte wartet nicht mehr".
 
 **Noch offen auf James' Seite** (nicht Teil dieses Repos): im Skill `cockpit` den `operatorLink`
@@ -166,10 +175,13 @@ bleiben unverändert: Der Envelope wird genauso geprüft wie vorher.
   Selbstfreigabe per Token.
 - `apps/api/test/host-run-flow.test.ts` — James bestellt mit seinem Token, Jochen gibt als Admin
   frei, der Lauf startet in James' Sitzung (vorher: `blocked_prerequisite`).
-- `apps/web/src/Inbox.test.tsx` — Countdown, Zustandszeile, Knöpfe erst mit Grund, Befunde
+- `apps/web/src/Inbox.test.tsx` — Startseite nur mit Art, Frist, Absicht und „Details" (kein
+  Grund, keine Befunde, kein Knopf zum Entscheiden), Dialog je Karte (öffnen, ganze Absicht,
+  Kennung, schließen mit ✕ und Escape), Countdown, Zustandszeile, Knöpfe erst mit Grund, Befunde
   ausklappbar, „Neu bestellen lassen", Anomalie, Fehleranzeige, Direktlink; Handyansicht über die
-  tragenden CSS-Regeln (eine Spalte zuerst, Knöpfe ≥ 44 px, nichts breiter als 360 px) und die
-  Lesereihenfolge der Karte. jsdom rechnet kein Layout; ein echter Blick auf dem Handy bleibt
-  nötig.
+  tragenden CSS-Regeln (eine Spalte zuerst, Knöpfe ≥ 44 px, nichts breiter als 360 px, Dialog
+  bildschirmfüllend) und die Lesereihenfolge im Dialog. jsdom rechnet kein Layout; gemessen wurde
+  zusätzlich in Chromium bei 360 × 740 px (kein Element breiter als der Bildschirm, Knöpfe 52 px,
+  ✕ 45 px) und 1280 px (Dialog 768 px mittig). Ein Blick auf dem echten Handy bleibt sinnvoll.
 - `apps/web/src/App.test.tsx` — Startseite zeigt „Wartet auf dich", der Rest ist hinter „Mehr"
-  zu; Freigaben laufen über die Karte mit Grund.
+  zu; Freigaben laufen über den Dialog der Karte mit Grund.

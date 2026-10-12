@@ -5,8 +5,10 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import Inbox, { countdown, statusLine, type InboxCard } from "./Inbox";
 
-// "Wartet auf dich": Karten mit Frist, Befunden und Knöpfen; Grund ist Pflicht;
-// ein abgelaufener Envelope bietet "Neu bestellen lassen" statt Freigeben.
+// "Wartet auf dich": auf der Startseite je Aufgabe nur Art, Frist, Absicht und
+// "Details"; erst der Dialog zeigt Grund, Befunde, Zeiten und die Knöpfe.
+// Grund ist Pflicht; ein abgelaufener Envelope bietet "Neu bestellen lassen"
+// statt Freigeben.
 // Die Handyansicht prüfen wir an den CSS-Regeln, die sie tragen (jsdom
 // rechnet kein Layout): eine Spalte zuerst, große Knöpfe, nichts breiter als
 // der Bildschirm.
@@ -41,6 +43,13 @@ function serve(cards: InboxCard[], answers: Record<string, { status: number; bod
   });
   vi.stubGlobal("fetch", fetchMock);
   return fetchMock;
+}
+
+/** Öffnet die Details der (ersten) Karte und liefert den Dialog. */
+async function openDetails(user: ReturnType<typeof userEvent.setup>, index = 0) {
+  const buttons = await screen.findAllByRole("button", { name: "Details" });
+  await user.click(buttons[index]);
+  return screen.getByRole("dialog");
 }
 
 function posted(fetchMock: ReturnType<typeof serve>, url: string) {
@@ -85,16 +94,60 @@ describe("Wartet auf dich", () => {
     expect(screen.getByTestId("inbox-status").textContent).toContain("Platte /: 120 GB frei");
   });
 
-  it("shows intent, reason, collapsed findings and the countdown, and approves only with a reason", async () => {
+  it("shows only kind, deadline, intent and one Details button on the start page", async () => {
+    serve([hermesCard(), hermesCard({ id: "job-j2", jobId: "j2", title: "Andere Änderung." })]);
+    render(<Inbox />);
+
+    expect(await screen.findByText("Selbstupdate auf PR #25 einspielen.")).toBeTruthy();
+    expect(screen.getByRole("heading", { name: /Wartet auf dich\s*\(2\)/ })).toBeTruthy();
+    const card = screen.getByText("Selbstupdate auf PR #25 einspielen.").closest("article") as HTMLElement;
+    expect(card.textContent).toContain("Änderung von James");
+    expect(card.querySelector("[aria-label='Frist']")!.textContent).toMatch(/läuft ab in (19|20):\d\d/);
+    // Grund, Befunde, Grund-Feld und Entscheidung stehen nicht auf der Startseite.
+    expect(screen.queryByText(/The update reviewer flagged G1\./)).toBeNull();
+    expect(screen.queryByText("Doorkeeper approves root")).toBeNull();
+    expect(screen.queryByRole("textbox")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Freigeben" })).toBeNull();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(Array.from(card.querySelectorAll("button")).map((button) => button.textContent)).toEqual(["Details"]);
+  });
+
+  it("opens the details of exactly one card as a dialog and closes it with the button or Escape", async () => {
+    serve([hermesCard({ intent: "Selbstupdate auf PR #25 einspielen. Danach den Web-Container neu starten." }), hermesCard({ id: "job-j2", jobId: "j2", title: "Andere Änderung." })]);
+    const user = userEvent.setup();
+    render(<Inbox />);
+
+    const dialog = await openDetails(user);
+    expect(dialog.getAttribute("aria-modal")).toBe("true");
+    expect(dialog.textContent).toContain("Selbstupdate auf PR #25 einspielen.");
+    expect(dialog.textContent).toContain("Ganze Absicht: Selbstupdate auf PR #25 einspielen. Danach den Web-Container neu starten.");
+    expect(dialog.textContent).toContain("Warum gestoppt: The update reviewer flagged G1.");
+    expect(dialog.textContent).toContain("Befunde (1)");
+    expect(dialog.textContent).toContain("Job j1");
+    expect(dialog.textContent).toContain("Angelegt");
+    expect(dialog.textContent).not.toContain("Andere Änderung.");
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Schließen" }));
+
+    await user.click(screen.getByRole("button", { name: "Schließen" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+
+    await openDetails(user, 1);
+    expect(screen.getByRole("dialog").textContent).toContain("Andere Änderung.");
+    expect(screen.getByRole("dialog").textContent).not.toContain("Ganze Absicht");
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("shows reason, collapsed findings and the countdown in the details, and approves only with a reason", async () => {
     const fetchMock = serve([hermesCard()]);
     const onDecided = vi.fn();
     const user = userEvent.setup();
     render(<Inbox onDecided={onDecided} />);
 
-    expect(await screen.findByText("Selbstupdate auf PR #25 einspielen.")).toBeTruthy();
-    expect(screen.getByRole("heading", { name: /Wartet auf dich\s*\(1\)/ })).toBeTruthy();
+    await openDetails(user);
     expect(screen.getByText(/The update reviewer flagged G1\./)).toBeTruthy();
-    expect(screen.getByLabelText("Frist").textContent).toMatch(/läuft ab in (19|20):\d\d/);
+    expect(screen.getAllByLabelText("Frist")[0].textContent).toMatch(/läuft ab in (19|20):\d\d/);
 
     // Befund: Titel, Garantie, Datei und Zeile sichtbar; die Begründung ausklappbar.
     const details = screen.getByText("Doorkeeper approves root").closest("details") as HTMLDetailsElement;
@@ -123,7 +176,8 @@ describe("Wartet auf dich", () => {
     const fetchMock = serve([hermesCard()]);
     const user = userEvent.setup();
     render(<Inbox />);
-    await user.type(await screen.findByLabelText(/Grund \(Pflicht\)/), "nicht jetzt");
+    await openDetails(user);
+    await user.type(screen.getByLabelText(/Grund \(Pflicht\)/), "nicht jetzt");
     await user.click(screen.getByRole("button", { name: "Ablehnen" }));
     await waitFor(() => expect(posted(fetchMock, "/api/hermes/jobs/j1/approval")).toEqual({ decision: "rejected", reason: "nicht jetzt" }));
   });
@@ -133,6 +187,7 @@ describe("Wartet auf dich", () => {
     const user = userEvent.setup();
     render(<Inbox />);
     expect(await screen.findByText("Abgelaufen")).toBeTruthy();
+    await openDetails(user);
     expect(screen.getByText(/Die Frist ist abgelaufen/)).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Freigeben" })).toBeNull();
     await user.type(screen.getByLabelText("Notiz an James (optional)"), "bitte frisch prüfen");
@@ -146,6 +201,7 @@ describe("Wartet auf dich", () => {
     const user = userEvent.setup();
     render(<Inbox />);
     expect(await screen.findByText("Freigabe")).toBeTruthy();
+    await openDetails(user);
     await user.type(screen.getByLabelText(/Grund \(Pflicht\)/), "ok");
     await user.click(screen.getByRole("button", { name: "Freigeben" }));
     await waitFor(() => expect(posted(fetchMock, "/api/approvals/a1/decision")).toEqual({ decision: "approved", reason: "ok" }));
@@ -156,8 +212,10 @@ describe("Wartet auf dich", () => {
     const fetchMock = serve([anomaly]);
     const user = userEvent.setup();
     render(<Inbox />);
-    const field = await screen.findByLabelText(/mind\. 10 Zeichen/);
+    const dialog = await openDetails(user);
+    const field = screen.getByLabelText(/mind\. 10 Zeichen/);
     expect(screen.queryByLabelText("Frist")).toBeNull();
+    expect(dialog.textContent).toContain("Fristkeine");
     await user.type(field, "kurz");
     expect((screen.getByRole("button", { name: "Freigeben" }) as HTMLButtonElement).disabled).toBe(true);
     await user.click(screen.getByRole("button", { name: "Ablehnen (angehalten lassen)" }));
@@ -166,7 +224,8 @@ describe("Wartet auf dich", () => {
     cleanup();
     const second = serve([anomaly]);
     render(<Inbox />);
-    await user.type(await screen.findByLabelText(/mind\. 10 Zeichen/), "ich habe sie selbst gelöscht");
+    await openDetails(user);
+    await user.type(screen.getByLabelText(/mind\. 10 Zeichen/), "ich habe sie selbst gelöscht");
     await user.click(screen.getByRole("button", { name: "Freigeben" }));
     await waitFor(() => expect(posted(second, "/api/borg/retention/resume")).toEqual({ anomalyId: "0123456789abcdef", approval: { confirmed: true, reason: "ich habe sie selbst gelöscht" } }));
   });
@@ -175,17 +234,19 @@ describe("Wartet auf dich", () => {
     serve([hermesCard()], { "/api/hermes/jobs/j1/approval": { status: 409, body: { message: "execution envelope validation failed" } } });
     const user = userEvent.setup();
     render(<Inbox />);
-    await user.type(await screen.findByLabelText(/Grund \(Pflicht\)/), "los");
+    await openDetails(user);
+    await user.type(screen.getByLabelText(/Grund \(Pflicht\)/), "los");
     await user.click(screen.getByRole("button", { name: "Freigeben" }));
     expect((await screen.findByRole("alert")).textContent).toBe("execution envelope validation failed");
-    expect(screen.getByText("Selbstupdate auf PR #25 einspielen.")).toBeTruthy();
+    expect(screen.getByRole("dialog").textContent).toContain("Selbstupdate auf PR #25 einspielen.");
   });
 
   it("offers the re-order when the server refuses an approval as expired", async () => {
     const fetchMock = serve([hermesCard()], { "/api/hermes/jobs/j1/approval": { status: 409, body: { message: "execution envelope validation failed" } } });
     const user = userEvent.setup();
     render(<Inbox />);
-    await user.type(await screen.findByLabelText(/Grund \(Pflicht\)/), "knapp");
+    await openDetails(user);
+    await user.type(screen.getByLabelText(/Grund \(Pflicht\)/), "knapp");
     await user.click(screen.getByRole("button", { name: "Freigeben" }));
     expect(await screen.findByRole("button", { name: "Neu bestellen lassen" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Freigeben" })).toBeNull();
@@ -195,7 +256,9 @@ describe("Wartet auf dich", () => {
 
   it("tells an expired plan approval to be planned again and only allows rejecting it", async () => {
     serve([{ ...hermesCard(), id: "approval-a1", kind: "approval", jobId: "jx", approvalId: "a1", findings: [], expired: true, expiresAt: new Date(Date.now() - 1000).toISOString() }]);
+    const user = userEvent.setup();
     render(<Inbox />);
+    await openDetails(user);
     expect(await screen.findByText(/Plane den Lauf unter „Mehr“ neu/)).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Freigeben" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Neu bestellen lassen" })).toBeNull();
@@ -208,16 +271,19 @@ describe("Wartet auf dich", () => {
     expect((await screen.findByRole("alert")).textContent).toBe("authentication required");
   });
 
-  it("jumps to the card from a direct link and says when it no longer waits", async () => {
+  it("jumps to the card from a direct link, opens its details and says when it no longer waits", async () => {
     const scroll = vi.fn();
     Element.prototype.scrollIntoView = scroll;
     window.location.hash = "#karte-job-j1";
     serve([hermesCard(), hermesCard({ id: "job-j2", jobId: "j2", title: "Andere Änderung." })]);
     render(<Inbox />);
-    const card = (await screen.findByText("Selbstupdate auf PR #25 einspielen.")).closest("article") as HTMLElement;
+    // Die Absicht steht zweimal da: auf der Karte und im geöffneten Dialog.
+    const card = (await screen.findAllByText("Selbstupdate auf PR #25 einspielen."))[0].closest("article") as HTMLElement;
     expect(card.id).toBe("karte-job-j1");
     expect(card.className).toContain("inbox-card-highlight");
     await waitFor(() => expect(scroll).toHaveBeenCalled());
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+    expect(card.contains(screen.getByRole("dialog"))).toBe(true);
     expect(screen.getByText("Andere Änderung.").closest("article")!.className).not.toContain("inbox-card-highlight");
 
     cleanup();
@@ -248,6 +314,7 @@ describe("Handyansicht", () => {
   it("makes the decision buttons and finding rows big enough for a thumb (≥ 44 px)", () => {
     expect(rem(rule(".inbox-button").match(/min-height:\s*([\d.]+rem)/)![1])).toBeGreaterThanOrEqual(44);
     expect(rem(rule(".more-toggle").match(/min-height:\s*([\d.]+rem)/)![1])).toBeGreaterThanOrEqual(44);
+    expect(rem(rule(".inbox-close").match(/min-height:\s*([\d.]+rem)/)![1])).toBeGreaterThanOrEqual(44);
     expect(rem(rule(".inbox-finding summary").match(/min-height:\s*([\d.]+rem)/)![1])).toBeGreaterThanOrEqual(44);
   });
 
@@ -257,18 +324,25 @@ describe("Handyansicht", () => {
     expect(rule(".two-column")).toContain("minmax(min(22rem, 100%), 1fr)");
     expect(rule(".three-column")).toContain("minmax(min(18rem, 100%), 1fr)");
     expect(rule(".inbox-reason,\n.inbox-expired-note")).toContain("overflow-wrap: anywhere");
+    // Der Dialog füllt auf dem Handy den Bildschirm und scrollt selbst; erst
+    // ab 40rem wird er ein Fenster in der Mitte.
+    expect(rule(".inbox-overlay")).toMatch(/position:\s*fixed;[\s\S]*inset:\s*0;/);
+    expect(rule(".inbox-dialog")).toMatch(/width:\s*100%;/);
+    expect(rule(".inbox-dialog")).toMatch(/overflow-y:\s*auto;/);
+    expect(css).toMatch(/@media \(min-width: 40rem\) \{[\s\S]*\.inbox-dialog \{[^}]*width:\s*min\(48rem, 100%\);/);
     const viewport = readFileSync(path.join(__dirname, "..", "index.html"), "utf8");
     expect(viewport).toContain('name="viewport" content="width=device-width, initial-scale=1.0"');
   });
 
-  it("renders every card control on a 360 px wide window", async () => {
+  it("renders every control of the details on a 360 px wide window", async () => {
     window.innerWidth = 360;
     window.dispatchEvent(new Event("resize"));
     serve([hermesCard()]);
     render(<Inbox />);
-    const card = (await screen.findByText("Selbstupdate auf PR #25 einspielen.")).closest("article") as HTMLElement;
-    const order = Array.from(card.querySelectorAll("h3, .inbox-reason, details, textarea, button")).map((element) => element.tagName + (element.className ? `.${element.className.split(" ")[0]}` : ""));
-    // Absicht, Grund, Befunde, dann Grund-Feld und Knöpfe — in Lesereihenfolge.
+    const user = userEvent.setup();
+    const dialog = await openDetails(user);
+    const order = Array.from(dialog.querySelectorAll("h3, .inbox-reason, details, textarea, .inbox-button")).map((element) => element.tagName + (element.className ? `.${element.className.split(" ")[0]}` : ""));
+    // Im Dialog: Absicht, Grund, Befunde, dann Grund-Feld und Knöpfe — in Lesereihenfolge.
     expect(order).toEqual(["H3.inbox-title", "P.inbox-reason", "DETAILS", "TEXTAREA", "BUTTON.inbox-button", "BUTTON.inbox-button"]);
   });
 });
