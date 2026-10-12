@@ -259,7 +259,7 @@ export default function App() {
   const [credentials, setCredentials] = useState({ username: "admin", password: "change-me-now" });
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  // Alles außer "Wartet auf dich" liegt eingeklappt hinter "Mehr".
+  // Alles außer "Wartet auf dich" liegt hinter "Mehr" in der Kopfzeile.
   const [moreOpen, setMoreOpen] = useState(false);
   // Jede Aktualisierung des Dashboards lädt auch "Wartet auf dich" neu.
   const [inboxKey, setInboxKey] = useState(0);
@@ -589,22 +589,24 @@ export default function App() {
             Signed in as <strong>{user.username}</strong> ({user.role})
           </p>
         </div>
-        <button onClick={handleLogout} disabled={busy}>
-          Sign out
-        </button>
+        {/* "Mehr" sitzt in der Kopfzeile: unter den Aufgaben steht sonst nichts. */}
+        <div className="topbar-actions">
+          <button
+            className="more-toggle"
+            aria-expanded={moreOpen}
+            aria-controls="more-content"
+            onClick={() => setMoreOpen((open) => !open)}
+          >
+            {moreOpen ? "Mehr ▴" : "Mehr ▾"}
+          </button>
+          <button onClick={handleLogout} disabled={busy}>
+            Sign out
+          </button>
+        </div>
       </header>
 
-      {/* Die Startseite: was Jochen entscheiden muss (doc/setup/wartet-auf-dich.md). */}
+      {/* Die Startseite: nur Jochens Aufgaben, Details im Dialog (doc/setup/wartet-auf-dich.md). */}
       <Inbox refreshKey={inboxKey} onDecided={refreshDashboard} />
-
-      <button
-        className="more-toggle"
-        aria-expanded={moreOpen}
-        aria-controls="more-content"
-        onClick={() => setMoreOpen((open) => !open)}
-      >
-        {moreOpen ? "Mehr ▴" : "Mehr ▾"}
-      </button>
 
       {error ? <p className="error">{error}</p> : null}
 
