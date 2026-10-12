@@ -310,3 +310,62 @@ describe("decisions need a reason", () => {
     expect(rejected.json().job.status).toBe("rejected");
   });
 });
+
+// Fall Job d86b653c (12.10.2026): Die Karte zeigte noch Stunden Restzeit, und
+// "abgelaufen" darf dann nie die Antwort sein. Karte und Freigabe-Route lesen
+// dieselbe Frist (envelope.expiresAt); eine Freigabe kurz davor geht durch,
+// und eine Ablehnung aus anderem Grund heißt nicht "expired".
+describe("approval against the deadline the card shows", () => {
+  async function signed(issuedMinutesAgo: number) {
+    const fixture = await setup();
+    const db = fixture.inspect();
+    const current = db.getJob(fixture.stale.id)!;
+    const intent = hostRunOutput.explanation.intent;
+    const output = { ...current.output!, plan: "plan", policy: hostRunOutput.policy, capabilities: ["host.run"] };
+    const envelope = createExecutionEnvelope({
+      jobId: fixture.stale.id, actorId: db.getJobOwnerId(fixture.stale.id)!, sessionId: current.sessionId!, intent, evidence: [], plan: "plan",
+      safety: output.safety, policy: output.policy, capabilities: ["host.run"], ttlMinutes: 30, signingSecret: "test-envelope-secret",
+      now: new Date(Date.now() - issuedMinutesAgo * 60_000),
+    });
+    db.updateJob(fixture.stale.id, { status: "blocked_user_approval", output: { ...output, envelope }, completedAt: null });
+    db.close();
+    return { ...fixture, jobId: fixture.stale.id, envelope };
+  }
+
+  it("shows the envelope's own deadline and accepts an approval seconds before it", async () => {
+    // Ausgestellt vor 29 min 50 s bei 30 min Frist: noch 10 s Zeit.
+    const { app, admin, jobId, envelope, inspect } = await signed(29 + 50 / 60);
+    const inbox = (await app.inject({ method: "GET", url: "/api/inbox", headers: admin })).json();
+    const card = inbox.cards.find((item: { jobId: string }) => item.jobId === jobId);
+    expect(card).toMatchObject({ expiresAt: envelope.expiresAt, expired: false });
+    const response = await app.inject({ method: "POST", url: `/api/hermes/jobs/${jobId}/approval`, headers: admin, payload: { decision: "approved", reason: "kurz vor knapp" } });
+    expect(response.json().message).not.toMatch(/expired|validation failed/);
+    expect(response.json().job?.status).not.toBe("blocked_policy");
+    const db = inspect();
+    expect(db.hasAudit("hermes.change.approval_invalid", jobId)).toBe(false);
+    expect(db.hasAudit("hermes.change.approved", jobId)).toBe(true);
+    db.close();
+  });
+
+  it("calls a refusal 'expired' only when the shown deadline has passed", async () => {
+    const late = await signed(31);
+    const lateCard = (await late.app.inject({ method: "GET", url: "/api/inbox", headers: late.admin })).json()
+      .cards.find((item: { jobId: string }) => item.jobId === late.jobId);
+    expect(lateCard).toMatchObject({ expiresAt: late.envelope.expiresAt, expired: true });
+    const expired = await late.app.inject({ method: "POST", url: `/api/hermes/jobs/${late.jobId}/approval`, headers: late.admin, payload: { decision: "approved", reason: "zu spät" } });
+    expect(expired.statusCode).toBe(409);
+    expect(expired.json()).toMatchObject({ message: "execution envelope expired", envelopeErrors: ["execution envelope expired"] });
+
+    // Gültige Frist, aber der Plan hat sich nach der Prüfung geändert: Ablehnung, kein Ablauf.
+    const drift = await signed(1);
+    const db = drift.inspect();
+    const current = db.getJob(drift.jobId)!;
+    db.updateJob(drift.jobId, { status: "blocked_user_approval", output: { ...current.output, plan: "plan, nachträglich geändert" }, completedAt: null });
+    db.close();
+    const refused = await drift.app.inject({ method: "POST", url: `/api/hermes/jobs/${drift.jobId}/approval`, headers: drift.admin, payload: { decision: "approved", reason: "passt" } });
+    expect(refused.statusCode).toBe(409);
+    expect(refused.json().message).toBe("execution envelope validation failed");
+    expect(refused.json().message).not.toMatch(/expired/);
+    expect(refused.json().envelopeErrors).toEqual(["reviewed plan drift"]);
+  });
+});

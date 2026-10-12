@@ -63,6 +63,12 @@ die Freigabe-Route den Job wie bisher mit „execution envelope expired". Die Ka
 stehen und bietet „Neu bestellen lassen"; die Route nimmt auch einen so geschlossenen Job an
 (einmal).
 
+Karte und Freigabe-Route lesen dieselbe Frist: `envelope.expiresAt`. „Abgelaufen" heißt nur ein
+echter Ablauf: Die 409-Antwort trägt dann die Meldung „execution envelope expired", und nur darauf
+schaltet die Karte auf „Abgelaufen". Jede andere Ablehnung (Signatur, Drift von Plan, Prüfung oder
+Policy) kommt als „execution envelope validation failed" mit `envelopeErrors`; die Karte zeigt
+diesen Grund und behält ihren Countdown — vorher stand dort auch bei Drift „Frist abgelaufen".
+
 ## Abgelaufene Frist: James reaktiviert (Frist neu, keine Freigabe)
 
 Verpasst Jochen nur das Zeitfenster, muss der Plan nicht neu bestellt werden:
