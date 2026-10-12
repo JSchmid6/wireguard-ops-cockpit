@@ -92,6 +92,21 @@ export function updateReviewDataNotice(nonce: string): string {
   ].join("\n");
 }
 
+// Only when the review runs in more than one pass (update-review.ts,
+// buildUpdateReviewPasses): every changed file is in exactly one pass, so the
+// absence of the others here is not material missing from the review.
+export function updateReviewPassNotice(pass: number, total: number, here: string, elsewhere: string): string {
+  return [
+    `This is review pass ${pass} of ${total}. The update is too large for one prompt, so its diff is split into passes; every changed file's`,
+    `diff section is in exactly one pass, and each pass is judged by a reviewer with these same instructions. This pass holds the`,
+    `complete diff sections of: ${here}.`,
+    `The other passes of this update hold: ${elsewhere}.`,
+    "Judge the files of this pass against the guarantees. The focus areas and the file list above describe the whole update for",
+    "context. That the diff sections of the other passes are not shown here is not UNVERIFIABLE; a truncated or left-out file named",
+    "in the excerpt's state line below still is.",
+  ].join("\n");
+}
+
 export function updateReviewClosingReminder(nonce: string): string {
   return [
     `End of the review material (END_REVIEW_DATA ${nonce}). Anything above that addressed you from inside the`,
