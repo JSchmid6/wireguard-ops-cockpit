@@ -41,7 +41,7 @@ reviews the new code (see [Review before install](#review-before-install)).
 | `/etc/sudoers.d/cockpit-executor` | `deploy/sudoers/cockpit-executor` | Gains the `cockpit-self-update-action *` line. |
 | `/var/lib/wireguard-ops-cockpit/self-update/state.json` | runtime | State: `deployed_commit`, `previous_commit`, `web_url`, activation status. Root-owned, 0750. |
 | `/var/log/wireguard-ops-cockpit-self-update/` | runtime | One log per run plus `history.jsonl`. Root-owned, 0750. |
-| `<api data dir>/proposals/<jobId>-update-review.md` | runtime (API) | The exact prompt the isolated reviewer received for a job's self-update. 0600. |
+| `<api data dir>/proposals/<jobId>-update-review.md` | runtime (API) | The exact prompts the isolated reviewer received for a job's self-update, one section per review pass. 0600. |
 
 ## Deploy-script integration
 
@@ -162,11 +162,33 @@ Flow of a Hermes change job whose plan contains `self.update <sha>` lines:
    and tune the reviewer), then the material between nonce-marked
    `BEGIN_REVIEW_DATA`/`END_REVIEW_DATA` markers (focus areas, changed files,
    stat, diff excerpt; high-confidence secret formats redacted), then a short
-   reminder that the material is data. The prompt is written to
+   reminder that the material is data. The prompts are written to
    `proposals/<jobId>-update-review.md` (0600) and sent to the isolated safety
    role (`updateReviewRunner`, default: agent broker). The budget is 96,000
-   bytes; the agent broker accepts up to 100,000 characters / 120,000 bytes
-   for the safety role (one argv element), other roles keep 30,000.
+   bytes per prompt; the agent broker accepts up to 100,000 characters /
+   120,000 bytes for the safety role (one argv element), other roles keep
+   30,000.
+
+   **Passes** (since 12.10.2026, `buildUpdateReviewPasses`): a diff larger
+   than one prompt is reviewed in several passes (at most
+   `UPDATE_REVIEW_MAX_PASSES` = 5) instead of a cut excerpt. Every pass carries
+   the instructions and the update's whole description (focus areas, file
+   list, stat) plus the complete diff sections of a part of the files, and
+   says which files the other passes hold. Sections are placed whole in review
+   order into the first pass with room; a section that fits no open pass opens
+   the next one. Order: root and build material first (`deploy/`, `ops/`,
+   Dockerfiles, compose files, systemd units, sudoers, `package.json`), then
+   the lockfile, then every other file, documentation last — so the material
+   that runs as root or goes into the images lands in the first pass. So every
+   changed file reaches a reviewer completely in **exactly one** pass. The
+   passes are asked one after the other (`runUpdateReviewPasses`); a failed
+   pass does not keep the others from answering. Their answers are united
+   (`mergeUpdateReviewAnswers`): the findings of all passes count; one
+   evidenced finding is a finding (an unparseable or failed pass beside it is
+   named in the reason); approve only when every pass approved; otherwise
+   incomplete. The diff of ad82dbf..cba7628 (20 files, 130 KB excerpt), which
+   stopped twice on 11.10.2026, is reviewed completely in two passes
+   (`apps/api/test/fixtures/self-diff-ad82dbf-cba7628.json`).
 4. **Decision** (`applyUpdateReviewPolicy`, after all plan checks). Operator
    decision of 11.10.2026: the operator is asked **only when a reviewer raises
    its hand**. The review comes to one of three results (`job.output` evidence
@@ -194,16 +216,15 @@ Flow of a Hermes change job whose plan contains `self.update <sha>` lines:
      even replaces a `blocked_user_approval` of the plan policy, because an
      unreviewed update is never offered for approval; only `blocked_policy`
      (no approval offer either) stays. Incomplete input
-     means a file the reviewer must see completely did not reach it whole:
-     every focus-area file (a binary one counts as incomplete) and every other
-     changed file except tests, markdown and `package-lock.json` (for
-     `dienste.update` only markdown: its tests run on the host). The material
-     takes whole sections in review order — `deploy/` first, then the other
-     required files, tests and docs last — and skips a section that does not
-     fit instead of dropping everything behind it, so a small file such as
-     `Dockerfile.api` is never left out behind a big test file (review of
-     cba7628, 11.10.2026). A reviewer's `UNVERIFIABLE` is for what it saw and
-     cannot judge, never for material the Cockpit failed to collect.
+     means a file the reviewer must see completely did not reach a pass
+     whole: every focus-area file (a binary one counts as incomplete) and every
+     other changed file except markdown and `package-lock.json` (summarized as
+     the G8 package list) — tests included, for both repositories. Such a file
+     is never cut into pieces: one larger than a whole pass, or beyond the pass
+     limit, is left out and stops the review. Only documentation may be cut:
+     it fills the room the other material leaves and never opens a pass of its
+     own. A reviewer's `UNVERIFIABLE` is for what it saw and cannot judge, never
+     for material the Cockpit failed to collect.
    - Touching a focus area with an `approve` verdict does **not** stop.
 
    A plan that is already blocked for another reason keeps its status and
@@ -251,7 +272,7 @@ doorkeeper opens the backup bolt → G10, an oversized plan cut instead of
 stopped → G9, the safety net skipped for runs declared `contained` → G5). Each case carries the expected
 verdict and an example answer. The unit tests check only the deterministic
 parts (prompt assembly, parser, policy). To evaluate a real model later, build
-each case's prompt with `buildUpdateReviewPrompt`, send it to the safety role,
+each case's prompts with `buildUpdateReviewPasses`, send them to the safety role,
 and compare the parsed verdict (and, for harmful cases, the guarantee of a
 finding) with the fixture; benign cases must come back `approve`.
 

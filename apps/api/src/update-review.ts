@@ -13,6 +13,7 @@ import {
   UPDATE_REVIEW_INSTRUCTIONS,
   updateReviewClosingReminder,
   updateReviewDataNotice,
+  updateReviewPassNotice,
 } from "./update-review-prompt.js";
 
 // Pre-install review of a Cockpit self-update.
@@ -28,8 +29,8 @@ import {
 // is not UNVERIFIABLE). Everything else that keeps the review from a judgement
 // on complete material stops the job without an approval offer
 // (blocked_prerequisite, for the agent): the review input is unavailable or
-// incomplete (a focus-area file or any changed file that is not a test or
-// documentation did not reach the reviewer completely), the reviewer failed,
+// incomplete (a focus-area file or any changed file that is not documentation
+// did not reach a review pass completely), the reviewer failed,
 // its answer does not parse, or it flagged only UNVERIFIABLE points. Touching a
 // focus area is never a stop by itself. See applyUpdateReviewPolicy.
 //
@@ -39,7 +40,7 @@ import {
 // supervisor's own guarantees (D1-D8), and its bindings carry their own
 // evidence source, so a review of one repository never unlocks the other.
 
-// Bytes of the whole reviewer prompt. Stays below the agent broker's
+// Bytes of one reviewer prompt (one review pass). Stays below the agent broker's
 // safety-role bounds (100,000 characters, 120,000 bytes: one argv element).
 export const UPDATE_REVIEW_PROMPT_LIMIT = 96_000;
 const FILE_LIST_BUDGET = 8_000;
@@ -58,30 +59,27 @@ export interface UpdateKindSpec {
   subject: string;
   // Changed files that never run, build or install anything on the host. They
   // come last in the material and may be cut for the budget; every other
-  // changed file must reach the reviewer completely, or the review stops.
+  // changed file must reach the reviewer completely in one pass, or the review
+  // stops.
   supplementary: (path: string) => boolean;
 }
 
 // Documentation and agent instructions (markdown) and the npm lockfile, whose
 // package changes the runner summarizes as the G8 package list. Markdown under
 // bin/ is not documentation: the runbook plans there (bin/gen-*.md) are read
-// at runtime (safety-review.ts).
+// at runtime (safety-review.ts). Tests are not supplementary since the review
+// runs in passes (12.10.2026): only documentation may be cut.
 const DOCS_AND_LOCKFILES = /^(?!bin\/)(?:.*\.(?:md|markdown)$|(?:.*\/)?package-lock\.json$)/i;
-// The runner's test path rule (cockpit-self-update-run: TEST_PATH_RE).
-const TEST_FILES = /(?:^|\/)tests?\/|\.(?:test|spec)\.[A-Za-z0-9]+$/;
 
 export const UPDATE_KINDS: Record<UpdateKind, UpdateKindSpec> = {
   self: {
     diffAction: "self.diff", updateAction: "self.update", evidencePrefix: "self-update-review",
     instructions: UPDATE_REVIEW_INSTRUCTIONS, subject: "the new Cockpit code",
-    // The Cockpit's tests run in CI, never on the host (the deploy script only builds).
-    supplementary: (path) => DOCS_AND_LOCKFILES.test(path) || TEST_FILES.test(path),
+    supplementary: (path) => DOCS_AND_LOCKFILES.test(path),
   },
   dienste: {
     diffAction: "dienste.diff", updateAction: "dienste.update", evidencePrefix: "dienste-update-review",
     instructions: DIENSTE_REVIEW_INSTRUCTIONS, subject: "the new server-dienste stand (root supervisor)",
-    // bin/uebernehmen runs the new stand's tests on the host before activation
-    // (D6, D8): they are material the reviewer must see.
     supplementary: (path) => DOCS_AND_LOCKFILES.test(path),
   },
 };
@@ -154,6 +152,8 @@ export interface UpdateReviewCoverage {
   // Files cut or left out of the prompt (focus or not), for the record.
   cut: string[];
   omitted: string[];
+  // The files of each review pass of this update, in pass order.
+  passes?: string[][];
 }
 
 export interface UpdateReviewFinding {
@@ -290,24 +290,25 @@ export function focusFiles(diff: UpdateDiff): Set<string> {
   return new Set(diff.focusAreas.flatMap((area) => area.files));
 }
 
-// Material that runs as root on the host: the deploy tree holds the installer,
-// the root helpers, the systemd units and the sudoers sources. It comes first in
-// the excerpt. The runner orders its sections by file class, which puts a file
-// it classes as `other` behind tests and docs — that is how
-// deploy/vps/vps-cockpit-deploy.sh fell out of the material of the 28.09.2026
-// rollout review although it installs everything as root, and Dockerfile.api out
-// of the 11.10.2026 review of cba7628.
-const DEPLOY_MATERIAL = /^deploy\//;
+// Material that runs as root on the host or goes into the service images: the
+// deploy tree (installer, root helpers, systemd units, sudoers sources), the
+// helper copies under ops/, Dockerfiles, compose files, systemd units anywhere
+// and the npm manifests. It comes first, so it lands complete in the first
+// review pass. The runner orders its sections by file class, which put
+// deploy/vps/vps-cockpit-deploy.sh behind tests and docs in the rollout review
+// of 28.09.2026, and Dockerfile.api in the review of cba7628 (11.10.2026).
+const SECURITY_MATERIAL = /^(?:deploy|ops)\/|(?:^|\/)(?:Dockerfile[^/]*|(?:docker-)?compose[^/]*\.ya?ml|package\.json)$|\.(?:service|timer|socket|path)$|(?:^|\/)sudoers(?:\.d)?\//;
+// The npm lockfile: summarized by the runner as the G8 package list, shown
+// whole when it fits a pass.
+const LOCKFILE = /(?:^|\/)package-lock\.json$/;
 
-// The diff sections in review order: deploy material first, then every other
-// file the review must see, supplementary files (tests, docs) last; stable
-// inside each group, so a focus area still precedes the rest.
+// The diff sections in review order: root and build material first, then the
+// lockfile, then every other file the review must see, supplementary files
+// (documentation) last; stable inside each group, so a focus area still
+// precedes the rest.
 export function materialOrder(sections: UpdateDiffSection[], supplementary: (path: string) => boolean = () => false): UpdateDiffSection[] {
-  return [
-    ...sections.filter((section) => DEPLOY_MATERIAL.test(section.path)),
-    ...sections.filter((section) => !DEPLOY_MATERIAL.test(section.path) && !supplementary(section.path)),
-    ...sections.filter((section) => !DEPLOY_MATERIAL.test(section.path) && supplementary(section.path)),
-  ];
+  const group = (path: string) => SECURITY_MATERIAL.test(path) ? 0 : LOCKFILE.test(path) ? 1 : supplementary(path) ? 3 : 2;
+  return [0, 1, 2, 3].flatMap((rank) => sections.filter((section) => group(section.path) === rank));
 }
 
 function bytes(text: string): number {
@@ -383,100 +384,158 @@ function describeUpdate(diff: UpdateDiff, index: number, total: number): string 
   return lines.join("\n");
 }
 
-// The complete reviewer prompt. The instruction block comes first, then the
-// material inside nonce-marked data markers, then a short reminder. Sections of
-// the diff are taken whole in review order while they fit the budget; a section
-// that does not fit is skipped, never the ones behind it, and the skipped ones
-// are shown truncated with what is left. Every changed file except the kind's
-// supplementary ones (and every focus-area file) must reach the reviewer
-// completely: what does not is incomplete coverage — a deterministic stop
-// before the reviewer's answer counts, never a gap the reviewer has to guess at.
-export function buildUpdateReviewPrompt(diffs: UpdateDiff[], options: { nonce?: string; limit?: number } = {}): { prompt: string; coverage: UpdateReviewCoverage[] } {
+// At most this many reviewer calls per job. The runner caps its excerpt at
+// 200 KB, which fills about three passes.
+export const UPDATE_REVIEW_MAX_PASSES = 5;
+// Per pass: the pass notice and the state line (two name lists each), the
+// headings and the fence lines.
+const PASS_FRAME = 1200 + 4 * NAME_LIST_BUDGET;
+
+interface ReviewPass {
+  update: number;
+  paths: string[];
+  texts: string[];
+  used: number;
+  fenceLength: number;
+}
+
+// The reviewer prompts of one review: one or more passes, each inside the
+// budget. Every pass carries the instruction block, the update's description
+// (focus areas, file list, stat) and complete diff sections of a part of its
+// files, inside nonce-marked data markers. Sections are placed whole in review
+// order (root and build material first) into the first pass with room; a
+// section that fits no open pass opens the next one. So every changed file
+// reaches the reviewer completely in exactly one pass, and the answers of all
+// passes are united (mergeUpdateReviewAnswers).
+//
+// Only the kind's supplementary files (documentation) may be cut: they fill the
+// room the other material leaves and never open a pass of their own. Every
+// other file (and every focus-area file) that does not reach a pass completely
+// — larger than a whole pass, beyond the pass limit, cut or left out by the
+// runner, or not listed at all — is incomplete coverage: a deterministic stop
+// before any reviewer's answer counts, never a gap the reviewer has to guess at.
+export function buildUpdateReviewPasses(diffs: UpdateDiff[], options: { nonce?: string; limit?: number; maxPasses?: number } = {}): { prompts: string[]; coverage: UpdateReviewCoverage[] } {
   const nonce = options.nonce || randomBytes(8).toString("hex");
   const limit = options.limit ?? UPDATE_REVIEW_PROMPT_LIMIT;
+  const maxPasses = options.maxPasses ?? UPDATE_REVIEW_MAX_PASSES;
   // One reviewer, one set of guarantees: a prompt never mixes repositories.
   const kinds = new Set(diffs.map((diff) => kindOf(diff.kind)));
   if (kinds.size > 1) throw new Error("one review covers one repository; the plan mixes self.update and dienste.update");
   const spec = UPDATE_KINDS[kindOf(diffs[0]?.kind)];
   const head = [spec.instructions, "", updateReviewDataNotice(nonce), "", `BEGIN_REVIEW_DATA ${nonce}`].join("\n");
   const tail = [`END_REVIEW_DATA ${nonce}`, "", updateReviewClosingReminder(nonce)].join("\n");
-  // Per update: the block frame and the two name lists of the state line, and
-  // at most its share of the rest for its description (a mass change of focus files
-  // or packages is clipped there, and the clip is incomplete coverage).
-  const frame = 400 + 2 * NAME_LIST_BUDGET;
   const room = limit - bytes(head) - bytes(tail);
-  const descriptionLimit = Math.max(0, Math.floor(room / Math.max(1, diffs.length)) - frame);
-  const full = diffs.map((diff, index) => describeUpdate(diff, index, diffs.length));
-  const descriptions = full.map((text) => clipBytes(text, descriptionLimit, "[... update description clipped for the review budget ...]"));
-  let remaining = room - descriptions.reduce((sum, text) => sum + bytes(text) + frame, 0);
+  const passes: ReviewPass[] = [];
   const coverage: UpdateReviewCoverage[] = [];
-  const blocks: string[] = [];
+  const descriptions: string[] = [];
   diffs.forEach((diff, index) => {
+    // The description goes into every pass of its update and takes at most
+    // half of a pass's room; a mass change of focus files or packages is clipped there,
+    // and the clip is incomplete coverage.
+    const full = describeUpdate(diff, index, diffs.length);
+    const description = clipBytes(full, Math.max(0, Math.floor((room - PASS_FRAME) / 2)), "[... update description clipped for the review budget ...]");
+    descriptions.push(description);
+    const capacity = room - bytes(description) - PASS_FRAME;
     const focus = focusFiles(diff);
     const supplementary = (path: string) => !focus.has(path) && spec.supplementary(path);
-    const included: string[] = [];
-    const cut: string[] = [];
-    const omitted: string[] = [...diff.omittedFiles];
+    const own: ReviewPass[] = [];
     const complete = new Set<string>();
     const shown = new Set<string>();
-    const skipped: { path: string; text: string }[] = [];
-    // The excerpt's fence (twice in the block) outgrows any backtick run in it.
-    let fenceLength = 3;
-    const fenceCost = (text: string) => 2 * Math.max(0, backtickRun(text) + 1 - fenceLength);
+    const cut: string[] = [];
+    const omitted: string[] = [...diff.omittedFiles];
+    const skipped: UpdateDiffSection[] = [];
+    // A pass's fence (twice in the block) outgrows any backtick run in it.
+    const fenceCost = (fenceLength: number, text: string) => 2 * Math.max(0, backtickRun(text) + 1 - fenceLength);
+    const fits = (pass: ReviewPass, text: string) => pass.used + bytes(text) + fenceCost(pass.fenceLength, text) <= capacity;
+    const open = (): ReviewPass | null => {
+      if (passes.length + own.length >= maxPasses) return null;
+      const pass: ReviewPass = { update: index, paths: [], texts: [], used: 0, fenceLength: 3 };
+      own.push(pass);
+      return pass;
+    };
+    const place = (pass: ReviewPass, path: string, text: string) => {
+      pass.used += bytes(text) + fenceCost(pass.fenceLength, text);
+      pass.fenceLength = Math.max(pass.fenceLength, backtickRun(text) + 1);
+      pass.texts.push(text);
+      pass.paths.push(path);
+      shown.add(path);
+    };
     for (const section of materialOrder(diff.excerpt, supplementary)) {
       const text = redactSecrets(section.text.endsWith("\n") ? section.text : `${section.text}\n`);
-      const size = bytes(text) + fenceCost(text);
-      if (size > remaining) {
-        skipped.push({ path: section.path, text });
+      const optional = supplementary(section.path);
+      const alone = bytes(text) + fenceCost(3, text) <= capacity;
+      // Documentation never opens a pass of its own (the lockfile may).
+      const mayOpen = alone && (!optional || LOCKFILE.test(section.path) || own.length === 0);
+      const pass = own.find((item) => fits(item, text)) ?? (mayOpen ? open() : null);
+      if (pass) {
+        place(pass, section.path, text);
+        if (diff.partialFiles.includes(section.path)) continue;
+        // git shows a binary file only by name: complete for an ordinary file,
+        // never for a focus-area file.
+        if (!focus.has(section.path) || !/^Binary files /m.test(text)) complete.add(section.path);
         continue;
       }
-      included.push(text);
-      remaining -= size;
-      fenceLength = Math.max(fenceLength, backtickRun(text) + 1);
-      shown.add(section.path);
-      if (diff.partialFiles.includes(section.path)) continue;
-      // git shows a binary file only by name: complete for an ordinary file,
-      // never for a focus-area file.
-      if (!focus.has(section.path) || !/^Binary files /m.test(text)) complete.add(section.path);
+      if (!optional) {
+        // Never cut into pieces the reviewer would have to guess at: left out,
+        // and that stops the review.
+        omitted.push(section.path);
+        continue;
+      }
+      skipped.push({ path: section.path, text });
     }
+    // Documentation that fits nowhere whole: after everything else, cut into
+    // the pass with the most room.
     for (const { path, text } of skipped) {
       const note = `\n[... ${path} truncated for the review budget ...]\n`;
-      // The cut part's backtick runs are at most the whole section's.
-      const usable = remaining - bytes(note) - fenceCost(text);
-      if (usable > 1024) {
+      const target = own.reduce<ReviewPass | null>((best, item) => !best || item.used < best.used ? item : best, null) ?? open();
+      const usable = target ? capacity - target.used - bytes(note) - fenceCost(target.fenceLength, text) : 0;
+      if (target && usable > 1024) {
         const kept = Buffer.from(text, "utf8").subarray(0, usable - 200).toString("utf8").replace(/\uFFFD+$/, "");
-        const partial = `${kept.slice(0, Math.max(0, kept.lastIndexOf("\n")))}${note}`;
-        included.push(partial);
-        remaining -= bytes(partial) + fenceCost(partial);
-        fenceLength = Math.max(fenceLength, backtickRun(partial) + 1);
+        place(target, path, `${kept.slice(0, Math.max(0, kept.lastIndexOf("\n")))}${note}`);
         cut.push(path);
       } else {
         omitted.push(path);
       }
     }
+    // An update without excerpt sections still gets its description reviewed.
+    if (own.length === 0) open();
+    passes.push(...own);
     // Files the review must see completely: every focus-area file and every
     // changed file that is not supplementary — whether the runner sent a
     // section, cut it, left it out or did not list the file at all.
     const required = [...new Set([...focus, ...diff.files.map((file) => file.path).filter((path) => !supplementary(path))])];
+    // git can show one path in two sections (a type change: symlink to file);
+    // a path is complete only when none of its sections was cut or left out.
+    const lost = new Set([...omitted, ...cut, ...diff.partialFiles]);
+    for (const path of lost) complete.delete(path);
     const incomplete = required.filter((file) => !complete.has(file)).sort();
     const unlisted = Math.max(0, diff.filesTotal - diff.files.length);
     if (unlisted > 0) incomplete.push(`(${unlisted} changed file(s) the runner did not list)`);
-    if (descriptions[index] !== full[index]) incomplete.push("(the update description: focus areas or file list clipped)");
-    // cut: partially in the prompt (by the runner or here); omitted: not at all.
+    if (own.length === 0) incomplete.push(`(no review pass left for this update: at most ${maxPasses} passes)`);
+    if (description !== full) incomplete.push("(the update description: focus areas or file list clipped)");
+    // cut: partially in a pass (by the runner or here); omitted: not at all.
     const cutFiles = [...new Set([...diff.partialFiles.filter((file) => shown.has(file)), ...cut])];
     const missing = required.filter((path) => !complete.has(path) && !cutFiles.includes(path));
     const omittedFiles = [...new Set([...omitted, ...missing])];
-    coverage.push({ sha: diff.sha, incomplete, cut: cutFiles, omitted: omittedFiles });
-    const excerpt = included.join("");
-    // Required files are named first; the full lists stay in the coverage.
-    const named = [...missing, ...omittedFiles.filter((path) => !missing.includes(path))];
-    const state = cutFiles.length || omittedFiles.length
-      ? `The excerpt is INCOMPLETE. Cut: ${nameList(cutFiles)}. Left out: ${nameList(named)}.`
-      : "The excerpt is complete (every changed file's diff section is included; lockfiles are summarized above).";
-    const marker = fence(excerpt);
-    blocks.push([descriptions[index], "", "## Diff excerpt", state, `${marker}diff`, excerpt.trimEnd(), marker].join("\n"));
+    coverage.push({ sha: diff.sha, incomplete, cut: cutFiles, omitted: omittedFiles, passes: own.map((pass) => pass.paths) });
   });
-  return { prompt: [head, blocks.join("\n\n"), tail].join("\n"), coverage };
+  const prompts = passes.map((pass, number) => {
+    const item = coverage[pass.update];
+    // Required files are named first; the full lists stay in the coverage.
+    const named = [...item.omitted.filter((path) => item.incomplete.includes(path)), ...item.omitted.filter((path) => !item.incomplete.includes(path))];
+    const state = item.cut.length || item.omitted.length
+      ? `The excerpt is INCOMPLETE. Cut: ${nameList(item.cut)}. Left out: ${nameList(named)}.`
+      : "The excerpt is complete (every changed file's diff section is included; lockfiles are summarized above).";
+    const elsewhere = passes.filter((other) => other.update === pass.update && other !== pass).flatMap((other) => other.paths);
+    const notice = passes.length > 1
+      ? ["", "## Review pass", updateReviewPassNotice(number + 1, passes.length, nameList(pass.paths), nameList(elsewhere))]
+      : [];
+    const excerpt = pass.texts.join("");
+    const marker = fence(excerpt);
+    const block = [descriptions[pass.update], ...notice, "", "## Diff excerpt", state, `${marker}diff`, excerpt.trimEnd(), marker].join("\n");
+    return [head, block, tail].join("\n");
+  });
+  return { prompts, coverage };
 }
 
 // Upper-case keys only (as the format demands), optionally bulleted or bold.
@@ -563,6 +622,47 @@ export function verifyQuotes(answer: UpdateReviewAnswer, prompt: string): Update
   return { ...answer, findings };
 }
 
+// The answers of all review passes as one: the union of their findings. One
+// flag makes the whole a flag (findings of every pass, also of an unparseable
+// one); an unparseable pass beside it is named as the problem (a gap for
+// updateReviewFindings). Without a flag, one unparseable pass makes the whole
+// unparseable; approve only when every answered pass approved. A pass whose
+// reviewer failed is null here (the caller records the failure as
+// reviewerError); null when no pass answered.
+export function mergeUpdateReviewAnswers(answers: Array<UpdateReviewAnswer | null>): UpdateReviewAnswer | null {
+  const answered = answers.flatMap((answer, index) => answer ? [{ answer, label: `pass ${index + 1}/${answers.length}` }] : []);
+  if (answered.length === 0) return null;
+  if (answers.length === 1) return answered[0].answer;
+  // Evidenced findings first, so the bound never drops one behind UNVERIFIABLE points.
+  const all = answered.flatMap(({ answer }) => answer.findings);
+  const findings = [...all.filter((finding) => !unverifiable(finding)), ...all.filter(unverifiable)].slice(0, 30);
+  const notes = clip(answered.flatMap(({ answer, label }) => answer.notes ? [`${label}: ${answer.notes}`] : []).join("\n"), 4000);
+  const problems = answered.flatMap(({ answer, label }) => answer.verdict !== "approve" && answer.problem ? [`${label}: ${answer.problem}`] : []);
+  if (answered.some(({ answer }) => answer.verdict === "flag")) return { verdict: "flag", findings, notes, problem: problems.join("; ") || null };
+  if (answered.some(({ answer }) => answer.verdict === "invalid")) return { verdict: "invalid", findings, notes, problem: problems.join("; ") };
+  return { verdict: "approve", findings: [], notes, problem: null };
+}
+
+// Asks the reviewer pass by pass, one after the other (the reviewer's host is
+// shared). A failed pass does not keep the others from answering, so a finding
+// still reaches the operator; the failure is the reviewerError (a gap). Each
+// quote is checked against the material of its own pass.
+export async function runUpdateReviewPasses(prompts: string[], runner: (prompt: string) => Promise<string>): Promise<Pick<UpdateReviewOutcome, "answer" | "reviewerError">> {
+  const answers: Array<UpdateReviewAnswer | null> = [];
+  const errors: string[] = [];
+  for (const [index, prompt] of prompts.entries()) {
+    try {
+      answers.push(verifyQuotes(parseUpdateReviewAnswer(redactSecrets(await runner(prompt))), prompt));
+    } catch (error) {
+      answers.push(null);
+      const message = error instanceof Error ? error.message : "reviewer failed";
+      errors.push(prompts.length === 1 ? message : `pass ${index + 1}/${prompts.length}: ${message}`);
+    }
+  }
+  const answer = mergeUpdateReviewAnswers(answers);
+  return { ...(answer ? { answer } : {}), ...(errors.length ? { reviewerError: errors.join("; ") } : {}) };
+}
+
 function describeFinding(finding: UpdateReviewFinding): string {
   return clip([
     `FINDING [${finding.guarantee || "?"}, ${finding.severity || "?"}]: ${finding.title || "(untitled)"}`,
@@ -638,6 +738,9 @@ export function updateReviewFindings(outcome: UpdateReviewOutcome): {
       needed.push("Clear why the reviewer could not judge the update (missing material is a fault of the collection, not a question for the operator), then submit it again.");
     }
     if (answer.problem) evidence.push(`reviewer answer: ${answer.problem}`);
+    // A finding of one pass goes to the operator; a pass beside it without a
+    // usable answer is named in the reason too.
+    if (answer.problem && real.length > 0) gaps.push(`part of the review gave no usable answer (${answer.problem.slice(0, 300)})`);
   }
   if (answer) evidence.push(`pre-install review verdict: ${answer.verdict}`);
   if (answer && answer.verdict !== "approve") evidence.push(...answer.findings.slice(0, 8).map(describeFinding));

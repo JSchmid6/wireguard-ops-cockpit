@@ -71,17 +71,16 @@ import {
 } from "./hermes-security.js";
 import {
   applyUpdateReviewPolicy,
-  buildUpdateReviewPrompt,
+  buildUpdateReviewPasses,
   normalizeUpdateBindings,
   parseUpdateDiff,
-  parseUpdateReviewAnswer,
   redactSecrets,
   reviewedDiffFor,
+  runUpdateReviewPasses,
   summarizeUpdateReview,
   updateBindings,
   updateReviewEvidence,
   updateTargets as reviewedUpdateTargets,
-  verifyQuotes,
   UPDATE_KINDS,
   type UpdateBinding,
   type UpdateDiff,
@@ -2104,9 +2103,11 @@ export async function createApp(options: AppOptions = {}) {
   }
 
   // Pre-install review of the commits a plan would install (see
-  // update-review.ts). The reviewer prompt is written next to the proposal
-  // (<jobId>-update-review.md, 0600): it is exactly what the isolated
-  // reviewer received.
+  // update-review.ts). The reviewer prompts are written next to the proposal
+  // (<jobId>-update-review.md, 0600, one section per pass): exactly what the
+  // isolated reviewer received. The passes run one after the other (the
+  // reviewer's host is shared); a failed pass does not keep the others from
+  // answering, so a finding still reaches the operator.
   async function reviewSelfUpdates(
     jobId: string, targets: UpdateTarget[], proposalDir: string,
   ): Promise<{ diffs: UpdateDiff[]; reviewPath: string | null; outcome: UpdateReviewOutcome }> {
@@ -2126,15 +2127,13 @@ export async function createApp(options: AppOptions = {}) {
     } catch (error) {
       return { diffs: [], reviewPath: null, outcome: { kind, bindings: [], coverage: [], unavailable: error instanceof Error ? error.message : `${UPDATE_KINDS[kind].diffAction} failed` } };
     }
-    const { prompt, coverage } = buildUpdateReviewPrompt(diffs);
+    const { prompts, coverage } = buildUpdateReviewPasses(diffs);
     const reviewPath = path.join(proposalDir, `${jobId}-update-review.md`);
-    await writeFile(reviewPath, prompt, { encoding: "utf-8", mode: 0o600 });
+    const record = prompts.length === 1 ? prompts[0]
+      : prompts.map((prompt, index) => `<!-- review pass ${index + 1}/${prompts.length} -->\n${prompt}`).join("\n\n");
+    await writeFile(reviewPath, record, { encoding: "utf-8", mode: 0o600 });
     const outcome: UpdateReviewOutcome = { kind, bindings: updateBindings(diffs), coverage };
-    try {
-      outcome.answer = verifyQuotes(parseUpdateReviewAnswer(redactSecrets(await updateReviewRunner(prompt))), prompt);
-    } catch (error) {
-      outcome.reviewerError = error instanceof Error ? error.message : "reviewer failed";
-    }
+    Object.assign(outcome, await runUpdateReviewPasses(prompts, updateReviewRunner));
     return { diffs, reviewPath, outcome };
   }
 

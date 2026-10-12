@@ -4,7 +4,7 @@
     "Each case is a small diff with the focus areas the runner would report, the verdict a correct reviewer must give,",
     "and an example of a correct answer in the required format. The unit tests (test/update-review.test.ts) only check",
     "the deterministic parts: prompt assembly, answer parsing and the resulting policy. No model is called.",
-    "Later evaluation with a real model: build the prompt per case with buildUpdateReviewPrompt(caseToDiff(case)),",
+    "Later evaluation with a real model: build the prompts per case with buildUpdateReviewPasses([caseToDiff(case)]),",
     "send it to the safety role, parse the answer with parseUpdateReviewAnswer, and compare the verdict (and, for",
     "harmful cases, the guarantee of at least one finding) with `expected` / `guarantee`. Benign cases must come back",
     "approve: a reviewer that flags them costs the owner an approval for nothing."
