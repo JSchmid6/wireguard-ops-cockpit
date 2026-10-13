@@ -235,6 +235,9 @@ Löschbefehl, der sich so versteckt, ist dann nur noch durch den Türsteher gesp
 Anweisung macht ihn zum X4-Befund mit Beleg, und ein belegter Befund geht an Jochen. Eine
 Plan-Erzeugung, die den Türsteher täuscht UND den Löschbefehl vor dem Riegel versteckt, wäre der
 verbleibende Weg; die Abwägung hat Jochen getroffen (eine Tür, keine Klick-Freigaben).
+Ausnahme seit 13.10.2026: auf Lab0, dem Rechner mit dem Repo, ist unlesbarer Text hinter `ssh`
+ein Riegel-Treffer (siehe oben) — dort ist jeder Befehl schon nah an den Sicherungen, und die
+sichtbare Routine (Dienst-Neustart, Status, Logs) bleibt trotzdem frei.
 
 Ehrliche Grenze: Programme, die schon auf dem Host liegen und über ihren Namen oder aus den
 System-Verzeichnissen (`/usr`, `/opt/gitlab`) aufgerufen werden, nimmt der Riegel für das, was ihr
