@@ -159,6 +159,37 @@ export function parseHostRunManifest(plan: string): HostRunManifest | null {
   };
 }
 
+// The operator's own manifest, when the trusted intent carries one (Vorfall
+// 10./13.10.2026, Jobs 611ad26d und 83434c34): the planner had to copy a
+// 6-12 kB manifest "byte for byte on one line" and broke its escapes, so the
+// run died at "not valid JSON". A manifest the operator wrote into the intent
+// is taken from the intent itself; the planner's copy only gets compared.
+// Only an explicit ```host-run fence counts, never untrusted evidence. Two
+// fences or a broken one stop the job — never fall back to the planner's copy.
+export function intentHostRunManifest(intent: string): HostRunManifest | null {
+  const fences = intent.match(/```(?:json\s+)?host-run\s*\n/gi) ?? [];
+  if (fences.length === 0) return null;
+  if (fences.length > 1) throw new Error("the intent carries more than one host-run manifest; one door per job");
+  const block = intent.match(HOST_RUN_FENCE)?.[1];
+  if (block === undefined) throw new Error("the intent's host-run manifest has no closing fence");
+  try {
+    return parseHostRunManifest("```host-run\n" + block + "```")!;
+  } catch (error) {
+    throw new Error(`the intent's host-run manifest is invalid: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+// How the planner's copy compares with the intent's manifest — evidence only.
+export function plannerHostRunCopy(plan: string, intentManifest: HostRunManifest): string {
+  try {
+    const copy = parseHostRunManifest(plan);
+    if (!copy) return "absent";
+    return hostRunManifestHash(copy) === hostRunManifestHash(intentManifest) ? "identical" : "differs";
+  } catch (error) {
+    return `invalid (${error instanceof Error ? error.message : String(error)})`;
+  }
+}
+
 export function hostRunManifestHash(manifest: HostRunManifest): string {
   return hashCanonical(manifest);
 }

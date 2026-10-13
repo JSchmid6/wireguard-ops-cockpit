@@ -96,7 +96,9 @@ import {
   hostRunPolicy,
   hostRunResultText,
   hostRunSafetyRecord,
+  intentHostRunManifest,
   parseHostRunManifest,
+  plannerHostRunCopy,
   parseHostRunReviewAnswer,
   parseHostRunStatus,
   stateStepKinds,
@@ -2968,6 +2970,9 @@ Follow these rules:
           }));
           return;
         }
+        // A host-run manifest in the trusted intent is the one that runs; a
+        // broken one stops here, before any planner time is spent.
+        const intentHostRun = intentHostRunManifest(intent);
         const planner = findAgent("planner-agent", "opencode");
         if (!planner) throw new Error("planner not available");
         updateHermesJob(job.id, "running", explanation({ phase: "planning", intent, reason: "Planner is producing a structured change plan." }));
@@ -2987,7 +2992,8 @@ Follow these rules:
         };
 
         const manifest = parseCapabilityManifest(planText);
-        const hostRun = parseHostRunManifest(planText);
+        const hostRun = intentHostRun ?? parseHostRunManifest(planText);
+        const intentHostRunNote = intentHostRun ? `host-run manifest taken from the trusted intent; planner copy: ${plannerHostRunCopy(planText, intentHostRun)}` : null;
         if (manifest && hostRun) throw new Error("the plan carries a capability manifest and a host-run manifest; one door per job");
         const updateTargets = manifest || hostRun ? [] : reviewedUpdateTargets(planText);
         let updateReview: Awaited<ReturnType<typeof reviewSelfUpdates>> | null = null;
@@ -3014,6 +3020,7 @@ Follow these rules:
         if (hostRun) {
           const hostRunReview = await reviewHostRun(job.id, hostRun, proposalDir);
           policy = hostRunPolicy(hostRun, hostRunReview);
+          if (intentHostRunNote) policy = { ...policy, evidence: [...policy.evidence, intentHostRunNote] };
           review = hostRunSafetyRecord(hostRun, hostRunReview, policy);
         } else {
           review = await safetyReviewRunner({

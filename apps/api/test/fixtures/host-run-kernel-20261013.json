@@ -1,0 +1,130 @@
+{
+ "version": "cockpit-host-run/v1",
+ "name": "kernel-update-neustart-20261013",
+ "purpose": "Geplantes naechtliches Wartungsfenster (Jochen, 12.10.2026, 03:30): die 5 offenen Kernel-Pakete (linux-generic linux-headers-generic linux-image-generic linux-libc-dev linux-tools-common) aus den eingetragenen Ubuntu-Quellen einspielen, initrd und GRUB-Standard pruefen, den VPS neu starten und danach die Dienste pruefen. Der bisherige Kernel bleibt installiert und im GRUB-Menue; Zustandsdateien nur unter /var/tmp/cockpit-kernel-20261013. Rueckweg ist der Snapshot der Tuer.",
+ "mutates": true,
+ "steps": [
+  {
+   "name": "vorher festhalten und Ruhe pruefen",
+   "run": "install -d -m 0700 /var/tmp/cockpit-kernel-20261013\nuname -r > /var/tmp/cockpit-kernel-20261013/kernel-vorher.txt\ndocker ps --format '{{.Names}}' | sort > /var/tmp/cockpit-kernel-20261013/container-vorher.txt\ncat /var/tmp/cockpit-kernel-20261013/kernel-vorher.txt; wc -l < /var/tmp/cockpit-kernel-20261013/container-vorher.txt\ntest -z \"$(dpkg --audit)\"\nif fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock >/dev/null 2>&1; then echo 'dpkg ist belegt'; exit 1; fi\nif systemctl is-active --quiet borgmatic.service; then echo 'borgmatic laeuft gerade'; exit 1; fi",
+   "timeoutSeconds": 300,
+   "uninterruptible": false
+  },
+  {
+   "name": "Kernel-Pakete einspielen (apt)",
+   "run": "export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l\napt-get update\napt-get install -y --only-upgrade -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold linux-generic linux-headers-generic linux-image-generic linux-libc-dev linux-tools-common\ntest -z \"$(dpkg --audit)\"",
+   "timeoutSeconds": 3600
+  },
+  {
+   "name": "neuen Kernel, initrd und GRUB-Standard pruefen",
+   "run": "v=$(ls /boot/vmlinuz-*-generic | sed 's#^/boot/vmlinuz-##' | sort -V | tail -1)\necho \"neuester Kernel: $v\"\necho \"$v\" > /var/tmp/cockpit-kernel-20261013/kernel-erwartet.txt\ndpkg-query -W -f='${Status}\\n' linux-image-$v | grep -c '^install ok installed$'\ntest -f /boot/vmlinuz-$v\ns=$(stat -c %s /boot/initrd.img-$v); echo \"initrd $s Bytes\"; test \"$s\" -gt 10485760\nlsinitramfs /boot/initrd.img-$v | grep -c \"lib/modules/$v/modules.dep\"\ngrep -q \"vmlinuz-$v \" /boot/grub/grub.cfg\ngrep -m1 -E '^[[:space:]]*linux[[:space:]].*vmlinuz-' /boot/grub/grub.cfg | grep -c \"vmlinuz-$v \"\ngrep -E '^GRUB_DEFAULT=' /etc/default/grub\ntest -z \"$(grub-editenv list | grep -E '^(next_entry|saved_entry)=' || true)\"\no=$(cat /var/tmp/cockpit-kernel-20261013/kernel-vorher.txt); test -f /boot/initrd.img-$o; test -f /boot/vmlinuz-$o; echo \"Rueckfall $o bleibt im Menue (Erweitert)\"",
+   "timeoutSeconds": 600,
+   "uninterruptible": false
+  },
+  {
+   "name": "reboot",
+   "reboot": true
+  },
+  {
+   "name": "nach dem Start: auf Container und Telegram warten",
+   "run": "for i in $(seq 1 90); do\n  b=$(date -u -d \"$(uptime -s)\" '+%Y-%m-%d %H:%M:%S')\n  fehlt=$(comm -23 /var/tmp/cockpit-kernel-20261013/container-vorher.txt <(docker ps --filter status=running --format '{{.Names}}' | sort) | wc -l)\n  tg=$(grep 'Connected to Telegram' /home/hermes/.hermes/logs/gateway.log | awk -v b=\"$b\" 'substr($0,1,19)>=b' | wc -l)\n  echo \"$(date -u +%T) fehlende Container: $fehlt, Telegram seit Start: $tg\"\n  if [ \"$fehlt\" = 0 ] && [ \"$tg\" -gt 0 ]; then break; fi\n  sleep 10\ndone\nuname -r",
+   "timeoutSeconds": 1200,
+   "uninterruptible": false
+  }
+ ],
+ "checks": [
+  {
+   "name": "sshd lauscht auf 50867",
+   "run": "ss -ltnH '( sport = :50867 )' | grep -c LISTEN",
+   "timeoutSeconds": 120
+  },
+  {
+   "name": "apache2 aktiv",
+   "run": "systemctl is-active --quiet apache2",
+   "timeoutSeconds": 120
+  },
+  {
+   "name": "php-fpm aktiv",
+   "run": "systemctl list-units --type=service --state=active --no-legend 'php*-fpm.service' | grep -c fpm",
+   "timeoutSeconds": 120
+  },
+  {
+   "name": "mariadb aktiv",
+   "run": "systemctl is-active --quiet mariadb",
+   "timeoutSeconds": 120
+  },
+  {
+   "name": "redis aktiv",
+   "run": "systemctl list-units --type=service --state=active --no-legend 'redis*.service' | grep -c redis",
+   "timeoutSeconds": 120
+  },
+  {
+   "name": "docker aktiv",
+   "run": "systemctl is-active --quiet docker",
+   "timeoutSeconds": 120
+  },
+  {
+   "name": "wg0 oben",
+   "run": "ip link show wg0 >/dev/null && wg show wg0 >/dev/null",
+   "timeoutSeconds": 120
+  },
+  {
+   "name": "Cockpit-Dienste aktiv",
+   "run": "systemctl is-active --quiet wireguard-ops-cockpit-api wireguard-ops-cockpit-agent wireguard-ops-cockpit-executor",
+   "timeoutSeconds": 120
+  },
+  {
+   "name": "Supervisor aktiv",
+   "run": "systemctl is-active --quiet hermes-supervisor",
+   "timeoutSeconds": 120
+  },
+  {
+   "name": "borgmatic.timer aktiv",
+   "run": "systemctl is-active --quiet borgmatic.timer",
+   "timeoutSeconds": 120
+  },
+  {
+   "name": "Nextcloud ok, keine Wartung",
+   "run": "s=$(curl -fsSk --max-time 20 https://127.0.0.1/status.php); echo \"$s\" | grep -c '\"installed\":true'; echo \"$s\" | grep -c '\"maintenance\":false'",
+   "timeoutSeconds": 120
+  },
+  {
+   "name": "James s6 up",
+   "run": "timeout -k 10 30 docker exec hermes /command/s6-svstat /run/service/gateway-default | grep -c '^up'",
+   "timeoutSeconds": 120
+  },
+  {
+   "name": "dpkg sauber",
+   "run": "test -z \"$(dpkg --audit)\"",
+   "timeoutSeconds": 120
+  },
+  {
+   "name": "alle vorher laufenden Container Up",
+   "run": "test -z \"$(comm -23 /var/tmp/cockpit-kernel-20261013/container-vorher.txt <(docker ps --filter status=running --format '{{.Names}}' | sort))\"",
+   "timeoutSeconds": 120
+  },
+  {
+   "name": "Telegram seit Start verbunden",
+   "run": "b=$(date -u -d \"$(uptime -s)\" '+%Y-%m-%d %H:%M:%S'); grep 'Connected to Telegram' /home/hermes/.hermes/logs/gateway.log | awk -v b=\"$b\" 'substr($0,1,19)>=b' | grep -c .",
+   "timeoutSeconds": 120
+  },
+  {
+   "name": "uname -r = neuer Kernel",
+   "run": "test \"$(uname -r)\" = \"$(cat /var/tmp/cockpit-kernel-20261013/kernel-erwartet.txt)\"; test \"$(uname -r)\" != \"$(cat /var/tmp/cockpit-kernel-20261013/kernel-vorher.txt)\"",
+   "timeoutSeconds": 120
+  },
+  {
+   "name": "keine fehlgeschlagene Unit",
+   "run": "test -z \"$(systemctl list-units --failed --no-legend --plain)\"",
+   "timeoutSeconds": 120
+  }
+ ],
+ "rollback": [
+  "Startet der neue Kernel nicht sauber: im GRUB-Menue (Erweitert) den bisherigen Kernel waehlen; er bleibt installiert (kernel-vorher.txt).",
+  "Scheitert apt: die Tuer raeumt selbst auf (sshd zuerst, dpkg --configure -a, apt-get -f install, Dienste).",
+  "Letztes Mittel: Maschinen-Snapshot der Tuer zuruecksetzen - nur mit Jochens Freigabe."
+ ],
+ "risk": [
+  "contained"
+ ]
+}

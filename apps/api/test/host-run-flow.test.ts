@@ -1,5 +1,5 @@
 import { createHmac } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -73,7 +73,7 @@ const planWith = (...manifests: Array<{ version: string }>) => [
   "## Intent", "Keep the host's packages current.",
 ].join("\n");
 
-async function setup(options: { plan: string; doorkeeper: string; ownedByAutomation?: boolean; hostState?: () => Record<string, unknown> | null }) {
+async function setup(options: { plan: string; doorkeeper: string; intent?: string; ownedByAutomation?: boolean; hostState?: () => Record<string, unknown> | null }) {
   const dir = mkdtempSync(path.join(tmpdir(), "host-run-flow-"));
   cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
   const seed = new CockpitDatabase(path.join(dir, "cockpit.sqlite"));
@@ -118,13 +118,15 @@ async function setup(options: { plan: string; doorkeeper: string; ownedByAutomat
     while (inspect.getJob(jobId)?.status === "running" && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
     return inspect.getJob(jobId)!;
   };
-  const submit = async () => {
-    const created = await app.inject({ method: "POST", url: "/api/hermes/runbook", headers: bearer ? { authorization: `Bearer ${bearer}` } : { cookie }, payload: { intent: "Keep the host's packages current", sessionId: session.id, timeoutMs: 0 } });
-    expect(created.statusCode).toBe(202);
-    return settled(created.json().jobId as string);
+  const intent = options.intent ?? "Keep the host's packages current";
+  // 200 when the job is already finished at the answer (it stopped before the planner).
+  const submit = async (status = 202) => {
+    const created = await app.inject({ method: "POST", url: "/api/hermes/runbook", headers: bearer ? { authorization: `Bearer ${bearer}` } : { cookie }, payload: { intent, sessionId: session.id, timeoutMs: 0 } });
+    expect(created.statusCode).toBe(status);
+    return settled((created.json().jobId ?? created.json().id) as string);
   };
   const submitted = async () => {
-    const created = await app.inject({ method: "POST", url: "/api/hermes/runbook", headers: bearer ? { authorization: `Bearer ${bearer}` } : { cookie }, payload: { intent: "Keep the host's packages current", sessionId: session.id, timeoutMs: 0 } });
+    const created = await app.inject({ method: "POST", url: "/api/hermes/runbook", headers: bearer ? { authorization: `Bearer ${bearer}` } : { cookie }, payload: { intent, sessionId: session.id, timeoutMs: 0 } });
     expect(created.statusCode).toBe(202);
     return created.json().jobId as string;
   };
@@ -298,5 +300,85 @@ describe("host door: uninterruptible steps through the API", () => {
     expect(flow.agentCalls.some((call) => call.role === "runner")).toBe(false);
     expect(job.status).not.toBe("completed");
     expect(JSON.stringify(job.output)).toContain("state steps (package)");
+  });
+});
+
+// Vorfall 10./13.10.2026 (Jobs 611ad26d, 83434c34): the planner copied the
+// operator's long manifest into a line that was not valid JSON, and the run
+// died before the doorkeeper. A manifest in the trusted intent is now the one
+// that is reviewed, signed and run; the planner's copy is only compared.
+describe("host door: the operator's manifest comes from the intent", () => {
+  const recorded = readFileSync(new URL("./fixtures/host-run-kernel-20261013.json", import.meta.url), "utf8");
+  const realIntent = readFileSync(new URL("./fixtures/host-run-kernel-20261013-intent.txt", import.meta.url), "utf8");
+  // The real manifest had 17 checks (limit 16); fitted by joining the last two.
+  const raw = JSON.parse(recorded) as { checks: Array<{ name: string; run: string; timeoutSeconds: number }> };
+  const [last2, last1] = raw.checks.slice(-2);
+  const fitted = { ...raw, checks: [...raw.checks.slice(0, -2), { name: `${last2.name}; ${last1.name}`, run: `${last2.run}\n${last1.run}`, timeoutSeconds: last2.timeoutSeconds }] };
+  const copied = "```host-run\n" + JSON.stringify(fitted) + "\n```";
+  const kernelIntent = realIntent.slice(0, realIntent.indexOf("```host-run")) + copied;
+  // What the planner made of it: one escape lost, as on 13.10.
+  const brokenCopy = copied.replace('\\"$(dpkg --audit)\\"', '"$(dpkg --audit)"');
+  const evidence = (job: { output?: Record<string, unknown> | null }) => ((job.output?.policy as { evidence: string[] }).evidence).join("\n");
+
+  it("runs the real kernel manifest from the intent although the planner's copy is not valid JSON", async () => {
+    const flow = await setup({ intent: kernelIntent, plan: brokenCopy, doorkeeper: "VERDICT: pass\nNOTES: planned kernel window" });
+    const job = await flow.submit();
+
+    expect(job.status).toBe("completed");
+    const start = flow.executorCalls.find((call) => call.payload.action === "host.run")!;
+    expect(start.payload.manifest).toEqual(JSON.parse(JSON.stringify(job.output?.hostRun)));
+    expect(job.output?.hostRun).toMatchObject({ name: fitted.name, mutates: true });
+    expect(start.payload.envelope).toMatchObject({ gatePassed: true, capabilities: ["host.run"] });
+    expect(flow.doorkeeperPrompts[0]).toContain("docker ps --format '{{.Names}}'");
+    expect(evidence(job)).toContain("host-run manifest taken from the trusted intent; planner copy: invalid (host-run manifest is not valid JSON)");
+    expect(flow.agentCalls.map((call) => call.role)).toEqual(["planner", "verifier"]);
+  });
+
+  it("dry run through the planner path: an exact copy is recorded as identical", async () => {
+    const flow = await setup({ intent: kernelIntent, plan: copied, doorkeeper: "VERDICT: pass" });
+    const job = await flow.submit();
+    expect(job.status).toBe("completed");
+    expect(evidence(job)).toContain("planner copy: identical");
+  });
+
+  it("keeps the intent's manifest when the planner rewrites a step or leaves it out", async () => {
+    for (const [plan, note] of [[copied.replace("{{.Names}}", "{{.ID}}"), "differs"], ["## Plan\nRun the manifest from the intent.", "absent"]]) {
+      const flow = await setup({ intent: kernelIntent, plan, doorkeeper: "VERDICT: pass" });
+      const job = await flow.submit();
+      expect(job.status).toBe("completed");
+      expect(evidence(job)).toContain(`planner copy: ${note}`);
+      const start = flow.executorCalls.find((call) => call.payload.action === "host.run")!;
+      expect(start.payload.manifest.steps[0].run).toContain("{{.Names}}");
+    }
+  });
+
+  it("stops the real 17-check intent of 13.10. before the planner runs", async () => {
+    const flow = await setup({ intent: realIntent, plan: realIntent.slice(realIntent.indexOf("```host-run")), doorkeeper: "VERDICT: pass" });
+    const job = await flow.submit(200);
+    expect(job.status).toBe("failed_execution");
+    expect(JSON.stringify(job.output)).toContain("host-run manifest allows at most 16 checks");
+    expect(flow.agentCalls).toHaveLength(0);
+    expect(flow.executorCalls).toHaveLength(0);
+  });
+
+  it("stops on a broken manifest in the intent before the planner runs", async () => {
+    const flow = await setup({ intent: kernelIntent.replace('"mutates":true,', '"mutates":true'), plan: copied, doorkeeper: "VERDICT: pass" });
+    const job = await flow.submit(200);
+    expect(job.status).toBe("failed_execution");
+    expect(JSON.stringify(job.output)).toContain("the intent's host-run manifest is invalid");
+    expect(flow.agentCalls).toHaveLength(0);
+    expect(flow.executorCalls).toHaveLength(0);
+  });
+
+  it("still allows one door per job when the planner adds a capability manifest", async () => {
+    const capability = {
+      version: "cockpit-capability/v1", name: "read", purpose: "read a file", steps: [{ argv: ["/usr/bin/true"], cwd: "/tmp", runAsUser: "nobody" }],
+      readablePaths: [], writablePaths: [], network: "none", expectedEffects: ["none"], verification: ["exit 0"], rollback: ["none needed"], risk: ["contained"],
+    };
+    const flow = await setup({ intent: kernelIntent, plan: planWith(capability), doorkeeper: "VERDICT: pass" });
+    const job = await flow.submit();
+    expect(job.status).toBe("failed_execution");
+    expect(JSON.stringify(job.output)).toContain("one door per job");
+    expect(flow.executorCalls).toHaveLength(0);
   });
 });
