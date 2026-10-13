@@ -360,6 +360,18 @@ gewöhnliche Runbooks durch diese Tür. Der Planer-Vertrag (`hostRunPlannerContr
 Tür zum Standard für Host-Arbeit; ein Capability-Manifest nimmt er nur, wenn ein typisierter
 Helfer die Aufgabe genau abdeckt. Ein Plan mit beiden Manifesten wird abgelehnt.
 
+Schreibt der Operator das Manifest selbst in den Intent (genau ein ```` ```host-run ````-Block),
+gilt dieses Manifest — nicht die Abschrift des Planers (`intentHostRunManifest`). Anlass: Jobs
+611ad26d (10.10.2026) und 83434c34 (13.10.2026) scheiterten an „host-run manifest is not valid
+JSON“, weil der Planer lange, stark escapte Manifeste nicht fehlerfrei auf eine Zeile abschrieb.
+Die Abschrift wird nur noch verglichen und als Evidenz vermerkt (`planner copy: identical |
+differs | absent | invalid (…)`). Zwei Blöcke oder ein ungültiger Block im Intent beenden den Job
+vor dem Planer mit dem Grund; einen Rückfall auf die Planer-Abschrift gibt es nicht. Türsteher,
+Schloss, Snapshot und Abbruch-Sicherheit prüfen und fahren genau das Intent-Manifest. Nur der
+vertrauenswürdige Intent zählt, nie die Evidenz. Die Grenzen gelten weiter (u. a. höchstens 16
+Checks — das Kernel-Manifest vom 13.10. hatte 17 und wäre auch mit fehlerfreier Abschrift
+gestoppt worden).
+
 ## 6. Ehrliche Grenze
 
 Den Schlüssel zur Tür — die Zugangsdaten für die Cockpit-API, mit denen James Läufe bestellt —

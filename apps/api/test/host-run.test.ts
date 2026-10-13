@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -8,7 +10,9 @@ import {
   hostRunPolicy,
   hostRunResultText,
   hostRunSafetyRecord,
+  intentHostRunManifest,
   parseHostRunManifest,
+  plannerHostRunCopy,
   parseHostRunReviewAnswer,
   parseHostRunStatus,
   verifyHostRunFindings,
@@ -294,5 +298,54 @@ describe("hostRunPlannerContract", () => {
     expect(contract).toContain("\"reboot\":true");
     expect(contract).toContain("younger than 24 h");
     expect(contract).toContain("checks are mandatory");
+  });
+});
+
+// Vorfall 10./13.10.2026 (Jobs 611ad26d, 83434c34): the planner's one-line copy
+// of a long manifest was not valid JSON. A manifest in the trusted intent is
+// taken from the intent itself. The real kernel manifest of 13.10. also had 17
+// checks (limit 16): even a perfect copy would have stopped, now it stops
+// before the planner with that reason. Fitted to 16 checks, it is taken as is.
+describe("host-run manifest from the trusted intent", () => {
+  const recorded = readFileSync(new URL("./fixtures/host-run-kernel-20261013.json", import.meta.url), "utf8");
+  const intent = readFileSync(new URL("./fixtures/host-run-kernel-20261013-intent.txt", import.meta.url), "utf8");
+  const raw = JSON.parse(recorded) as { checks: Array<{ name: string; run: string; timeoutSeconds: number }> };
+  const [last2, last1] = raw.checks.slice(-2);
+  const fitted = { ...raw, checks: [...raw.checks.slice(0, -2), { name: `${last2.name}; ${last1.name}`, run: `${last2.run}\n${last1.run}`, timeoutSeconds: last2.timeoutSeconds }] };
+  const fittedIntent = intent.slice(0, intent.indexOf("```host-run")) + "```host-run\n" + JSON.stringify(fitted) + "\n```";
+  const expected = parseHostRunManifest("```host-run\n" + JSON.stringify(fitted) + "\n```")!;
+
+  it("stops the real kernel intent of 13.10. on its 17th check, before any planner copy", () => {
+    expect(raw.checks).toHaveLength(17);
+    expect(() => intentHostRunManifest(intent)).toThrow("the intent's host-run manifest is invalid: host-run manifest allows at most 16 checks");
+  });
+
+  it("takes exactly the operator's manifest from the fitted kernel intent", () => {
+    const manifest = intentHostRunManifest(fittedIntent)!;
+    expect(manifest).toEqual(expected);
+    expect(hostRunManifestHash(manifest)).toBe(hostRunManifestHash(expected));
+    expect(manifest.mutates).toBe(true);
+    expect(manifest.checks).toHaveLength(16);
+    expect(manifest.steps.some((step) => step.reboot === true)).toBe(true);
+    expect(manifest.steps[0].run).toContain("docker ps --format '{{.Names}}'");
+    expect(manifest.steps[2].run).toContain("dpkg-query -W -f='${Status}\\n'");
+  });
+
+  it("is null without a host-run fence, and stops on two fences, a broken or an unclosed one", () => {
+    expect(intentHostRunManifest("Update the packages on the host.")).toBeNull();
+    expect(intentHostRunManifest("```json\n{\"version\":\"cockpit-host-run/v1\"}\n```")).toBeNull();
+    expect(() => intentHostRunManifest(`${fittedIntent}\n${fittedIntent}`)).toThrow("more than one host-run manifest");
+    expect(() => intentHostRunManifest(fittedIntent.replace("\"mutates\":true,", "\"mutates\":true"))).toThrow("the intent's host-run manifest is invalid: host-run manifest is not valid JSON");
+    expect(() => intentHostRunManifest(fittedIntent.replace(/```\s*$/, ""))).toThrow("no closing fence");
+    expect(() => intentHostRunManifest(fittedIntent.replace("cockpit-host-run/v1", "cockpit-host-run/v2"))).toThrow("unsupported host-run manifest version");
+  });
+
+  it("compares the planner's copy only as evidence", () => {
+    const block = fittedIntent.slice(fittedIntent.indexOf("```host-run"));
+    expect(plannerHostRunCopy(block, expected)).toBe("identical");
+    expect(plannerHostRunCopy("```host-run\n" + JSON.stringify(fitted, null, 2) + "\n```", expected)).toBe("identical");
+    expect(plannerHostRunCopy(block.replace("{{.Names}}", "{{.ID}}"), expected)).toBe("differs");
+    expect(plannerHostRunCopy(block.replace('\\"$(dpkg --audit)\\"', '"$(dpkg --audit)"'), expected)).toBe("invalid (host-run manifest is not valid JSON)");
+    expect(plannerHostRunCopy("## Plan\nnothing", expected)).toBe("absent");
   });
 });
