@@ -260,12 +260,14 @@ describe("Wartet auf dich", () => {
     serve([hermesCard({ expiresAt: new Date(Date.now() + 12 * 3_600_000).toISOString() })], { "/api/hermes/jobs/j1/approval": { status: 409, body: { message: "execution envelope validation failed", envelopeErrors: ["reviewed plan drift"] } } });
     const user = userEvent.setup();
     render(<Inbox />);
+    await openDetails(user);
     await user.type(await screen.findByLabelText(/Grund \(Pflicht\)/), "los");
     await user.click(screen.getByRole("button", { name: "Freigeben" }));
     expect((await screen.findByRole("alert")).textContent).toBe("execution envelope validation failed");
     expect(screen.queryByText(/abgelaufen/i)).toBeNull();
     expect(screen.queryByRole("button", { name: "Neu bestellen lassen" })).toBeNull();
-    expect(screen.getByLabelText("Frist").textContent).toMatch(/^läuft ab in 1[12]:\d\d:\d\d$/);
+    // Die Frist steht auf der Karte und im geöffneten Dialog.
+    for (const deadline of screen.getAllByLabelText("Frist")) expect(deadline.textContent).toMatch(/^läuft ab in 1[12]:\d\d:\d\d$/);
   });
 
   it("tells an expired plan approval to be planned again and only allows rejecting it", async () => {
