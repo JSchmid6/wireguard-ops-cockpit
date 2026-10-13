@@ -92,6 +92,16 @@ const gated: Array<[string, string]> = [
   ["nested ssh from Lab0", "ssh lab0 ssh borg@localhost"],
   ["deletion after a quoted separator on Lab0", "ssh lab0 'true; rm -rf /srv/x'"],
   ["foreign script after a quoted separator on Lab0", "ssh lab0 'systemctl restart android-adb.service && /root/x.sh'"],
+  // Zweitprüfung PR #45: Inline-Code auf Lab0, der den Pfad erst zur Laufzeit baut,
+  // und ein Löschwort direkt hinter einem Quote.
+  ["python -c on Lab0 with a path built at run time", String.raw`ssh root@10.0.0.5 'python3 -c "import shutil; shutil.rmtree(\"/media/R\"+\"AID\")"'`],
+  ["python -c on Lab0 with chr and glob", String.raw`ssh root@10.0.0.5 'python3 -c "import shutil,glob; [shutil.rmtree(p) for p in glob.glob(chr(47)+\"media/R*/b*\")]"'`],
+  ["perl -e on Lab0 with a joined path", "ssh root@10.0.0.5 'perl -e \"system(qq{rm -rf /media/R}.qq{AID})\"'"],
+  ["node -e on Lab0", String.raw`ssh root@10.0.0.5 'node -e "require(\"fs\").rmSync(\"/media/RAID\",{recursive:true})"'`],
+  ["python -c on Lab0 after a quoted separator", "ssh lab0 'systemctl status android-adb.service; python3 -c \"import os; os.system(chr(114)+chr(109))\"'"],
+  ["awk system() on Lab0", "ssh lab0 'awk \"BEGIN{system(\\\"true\\\")}\"'"],
+  ["rm right after a quote on Lab0", "ssh root@10.0.0.5 'bash -c \"rm -rf /x\"'"],
+  ["shred right after a quote on Lab0", "ssh root@10.0.0.5 'bash -c \"shred -u /media/RAID/x\"'"],
 ];
 
 describe("backup bolt, Lab0 (13.10.2026): routine without the operator", () => {

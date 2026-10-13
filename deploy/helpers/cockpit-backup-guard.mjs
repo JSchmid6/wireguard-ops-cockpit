@@ -866,9 +866,18 @@ function analyzeScript(prefix, text, context, hits, language = "shell") {
 
   for (const { line, segments } of prepared) {
     const code = line.raw;
-    if (INLINE_INTERPRETER.test(line.code) && CODE_PRIMITIVES.test(line.code)) hit(line.id, "uncertain", "inline interpreter code that starts processes, touches files or builds code at run time", code);
-    if (/\b[gm]?awk\b/.test(line.code) && AWK_PRIMITIVES.test(line.code)) hit(line.id, "uncertain", "awk that runs commands or writes files", code);
-    if (/\bsed\b[^|;]*\s(?:-[a-zA-Z]*e\s+)?\S*(?:\/[gpIiMm0-9]*e[gpIiMm0-9]*(?:\s|$)|(?:^|;)\s*e\b)/.test(normalize(line.code))) hit(line.id, "uncertain", "sed that executes its pattern space", code);
+    // Code, den der Riegel nicht liest (python -c, awk system(), sed …e). Geht
+    // die Zeile per ssh nach Lab0, ist er dort ein Treffer: der Inline-Code ist
+    // oben schon durch CODE ersetzt, die Analyse des ssh-Befehls sieht ihn nicht.
+    const unreadable = [];
+    if (INLINE_INTERPRETER.test(line.code) && CODE_PRIMITIVES.test(line.code)) unreadable.push("inline interpreter code that starts processes, touches files or builds code at run time");
+    if (/\b[gm]?awk\b/.test(line.code) && AWK_PRIMITIVES.test(line.code)) unreadable.push("awk that runs commands or writes files");
+    if (/\bsed\b[^|;]*\s(?:-[a-zA-Z]*e\s+)?\S*(?:\/[gpIiMm0-9]*e[gpIiMm0-9]*(?:\s|$)|(?:^|;)\s*e\b)/.test(normalize(line.code))) unreadable.push("sed that executes its pattern space");
+    for (const reason of unreadable) hit(line.id, "uncertain", reason, code);
+    if (unreadable.length > 0) {
+      const toLab0 = segments.map((segment) => commandOf(segment.words, false)).map((head) => (head.word ? remoteCommand(baseName(head.word), head.args) : null)).find((remote) => remote && remote.lab0);
+      for (const reason of toLab0 ? unreadable : []) hit(line.id, "backup", `on Lab0 (${toLab0.host}), the machine that holds the borg repository: ${reason}`, code);
+    }
     // Was ein Backup-Befehl ausgibt, darf nicht in einen schreibenden Befehl
     // fließen. In crontab heißt das: der Eintrag der Sicherung wird gestrichen
     // (crontab -l | grep -v borgmatic | crontab -); sonst ein Hinweis.
@@ -985,7 +994,7 @@ function remoteCommand(name, args) {
   return { host: args[i], lab0, command: args.slice(i + 1).filter((arg) => !/^<<-?\S*$/.test(arg)).join(" ").replace(/<<-?\s*\S+/g, " ").trim() };
 }
 const LAB0_HOST = /\b10\.0\.0\.5\b|\blab0\b|^borg@/i;
-const REMOTE_DELETE = /(?:^|[\s;&|])(?:sudo\s+)?(?:rm|rmdir|mv|shred|unlink|truncate|dd|wipefs|mkfs\S*|lvremove|vgremove|zfs\s+destroy|btrfs\s+subvolume\s+delete)\s|\bfind\b[^\n]*\s-delete\b|\brsync\b[^\n]*\s--delete/;
+const REMOTE_DELETE = /(?:^|[\s;&|"'(`])(?:sudo\s+)?(?:rm|rmdir|mv|shred|unlink|truncate|dd|wipefs|mkfs\S*|lvremove|vgremove|zfs\s+destroy|btrfs\s+subvolume\s+delete)\s|\bfind\b[^\n]*\s-delete\b|\brsync\b[^\n]*\s--delete/;
 
 // Schlägt der Riegel bei diesem einfachen Befehl an? Liefert den Grund oder null.
 function segmentBolt(text, command, name, readOnly, cwds, context, line, piped) {
