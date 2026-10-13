@@ -242,6 +242,20 @@ function scanUnquoted(line) {
   return { heredocs, code: commentAt >= 0 ? line.slice(0, commentAt) : line };
 }
 
+// Der Quote, der am Ende einer Zeile noch offen ist ('…<NL>…'), ausgehend vom
+// Quote, der am Anfang offen war. null: alle Quotes geschlossen.
+function openQuoteAfter(line, quote) {
+  for (let i = 0; i < line.length; i += 1) {
+    const char = line[i];
+    if (quote === "'") { if (char === "'") quote = null; continue; }
+    if (char === "\\") { i += 1; continue; }
+    if (quote === '"') { if (char === '"') quote = null; continue; }
+    if (char === "'" || char === '"') { quote = char; continue; }
+    if (char === "#" && (i === 0 || /[\s;&|()]/.test(line[i - 1]))) break;
+  }
+  return quote;
+}
+
 // Logische Zeilen (Fortsetzungen verbunden) und Heredoc-Körper, jede mit der
 // Kennung ihrer ersten physischen Zeile (S<n>:L<n> wie beim Türsteher).
 function splitScript(prefix, text) {
@@ -864,8 +878,18 @@ function analyzeScript(prefix, text, context, hits, language = "shell") {
     }
   }
 
+  // ssh lab0 '<NL>python3 -c …<NL>': ein Quote, der über das Zeilenende reicht,
+  // trägt den Befehl nach Lab0 in die Folgezeilen. Dort ist jedes Löschen und
+  // alles, was der Riegel nicht lesen kann, ein Treffer — wie in derselben Zeile.
+  let quote = null;
+  let lab0Block = null;
   for (const { line, segments } of prepared) {
     const code = line.raw;
+    const onLab0Block = quote ? lab0Block : null;
+    quote = openQuoteAfter(line.raw, quote);
+    if (!quote) lab0Block = null;
+    else if (!onLab0Block) lab0Block = segments.map((segment) => commandOf(segment.words, false)).map((head) => (head.word ? remoteCommand(baseName(head.word), head.args) : null)).find((remote) => remote && remote.lab0)?.host || null;
+    if (onLab0Block && REMOTE_DELETE.test(` ${line.raw}`)) hit(line.id, "backup", `deletes on Lab0 (${onLab0Block}), the machine that holds the borg repository`, code);
     // Code, den der Riegel nicht liest (python -c, awk system(), sed …e). Geht
     // die Zeile per ssh nach Lab0, ist er dort ein Treffer: der Inline-Code ist
     // oben schon durch CODE ersetzt, die Analyse des ssh-Befehls sieht ihn nicht.
@@ -920,6 +944,11 @@ function analyzeScript(prefix, text, context, hits, language = "shell") {
       carry = segment.piped ? carry || touching : touching;
       echoed = segment.piped ? echoed || nextEchoed : nextEchoed;
       found = segment.piped ? [...found, ...nextFound] : nextFound;
+    }
+    if (onLab0Block) {
+      for (const item of hits.filter((found) => found.where === line.id && found.kind === "uncertain")) {
+        hit(line.id, "backup", `on Lab0 (${onLab0Block}), the machine that holds the borg repository: ${item.reason}`, code);
+      }
     }
   }
 

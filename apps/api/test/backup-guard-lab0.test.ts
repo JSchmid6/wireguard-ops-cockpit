@@ -39,6 +39,9 @@ const free: Array<[string, string]> = [
   ["borg reads stay free (10.10.2026)", "borg list ::\nborgmatic check --force\nborg info ::"],
   ["apt on Lab0", "ssh root@10.0.0.5 'apt-get update && apt-get -y upgrade'"],
   ["ssh with input from /dev/null", "ssh root@10.0.0.5 systemctl restart android-adb.service < /dev/null"],
+  ["multi-line restart on Lab0", "ssh lab0 'systemctl restart android-adb.service\nsystemctl is-active android-adb.service'"],
+  ["multi-line routine on Lab0", "ssh root@10.0.0.5 '\nsystemctl restart android-emulator.service\njournalctl -u android-emulator.service -n 50 --no-pager\nss -ltn | grep -q 5037\n'"],
+  ["local inline code after a closed ssh argument", "ssh lab0 'systemctl status android-adb.service'\npython3 -c \"import os; print(os.listdir('.'))\""],
 ];
 
 // 2: Borg-Aktionen, Repo, Zugangsdaten — auch über Umwege.
@@ -102,6 +105,22 @@ const gated: Array<[string, string]> = [
   ["awk system() on Lab0", "ssh lab0 'awk \"BEGIN{system(\\\"true\\\")}\"'"],
   ["rm right after a quote on Lab0", "ssh root@10.0.0.5 'bash -c \"rm -rf /x\"'"],
   ["shred right after a quote on Lab0", "ssh root@10.0.0.5 'bash -c \"shred -u /media/RAID/x\"'"],
+  // Zweitprüfung PR #45 (8d4e33e): derselbe Code in einer Folgezeile eines
+  // mehrzeiligen ssh-Arguments.
+  ["perl -e on the next line of a multi-line ssh argument", "ssh root@10.0.0.5 'systemctl status android-adb.service\nperl -e \"system(qq{rm -rf /media/R}.qq{AID})\"'"],
+  ["python -c alone inside a multi-line ssh argument", String.raw`ssh root@10.0.0.5 '
+python3 -c "import shutil; shutil.rmtree(\"/media/R\"+\"AID\")"
+'`],
+  ["python -c on the third line of a multi-line ssh argument", "ssh root@10.0.0.5 'systemctl status x\nsystemctl is-active x\npython3 -c \"import os; os.system(chr(114))\"'"],
+  ["awk system() inside a multi-line ssh argument", "ssh root@10.0.0.5 'systemctl status x\nawk \"BEGIN{system(\\\"true\\\")}\"'"],
+  ["node -e inside a multi-line ssh argument", String.raw`ssh root@10.0.0.5 '
+node -e "require(\"fs\").rmSync(\"/media/RAID\",{recursive:true})"
+'`],
+  ["ruby -e inside a multi-line ssh argument", "ssh root@10.0.0.5 '\nruby -e \"system(%q{true})\"\n'"],
+  ["sed e inside a multi-line ssh argument", "ssh root@10.0.0.5 '\nsed -n \"s/x/y/e\" /tmp/a\n'"],
+  ["python -c inside a multi-line double-quoted ssh argument", "ssh lab0 \"\npython3 -c 'import os; os.system(chr(114))'\n\""],
+  ["deletion inside a multi-line ssh argument", "ssh root@10.0.0.5 '\nrm -rf /srv/x\n'"],
+  ["decoded text inside a multi-line ssh argument", "ssh root@10.0.0.5 '\necho Ym9yZw== | base64 -d | sh\n'"],
 ];
 
 describe("backup bolt, Lab0 (13.10.2026): routine without the operator", () => {
