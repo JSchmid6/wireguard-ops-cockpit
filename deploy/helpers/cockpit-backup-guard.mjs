@@ -38,7 +38,18 @@
 //                     - dem Löschen eines Maschinen-Snapshots
 //                       (cockpit-vps-snapshot delete, DELETE …/snapshots). Die
 //                       Rotation des Werkzeugs selbst (create räumt den ältesten
-//                       eigenen Snapshot) bleibt frei (Jochen, 28.09.2026).
+//                       eigenen Snapshot) bleibt frei (Jochen, 28.09.2026);
+//                     - dem Lesen der Zugangsdaten (borgmatic-Konfiguration,
+//                       borg-Schlüssel, Passphrase des Aufräum-Dienstes) und des
+//                       Repo-Inhalts (cat, cp, scp, rsync, sshfs …; borg/borgmatic
+//                       mount, extract, export-tar, restore). Metadaten (ls, stat,
+//                       du, df, test) bleiben frei;
+//                     - Code auf Lab0, den der Plan nicht zeigt: ssh zu Lab0 mit
+//                       Text aus einer Pipe oder Datei, oder ein Befehl dort, den der
+//                       Riegel nicht lesen kann (fremdes Skript, eval, $CMD …).
+//                       Sichtbare Routine auf Lab0 (systemctl restart
+//                       android-adb.service, Status, Logs) bleibt frei (Jochen,
+//                       13.10.2026: „ein umkehrbarer Routineschritt braucht kein Ja“).
 //   backupGuardFocus  Hinweise für den Türsteher (Art "mention" oder
 //                     "uncertain"), die den Lauf NICHT anhalten: ein Befehl
 //                     nennt oder berührt die Backups, ohne zu löschen
@@ -65,7 +76,7 @@
 
 import { classifyRetention, parseRetentionArgs } from "./cockpit-borg-retention-rules.mjs";
 
-export const BACKUP_GUARD_VERSION = "cockpit-backup-guard/v3";
+export const BACKUP_GUARD_VERSION = "cockpit-backup-guard/v4";
 
 // Was die Backups sind. TOKEN greift im normalisierten Text (ohne Quotes und
 // Backslashes), also auch in b"o"rg und bo\rg.
@@ -104,6 +115,17 @@ const DATA = [
   "/var/backups",
   "/var/opt/gitlab/backups",
 ];
+// Lesen ist hier schon der Schaden: die Zugangsdaten (Passphrase, Schlüssel) und
+// der Inhalt des Repos. Metadaten (ls, stat, du, df, test …) bleiben frei.
+const SECRETS = ["/etc/borgmatic", "/etc/borgmatic.d", "/root/.config/borg", "/root/.borgmatic", "/etc/cockpit-borg-retention"];
+const REPO = ["/media/RAID/backup_VServer"];
+const GUARDED_READ = [...SECRETS, ...REPO];
+const METADATA = new Set(["ls", "stat", "test", "[", "[[", "du", "df", "findmnt", "readlink", "realpath", "basename", "dirname", "lsblk", "file", "wc", "sha256sum", "sha1sum", "md5sum", "b2sum", "cksum", "cd", "pushd", "mountpoint", "namei", "getfacl", "lsattr"]);
+const BORG_TOOLS = /^(?:borg|borgmatic|cockpit-borg-action|cockpit-borg-retention)$/;
+// Lesen, die einen ganzen Baum durchgehen (grep -r /etc) oder einhängen.
+const TREE_READERS = /^(?:rg|sshfs|mount|bindfs|rclone)$/;
+const BORG_READ_OUT = new Set(["mount", "extract", "export-tar"]);
+const BORGMATIC_READ_OUT = new Set(["mount", "extract", "export-tar", "restore"]);
 // Nur Hinweis für den Türsteher: berührt den Rückweg, löscht aber keine Sicherung.
 const WATCH = ["/root/.cache/borg", "/root/.ssh"];
 const PROTECTED = [...CONFIG, ...DATA, ...WATCH];
@@ -115,6 +137,7 @@ const ancestorsOf = (items) => [...new Set(items.flatMap((item) => {
 }))];
 const ANCESTORS = ancestorsOf(PROTECTED);
 const BOLTED_ANCESTORS = ancestorsOf(BOLTED);
+const GUARDED_READ_ANCESTORS = ancestorsOf(GUARDED_READ);
 const DEFAULT_CWD = "/"; // cockpit-host-run startet jeden Schritt mit cwd "/"
 
 // Befehle, die einen ganzen Baum treffen: für sie zählt auch ein Vorfahr eines
@@ -618,6 +641,34 @@ const touchesConfig = (path) => pathTouches(path, false, CONFIG, []);
 const DATA_ANCESTORS = ancestorsOf(DATA);
 const touchesData = (path, bulk) => pathTouches(path, bulk, DATA, DATA_ANCESTORS);
 const touchesBolted = (path) => pathTouches(path, true, BOLTED, BOLTED_ANCESTORS);
+const touchesGuardedRead = (path, tree) => pathTouches(path, tree, GUARDED_READ, GUARDED_READ_ANCESTORS);
+
+// Quellen einer Eingabe-Umleitung (cat < f, done < f); nicht <<, <<<, <(, <&.
+function inputSources(text) {
+  const sources = [];
+  const pattern = /(?:^|[^<\d])\d*<(?![<(&])\s*([^\s;&|<>()]+)/g;
+  let match;
+  while ((match = pattern.exec(text)) !== null) sources.push(match[1]);
+  return sources.filter((source) => source !== "/dev/null");
+}
+
+// Liest der Befehl die Zugangsdaten der Sicherung oder den Inhalt des Repos?
+// Metadaten (ls, stat, du, df, test …) und die borg-Werkzeuge selbst nicht; was
+// borg/borgmatic aus dem Repo holen, prüft segmentBolt. Ein Baum (grep -r /etc,
+// cp -a /etc, tar c /root, sshfs lab0:/media) zählt auch über einen Vorfahren.
+function readBolt(text, command, name, cwds) {
+  const resolveAll = (list) => list.filter((target) => !target.includes(OPAQUE)).flatMap((target) => [...cwds].map((cwd) => resolvePath(target, cwd)));
+  const reads = (paths, tree) => (paths.some((path) => touchesGuardedRead(path, tree)) ? "reads the backup credentials (borgmatic configuration, borg keys, retention passphrase) or the borg repository" : null);
+  if (!METADATA.has(name)) { const viaInput = reads(resolveAll(inputSources(text)), false); if (viaInput) return viaInput; }
+  if (!name || METADATA.has(name) || ECHOES.has(name) || BORG_TOOLS.test(name)) return null;
+  const { args } = command;
+  if (name === "find" && !args.some((arg) => /^-(?:exec|execdir|ok|okdir|fprint0?|fprintf|fls)$/.test(arg))) return null;
+  const tree = TREE_READERS.test(name) || name === "rsync" || name === "find"
+    || (/^(?:grep|egrep|fgrep|zgrep)$/.test(name) && args.some((arg) => /^-[a-zA-Z]*[rR]|^--(?:dereference-)?recursive$/.test(arg)))
+    || (/^(?:cp|scp|zip)$/.test(name) && args.some((arg) => /^-[a-zA-Z]*[rRa]|^--recursive$|^--archive$/.test(arg)))
+    || (name === "tar" && args.some((arg) => /^-?[a-zA-Z]*c[a-zA-Z]*$/.test(arg) || arg === "--create"));
+  return reads(resolveAll((name === "find" ? findStarts(args) : pathWords(args, name)).filter((word) => word !== "{}" && word !== "{}+")), tree);
+}
 
 // Die Wörter eines Befehls, die Pfade sein können, aufgelöst gegen jedes cwd.
 function pathWords(args, name) {
@@ -826,14 +877,27 @@ function analyzeScript(prefix, text, context, hits, language = "shell") {
     let carry = false;
     let echoed = null;
     let found = [];
+    // ssh lab0 'a; b | c': was nach einem Trenner in Quotes kommt, läuft auf Lab0.
+    // Dort ist jedes Löschen und alles, was der Riegel nicht lesen kann, ein Treffer.
+    let lab0 = null;
     for (const segment of segments) {
+      if (!segment.quoted) lab0 = null;
+      const onLab0 = lab0;
+      const segmentHit = !onLab0 ? hit : (where, kind, reason, text) => {
+        hit(where, kind, reason, text);
+        if (kind === "uncertain") hit(where, "backup", `on Lab0 (${onLab0}), the machine that holds the borg repository: ${reason}`, text);
+      };
       const variants = expandText(segment.text, resolve);
-      if (!variants) { hit(line.id, "uncertain", "too many values for the variables in this command", code); continue; }
+      if (!variants) { segmentHit(line.id, "uncertain", "too many values for the variables in this command", code); continue; }
+      if (onLab0 && REMOTE_DELETE.test(` ${segment.text}`)) hit(line.id, "backup", `deletes on Lab0 (${onLab0}), the machine that holds the borg repository`, code);
+      const head = commandOf(segment.words, false);
+      const remote = head.word ? remoteCommand(baseName(head.word), head.args) : null;
+      if (remote && remote.lab0) lab0 = remote.host;
       let touching = false;
       let nextEchoed = null;
       let nextFound = [];
       for (const text of variants) {
-        const result = checkSegment(text, segment, line, context, cwds, hit);
+        const result = checkSegment(text, segment, line, context, cwds, segmentHit);
         if (segment.piped && carry && !result.readOnly) {
           if (result.name === "crontab") hit(line.id, "backup", "rewrites the crontab from output about the backups: that drops or changes their schedule", code);
           else hit(line.id, "mention", "output about the backups flows into a command that changes something", code);
@@ -876,7 +940,9 @@ function analyzeScript(prefix, text, context, hits, language = "shell") {
       analyzeScript(bodyPrefix, bodyText, context, sub, language);
       for (const item of sub) hits.push({ ...item, where: shiftLine(item.where, offset) });
       const remote = remoteCommand(name, command.args.filter((arg) => !arg.startsWith("<<")));
-      if (remote && LAB0_HOST.test(remote.host) && REMOTE_DELETE.test(` ${bodyText}`)) hit(heredoc.line.id, "backup", `deletes on Lab0 (${remote.host}), the machine that holds the borg repository`, heredoc.line.raw);
+      if (remote && remote.lab0 && REMOTE_DELETE.test(` ${bodyText}`)) hit(heredoc.line.id, "backup", `deletes on Lab0 (${remote.host}), the machine that holds the borg repository`, heredoc.line.raw);
+      const unclear = remote && remote.lab0 && sub.find((item) => item.kind === "uncertain");
+      if (unclear) hit(heredoc.line.id, "backup", `on Lab0 (${remote.host}), the machine that holds the borg repository: ${unclear.reason}`, heredoc.line.raw);
       continue;
     }
     // cat <<EOF ohne Umleitung und ohne Pipe gibt nur Text aus.
@@ -908,18 +974,21 @@ function shiftLine(where, offset) {
 
 // Der Befehl, den ssh auf dem anderen Rechner ausführt, und wohin.
 const SSH_VALUED = new Set(["-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-p", "-Q", "-R", "-S", "-W", "-w", "-B"]);
+// lab0: das Ziel ist Lab0, auch über eine Option (-o HostName=10.0.0.5, -J lab0).
+// Ein Heredoc-Wort (<<EOF) gehört nicht zum Befehl; den Heredoc liest analyzeScript.
 function remoteCommand(name, args) {
   if (!/^(?:ssh|autossh|mosh)$/.test(name)) return null;
   let i = 0;
   while (i < args.length && args[i].startsWith("-")) { if (SSH_VALUED.has(args[i])) i += 1; i += 1; }
   if (i >= args.length) return null;
-  return { host: args[i], command: args.slice(i + 1).join(" ") };
+  const lab0 = LAB0_HOST.test(args[i]) || args.slice(0, i).some((arg) => LAB0_HOST.test(arg.replace(/^-o\s*\w+=|^\w+=/i, "")));
+  return { host: args[i], lab0, command: args.slice(i + 1).filter((arg) => !/^<<-?\S*$/.test(arg)).join(" ").replace(/<<-?\s*\S+/g, " ").trim() };
 }
 const LAB0_HOST = /\b10\.0\.0\.5\b|\blab0\b|^borg@/i;
 const REMOTE_DELETE = /(?:^|[\s;&|])(?:sudo\s+)?(?:rm|rmdir|mv|shred|unlink|truncate|dd|wipefs|mkfs\S*|lvremove|vgremove|zfs\s+destroy|btrfs\s+subvolume\s+delete)\s|\bfind\b[^\n]*\s-delete\b|\brsync\b[^\n]*\s--delete/;
 
 // Schlägt der Riegel bei diesem einfachen Befehl an? Liefert den Grund oder null.
-function segmentBolt(text, command, name, readOnly, cwds, context, line) {
+function segmentBolt(text, command, name, readOnly, cwds, context, line, piped) {
   const { args } = command;
   // Lesen ist nie Löschen. echo/printf/logger geben Text aus: ein Löschwort
   // darin zählt erst, wenn es in eine Datei geht (hier) oder in eine Pipe
@@ -935,16 +1004,25 @@ function segmentBolt(text, command, name, readOnly, cwds, context, line) {
     const phrase = phraseBolt(text);
     if (phrase) return phrase;
   }
+  // Auch ein Lesebefehl: Zugangsdaten und Repo-Inhalt (cat /etc/borgmatic/config.yaml).
+  const read = readBolt(text, command, name, cwds);
+  if (read) return read;
+  // ssh nach Lab0, das seinen Befehl aus einer Pipe oder Datei liest: der Text,
+  // der dort läuft, steht nicht im Plan (ein Heredoc wird eigens gelesen).
+  const remote = remoteCommand(name, args);
+  if (remote && remote.lab0 && (piped || inputSources(text).length > 0)) return `runs text from a pipe or file on Lab0 (${remote.host}), the machine that holds the borg repository`;
   if (readOnly) return null;
 
   if (name === "borg") {
     const key = args.indexOf("key");
     if (args.some((arg) => BORG_DELETE.has(arg)) || (key >= 0 && BORG_KEY_CHANGE.has(args[key + 1]))) return "deletes backups (borg delete, prune, compact, recreate, break-lock or a key change)";
     if (args.includes("--repair")) return "borg check --repair can delete archives";
+    if (args.some((arg) => BORG_READ_OUT.has(arg))) return "reads backup contents out of the repository (borg mount, extract or export-tar)";
   }
   if (name === "borgmatic") {
     if (args.some((arg) => BORGMATIC_DELETE.has(arg))) return "deletes backups (borgmatic delete, prune, compact, recreate, break-lock, key or raw borg)";
     if (args.includes("--repair")) return "borgmatic check --repair can delete archives";
+    if (args.some((arg) => BORGMATIC_READ_OUT.has(arg))) return "reads backup contents out of the repository (borgmatic mount, extract, export-tar or restore)";
     const actions = args.filter((arg) => BORGMATIC_ALL_ACTIONS.has(arg));
     if (actions.length === 0 && args.some((arg) => /^(?:-c|--config|--override)(?:=|$)/.test(arg))) return "a borgmatic run with another configuration or an override prunes with other retention";
   }
@@ -1008,14 +1086,16 @@ function segmentBolt(text, command, name, readOnly, cwds, context, line) {
   if (overwritten.some((path) => touchesConfig(path) || touchesData(path, false) || namesUnit(path))) return `${name} overwrites backups or their configuration`;
   if (written.some((path) => touchesConfig(path) || namesUnit(path))) return `${name} writes the backup configuration, retention, keys or timer`;
 
-  // Auf Lab0, dem Rechner mit dem borg-Repo: jedes Löschen.
-  const remote = remoteCommand(name, args);
+  // Auf Lab0, dem Rechner mit dem borg-Repo: jedes Löschen, und jeder Befehl,
+  // den der Riegel nicht lesen kann (dort ist er selbst der Weg zum Repo).
   if (remote && remote.command) {
     const sub = [];
     analyzeScript(`${line.id}>`, remote.command, context, sub);
     const inner = sub.find((item) => item.kind === "backup");
     if (inner) return `over ${name}: ${inner.reason}`;
-    if (LAB0_HOST.test(remote.host) && REMOTE_DELETE.test(` ${remote.command}`)) return `deletes on Lab0 (${remote.host}), the machine that holds the borg repository`;
+    if (remote.lab0 && REMOTE_DELETE.test(` ${remote.command}`)) return `deletes on Lab0 (${remote.host}), the machine that holds the borg repository`;
+    const unclear = remote.lab0 && sub.find((item) => item.kind === "uncertain");
+    if (unclear) return `on Lab0 (${remote.host}), the machine that holds the borg repository: ${unclear.reason}`;
   }
   return null;
 }
@@ -1054,7 +1134,7 @@ function checkSegment(text, { piped, quoted }, line, context, cwds, hit) {
   if (command.problem) hit(line.id, "uncertain", command.problem, code);
   if (!word) {
     // Nur Zuweisungen, oder ein Vorsatz ohne erkennbaren Befehl (runuser -u borg -- …).
-    const bolt = phraseBolt(text);
+    const bolt = phraseBolt(text) || readBolt(text, command, "", cwds);
     if (bolt) hit(line.id, "backup", bolt, code);
     else if (TOKEN.test(text)) hit(line.id, "mention", "a value that names the backups", code);
     return { touching: TOKEN.test(text), readOnly: true, name, deletesFromInput: false, runsInput: false, echoed: null, found: [] };
@@ -1116,7 +1196,7 @@ function checkSegment(text, { piped, quoted }, line, context, cwds, hit) {
 
   // Der Riegel: löscht oder verkürzt der Befehl Sicherungen, schaltet er sie ab?
   const readOnly = readOnlyForm(strict, text);
-  const bolt = segmentBolt(text, command, name, readOnly, cwds, context, line);
+  const bolt = segmentBolt(text, command, name, readOnly, cwds, context, line, piped);
   if (bolt) hit(line.id, "backup", bolt, code);
 
   // Sonst: nennt oder berührt er die Backups? Dann ist es ein Hinweis.

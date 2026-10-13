@@ -127,7 +127,7 @@ gibt es nicht; nach der Freigabe kann Jochen alles davon tun.
 Die Erkennung ist deterministisch und hat genau eine Quelle:
 `deploy/helpers/cockpit-backup-guard.mjs` (installiert neben dem Helfer als
 `/usr/local/lib/wireguard-ops-cockpit/cockpit-backup-guard.mjs`, Version
-`cockpit-backup-guard/v3`). Sie liefert zwei Listen:
+`cockpit-backup-guard/v4`). Sie liefert zwei Listen:
 
 - `backupGuardHits` — der Riegel (Art `backup`). Drei Stellen fragen ihn:
   1. die Policy der API (`hostRunPolicy`): ein Treffer macht aus `pass` ein
@@ -169,8 +169,20 @@ jedes `cd`-Ziel aufgelöst. Kommentare zählen nicht.
   `find … -delete` (oder `-exec rm`), `rsync --delete` ins Ziel, `git clean|rm`, `truncate`,
   `dd of=`, `chattr`; bei Löschbefehlen auch über einen Vorfahren (`rm -rf /var`,
   `cd /etc && rm -rf *`, `rm -rf /media`);
-- auf Lab0 (`ssh borg@10.0.0.5 …`, `ssh lab0 …`): jeder Löschbefehl (`rm`, `mv`, `find -delete`,
-  `zfs destroy` …), und jeder Riegel-Treffer im Befehl hinter einem beliebigen `ssh <host>`;
+- auf Lab0 (`ssh borg@10.0.0.5 …`, `ssh lab0 …`, auch `-o HostName=10.0.0.5`): jeder Löschbefehl
+  (`rm`, `mv`, `find -delete`, `zfs destroy` …), auch nach einem Trenner in Quotes
+  (`ssh lab0 'true; rm -rf …'`); jeder Befehl dort, den der Riegel nicht lesen kann (fremdes
+  Skript, `eval`, Dekodieren, `$CMD`, verschachteltes `ssh`); `ssh` nach Lab0 mit Text aus einer
+  Pipe oder Datei (`… | ssh lab0 bash`, `ssh lab0 sh < plan.sh`) — ein Heredoc wird gelesen wie
+  ein Schritt; und jeder Riegel-Treffer im Befehl hinter einem beliebigen `ssh <host>`;
+- Lesen der Zugangsdaten und des Repo-Inhalts (seit 13.10.2026, `cockpit-backup-guard/v4`):
+  `/etc/borgmatic`, `/etc/borgmatic.d`, `/root/.config/borg` (Schlüssel), `/root/.borgmatic`,
+  `/etc/cockpit-borg-retention` (Passphrase des Aufräum-Dienstes) und `/media/RAID/backup_VServer`
+  — mit jedem Befehl außer Metadaten (`ls`, `stat`, `du`, `df`, `test`, Prüfsummen …): `cat`,
+  `grep`, `cp`, `ln -s`, `base64`, `find -exec`, `docker -v`, Eingabe-Umleitung (`< f`, `$(< f)`),
+  `scp`/`rsync`/`sshfs` von `lab0:` — auch über Globs, Variablen, `sudo`, `bash -c`; ganze Bäume
+  über einen Vorfahren (`grep -r … /etc`, `cp -a /etc`, `tar c /root`, `sshfs lab0:/media`);
+  `borg mount|extract|export-tar`, `borgmatic mount|extract|export-tar|restore`;
 - Abschalten: `systemctl` mit einem Verb, das eine Unit nicht laufen lässt (`stop`, `disable`,
   `mask`, `kill`, `edit`, `revert`, `set-property`, `freeze` …) an `borgmatic.timer|.service`,
   `cockpit-borg-retention.*` oder `timers.target` (auch per Glob wie `*.timer`), `service …
@@ -199,8 +211,13 @@ borgmatic.service`, ein nacktes `borgmatic` (konfigurierte Aufbewahrung),
 `cockpit-borg-action status|check`, `systemctl status|is-active|show|list-timers …`,
 `journalctl -u borgmatic`, lesende docker-Befehle (`ps`, `images`, `inspect`, `logs`, `stats`,
 `version`, `info`, `compose ps|config|logs`), Paket-Updates — auch wenn `borgbackup` oder
-`borgmatic` darunter sind —, `gitlab-backup create`, Lesebefehle (`ls`, `cat`, `grep`, `test`)
-und `curl` ohne Upload an die Statusdatei auf Lab0.
+`borgmatic` darunter sind —, `gitlab-backup create`, Lesebefehle (`ls`, `cat`, `grep`, `test`;
+nicht auf Zugangsdaten und Repo-Inhalt, siehe oben) und `curl` ohne Upload an die Statusdatei auf
+Lab0. Auf Lab0 bleibt sichtbare Routine per `ssh` frei (Jochen, 13.10.2026: „ein umkehrbarer
+Routineschritt braucht kein Ja“): `systemctl start|stop|restart` an Units außerhalb der
+Sicherung (`android-adb.service`, `android-emulator.service`, die Cockpit-Units), Status,
+`journalctl`, Metadaten des Repos (`df`, `du`, `ls`), Paket-Updates. Der Türsteher sieht `ssh`
+nach Lab0 weiter als Hinweis.
 
 **Aufräum-Dienst auf Lab0** (`doc/setup/borg-retention.md`): frei ist seine Routine —
 `/usr/local/sbin/cockpit-borg-retention status|run`, `set <d> <w> <m> <HH:MM>` innerhalb der festen
