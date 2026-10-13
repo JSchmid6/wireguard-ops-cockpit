@@ -37,6 +37,9 @@ reviews the new code (see [Review before install](#review-before-install)).
 | --- | --- | --- |
 | `/usr/local/sbin/cockpit-self-update-action` | `deploy/helpers/cockpit-self-update-action` | The only sudo-exposed entry point. Pinned usage: `status`, `diff <sha>`, or `<sha> <diff-sha256>` (full lowercase 40-hex sha, 64-hex hash). |
 | `/usr/local/lib/wireguard-ops-cockpit/cockpit-self-update-run` | `deploy/helpers/cockpit-self-update-run` | The runner. Deliberately **not** a sudo target; started only by the one-shot unit and by the transient review-diff unit. |
+| `/usr/local/lib/wireguard-ops-cockpit/cockpit-self-update-snapshot` | `deploy/helpers/cockpit-self-update-snapshot` | Lab0 only: the safety net (copy of the Cockpit footprint before an update, restore on failure). Not a sudo target; called only by the runner. See [Lab0: snapshot and rollback](#lab0-snapshot-and-rollback). |
+| `/usr/local/lib/wireguard-ops-cockpit/homeserver-cockpit-deploy.sh` | `deploy/lab0/homeserver-cockpit-deploy.sh` | Lab0's reviewed deploy script; installs itself here on every run. |
+| `/var/lib/wireguard-ops-cockpit-self-update-snapshots/` | runtime (Lab0) | The snapshots, root 0700, newest two kept. |
 | `/etc/systemd/system/wireguard-ops-cockpit-self-update@.service` | `deploy/systemd/wireguard-ops-cockpit-self-update@.service` | One-shot deploy unit, instance = `<sha>-<diff-sha256>`. |
 | `/etc/sudoers.d/cockpit-executor` | `deploy/sudoers/cockpit-executor` | Gains the `cockpit-self-update-action *` line. |
 | `/var/lib/wireguard-ops-cockpit/self-update/state.json` | runtime | State: `deployed_commit`, `previous_commit`, `web_url`, activation status. Root-owned, 0750. |
@@ -117,7 +120,74 @@ runner only.
 
 Rollback is plain forward motion: run the job again with the `previous_commit`
 sha from `state.json` (it is an ancestor of `origin/main`, so it deploys like
-any other stand — and is reviewed like any other stand).
+any other stand — and is reviewed like any other stand). On Lab0 a failing
+update additionally rolls back by itself (next section).
+
+## Lab0: snapshot and rollback
+
+Stand 13.10.2026 (Kanban t_d25614f4). The VPS deploy script restores its own
+targets on failure, and the general door takes a hoster snapshot. Lab0 has
+neither a hoster snapshot nor a borg backup of itself — Lab0 *is* the backup
+box. Its safety net for a self-update is therefore a local copy of exactly what
+an update changes: `deploy/helpers/cockpit-self-update-snapshot`.
+
+**Footprint** (what `deploy/lab0/homeserver-cockpit-deploy.sh` writes): the
+checkout `/opt/wireguard-ops-cockpit` with build output and `node_modules`,
+`/usr/local/lib/wireguard-ops-cockpit` (helpers, runner, the deploy script
+itself), the web root, the API drop-in directory, `/usr/local/sbin/cockpit-*`,
+`/etc/systemd/system/wireguard-ops-cockpit-*.service`, the retention
+service/timer, `/etc/sudoers.d/cockpit-executor`, the nginx site and its wg0
+drop-in, the agent's opencode config and `self-update/state.json`. Not copied:
+`/etc/wireguard-ops-cockpit` (the deploy script only creates missing secrets,
+never rewrites them), packages, Node/opencode under `/opt/node-*`, the borg
+repository, borgmatic and everything else on the box.
+
+**Flow** (runner, only where the helper is installed; the VPS has none and is
+unchanged):
+
+1. After the review hash matched and before the deploy script runs:
+   `create su-<sha12>-<UTC time>`. The copy goes to
+   `/var/lib/wireguard-ops-cockpit-self-update-snapshots/<name>/` (root 0700,
+   deliberately not below `/var/lib/wireguard-ops-cockpit`, where `wgops`
+   writes), the manifest is written last (`complete: true`). Rotation keeps
+   the newest two and touches only names of its own form; too little free
+   space (size plus 512 MB) refuses. **No snapshot, no deploy:** a failing
+   create ends the job with 67, phase `snapshot`, nothing changed.
+   `state.json` names the snapshot (`snapshot`) for the activation.
+2. Deploy script, pre-activation verification or scheduling fail →
+   `restore`, `systemctl daemon-reload`, `reload nginx` (when active), restart
+   the four services only if one is down (in `defer` mode the old code is still
+   the running one), then the full verification against the previous commit.
+   The job keeps its failure code; `last-result.json` carries `rollback`
+   (`result`, `verification` or `error`), `state.json` is the restored one plus
+   `rollback` (failed commit, snapshot, phase).
+3. Activation fails (restart, verification) → the same restore, then restart of
+   the services and verification of the previous commit;
+   `activation.status = rolled-back` (or `failed` when the rollback itself could
+   not prove the previous stand), exit 68.
+4. A rollback that cannot restore or verify says so loudly
+   (`rollback incomplete: …`) and leaves the snapshot in place for the operator.
+
+`restore` puts back bytes, modes, owners and symlinks (`cp -a`), removes what
+the update added below the globs, and swaps directories in by rename after the
+copy is complete, so a failed copy (e.g. no space) leaves the live tree as it
+was.
+
+**What this is not:** a net for general host changes. The general door
+(`cockpit-host-run`) keeps requiring a borg backup and a machine snapshot for
+`mutates: true`; on Lab0 neither exists, so mutating host runs keep failing
+their preflight there, on purpose — a copy of the Cockpit's files is no way back
+for packages or a kernel. Cockpit code reaches Lab0 only through this typed
+self-update (doorkeeper X2 sends Cockpit code changes here anyway).
+
+**Rollout on Lab0.** The runner calls the installed
+`/usr/local/lib/wireguard-ops-cockpit/homeserver-cockpit-deploy.sh`; the
+scripts before this change did not install themselves there, so the first stand
+with this module needs one manual root run on the box (bootstrap copy of
+`deploy/lab0/homeserver-cockpit-deploy.sh`, `REPO_COMMIT=<merge sha>`). From
+then on an update is a Cockpit job on Lab0 with the plan line
+`/usr/local/sbin/cockpit-self-update-action <sha>`, reviewed before install,
+with snapshot and rollback. Nothing polls: the job is ordered when wanted.
 
 ## Review before install
 
@@ -148,7 +218,7 @@ Flow of a Hermes change job whose plan contains `self.update <sha>` lines:
    | kind | guarantee | what |
    | --- | --- | --- |
    | `sudoers-additions` | G4 | added non-comment lines in `deploy/sudoers/*` (`#include`/`#includedir` count as directives) |
-   | `update-mechanism` | G7 | the self-update helper, runner, unit, `update-review.ts`, `update-review-prompt.ts` |
+   | `update-mechanism` | G7 | the self-update helper, runner, snapshot helper, Lab0 deploy script, unit, `update-review.ts`, `update-review-prompt.ts` |
    | `envelope-signing` | G2 | hunks touching `signEnvelope`, `verifyExecutionEnvelopeSignature`, `approveExecutionEnvelope`, `createExecutionEnvelope`, `validateExecutionEnvelope`, and `verifyEnvelope` in the capability helper |
    | `broker-validation` | G3 | hunks touching `validateRequest`/`signature` in the executor broker |
    | `host-door` | G2/G5/G6/G9/G10 | the general door: `apps/api/src/host-run.ts`, `deploy/helpers/cockpit-host-run`, `cockpit-backup-guard.mjs`, `cockpit-borg-retention-rules.mjs`, `cockpit-state-steps.mjs`, the host-run resume unit |
@@ -335,6 +405,16 @@ under the state directory — never a bare exit code.
   read-only), reviewed-hash binding (mismatch refused before the deploy script,
   moved base invalidates an older review), runner refusals, diff during a
   deployment.
+  S17 covers Lab0's safety net with a stub snapshot helper: snapshot before the
+  deploy script, rollback after a failing deploy (checkout and state back, no
+  restart), failing snapshot stops before the deploy, rollback after a failing
+  activation (restart, previous commit verified, `rolled-back`), a rollback
+  that cannot verify or restore is reported, never hidden.
+- `sudo bash test/cockpit-self-update-snapshot.test.sh` — the snapshot helper
+  against a fixture root: byte-, mode- and owner-exact restore of a changed
+  footprint (changed, added, removed files, new helper and unit), secrets and
+  foreign files untouched, refusals (name, existing, incomplete, space),
+  rotation.
 - `apps/api/test/update-review.test.ts` — prompt assembly, answer parser,
   coverage/truncation stop, policy, envelope binding, prompt cases.
 - `bash test/cockpit-self-update-e2e.sh` — disposable privileged container with
