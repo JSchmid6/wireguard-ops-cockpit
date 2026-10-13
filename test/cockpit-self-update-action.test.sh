@@ -218,6 +218,8 @@ case "\${1:-}" in
     # S16: the restart swaps the web container onto the tagged image, unless
     # the test simulates a web unit that leaves the old container running.
     if [ -e "$FIX/docker-tag" ] && [ ! -e "$FIX/web-stale" ]; then cp "$FIX/docker-tag" "$FIX/docker-running"; fi
+    # S17d: one failing restart (the activation), the rollback's restart works
+    if [ -e "$FIX/restart-fail-once" ]; then rm -f "$FIX/restart-fail-once"; exit 1; fi
     exit "\${FIX_RESTART_RC:-0}"
     ;;
   is-active) exit "\${FIX_ISACTIVE_RC:-0}" ;;
@@ -396,6 +398,8 @@ export COCKPIT_SELF_UPDATE_RUN_PATH="$RUNNER"
 export COCKPIT_SELF_UPDATE_WG_IP="10.0.0.5"
 export COCKPIT_SELF_UPDATE_API_HEALTH_URL="http://127.0.0.1:3001/api/health"
 export COCKPIT_SELF_UPDATE_TTYD_URL="http://127.0.0.1:7681/terminal/"
+# S1-S16 run without the Lab0 safety net (as on the VPS); S17 installs a stub.
+export COCKPIT_SELF_UPDATE_SNAPSHOT="$FIX/no-snapshot-helper"
 export DEPLOY_FIX="$FIX"
 export FIX
 
@@ -867,6 +871,109 @@ H8="$(review_hash "$C8" "$FIX/s16-diff8.out")"
 "$HELPER" "$C8" "$H8" > /dev/null 2> "$FIX/s16g.err"; rc=$?
 check "S16 deploy whose built image is not tagged -> 68" "$([ "$rc" -eq 68 ] && echo 0 || echo 1)" "rc=$rc $(head -c 300 "$FIX/s16g.err")"
 check "S16 untagged build: no activation scheduled" "$(grep -q "systemd-run:.*activate" "$FIX/record.log" && echo 1 || echo 0)" ""
+
+# --------------------------------------------------------------------------
+# S17: Lab0 safety net — snapshot before the deploy script, rollback after a
+# failing deploy and after a failing activation (stub helper: create saves the
+# checkout HEAD and state.json, restore puts both back).
+# --------------------------------------------------------------------------
+echo "--- S17: snapshot and rollback (Lab0)"
+rm -f "$FIX/web-image-on"
+cat > "$FIX/bin/snapshot" <<EOF
+#!/bin/bash
+echo "snapshot: \$*" >> "$FIX/record.log"
+dir="$FIX/snaps/\$2"
+case "\$1" in
+  create)
+    [ -e "$FIX/snap-create-fails" ] && { echo "disk full" >&2; exit 66; }
+    mkdir -p "\$dir"
+    git -C "$CLONE" rev-parse HEAD > "\$dir/head"
+    cp "$FIX/state/state.json" "\$dir/state.json"
+    echo "{\"ok\": true, \"bytes\": 42, \"checkout_head\": \"\$(cat "\$dir/head")\", \"rotated\": []}"
+    ;;
+  restore)
+    [ -e "$FIX/snap-restore-fails" ] && { echo "restore broke" >&2; exit 67; }
+    [ -d "\$dir" ] || exit 65
+    git -C "$CLONE" checkout --quiet --detach "\$(cat "\$dir/head")"
+    cp "\$dir/state.json" "$FIX/state/state.json"
+    echo '{"ok": true}'
+    ;;
+  *) exit 64 ;;
+esac
+EOF
+chmod 755 "$FIX/bin/snapshot"
+export COCKPIT_SELF_UPDATE_SNAPSHOT="$FIX/bin/snapshot"
+export COCKPIT_SELF_UPDATE_ROLLBACK_RELOAD="fixture-nginx"
+reset_base() { # the deployed stand = the checkout HEAD, activation ok
+  local head
+  head="$(git -C "$CLONE" rev-parse HEAD)"
+  cat > "$FIX/state/state.json" <<EOF2
+{"version":1,"deployed_commit":"$head","previous_commit":null,"web_url":"https://10.0.0.5:18181","activation":{"status":"ok"}}
+EOF2
+  echo "$head"
+}
+
+# a) deploy script fails -> rollback restores the previous checkout and state
+B17="$(reset_base)"
+C9="$(add_commit c9)"
+H9="$(review_hash "$C9" "$FIX/s17-diff9.out")"
+: > "$FIX/record.log"
+COCKPIT_SELF_UPDATE_DEPLOY_SH="$FIX/deploy-bad.sh" "$HELPER" "$C9" "$H9" > /dev/null 2> "$FIX/s17a.err"; rc=$?
+check "S17a failing deploy -> 69" "$([ "$rc" -eq 69 ] && echo 0 || echo 1)" "rc=$rc $(head -c 300 "$FIX/s17a.err")"
+check "S17a snapshot taken before the deploy script" \
+  "$(grep -n "snapshot: create su-${C9:0:12}-" "$FIX/record.log" | head -1 | grep -q . && echo 0 || echo 1)" "$(cat "$FIX/record.log")"
+check "S17a snapshot restored" "$(grep -q "snapshot: restore su-${C9:0:12}-" "$FIX/record.log" && echo 0 || echo 1)" "$(cat "$FIX/record.log")"
+expect_json "S17a rollback ok" "$FIX/state/last-result.json" "rollback.result" "ok"
+expect_json "S17a rollback verified the previous commit" "$FIX/state/last-result.json" "rollback.verification.revision" "ok"
+expect_json "S17a state back on the previous commit" "$FIX/state/state.json" "deployed_commit" "$B17"
+expect_json "S17a state notes the rollback" "$FIX/state/state.json" "rollback.failed_commit" "$C9"
+check "S17a checkout back on the previous commit" "$([ "$(git -C "$CLONE" rev-parse HEAD)" = "$B17" ] && echo 0 || echo 1)" ""
+check "S17a no service restart (old code still runs)" "$(grep -q "restart:" "$FIX/record.log" && echo 1 || echo 0)" "$(cat "$FIX/record.log")"
+check "S17a error says rolled back" "$(grep -q "rolled back to ${B17:0:12}" "$FIX/state/last-result.json" && echo 0 || echo 1)" "$(head -c 400 "$FIX/state/last-result.json")"
+
+# b) snapshot fails -> nothing deployed
+: > "$FIX/snap-create-fails"
+: > "$FIX/invocations.log"
+"$HELPER" "$C9" "$H9" > /dev/null 2> "$FIX/s17b.err"; rc=$?
+rm -f "$FIX/snap-create-fails"
+check "S17b failing snapshot -> 67" "$([ "$rc" -eq 67 ] && echo 0 || echo 1)" "rc=$rc $(head -c 300 "$FIX/s17b.err")"
+expect_json "S17b phase snapshot" "$FIX/state/last-result.json" "phase" "snapshot"
+check "S17b deploy script never ran" "$([ -s "$FIX/invocations.log" ] && echo 1 || echo 0)" "$(cat "$FIX/invocations.log")"
+expect_json "S17b state untouched" "$FIX/state/state.json" "deployed_commit" "$B17"
+
+# c) deploy ok, activation fails -> rollback with restart, previous commit verified
+: > "$FIX/record.log"
+"$HELPER" "$C9" "$H9" > "$FIX/s17c.out" 2> "$FIX/s17c.err"; rc=$?
+check "S17c deploy rc=0" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "rc=$rc $(head -c 300 "$FIX/s17c.err")"
+check "S17c state names the snapshot" "$(json_get "$FIX/state/state.json" snapshot | grep -q "^su-${C9:0:12}-" && echo 0 || echo 1)" "$(head -c 400 "$FIX/state/state.json")"
+FIX_ISACTIVE_RC=1 FIX_RESTART_RC=0 COCKPIT_SELF_UPDATE_VERIFY_RETRIES=1 "$RUNNER" activate "$C9" > "$FIX/s17c-act.out" 2>&1; rc=$?
+check "S17c activation with dead services -> 68" "$([ "$rc" -eq 68 ] && echo 0 || echo 1)" "rc=$rc $(tail -c 300 "$FIX/s17c-act.out")"
+check "S17c activation restored the snapshot" "$(grep -q "snapshot: restore su-${C9:0:12}-" "$FIX/record.log" && echo 0 || echo 1)" "$(cat "$FIX/record.log")"
+expect_json "S17c state back on the previous commit" "$FIX/state/state.json" "deployed_commit" "$B17"
+check "S17c checkout back on the previous commit" "$([ "$(git -C "$CLONE" rev-parse HEAD)" = "$B17" ] && echo 0 || echo 1)" ""
+# the stub's is-active stayed 1, so the restored stand cannot verify either: reported, not hidden
+expect_json "S17c rollback reported incomplete while services stay down" "$FIX/state/last-result.json" "activation.status" "failed"
+check "S17c reason names the rollback" "$(grep -q "rollback incomplete" "$FIX/state/last-result.json" && echo 0 || echo 1)" "$(head -c 400 "$FIX/state/last-result.json")"
+
+# d) deploy ok, activation verification fails only for the new stand -> rolled-back
+"$HELPER" "$C9" "$H9" > /dev/null 2> "$FIX/s17d.err"; rc=$?
+check "S17d deploy rc=0" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "rc=$rc $(head -c 300 "$FIX/s17d.err")"
+: > "$FIX/record.log"
+: > "$FIX/restart-fail-once"
+"$RUNNER" activate "$C9" > "$FIX/s17d-act.out" 2>&1; rc=$?
+check "S17d failing restart -> 68" "$([ "$rc" -eq 68 ] && echo 0 || echo 1)" "rc=$rc"
+expect_json "S17d activation rolled back" "$FIX/state/last-result.json" "activation.status" "rolled-back"
+expect_json "S17d rollback verified" "$FIX/state/last-result.json" "activation.rollback.result" "ok"
+expect_json "S17d state back on the previous commit" "$FIX/state/state.json" "deployed_commit" "$B17"
+
+# e) restore itself fails -> loud, snapshot named, exit stays the failure code
+: > "$FIX/snap-restore-fails"
+COCKPIT_SELF_UPDATE_DEPLOY_SH="$FIX/deploy-bad.sh" "$HELPER" "$C9" "$H9" > /dev/null 2> "$FIX/s17e.err"; rc=$?
+rm -f "$FIX/snap-restore-fails"
+check "S17e failing restore keeps 69" "$([ "$rc" -eq 69 ] && echo 0 || echo 1)" "rc=$rc"
+expect_json "S17e rollback failed" "$FIX/state/last-result.json" "rollback.result" "failed"
+check "S17e reason names the restore" "$(grep -q "restore broke" "$FIX/state/last-result.json" && echo 0 || echo 1)" "$(head -c 400 "$FIX/state/last-result.json")"
+export COCKPIT_SELF_UPDATE_SNAPSHOT="$FIX/no-snapshot-helper"
 
 echo
 echo "Gerüst: $FIX (wird beim Beenden entfernt)"

@@ -46,6 +46,15 @@
 #           this separate, scheduled step: the deploy job completes cleanly
 #           before the activation fires.
 #
+# Safety net (Lab0, doc/setup/self-update.md "Lab0: snapshot and rollback"):
+#           where cockpit-self-update-snapshot is installed, deploy copies the
+#           Cockpit's own footprint before the deploy script runs (no snapshot,
+#           no deploy). A failing deploy script, pre-activation verification or
+#           scheduling, and a failing activation, put that copy back, reload
+#           systemd and nginx, restart the services where needed and verify
+#           the previous commit again. The VPS has no such helper: its deploy
+#           script restores its own targets, and nothing changes there.
+#
 # Security contract:
 #   * Exactly one full lowercase 40-hex commit from the allowlisted
 #     repository https://github.com/JSchmid6/wireguard-ops-cockpit.git;
@@ -95,6 +104,8 @@ REVIEWED_TARGET_RE = re.compile(r"^([a-f0-9]{40})-([a-f0-9]{64})$")
 UPDATE_MECHANISM_FILES = (
     "deploy/helpers/cockpit-self-update-action",
     "deploy/helpers/cockpit-self-update-run",
+    "deploy/helpers/cockpit-self-update-snapshot",
+    "deploy/lab0/homeserver-cockpit-deploy.sh",
     "deploy/systemd/wireguard-ops-cockpit-self-update@.service",
     # The API half of the review (prompt, evidence, policy, reviewed-hash binding).
     "apps/api/src/update-review.ts",
@@ -134,8 +145,8 @@ FILE_AREAS = (
      lambda path: path in HOST_DOOR_FILES),
     ("capability-sandbox", ("G5",), "dynamic capability sandbox and protected paths",
      lambda path: path in ("deploy/helpers/cockpit-capability-action", "apps/api/src/capability-manifest.ts")),
-    ("root-helpers", ("G4", "G5"), "root helpers, systemd units and sudoers sources",
-     lambda path: path.startswith(("deploy/helpers/", "deploy/systemd/", "deploy/sudoers/"))),
+    ("root-helpers", ("G4", "G5"), "root helpers, systemd units, sudoers sources and the root-run deploy scripts",
+     lambda path: path.startswith(("deploy/helpers/", "deploy/systemd/", "deploy/sudoers/", "deploy/lab0/", "deploy/vps/"))),
     ("ci", ("G7",), "CI workflow definitions (the merge gate behind G7)", lambda path: bool(CI_PATH_RE.search(path))),
 )
 # Excerpt order: what the reviewer must see first comes first.
@@ -211,6 +222,10 @@ RUN_PATH = env("COCKPIT_SELF_UPDATE_RUN_PATH", "/usr/local/lib/wireguard-ops-coc
 WG_IP = env("COCKPIT_SELF_UPDATE_WG_IP", "10.0.0.5")
 API_HEALTH_URL = env("COCKPIT_SELF_UPDATE_API_HEALTH_URL", "http://127.0.0.1:3001/api/health")
 TTYD_URL = env("COCKPIT_SELF_UPDATE_TTYD_URL", "http://127.0.0.1:7681/terminal/")
+# Lab0's safety net; absent on the VPS (its deploy script restores itself).
+SNAPSHOT = env("COCKPIT_SELF_UPDATE_SNAPSHOT", "/usr/local/lib/wireguard-ops-cockpit/cockpit-self-update-snapshot")
+# Units reloaded (when active) after a rollback put their configuration back.
+ROLLBACK_RELOAD = env("COCKPIT_SELF_UPDATE_ROLLBACK_RELOAD", "nginx").split()
 
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 RESULT_FILE = os.path.join(STATE_DIR, "last-result.json")
@@ -912,6 +927,81 @@ def verify_phase(retries, delay, include_web, after_activation):
     return checks
 
 
+def take_snapshot(sha):
+    """The footprint copy before the deploy script runs; None where the helper
+    is not installed (VPS). A helper that is installed but fails stops the update."""
+    if not os.path.exists(SNAPSHOT):
+        log("no snapshot helper installed (%s): no automatic rollback for this host" % SNAPSHOT)
+        return None
+    name = "su-%s-%s" % (sha[:12], time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()))
+    made = run([SNAPSHOT, "create", name], timeout=3600)
+    if made.returncode != 0:
+        raise Failure(67, "snapshot", "snapshot before the update failed, nothing was deployed: %s"
+                      % (made.stderr.strip()[-400:] or "exit %s" % made.returncode))
+    try:
+        record = json.loads(made.stdout)
+    except ValueError:
+        raise Failure(67, "snapshot", "snapshot helper returned no result, nothing was deployed")
+    log("snapshot %s taken (%s bytes, checkout %s, rotated %s)"
+        % (name, record.get("bytes"), (record.get("checkout_head") or "?")[:12], record.get("rotated") or "none"))
+    return {"name": name, "bytes": record.get("bytes"), "checkout_head": record.get("checkout_head"),
+            "rotated": record.get("rotated") or []}
+
+
+def roll_back(snapshot, previous, failed_sha, phase, restart):
+    """Put the snapshot back and prove the previous commit runs again. Never raises."""
+    global ACTIVE_SHA
+    outcome = {"snapshot": snapshot, "phase": phase, "previous_commit": previous, "at": utcnow(), "result": "failed"}
+    log("rolling back to snapshot %s (commit %s) after the %s failure" % (snapshot, (previous or "?")[:12], phase))
+    try:
+        put = run([SNAPSHOT, "restore", snapshot], timeout=3600)
+        if put.returncode != 0:
+            outcome["error"] = "restore failed: %s" % (put.stderr.strip()[-600:] or "exit %s" % put.returncode)
+            log(outcome["error"])
+            return outcome
+        reload = run([SYSTEMCTL, "daemon-reload"], timeout=120)
+        if reload.returncode != 0:
+            outcome["error"] = "systemctl daemon-reload failed: %s" % reload.stderr.strip()[-300:]
+            return outcome
+        for unit in ROLLBACK_RELOAD:
+            if run([SYSTEMCTL, "is-active", "--quiet", unit], timeout=15).returncode == 0:
+                done = run([SYSTEMCTL, "reload", unit], timeout=120)
+                if done.returncode != 0:
+                    outcome["error"] = "reload of %s failed: %s" % (unit, done.stderr.strip()[-300:])
+                    return outcome
+        down = [name for name in SERVICES if run([SYSTEMCTL, "is-active", "--quiet", name], timeout=15).returncode != 0]
+        if restart or down:
+            log("restarting %s on the restored files" % " ".join(SERVICES))
+            again = run([SYSTEMCTL, "restart"] + SERVICES, timeout=300)
+            if again.returncode != 0:
+                outcome["error"] = "service restart after the restore failed: %s" % again.stderr.strip()[-300:]
+                return outcome
+        outcome["restarted"] = bool(restart or down)
+        state = read_json(STATE_FILE)
+        if isinstance(state, dict):
+            state["rollback"] = {"failed_commit": failed_sha, "snapshot": snapshot, "phase": phase, "at": utcnow()}
+            state["updated_at"] = utcnow()
+            write_json_atomic(STATE_FILE, state)
+        ACTIVE_SHA = previous or ""
+        try:
+            outcome["verification"] = verify_phase(retries=VERIFY_RETRIES * 2, delay=VERIFY_DELAY,
+                                                   include_web=True, after_activation=True)
+        except Failure as exc:
+            outcome["error"] = "the restored stand does not verify: %s" % exc.message
+            return outcome
+        finally:
+            ACTIVE_SHA = failed_sha
+        outcome["result"] = "ok"
+        log("rollback verified: commit %s runs again" % (previous or "?")[:12])
+    except Failure as exc:
+        outcome["error"] = exc.message
+    except Exception as exc:  # pragma: no cover - unexpected internal error
+        outcome["error"] = "internal error during rollback: %s" % exc
+    if outcome["result"] != "ok":
+        log("ROLLBACK INCOMPLETE: %s — operator needed (snapshot %s stays in place)" % (outcome.get("error"), snapshot))
+    return outcome
+
+
 def acquire_run_lock(wait=0):
     fd = os.open(RUN_LOCK, os.O_RDWR | os.O_CREAT, 0o640)
     deadline = time.time() + wait
@@ -998,6 +1088,8 @@ def cmd_deploy(sha, reviewed_sha256):
     result["review"] = review
     result["deploy"] = {"script": DEPLOY_SH, "sha256": deploy_sha256, "result": "failed", "exit_code": None, "log": logfile}
     log("previous deployed commit: %s" % (previous or "unknown"))
+    snapshot = take_snapshot(sha)
+    result["snapshot"] = snapshot
     log("running the reviewed deploy script (REPO_COMMIT=%s, service restarts deferred)" % sha)
     try:
         child_env = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "HOME": "/root", "REPO_COMMIT": sha,
@@ -1035,6 +1127,10 @@ def cmd_deploy(sha, reviewed_sha256):
                         RUN_PATH, "activate", sha], timeout=30)
         if schedule.returncode != 0:
             raise Failure(69, "schedule", "activation could not be scheduled: %s" % (schedule.stderr.strip()[-300:] or "no output"))
+        if snapshot:
+            new_state["snapshot"] = snapshot["name"]
+        else:
+            new_state.pop("snapshot", None)
         activation = {"status": "scheduled", "unit": unit_name, "scheduled_at": utcnow(), "delay_seconds": ACTIVATION_DELAY}
         result["activation"] = activation
         result["phase"] = "awaiting-activation"
@@ -1043,7 +1139,13 @@ def cmd_deploy(sha, reviewed_sha256):
         write_json_atomic(STATE_FILE, new_state)
         finish(result, 0)
     except Failure as exc:
-        if exc.phase in ("verify", "schedule"):
+        if snapshot and exc.phase in ("deploy", "verify", "schedule"):
+            result["rollback"] = roll_back(snapshot["name"], previous, sha, exc.phase, restart=False)
+            if result["rollback"]["result"] != "ok":
+                exc.message += "; rollback incomplete: %s" % result["rollback"].get("error")
+            else:
+                exc.message += "; rolled back to %s" % (previous or "?")[:12]
+        elif exc.phase in ("verify", "schedule"):
             current = read_json(STATE_FILE)
             if isinstance(current, dict):
                 current["activation"] = {"status": "not-activated", "checked_at": utcnow(), "detail": exc.message[:300]}
@@ -1113,6 +1215,18 @@ def cmd_activate(sha):
         activation["restart_exit_code"] = restart.returncode
         activation["restart_error"] = restart_detail
         error = error or ("service restart failed (%s)" % (restart_detail or restart.returncode))
+    snapshot = state.get("snapshot")
+    if activation["status"] != "ok" and snapshot and os.path.exists(SNAPSHOT):
+        rollback = roll_back(snapshot, state.get("previous_commit"), sha, "activate", restart=True)
+        activation["rollback"] = rollback
+        activation["status"] = "rolled-back" if rollback["result"] == "ok" else "failed"
+        result["activation"] = activation
+        result.update({"ok": False, "result": "failed", "phase": "activate", "code": 68, "finished_at": utcnow(),
+                       "error": "%s; %s" % (error or "activation verification failed",
+                                            "rolled back to %s" % (state.get("previous_commit") or "?")[:12]
+                                            if rollback["result"] == "ok" else "rollback incomplete: %s" % rollback.get("error"))})
+        # state.json is the restored one (the previous commit) plus the rollback note.
+        finish(result, 68)
     result["activation"] = activation
     result["finished_at"] = utcnow()
     new_state = dict(state)

@@ -342,6 +342,11 @@ Scheitert eines davon, läuft kein Schritt (`preflight_failed`). Scheitert spät
 eine Prüfung, nennt das Protokoll die Snapshot-Kennung; zurückgespielt wird er nur mit Jochens
 Freigabe (ein Revert nimmt alles seit dem Snapshot mit).
 
+Auf Lab0 gibt es keins von beiden (Lab0 ist selbst die Backup-Kiste): verändernde Läufe scheitern
+dort im Preflight, gewollt. Das Cockpit selbst kommt auf Lab0 über das typisierte Selbst-Update mit
+eigener Kopie und Rückfall (`doc/setup/self-update.md`, „Lab0: snapshot and rollback“), nicht durch
+diese Tür.
+
 Der Plan braucht Prüfschritte und einen Rückweg (`rollback`, Pflichtfeld). Ein Neustart ist ein
 gewöhnlicher Schritt (`{"name":"reboot","reboot":true}`, höchstens drei): der Lauf schreibt
 vorher, wo er weitermacht, `wireguard-ops-cockpit-host-run-resume.service` startet die

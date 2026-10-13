@@ -1,0 +1,293 @@
+#!/usr/bin/python3
+# cockpit-self-update-snapshot — the safety net of a Cockpit self-update on Lab0.
+#
+# Not a sudo target and not meant to be run by hand: only cockpit-self-update-run
+# calls it (as root, inside the self-update unit or its activation timer).
+#
+#   create  <name>   copy the Cockpit's own footprint into <store>/<name>/
+#   restore <name>   put exactly that footprint back (bytes, modes, owners;
+#                    files that did not exist at create time are removed)
+#   list             the snapshots in the store (JSON)
+#
+# Why a local copy and not a machine snapshot: the VPS has a hoster snapshot
+# (cockpit-vps-snapshot) and a borg backup that leaves the machine; Lab0 has
+# neither — Lab0 *is* the backup box, and this helper never touches the borg
+# repository, borgmatic or anything outside the list below. A self-update
+# changes only the Cockpit's own files, so the copy of exactly those files is
+# the complete return path for it. It is NOT a net for general host changes
+# (packages, kernel): the general door (cockpit-host-run) keeps failing its
+# preflight on Lab0 for mutating runs, on purpose.
+#
+# Footprint (what homeserver-cockpit-deploy.sh writes; nothing else):
+#   trees  the checkout incl. build output and node_modules, the helper
+#          library, the web root, the API drop-in directory
+#   globs  root helpers in /usr/local/sbin, the Cockpit's units, the retention
+#          service/timer
+#   files  sudoers file, nginx site, nginx drop-in, the agent's opencode
+#          config, the self-update state.json
+# Secrets in /etc/wireguard-ops-cockpit are not copied: the deploy script only
+# creates missing ones and never rewrites them.
+#
+# The store (/var/lib/wireguard-ops-cockpit-self-update-snapshots, root 0700)
+# is deliberately not below /var/lib/wireguard-ops-cockpit (wgops writes there).
+# `create` keeps the newest KEEP snapshots (default 2) and removes only
+# snapshots of its own name form; it refuses when the free space is too small.
+# A snapshot counts only with its manifest (written last, complete: true).
+#
+# Exit codes: 0 ok, 64 usage, 65 refused (name, store), 66 no space,
+# 67 copy/restore failed (restore names every path it could not put back).
+#
+# Harness hook (test only, never set in production): COCKPIT_SELF_UPDATE_SNAPSHOT_ROOT
+# prefixes every footprint path; COCKPIT_SELF_UPDATE_SNAPSHOT_STORE moves the store.
+import datetime
+import glob
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+
+ROOT = os.environ.get("COCKPIT_SELF_UPDATE_SNAPSHOT_ROOT", "").rstrip("/")
+STORE = os.environ.get("COCKPIT_SELF_UPDATE_SNAPSHOT_STORE") or ROOT + "/var/lib/wireguard-ops-cockpit-self-update-snapshots"
+KEEP = int(os.environ.get("COCKPIT_SELF_UPDATE_SNAPSHOT_KEEP", "2"))
+# Free space beyond the snapshot's own size, so a full disk never ends a deploy halfway.
+MARGIN = int(os.environ.get("COCKPIT_SELF_UPDATE_SNAPSHOT_MARGIN", str(512 * 1024 * 1024)))
+NAME_RE = re.compile(r"^su-[a-f0-9]{12}-[0-9]{8}T[0-9]{6}Z$")
+
+TREES = (
+    "/opt/wireguard-ops-cockpit",
+    "/usr/local/lib/wireguard-ops-cockpit",
+    "/var/www/wireguard-ops-cockpit",
+    "/etc/systemd/system/wireguard-ops-cockpit-api.service.d",
+)
+GLOBS = (
+    "/usr/local/sbin/cockpit-*",
+    "/etc/systemd/system/wireguard-ops-cockpit-*.service",
+    "/etc/systemd/system/cockpit-borg-retention.service",
+    "/etc/systemd/system/cockpit-borg-retention.timer",
+)
+FILES = (
+    "/etc/sudoers.d/cockpit-executor",
+    "/etc/nginx/sites-available/wireguard-ops-cockpit",
+    "/etc/systemd/system/nginx.service.d/wait-wg0.conf",
+    "/var/lib/wireguard-ops-agent/.config/opencode/opencode.jsonc",
+    "/var/lib/wireguard-ops-cockpit/self-update/state.json",
+)
+
+
+class Failure(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def host(path):
+    return ROOT + path
+
+
+def utcnow():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def check_store():
+    if os.path.lexists(STORE):
+        info = os.lstat(STORE)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0:
+            raise Failure(65, "snapshot store %s is not a root-owned directory" % STORE)
+    else:
+        os.makedirs(STORE, mode=0o700)
+    os.chmod(STORE, 0o700)
+
+
+def check_name(name):
+    if not NAME_RE.match(name):
+        raise Failure(64, "snapshot name must look like su-<12 hex>-<YYYYMMDDTHHMMSSZ>")
+    return os.path.join(STORE, name)
+
+
+def entries():
+    """The footprint as it is now: (host path, kind) for every target."""
+    found = [(path, "tree") for path in TREES]
+    for pattern in GLOBS:
+        found += [(match[len(ROOT):], "glob:" + pattern) for match in sorted(glob.glob(host(pattern)))]
+    found += [(path, "file") for path in FILES]
+    return found
+
+
+def size_of(path):
+    total = 0
+    if os.path.islink(path) or not os.path.isdir(path):
+        return os.lstat(path).st_size if os.path.lexists(path) else 0
+    for base, dirs, files in os.walk(path):
+        for name in dirs + files:
+            try:
+                total += os.lstat(os.path.join(base, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def copy(src, dst):
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    # cp -a keeps modes, owners, timestamps and symlinks; --reflink=auto is free where the fs allows it.
+    done = subprocess.run(["cp", "-a", "--reflink=auto", "--", src, dst], capture_output=True, text=True)
+    if done.returncode != 0:
+        raise Failure(67, "copy %s failed: %s" % (src, done.stderr.strip()[-300:]))
+
+
+def snapshots():
+    if not os.path.isdir(STORE):
+        return []
+    # oldest first, by the time in the name (the commit part says nothing about age)
+    return sorted((name for name in os.listdir(STORE) if NAME_RE.match(name)), key=lambda name: (name[-16:], name))
+
+
+def manifest_of(name):
+    try:
+        with open(os.path.join(STORE, name, "manifest.json"), "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) and data.get("complete") is True else None
+
+
+def remove_tree(path):
+    if os.path.islink(path) or not os.path.isdir(path):
+        os.unlink(path)
+    else:
+        shutil.rmtree(path)
+
+
+def cmd_create(name):
+    check_store()
+    target = check_name(name)
+    if os.path.lexists(target):
+        raise Failure(65, "snapshot %s exists already" % name)
+    # Room first: keep the newest KEEP-1, so with the new one there are KEEP.
+    removed = []
+    for old in snapshots()[: max(len(snapshots()) - (KEEP - 1), 0)]:
+        remove_tree(os.path.join(STORE, old))
+        removed.append(old)
+    footprint = entries()
+    need = sum(size_of(host(path)) for path, _ in footprint)
+    free = shutil.disk_usage(STORE).free
+    if free < need + MARGIN:
+        raise Failure(66, "not enough space in %s: need %d bytes plus %d margin, %d free" % (STORE, need, MARGIN, free))
+    partial = target + ".partial"
+    if os.path.lexists(partial):
+        remove_tree(partial)
+    os.makedirs(partial, mode=0o700)
+    recorded = []
+    try:
+        for path, kind in footprint:
+            present = os.path.lexists(host(path))
+            if present:
+                copy(host(path), os.path.join(partial, "data") + path)
+            recorded.append({"path": path, "kind": kind, "present": present})
+        head = subprocess.run(["git", "-C", host(TREES[0]), "rev-parse", "HEAD"], capture_output=True, text=True)
+        manifest = {"version": 1, "name": name, "created_at": utcnow(), "complete": True, "bytes": need,
+                    "checkout_head": head.stdout.strip() if head.returncode == 0 else None,
+                    "globs": list(GLOBS), "entries": recorded}
+        with open(os.path.join(partial, "manifest.json"), "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.rename(partial, target)
+    except Exception:
+        shutil.rmtree(partial, ignore_errors=True)
+        raise
+    return {"ok": True, "action": "create", "name": name, "path": target, "bytes": need,
+            "checkout_head": manifest["checkout_head"], "rotated": removed,
+            "entries": sum(1 for entry in recorded if entry["present"])}
+
+
+def put_back(saved, live):
+    """Replace live with saved: the copy goes next to it first, then one rename swaps it in."""
+    staged = live + ".snapshot-restore"
+    if os.path.lexists(staged):
+        remove_tree(staged)
+    try:
+        copy(saved, staged)
+    except Failure:
+        # e.g. no space: the live path stays untouched, the error names it
+        if os.path.lexists(staged):
+            remove_tree(staged)
+        raise
+    if os.path.lexists(live) and os.path.isdir(live) and not os.path.islink(live):
+        old = live + ".snapshot-old"
+        if os.path.lexists(old):
+            remove_tree(old)
+        os.rename(live, old)
+        os.rename(staged, live)
+        shutil.rmtree(old)
+    else:
+        os.replace(staged, live)
+
+
+def cmd_restore(name):
+    check_store()
+    target = check_name(name)
+    manifest = manifest_of(name)
+    if manifest is None:
+        raise Failure(65, "snapshot %s is missing or incomplete" % name)
+    data = os.path.join(target, "data")
+    recorded = {entry["path"]: entry for entry in manifest["entries"]}
+    restored, removed, errors = [], [], []
+    # Files a glob matches now but did not match at create time came with the update: remove them.
+    for pattern in manifest.get("globs", []):
+        for match in sorted(glob.glob(host(pattern))):
+            path = match[len(ROOT):]
+            if path not in recorded:
+                try:
+                    remove_tree(match)
+                    removed.append(path)
+                except OSError as exc:
+                    errors.append("%s: %s" % (path, exc))
+    for path, entry in recorded.items():
+        live = host(path)
+        try:
+            if entry["present"]:
+                put_back(data + path, live)
+                restored.append(path)
+            elif os.path.lexists(live):
+                remove_tree(live)
+                removed.append(path)
+        except (OSError, Failure) as exc:
+            errors.append("%s: %s" % (path, getattr(exc, "message", exc)))
+    result = {"ok": not errors, "action": "restore", "name": name, "checkout_head": manifest.get("checkout_head"),
+              "restored": restored, "removed": removed, "errors": errors}
+    if errors:
+        raise Failure(67, json.dumps(result, sort_keys=True))
+    return result
+
+
+def cmd_list():
+    return {"ok": True, "action": "list", "store": STORE,
+            "snapshots": [{"name": name, "complete": manifest_of(name) is not None} for name in snapshots()]}
+
+
+def main():
+    if os.geteuid() != 0:
+        print(json.dumps({"ok": False, "code": 65, "error": "must run as root"}), file=sys.stderr)
+        sys.exit(65)
+    args = sys.argv[1:]
+    try:
+        if args == ["list"]:
+            result = cmd_list()
+        elif len(args) == 2 and args[0] == "create":
+            result = cmd_create(args[1])
+        elif len(args) == 2 and args[0] == "restore":
+            result = cmd_restore(args[1])
+        else:
+            raise Failure(64, "usage: cockpit-self-update-snapshot create <name> | restore <name> | list")
+    except Failure as exc:
+        print(json.dumps({"ok": False, "code": exc.code, "error": exc.message}, sort_keys=True), file=sys.stderr)
+        sys.exit(exc.code)
+    print(json.dumps(result, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()
