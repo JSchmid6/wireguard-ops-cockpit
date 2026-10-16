@@ -83,7 +83,8 @@ const REPAIR_LIMIT_SECONDS = Number.parseInt(env.HOST_RUN_REPAIR_LIMIT_SECONDS |
 // antwortet (16.10.2026: health-ok 100 ms nach dem restart, curl (7), 4 s später
 // gesund). Ein gescheiterter Prüfschritt wird darum bis zu diesem Fenster ab
 // seinem ersten Versuch wiederholt; danach gilt er als gescheitert (fail closed).
-// Ein Prüfschritt, der seine Zeitgrenze erreicht hat, wird nie wiederholt.
+// Ein Prüfschritt, der seine Zeitgrenze erreicht hat, wird nie wiederholt,
+// ebenso keiner, den die Zustandserkennung als ändernd markiert (stateStepKinds).
 const CHECK_SETTLE_SECONDS = /^\d+$/.test(env.HOST_RUN_CHECK_SETTLE_SECONDS || "") ? Number.parseInt(env.HOST_RUN_CHECK_SETTLE_SECONDS, 10) : 30;
 const CHECK_RETRY_MS = 2000;
 // Hat bash eines unterbrechungssicheren Schritts geendet, ein Hintergrundprozess
@@ -692,7 +693,12 @@ async function payload(jobId) {
     const settleUntil = Date.now() + (manifest.mutates ? CHECK_SETTLE_SECONDS * 1000 : 0);
     let attempts = 1;
     let result = await runScript(check.run, check.timeoutSeconds, { uninterruptible });
-    while ((result.code !== 0 && !result.timedOut) && Date.now() + CHECK_RETRY_MS <= settleUntil) {
+    // Ein Prüfschritt, den die Erkennung als ändernd markiert, läuft genau einmal:
+    // ein Wiederholen könnte den Zustand ein zweites Mal ändern.
+    if (uninterruptible && result.code !== 0 && !result.timedOut && Date.now() + CHECK_RETRY_MS <= settleUntil) {
+      log(`== ${now()} check ${index + 1}/${manifest.checks.length}: ${check.name} exited ${result.code}; no retry: state-changing check`);
+    }
+    while (!uninterruptible && (result.code !== 0 && !result.timedOut) && Date.now() + CHECK_RETRY_MS <= settleUntil) {
       log(`== ${now()} check ${index + 1}/${manifest.checks.length}: ${check.name} exited ${result.code}; retry in ${CHECK_RETRY_MS / 1000} s (settle window ${CHECK_SETTLE_SECONDS} s)`);
       await new Promise((resolve) => setTimeout(resolve, CHECK_RETRY_MS));
       attempts += 1;

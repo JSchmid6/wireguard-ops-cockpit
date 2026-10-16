@@ -114,14 +114,27 @@ export function parseRunbookSafetyOutput(output: string): ParsedSafetyReport {
   // a passed report into blocked_policy), strict about the seven report lines:
   // each must appear exactly once, and no additional line may speak about the
   // verdict. Anything unclear fails closed — an unclear verdict never passes.
+  //
+  // Each line is read normalized: NFKC folds full-width and compatibility forms,
+  // and format characters (\p{Cf}: zero-width space, joiners, bidi marks) are
+  // removed, so "VER\u200bDICT" reads as VERDICT. Any additional line that still
+  // contains VERDICT — also glued to more text, as in VERDICT_OVERRIDE, VERDICT2
+  // or VERDICTS — fails closed, and so does a head with non-ASCII letters (a
+  // homoglyph such as a Cyrillic E, U+0415, in VERDICT is no key and no plain note).
   const values = new Map<string, string>();
-  for (const line of lines) {
+  for (const raw of lines) {
+    const line = raw.normalize("NFKC").replace(/\p{Cf}/gu, "").trim();
     const separator = line.indexOf(":");
-    const key = separator > 0 ? line.slice(0, separator).replace(/[*`#>\s-]/g, "").toUpperCase() : "";
+    const head = separator > 0 ? line.slice(0, separator) : "";
+    const key = head.replace(/[*`#>\s-]/g, "").toUpperCase();
     if (!REPORT_KEYS.has(key)) {
-      if (/\bVERDICT\b/i.test(line)) throw new Error(`ambiguous verdict line: ${line.substring(0, 60)}`);
+      if (/VERDICT/i.test(line)) throw new Error(`ambiguous verdict line: ${line.substring(0, 60)}`);
+      if (/\p{L}/u.test(head.replace(/[A-Za-z]/g, ""))) throw new Error(`unclear report line: ${line.substring(0, 60)}`);
       continue;
     }
+    // The verdict itself must be written plainly: a line that only reads as
+    // VERDICT after normalization is unclear, never a verdict.
+    if (key === "VERDICT" && line !== raw) throw new Error(`ambiguous verdict line: ${line.substring(0, 60)}`);
     if (values.has(key)) throw new Error(`duplicate ${key} line in the safety report`);
     values.set(key, line.slice(separator + 1).trim());
   }

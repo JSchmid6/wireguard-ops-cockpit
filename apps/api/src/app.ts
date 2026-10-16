@@ -41,7 +41,7 @@ import {
   listDynamicRunbooks
 } from "./registries.js";
 import { generateRunbookSafetyReview, type SafetyReviewRunner } from "./safety-review.js";
-import { activationAction, activationReason, pendingSelfUpdateActivations, selfUpdateVerifierNote } from "./self-update-activation.js";
+import { activationAction, activationReason, capabilityExecution, hostRunExecution, selfUpdateVerifierNote, typedActionsExecution, type TypedActionOutput, type TypedExecution } from "./self-update-activation.js";
 import { runBrokerAgent } from "./agent-broker.js";
 import { runDynamicCapability, runExecutorAction, type ExecutorActionKind } from "./executor-broker.js";
 import { borgStatusRequestDigest, createBorgStatusService } from "./borg-status.js";
@@ -1950,14 +1950,14 @@ export async function createApp(options: AppOptions = {}) {
     ].join("\n");
   }
 
-  async function executeTypedCapabilities(planText: string, envelope: ExecutionEnvelope, manifest?: CapabilityManifest | null, reviewedUpdates: UpdateBinding[] = [], hostRun?: HostRunManifest | null): Promise<string | null> {
-    if (hostRun) return await runHostRun(envelope, hostRun);
+  async function executeTypedCapabilities(planText: string, envelope: ExecutionEnvelope, manifest?: CapabilityManifest | null, reviewedUpdates: UpdateBinding[] = [], hostRun?: HostRunManifest | null): Promise<TypedExecution | null> {
+    if (hostRun) return hostRunExecution(await runHostRun(envelope, hostRun));
     if (manifest) {
       if (!config.executorBrokerSocket || !config.executorBrokerSecret) throw new Error("sandbox executor broker is not configured");
       const output = await runDynamicCapability(config.executorBrokerSocket, config.executorBrokerSecret, {
         action: "capability.execute", manifest, envelope, expiresAt: envelope.expiresAt, envelopeDigest: envelope.digest,
       });
-      return `## EXECUTION RESULT\nSTATUS: success\nEXIT_CODE: 0\nWHAT_RAN: ${manifest.name}\nOUTPUT: ${filterSensitiveContent(output).slice(-30000)}\nNOTES: executed from a signed, agent-authored capability manifest in the host-effect sandbox`;
+      return capabilityExecution(manifest.name, filterSensitiveContent(output));
     }
     const wantsService = envelope.capabilities.includes("service.manage");
     const wantsDisk = envelope.capabilities.includes("disk.manage");
@@ -2005,7 +2005,7 @@ export async function createApp(options: AppOptions = {}) {
       actions.push(...borg.actions);
     }
     if (actions.length === 0) throw new Error("typed capability plan contains no typed action");
-    const outputs: string[] = [];
+    const outputs: TypedActionOutput[] = [];
     for (const action of actions) {
       let diffSha256: string | null = null;
       const kind: UpdateKind | null = action.action === "self.update" ? "self" : action.action === "dienste.update" ? "dienste" : null;
@@ -2022,12 +2022,12 @@ export async function createApp(options: AppOptions = {}) {
           }, SELF_DIFF_EXECUTOR_TIMEOUT_MS), action.target, kind).diffSha256;
         }
       }
-      outputs.push(await runExecutorAction(config.executorBrokerSocket, config.executorBrokerSecret, {
+      outputs.push({ ...action, output: await runExecutorAction(config.executorBrokerSocket, config.executorBrokerSecret, {
         ...action, ...(diffSha256 ? { diffSha256 } : {}), expiresAt: envelope.expiresAt, envelopeDigest: envelope.digest,
-      }, kind === "self" ? SELF_UPDATE_EXECUTOR_TIMEOUT_MS : kind === "dienste" ? DIENSTE_UPDATE_EXECUTOR_TIMEOUT_MS : action.action.startsWith("borg.") ? BORG_EXECUTOR_TIMEOUT_MS : undefined));
+      }, kind === "self" ? SELF_UPDATE_EXECUTOR_TIMEOUT_MS : kind === "dienste" ? DIENSTE_UPDATE_EXECUTOR_TIMEOUT_MS : action.action.startsWith("borg.") ? BORG_EXECUTOR_TIMEOUT_MS : undefined) });
     }
-    const ran = actions.map((action) => `${action.action} ${action.target}`).join(", ");
-    return `## EXECUTION RESULT\nSTATUS: success\nEXIT_CODE: 0\nWHAT_RAN: typed executor actions: ${ran}\nOUTPUT: ${outputs.join("\n").slice(-10000)}\nNOTES: executed by isolated capability broker`;
+    // Activations come from the self.update actions' own return values only.
+    return typedActionsExecution(outputs);
   }
 
   // The update reviewer gets the prompt unwrapped, like the plan safety review
@@ -2479,12 +2479,13 @@ export async function createApp(options: AppOptions = {}) {
         completed: reviewedSteps,
         evidence: [review.summary, ...policy.evidence], rollbackAvailable: policy.rollbackAvailable,
       }), { plan: planText, safety: review, policy, capabilities, manifest, hostRun, envelope, provenance, proposalPath, ...reviewRecord });
-      const typedResult = await executeTypedCapabilities(planText, envelope, manifest, updateReview?.outcome.bindings ?? [], hostRun);
+      const typed = await executeTypedCapabilities(planText, envelope, manifest, updateReview?.outcome.bindings ?? [], hostRun);
+      const typedResult = typed?.result ?? null;
       const runnerRaw = typedResult || await runIsolatedRunner(actor, session, planner, proposalPath, planText);
       const result = typedResult || filterSensitiveContent(extractRunnerHandoff(runnerRaw));
       if (!result) throw new Error("runner produced no structured execution result");
       const runnerSuccess = /STATUS:\s*success/i.test(result);
-      const pendingActivations = pendingSelfUpdateActivations(typedResult);
+      const pendingActivations = typed?.pendingActivations ?? [];
       const targetNote = selfUpdateVerifierNote(pendingActivations);
       let verification = "VERIFICATION_STATUS: failed\nREASON: runner did not report success";
       if (runnerSuccess) {
@@ -2709,11 +2710,12 @@ export async function createApp(options: AppOptions = {}) {
         const manifest = running.output?.manifest as CapabilityManifest | null | undefined;
         const reviewedUpdates = normalizeUpdateBindings((running.output?.updateReview as Record<string, unknown> | undefined)?.bindings);
         const hostRun = running.output?.hostRun as HostRunManifest | null | undefined;
-        const typedResult = await executeTypedCapabilities(reviewedPlan, envelope, manifest, reviewedUpdates, hostRun);
+        const typed = await executeTypedCapabilities(reviewedPlan, envelope, manifest, reviewedUpdates, hostRun);
+        const typedResult = typed?.result ?? null;
         const raw = typedResult || await runIsolatedRunner(actor, session, planner, proposalPath, reviewedPlan);
         const result = typedResult || filterSensitiveContent(extractRunnerHandoff(raw));
         const runnerSuccess = /STATUS:\s*success/i.test(result);
-        const pendingActivations = pendingSelfUpdateActivations(typedResult);
+        const pendingActivations = typed?.pendingActivations ?? [];
         const verification = runnerSuccess
           ? await runIndependentVerification(actor, session, planner, intent, reviewedPlan, result, selfUpdateVerifierNote(pendingActivations))
           : "VERIFICATION_STATUS: failed\nREASON: runner did not report success";

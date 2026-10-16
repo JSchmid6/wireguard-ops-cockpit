@@ -400,6 +400,20 @@ describe("cockpit-host-run: door", () => {
     expect(readFileSync(counter, "utf8").trim()).toBe("1");
   }, 30_000);
 
+  it("never retries a check the state detection marks as state-changing", () => {
+    // "umschalt" trifft die Erkennung (Art switch): ein solcher Prüfschritt könnte
+    // beim zweiten Lauf den Zustand noch einmal ändern — er läuft genau einmal.
+    const counter = path.join(dir, "check-count");
+    const check = `n=$(cat ${counter} 2>/dev/null || echo 0); echo $((n+1)) > ${counter}; exit 3`;
+    run(["start"], request(manifest({ checks: [{ name: "umschalt-pruefen", run: check, timeoutSeconds: 30 }] })), { HOST_RUN_CHECK_SETTLE_SECONDS: "10" });
+    const { state, logTail } = status();
+    expect(state.status).toBe("check_failed");
+    expect(state.checks[0]).toMatchObject({ status: "failed", exitCode: 3, attempts: 1 });
+    expect(readFileSync(counter, "utf8").trim()).toBe("1");
+    expect(logTail).toContain("umschalt-pruefen exited 3; no retry: state-changing check");
+    expect(logTail).not.toContain("retry in 2 s");
+  }, 30_000);
+
   it("never retries a check that hit its time limit", () => {
     const counter = path.join(dir, "check-count");
     const check = `n=$(cat ${counter} 2>/dev/null || echo 0); echo $((n+1)) > ${counter}; sleep 5`;

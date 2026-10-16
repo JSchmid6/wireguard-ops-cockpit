@@ -5,8 +5,11 @@
 // b3833e76: failed_verification after a correct deploy. The target state of
 // the job is therefore "deployed, verified, activation scheduled".
 //
-// Read only from the typed executor result (the root helper's JSON), never
-// from a runner's free text: a model-written handoff cannot claim it.
+// Derived only from the return value of exactly the typed self.update action
+// (the root helper's JSON for the commit the plan named), never from a text
+// that merely contains such a line: neither a runner's handoff, nor the output
+// of an agent-authored capability (capability.execute), nor the host door
+// (host.run), nor another typed action can claim it.
 
 export interface PendingActivation {
   sha: string;
@@ -14,29 +17,66 @@ export interface PendingActivation {
   dueAt: string;
 }
 
+// The typed execution as executeTypedCapabilities hands it on: the result text
+// for runner handoff and verifier, and the activations of its self.update actions.
+export interface TypedExecution {
+  result: string;
+  pendingActivations: PendingActivation[];
+}
+
+export interface TypedActionOutput {
+  action: string;
+  target: string;
+  output: string;
+}
+
 const SHA = /^[0-9a-f]{40}$/;
 const UNIT = /^wireguard-ops-cockpit-self-update-activate-[0-9a-f]{7}-\d+$/;
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
 
-export function pendingSelfUpdateActivations(typedResult: string | null | undefined): PendingActivation[] {
-  if (!typedResult || !/^STATUS:\s*success$/m.test(typedResult)) return [];
-  const pending: PendingActivation[] = [];
-  for (const raw of typedResult.split("\n")) {
-    const line = raw.replace(/^OUTPUT:\s*/, "").trim();
+// One self.update action: its helper output, its commit (action.target).
+export function selfUpdateActivation(action: TypedActionOutput): PendingActivation | null {
+  if (action.action !== "self.update" || !SHA.test(action.target)) return null;
+  for (const raw of action.output.split("\n")) {
+    const line = raw.trim();
     if (!line.startsWith("{")) continue;
     let value: Record<string, any>;
     try { value = JSON.parse(line); } catch { continue; }
     const activation = value?.activation;
     if (value?.action !== "self.update" || value.ok !== true || value.result !== "ok" || value.phase !== "awaiting-activation") continue;
+    if (value.sha !== action.target) continue;
     if (!activation || activation.status !== "scheduled") continue;
-    if (typeof value.sha !== "string" || !SHA.test(value.sha)) continue;
     if (typeof activation.unit !== "string" || !UNIT.test(activation.unit)) continue;
     if (typeof activation.scheduled_at !== "string" || !ISO.test(activation.scheduled_at)) continue;
     const delay = Number.isInteger(activation.delay_seconds) && activation.delay_seconds >= 0 ? activation.delay_seconds : 0;
     const dueAt = new Date(Date.parse(activation.scheduled_at) + delay * 1000).toISOString();
-    pending.push({ sha: value.sha, unit: activation.unit, dueAt });
+    return { sha: action.target, unit: activation.unit, dueAt };
   }
-  return pending;
+  return null;
+}
+
+// The typed executor actions of a plan, all of which succeeded (a failed one
+// throws before this point).
+export function typedActionsExecution(actions: TypedActionOutput[]): TypedExecution {
+  const ran = actions.map((action) => `${action.action} ${action.target}`).join(", ");
+  return {
+    result: `## EXECUTION RESULT\nSTATUS: success\nEXIT_CODE: 0\nWHAT_RAN: typed executor actions: ${ran}\nOUTPUT: ${actions.map((action) => action.output).join("\n").slice(-10000)}\nNOTES: executed by isolated capability broker`,
+    pendingActivations: actions.map(selfUpdateActivation).filter((item): item is PendingActivation => item !== null),
+  };
+}
+
+// An agent-authored capability: its output is whatever the manifest printed,
+// so it never brings an activation.
+export function capabilityExecution(name: string, filteredOutput: string): TypedExecution {
+  return {
+    result: `## EXECUTION RESULT\nSTATUS: success\nEXIT_CODE: 0\nWHAT_RAN: ${name}\nOUTPUT: ${filteredOutput.slice(-30000)}\nNOTES: executed from a signed, agent-authored capability manifest in the host-effect sandbox`,
+    pendingActivations: [],
+  };
+}
+
+// The host door: its result never brings an activation either.
+export function hostRunExecution(result: string): TypedExecution {
+  return { result, pendingActivations: [] };
 }
 
 export function selfUpdateVerifierNote(pending: PendingActivation[]): string {
