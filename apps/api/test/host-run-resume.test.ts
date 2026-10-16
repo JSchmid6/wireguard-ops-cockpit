@@ -77,7 +77,8 @@ describe("host run across an API restart", () => {
         plan: "## Intent\nkernel", hostRun, policy: { rollbackAvailable: true }, [marker]: new Date().toISOString(),
       },
     });
-    // A running job without a started host run is not the watcher's business.
+    // A running job without a started host run is not the watcher's business:
+    // without a recorded request it is ended with the reason (job-restart-recovery.test.ts).
     const other = seed.createJob({ sessionId: session.id, kind: "runbook", subjectId: "hermes-change", status: "running", requiresApproval: false, output: { plan: "x" } });
     seed.close();
 
@@ -117,6 +118,7 @@ describe("host run across an API restart", () => {
     expect(String(finished.output?.verification)).toContain("VERIFICATION_STATUS: passed");
     expect(executorCalls.every((call) => call.payload.action === "host.status" && call.payload.target === job.id)).toBe(true);
     expect(agentCalls.map((call) => call.role)).toEqual(["verifier"]);
-    expect(inspect.getJob(other.id)?.status).toBe("running");
+    expect(inspect.getJob(other.id)?.status).toBe("failed_execution");
+    expect(agentCalls.filter((call) => call.role === "planner")).toHaveLength(0);
   });
 });

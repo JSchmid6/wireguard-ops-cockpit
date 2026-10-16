@@ -102,7 +102,22 @@ runner only.
    `not-recorded`. It then schedules
    the activation as a one-shot timer (`systemd-run --on-active=600`) and
    writes `activation.status=scheduled`.
-4. The activation waits for the run lock (a running deployment or review diff;
+4. The activation first waits until the API reports no Hermes job a restart
+   would interrupt (`GET /api/health` → `jobs.active`, by phase in
+   `jobs.phases`; a job following a host run is not counted, the restarted API
+   follows it). It logs what it waits for, notes `waiting-for-jobs` in the
+   history, and activates at the latest after
+   `COCKPIT_SELF_UPDATE_ACTIVATION_JOBS_WAIT` (default 1800 s) anyway; the
+   outcome (`idle`, `timeout` with the phases, or `unknown` for an API without
+   the count) is `activation.jobs_wait` in the result. A single lost health
+   answer does not end the wait; after `COCKPIT_SELF_UPDATE_ACTIVATION_JOBS_SILENT`
+   (default 4) in a row it activates without waiting. This wait is outside the
+   run lock: a job under review needs that lock for its diff. Between the last
+   `idle` answer and the restart lie a few seconds (lock, checks) in which a job
+   can still start, e.g. an operator approval. A job a restart interrupts is
+   taken up by the API at start-up (see
+   [Jobs across a restart](#jobs-across-a-restart)).
+   Then the activation waits for the run lock (a running deployment or review diff;
    up to `COCKPIT_SELF_UPDATE_ACTIVATION_LOCK_WAIT`, default 1900 s, then exit
    66 and `failed-busy` in the history — never a silent success). It skips when
    `state.json` names a different deployed commit than its own (the stand moved
@@ -125,6 +140,27 @@ runner only.
    `…-activate-…` service already says `success` (the default of a unit that
    never ran). Whether it ran shows `ActiveEnterTimestamp`/`ExecMainStartTimestamp`,
    the `activation` field of `state.json` and `history.jsonl`.
+
+### Jobs across a restart
+
+16.10.2026: an activation restarted the API while job `946bd6ae` was planning;
+the record stayed `running` with nothing behind it. At start-up the API now
+takes every running `hermes-change`/`hermes-research` job up again
+(`recoverInterruptedJob` in `apps/api/src/app.ts`) and notes it on the job
+(`output.restarts`: time, phase, `replanned` or `abandoned`, reason; audits
+`hermes.job.replanned` / `hermes.job.abandoned`):
+
+- a started host run is followed as before (`resumeHostRun`);
+- a job in `queued`, `planning` or `reviewing` — nothing has run on the host —
+  is planned again from the request recorded on the job (`output.request`:
+  intent, untrusted evidence, allowed capabilities, plan-only flag). The new
+  plan gets a new review, a new policy decision and a new envelope; the
+  interrupted attempt's plan is dropped. At most two times per job, and only
+  while its last progress is younger than one hour (an old intent never runs
+  unannounced);
+- anything else (execution outside the host door, a job without a recorded
+  request, the limits above) ends as `failed_execution` with the reason. It
+  keeps what it reached and does not count towards the change circuit breaker.
 
 Rollback is plain forward motion: run the job again with the `previous_commit`
 sha from `state.json` (it is an ancestor of `origin/main`, so it deploys like

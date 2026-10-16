@@ -281,6 +281,12 @@ case "$url" in
   *badapi*) body='{"ok":false}' ;;
   *badweb*) code=500 ;;
 esac
+# S19: FIX_HEALTH_SEQ names a file of health bodies, one per call; the last
+# one stays (the API's job count while the activation waits).
+if [ -n "${FIX_HEALTH_SEQ:-}" ] && [ -s "$FIX_HEALTH_SEQ" ] && [ "$want_code" = "no" ]; then
+  body="$(head -n 1 "$FIX_HEALTH_SEQ")"
+  [ "$(wc -l < "$FIX_HEALTH_SEQ")" -gt 1 ] && sed -i 1d "$FIX_HEALTH_SEQ"
+fi
 if [ "$want_code" = "yes" ]; then echo "$code"; exit 0; fi
 [ "$code" = "200" ] || exit 22
 printf '%s' "$body"
@@ -1031,6 +1037,55 @@ check "S18b dead services -> 68" "$([ "$rc" -eq 68 ] && echo 0 || echo 1)" "rc=$
 "$HELPER" status > "$FIX/s18b-status.out" 2>&1
 check "S18b status names the dead services" \
   "$(json_get "$FIX/s18b-status.out" last_attempt.error | grep -q "services not active: fixture-svc-a,fixture-svc-b" && echo 0 || echo 1)" "$(head -c 600 "$FIX/s18b-status.out")"
+
+# --------------------------------------------------------------------------
+# S19: the activation waits for Hermes jobs the restart would interrupt
+# (16.10.2026: a restart during planning orphaned job 946bd6ae). It says what
+# it waits for, activates once none is left, and activates anyway at its
+# limit (the restarted API plans an interrupted planning again).
+# --------------------------------------------------------------------------
+echo "--- S19: activation waits for running jobs"
+busy='{"ok":true,"jobs":{"active":1,"phases":{"planning":1}}}'
+idle='{"ok":true,"jobs":{"active":0,"phases":{}}}'
+printf '%s\n%s\n%s\n' "$busy" "$busy" "$idle" > "$FIX/health-seq"
+: > "$FIX/record.log"
+FIX_HEALTH_SEQ="$FIX/health-seq" COCKPIT_SELF_UPDATE_ACTIVATION_JOBS_POLL=1 \
+  "$RUNNER" activate "$C10" > "$FIX/s19a.out" 2>&1; rc=$?
+check "S19a activation after the jobs finished rc=0" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "rc=$rc $(tail -c 400 "$FIX/s19a.out")"
+check "S19a says what it waits for" "$(grep -q "waiting for 1 job(s) the restart would interrupt (1 planning)" "$FIX/s19a.out" && echo 0 || echo 1)" "$(head -c 600 "$FIX/s19a.out")"
+expect_json "S19a waited until idle" "$FIX/state/last-result.json" "activation.jobs_wait.outcome" "idle"
+check "S19a waited before the restart" \
+  "$(awk '/waiting for 1 job/{w=NR} /restarting .* to activate/{r=NR} END{exit !(w && r && w < r)}' "$FIX/s19a.out" && echo 0 || echo 1)" "$(head -c 600 "$FIX/s19a.out")"
+check "S19a history notes the wait" "$(grep -q '"result": "waiting-for-jobs"' "$FIX/state/history.jsonl" && echo 0 || echo 1)" ""
+check "S19a services restarted" "$(grep -q "^restart: " "$FIX/record.log" && echo 0 || echo 1)" "$(head -c 300 "$FIX/record.log")"
+
+printf '%s\n' "$busy" > "$FIX/health-seq"
+FIX_HEALTH_SEQ="$FIX/health-seq" COCKPIT_SELF_UPDATE_ACTIVATION_JOBS_WAIT=2 COCKPIT_SELF_UPDATE_ACTIVATION_JOBS_POLL=1 \
+  "$RUNNER" activate "$C10" > "$FIX/s19b.out" 2>&1; rc=$?
+check "S19b activation at the wait limit rc=0" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "rc=$rc $(tail -c 400 "$FIX/s19b.out")"
+check "S19b says it activates anyway" "$(grep -q "activating anyway" "$FIX/s19b.out" && echo 0 || echo 1)" "$(head -c 600 "$FIX/s19b.out")"
+expect_json "S19b wait outcome timeout" "$FIX/state/last-result.json" "activation.jobs_wait.outcome" "timeout"
+expect_json "S19b names the jobs" "$FIX/state/last-result.json" "activation.jobs_wait.jobs.planning" "1"
+rm -f "$FIX/health-seq"
+
+# One lost health answer does not end the wait (a silent API, see S19d, does).
+printf '%s\n%s\n%s\n%s\n' "$busy" "no-json" "$busy" "$idle" > "$FIX/health-seq"
+FIX_HEALTH_SEQ="$FIX/health-seq" COCKPIT_SELF_UPDATE_ACTIVATION_JOBS_POLL=1 \
+  "$RUNNER" activate "$C10" > "$FIX/s19e.out" 2>&1; rc=$?
+check "S19e lost answer rc=0" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "rc=$rc"
+expect_json "S19e still waited until idle" "$FIX/state/last-result.json" "activation.jobs_wait.outcome" "idle"
+check "S19e waited for the job after the lost answer" "$(python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["activation"]["jobs_wait"]["waited_seconds"] >= 2 else 1)' "$FIX/state/last-result.json" && echo 0 || echo 1)" "$(head -c 400 "$FIX/state/last-result.json")"
+
+printf '%s\n' "no-json" > "$FIX/health-seq"
+FIX_HEALTH_SEQ="$FIX/health-seq" COCKPIT_SELF_UPDATE_ACTIVATION_JOBS_POLL=1 COCKPIT_SELF_UPDATE_ACTIVATION_JOBS_SILENT=2 \
+  COCKPIT_SELF_UPDATE_VERIFY_RETRIES=1 "$RUNNER" activate "$C10" > "$FIX/s19d.out" 2>&1
+check "S19d a silent API is not waited for" "$(grep -q "no readable answer 2 times" "$FIX/s19d.out" && echo 0 || echo 1)" "$(head -c 400 "$FIX/s19d.out")"
+rm -f "$FIX/health-seq"
+
+# An API from before the job count: no wait.
+"$RUNNER" activate "$C10" > "$FIX/s19c.out" 2>&1; rc=$?
+check "S19c older API rc=0" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "rc=$rc"
+expect_json "S19c wait outcome unknown" "$FIX/state/last-result.json" "activation.jobs_wait.outcome" "unknown"
 
 echo
 echo "Gerüst: $FIX (wird beim Beenden entfernt)"
