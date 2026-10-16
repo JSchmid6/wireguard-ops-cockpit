@@ -130,6 +130,7 @@ describe("runbook safety review", () => {
     expect(parseRunbookSafetyOutput(REPORT.join("\r\n")).verdict).toBe("passed");
     expect(parseRunbookSafetyOutput([...REPORT, "Note: looks fine"].join("\n")).verdict).toBe("passed");
     expect(parseRunbookSafetyOutput([...REPORT, "Note: the helper never dictates a restart."].join("\n")).verdict).toBe("passed");
+    expect(parseRunbookSafetyOutput([...REPORT, "Whoever dictates the window: ops"].join("\n")).verdict).toBe("passed");
     expect(parseRunbookSafetyOutput([...REPORT, "Note: caf\u00e9 \u2014 all fine"].join("\n")).verdict).toBe("passed");
   });
 

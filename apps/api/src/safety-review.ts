@@ -122,11 +122,11 @@ export function parseRunbookSafetyOutput(output: string): ParsedSafetyReport {
   // or VERDICTS — fails closed, and so does a head with non-ASCII letters (a
   // homoglyph such as a Cyrillic E, U+0415, in VERDICT is no key and no plain note).
   //
-  // VERDICT is looked for on a letter skeleton (NFKD, only A-Z kept), so variation
-  // selectors, combining marks and dash variants inside the word do not hide it.
-  // In the head every non-letter goes; in the whole line spaces stay as word
-  // boundaries, so prose such as "never dictate" is no verdict. The head of an
-  // additional line must be plain printable ASCII, anything else is unclear.
+  // VERDICT is looked for on a letter skeleton (NFKD, only A-Z and spaces kept),
+  // so variation selectors, combining marks and dash variants inside the word do
+  // not hide it; spaces stay as word boundaries, so prose such as "never dictate"
+  // is no verdict (a spaced "VER DICT:" head is a key and handled as one). The
+  // head of an additional line must be plain printable ASCII, anything else is unclear.
   const values = new Map<string, string>();
   for (const raw of lines) {
     const line = raw.normalize("NFKC").replace(/\p{Cf}/gu, "").trim();
@@ -134,9 +134,7 @@ export function parseRunbookSafetyOutput(output: string): ParsedSafetyReport {
     const head = separator > 0 ? line.slice(0, separator) : "";
     const key = head.replace(/[*`#>\s-]/g, "").toUpperCase();
     if (!REPORT_KEYS.has(key)) {
-      if (/VERDICT/i.test(letterSkeleton(head, /[^A-Za-z]/g)) || /VERDICT/i.test(letterSkeleton(line, /[^A-Za-z\s]/g))) {
-        throw new Error(`ambiguous verdict line: ${line.substring(0, 60)}`);
-      }
+      if (/VERDICT/i.test(letterSkeleton(line))) throw new Error(`ambiguous verdict line: ${line.substring(0, 60)}`);
       if (/[^\x20-\x7E]/.test(head)) throw new Error(`unclear report line: ${line.substring(0, 60)}`);
       continue;
     }
@@ -522,8 +520,8 @@ async function runOpencodeSafetyReview(
   });
 }
 
-function letterSkeleton(value: string, drop: RegExp): string {
-  return value.normalize("NFKD").replace(drop, "");
+function letterSkeleton(value: string): string {
+  return value.normalize("NFKD").replace(/[^A-Za-z\s]/g, "");
 }
 
 function parseList(value: string): string[] {
