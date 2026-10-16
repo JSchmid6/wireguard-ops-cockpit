@@ -1068,6 +1068,20 @@ expect_json "S19b wait outcome timeout" "$FIX/state/last-result.json" "activatio
 expect_json "S19b names the jobs" "$FIX/state/last-result.json" "activation.jobs_wait.jobs.planning" "1"
 rm -f "$FIX/health-seq"
 
+# One lost health answer does not end the wait (a silent API, see S19d, does).
+printf '%s\n%s\n%s\n%s\n' "$busy" "no-json" "$busy" "$idle" > "$FIX/health-seq"
+FIX_HEALTH_SEQ="$FIX/health-seq" COCKPIT_SELF_UPDATE_ACTIVATION_JOBS_POLL=1 \
+  "$RUNNER" activate "$C10" > "$FIX/s19e.out" 2>&1; rc=$?
+check "S19e lost answer rc=0" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "rc=$rc"
+expect_json "S19e still waited until idle" "$FIX/state/last-result.json" "activation.jobs_wait.outcome" "idle"
+check "S19e waited for the job after the lost answer" "$(python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["activation"]["jobs_wait"]["waited_seconds"] >= 2 else 1)' "$FIX/state/last-result.json" && echo 0 || echo 1)" "$(head -c 400 "$FIX/state/last-result.json")"
+
+printf '%s\n' "no-json" > "$FIX/health-seq"
+FIX_HEALTH_SEQ="$FIX/health-seq" COCKPIT_SELF_UPDATE_ACTIVATION_JOBS_POLL=1 COCKPIT_SELF_UPDATE_ACTIVATION_JOBS_SILENT=2 \
+  COCKPIT_SELF_UPDATE_VERIFY_RETRIES=1 "$RUNNER" activate "$C10" > "$FIX/s19d.out" 2>&1
+check "S19d a silent API is not waited for" "$(grep -q "no readable answer 2 times" "$FIX/s19d.out" && echo 0 || echo 1)" "$(head -c 400 "$FIX/s19d.out")"
+rm -f "$FIX/health-seq"
+
 # An API from before the job count: no wait.
 "$RUNNER" activate "$C10" > "$FIX/s19c.out" 2>&1; rc=$?
 check "S19c older API rc=0" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "rc=$rc"

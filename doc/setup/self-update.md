@@ -109,9 +109,13 @@ runner only.
    history, and activates at the latest after
    `COCKPIT_SELF_UPDATE_ACTIVATION_JOBS_WAIT` (default 1800 s) anyway; the
    outcome (`idle`, `timeout` with the phases, or `unknown` for an API without
-   the count) is `activation.jobs_wait` in the result. This wait is outside the
-   run lock: a job under review needs that lock for its diff. A job a restart
-   interrupts nevertheless is taken up by the API at start-up (see
+   the count) is `activation.jobs_wait` in the result. A single lost health
+   answer does not end the wait; after `COCKPIT_SELF_UPDATE_ACTIVATION_JOBS_SILENT`
+   (default 4) in a row it activates without waiting. This wait is outside the
+   run lock: a job under review needs that lock for its diff. Between the last
+   `idle` answer and the restart lie a few seconds (lock, checks) in which a job
+   can still start, e.g. an operator approval. A job a restart interrupts is
+   taken up by the API at start-up (see
    [Jobs across a restart](#jobs-across-a-restart)).
    Then the activation waits for the run lock (a running deployment or review diff;
    up to `COCKPIT_SELF_UPDATE_ACTIVATION_LOCK_WAIT`, default 1900 s, then exit

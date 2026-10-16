@@ -2243,9 +2243,9 @@ export async function createApp(options: AppOptions = {}) {
   async function runResearchJob(job: JobRecord, actor: UserSummary, session: JobSession, agent: AgentManifest, request: ResearchRequest): Promise<void> {
     const { intent } = request;
     const createdSession = request.ownedSession;
-    const agentTask = `${buildAgentTask(intent, request.evidence)}\n\nREAD_ONLY_RESEARCH_CONTRACT:\nInvestigate and report the current state. Never return an executable plan.`;
     const startedAt = Date.now();
     try {
+      const agentTask = `${buildAgentTask(intent, request.evidence)}\n\nREAD_ONLY_RESEARCH_CONTRACT:\nInvestigate and report the current state. Never return an executable plan.`;
       if (session.tmuxBackend === "disabled") {
         updateHermesJob(job.id, "blocked_prerequisite", explanation({
           phase: "finished", intent, reason: "tmux is unavailable in this runtime.",
@@ -2291,9 +2291,9 @@ export async function createApp(options: AppOptions = {}) {
     const untrustedEvidence = request.evidence;
     const shouldExecute = request.execute;
     const createdSession = request.ownedSession;
-    const agentTask = `${buildAgentTask(intent, untrustedEvidence)}\n\nDYNAMIC CAPABILITY CONTRACT:\n${hostRunPlannerContract()}\n\n${capabilityPlannerContract()}`;
     const startedAt = Date.now();
     try {
+      const agentTask = `${buildAgentTask(intent, untrustedEvidence)}\n\nDYNAMIC CAPABILITY CONTRACT:\n${hostRunPlannerContract()}\n\n${capabilityPlannerContract()}`;
       const failureWindowStart = new Date(Date.now() - 60 * 60_000).toISOString();
       const recentFailures = database.countAuditsSinceForRuntime("hermes.change.failed", failureWindowStart, changeRuntimeFingerprint);
       if (recentFailures >= config.maxFailedChangesPerHour) {
@@ -4355,7 +4355,7 @@ Follow these rules:
     const planner = findAgent("planner-agent", "opencode");
     const age = Date.now() - Date.parse(job.updatedAt);
     const refusal = !REPLANNABLE_PHASES.has(phase) ? `it was in phase ${phase}, where steps may have run, so it is not repeated on its own`
-      : typeof request?.intent !== "string" ? "it has no recorded request to plan from"
+      : typeof request?.intent !== "string" || !Array.isArray(request.evidence) ? "it has no recorded request to plan from"
       : replans >= MAX_JOB_REPLANS ? `it was already planned again ${replans} times`
       : !(age < REPLAN_WINDOW_MS) ? `its last progress is ${Math.round(age / 60_000)} min old`
       : !actor || !session || !planner ? "its owner, session or planner is no longer available"

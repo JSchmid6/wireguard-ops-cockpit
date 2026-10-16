@@ -223,6 +223,7 @@ ACTIVATION_LOCK_WAIT = int(env("COCKPIT_SELF_UPDATE_ACTIVATION_LOCK_WAIT", "1900
 # lock: a job under review needs that lock for its diff.
 ACTIVATION_JOBS_WAIT = int(env("COCKPIT_SELF_UPDATE_ACTIVATION_JOBS_WAIT", "1800"))
 ACTIVATION_JOBS_POLL = int(env("COCKPIT_SELF_UPDATE_ACTIVATION_JOBS_POLL", "15"))
+ACTIVATION_JOBS_SILENT = int(env("COCKPIT_SELF_UPDATE_ACTIVATION_JOBS_SILENT", "4"))
 VERIFY_RETRIES = int(env("COCKPIT_SELF_UPDATE_VERIFY_RETRIES", "12"))
 VERIFY_DELAY = int(env("COCKPIT_SELF_UPDATE_VERIFY_DELAY", "5"))
 SERVICES = env("COCKPIT_SELF_UPDATE_SERVICES", "wireguard-ops-cockpit-api wireguard-ops-cockpit-agent wireguard-ops-cockpit-executor wireguard-ops-cockpit-ttyd").split()
@@ -1165,10 +1166,18 @@ def cmd_deploy(sha, reviewed_sha256):
 
 
 def interruptible_jobs():
-    """(active, phases) from the API's health answer; None when it cannot tell
-    (no answer, or an API from before the "jobs" field)."""
+    """(active, phases) from the API's health answer; "old" for an API from
+    before the "jobs" field; None when there is no readable answer."""
     try:
-        jobs = json.loads(http_body(API_HEALTH_URL) or "{}").get("jobs")
+        health = json.loads(http_body(API_HEALTH_URL))
+    except Exception:
+        return None
+    if not isinstance(health, dict):
+        return None
+    if "jobs" not in health:
+        return "old"
+    try:
+        jobs = health["jobs"]
         active = int(jobs["active"])
         phases = {str(key): int(value) for key, value in (jobs.get("phases") or {}).items()}
     except Exception:
@@ -1184,12 +1193,25 @@ def wait_for_jobs(sha, logfile):
     begun = time.time()
     deadline = begun + ACTIVATION_JOBS_WAIT
     last = None
+    silent = 0
     while True:
         jobs = interruptible_jobs()
         waited = int(time.time() - begun)
-        if jobs is None:
+        if jobs == "old":
             log("the API does not report its jobs; activating without waiting for them")
             return {"outcome": "unknown", "waited_seconds": waited}
+        if jobs is None:
+            # One lost answer (a busy event loop, a slow start) does not end
+            # the wait; an API that stays silent is not waited for.
+            silent += 1
+            if silent >= ACTIVATION_JOBS_SILENT:
+                log("the API gave no readable answer %d times; activating without waiting for its jobs" % silent)
+                return {"outcome": "unknown", "waited_seconds": waited}
+            if time.time() >= deadline:
+                return {"outcome": "timeout", "waited_seconds": waited}
+            time.sleep(min(ACTIVATION_JOBS_POLL, max(deadline - time.time(), 0.1)))
+            continue
+        silent = 0
         active, phases = jobs
         if active == 0:
             if last is not None:

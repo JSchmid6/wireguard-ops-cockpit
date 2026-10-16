@@ -131,6 +131,28 @@ describe("Hermes jobs across an API restart", () => {
     expect(start.payload.envelope).toMatchObject({ jobId, gatePassed: true });
   });
 
+  it("plans again as the job's owner, in the owner's session", async () => {
+    let jobId = "";
+    let ownerId = "";
+    let ownerSession = "";
+    const flow = await restart((db) => {
+      // James orders with his automation account; the job is his, not the admin's.
+      const owner = db.createUser("hermes-automation", "unusable-random-password", "automation");
+      ownerId = owner.id;
+      ownerSession = db.upsertSession({ name: "hermes-rb-j", ownerId: owner.id, tmuxSessionName: "cockpit-hermes-rb-j", tmuxBackend: "tmux", terminalUrl: null }).id;
+      jobId = db.createJob({
+        sessionId: ownerSession, kind: "runbook", subjectId: "hermes-change", status: "running", requiresApproval: false,
+        output: { explanation: planning(changeIntent), request: changeRequest },
+      }).id;
+    });
+    const job = await flow.settled(jobId);
+
+    expect(job.status).toBe("completed");
+    const envelope = job.output?.envelope as Record<string, unknown>;
+    expect(envelope).toMatchObject({ actorId: ownerId, sessionId: ownerSession, jobId });
+    expect(envelope.operatorApproved).toBeUndefined();
+  });
+
   it("plans a job again that was in review, dropping the interrupted attempt's plan", async () => {
     let jobId = "";
     const flow = await restart((db, { sessionId }) => {
