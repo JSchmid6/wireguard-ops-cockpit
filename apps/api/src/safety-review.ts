@@ -10,7 +10,8 @@ import { runBrokerAgent } from "./agent-broker.js";
 type SafetyVerdict = Extract<PlanReviewVerdict, "passed" | "approval_required" | "blocked">;
 
 const REVIEW_SCHEMA_VERSION = "runbook-safety-review/v1";
-const PARSER_VERSION = "line-schema/v1";
+const PARSER_VERSION = "line-schema/v2";
+const REPORT_KEYS = new Set(["VERDICT", "SUMMARY", "HAZARDS", "BLAST_RADIUS", "EXPECTED_IMPACT", "ROLLBACK_HINT", "OPERATOR_CHECKS"]);
 const COPILOT_TIMEOUT_MS = 30_000;
 const OPENCODE_TIMEOUT_MS = 60_000;
 const SECRET_ENV_VARS = [
@@ -76,7 +77,7 @@ export function buildRunbookSafetyPrompt(input: RunbookSafetyReviewInput): strin
   scriptContent = scriptContent.replace(/```/g, "[code]");
 
   return [
-    "Safety review: classify this runbook script. Return EXACTLY these 7 lines:",
+    "Safety review: classify this runbook script. Return EXACTLY these 7 lines and nothing else (no notes before or after):",
     "VERDICT: passed|approval_required|blocked",
     "SUMMARY: one sentence what the script does",
     "HAZARDS: list or none",
@@ -109,19 +110,39 @@ export function parseRunbookSafetyOutput(output: string): ParsedSafetyReport {
     .map((line) => line.trim())
     .filter(Boolean);
 
-  if (lines.length !== 7) {
-    throw new Error(`expected 7 non-empty lines, received ${lines.length}: ${lines.map(l=>l.substring(0,30)).join(" | ")}`);
-  }
-
+  // Tolerant against additional lines (16.10.2026: a trailing "Note: …" turned
+  // a passed report into blocked_policy), strict about the seven report lines:
+  // each must appear exactly once, and no additional line may speak about the
+  // verdict. Anything unclear fails closed — an unclear verdict never passes.
+  //
+  // Each line is read normalized: NFKC folds full-width and compatibility forms,
+  // and format characters (\p{Cf}: zero-width space, joiners, bidi marks) are
+  // removed, so "VER\u200bDICT" reads as VERDICT. Any additional line that still
+  // contains VERDICT — also glued to more text, as in VERDICT_OVERRIDE, VERDICT2
+  // or VERDICTS — fails closed, and so does a head with non-ASCII letters (a
+  // homoglyph such as a Cyrillic E, U+0415, in VERDICT is no key and no plain note).
+  //
+  // VERDICT is looked for on a letter skeleton (NFKD, only A-Z and spaces kept),
+  // so variation selectors, combining marks and dash variants inside the word do
+  // not hide it; spaces stay as word boundaries, so prose such as "never dictate"
+  // is no verdict (a spaced "VER DICT:" head is a key and handled as one). The
+  // head of an additional line must be plain printable ASCII, anything else is unclear.
   const values = new Map<string, string>();
-  for (const line of lines) {
+  for (const raw of lines) {
+    const line = raw.normalize("NFKC").replace(/\p{Cf}/gu, "").trim();
     const separator = line.indexOf(":");
-    if (separator <= 0) {
-      throw new Error(`invalid review line: ${line}`);
+    const head = separator > 0 ? line.slice(0, separator) : "";
+    const key = head.replace(/[*`#>\s-]/g, "").toUpperCase();
+    if (!REPORT_KEYS.has(key)) {
+      if (/VERDICT/i.test(letterSkeleton(line))) throw new Error(`ambiguous verdict line: ${line.substring(0, 60)}`);
+      if (/[^\x20-\x7E]/.test(head)) throw new Error(`unclear report line: ${line.substring(0, 60)}`);
+      continue;
     }
-    const key = line.slice(0, separator).trim();
-    const value = line.slice(separator + 1).trim();
-    values.set(key, value);
+    // The verdict itself must be written plainly: a line that only reads as
+    // VERDICT after normalization is unclear, never a verdict.
+    if (key === "VERDICT" && line !== raw) throw new Error(`ambiguous verdict line: ${line.substring(0, 60)}`);
+    if (values.has(key)) throw new Error(`duplicate ${key} line in the safety report`);
+    values.set(key, line.slice(separator + 1).trim());
   }
 
   const verdict = values.get("VERDICT");
@@ -497,6 +518,10 @@ async function runOpencodeSafetyReview(
       });
     });
   });
+}
+
+function letterSkeleton(value: string): string {
+  return value.normalize("NFKD").replace(/[^A-Za-z\s]/g, "");
 }
 
 function parseList(value: string): string[] {
