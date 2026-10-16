@@ -107,6 +107,32 @@ describe("runbook safety review", () => {
     }
   });
 
+  it("fails closed on VERDICT hidden by variation selectors, combining marks and dash variants", () => {
+    const additional = [
+      "VER\ufe0fDICT: blocked", // variation selector 16
+      "VER\ufe00DICT: blocked", // variation selector 1
+      "VER\u034fDICT: blocked", // combining grapheme joiner
+      "VER\u180bDICT: blocked", // Mongolian free variation selector
+      "VER\u{E0100}DICT: blocked", // variation selector 17
+      "V\u0301ERDICT: blocked", // combining acute
+      "VER\u2011DICT: blocked", // non-breaking hyphen
+    ];
+    for (const line of additional) {
+      expect(() => parseRunbookSafetyOutput([...REPORT, line].join("\n")), line).toThrow(/ambiguous verdict|unclear report line/);
+      expect(() => parseRunbookSafetyOutput([line, ...REPORT].join("\n")), line).toThrow(/ambiguous verdict|unclear report line/);
+    }
+    expect(() => parseRunbookSafetyOutput([...REPORT, "Note: VER\u2011DICT blocked"].join("\n"))).toThrow(/ambiguous verdict/);
+    expect(() => parseRunbookSafetyOutput([...REPORT, "Hinweis f\u00fcr Pr\u00fcfer: x"].join("\n"))).toThrow(/unclear report line/);
+  });
+
+  it("keeps plain reports and prose notes passing", () => {
+    expect(parseRunbookSafetyOutput(REPORT.join("\n")).verdict).toBe("passed");
+    expect(parseRunbookSafetyOutput(REPORT.join("\r\n")).verdict).toBe("passed");
+    expect(parseRunbookSafetyOutput([...REPORT, "Note: looks fine"].join("\n")).verdict).toBe("passed");
+    expect(parseRunbookSafetyOutput([...REPORT, "Note: the helper never dictates a restart."].join("\n")).verdict).toBe("passed");
+    expect(parseRunbookSafetyOutput([...REPORT, "Note: caf\u00e9 \u2014 all fine"].join("\n")).verdict).toBe("passed");
+  });
+
   it("still passes what was clear before the normalization", () => {
     expect(parseRunbookSafetyOutput(["VERDICT : passed", ...REPORT.slice(1)].join("\n")).verdict).toBe("passed");
     expect(parseRunbookSafetyOutput(["**VERDICT**: blocked", ...REPORT.slice(1)].join("\n")).verdict).toBe("blocked");

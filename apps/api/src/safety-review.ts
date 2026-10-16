@@ -121,6 +121,12 @@ export function parseRunbookSafetyOutput(output: string): ParsedSafetyReport {
   // contains VERDICT — also glued to more text, as in VERDICT_OVERRIDE, VERDICT2
   // or VERDICTS — fails closed, and so does a head with non-ASCII letters (a
   // homoglyph such as a Cyrillic E, U+0415, in VERDICT is no key and no plain note).
+  //
+  // VERDICT is looked for on a letter skeleton (NFKD, only A-Z kept), so variation
+  // selectors, combining marks and dash variants inside the word do not hide it.
+  // In the head every non-letter goes; in the whole line spaces stay as word
+  // boundaries, so prose such as "never dictate" is no verdict. The head of an
+  // additional line must be plain printable ASCII, anything else is unclear.
   const values = new Map<string, string>();
   for (const raw of lines) {
     const line = raw.normalize("NFKC").replace(/\p{Cf}/gu, "").trim();
@@ -128,8 +134,10 @@ export function parseRunbookSafetyOutput(output: string): ParsedSafetyReport {
     const head = separator > 0 ? line.slice(0, separator) : "";
     const key = head.replace(/[*`#>\s-]/g, "").toUpperCase();
     if (!REPORT_KEYS.has(key)) {
-      if (/VERDICT/i.test(line)) throw new Error(`ambiguous verdict line: ${line.substring(0, 60)}`);
-      if (/\p{L}/u.test(head.replace(/[A-Za-z]/g, ""))) throw new Error(`unclear report line: ${line.substring(0, 60)}`);
+      if (/VERDICT/i.test(letterSkeleton(head, /[^A-Za-z]/g)) || /VERDICT/i.test(letterSkeleton(line, /[^A-Za-z\s]/g))) {
+        throw new Error(`ambiguous verdict line: ${line.substring(0, 60)}`);
+      }
+      if (/[^\x20-\x7E]/.test(head)) throw new Error(`unclear report line: ${line.substring(0, 60)}`);
       continue;
     }
     // The verdict itself must be written plainly: a line that only reads as
@@ -512,6 +520,10 @@ async function runOpencodeSafetyReview(
       });
     });
   });
+}
+
+function letterSkeleton(value: string, drop: RegExp): string {
+  return value.normalize("NFKD").replace(drop, "");
 }
 
 function parseList(value: string): string[] {
