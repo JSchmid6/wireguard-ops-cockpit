@@ -166,6 +166,12 @@ def load(name):
         return "unreadable"
 
 
+def clip(value, limit=500):
+    text = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
+    text = "".join(ch if ch.isprintable() else " " for ch in text)
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
 state = load("state.json")
 result = load("last-result.json")
 if isinstance(state, dict):
@@ -193,7 +199,18 @@ if isinstance(result, dict):
         "log": result.get("log"),
         "review": result.get("review"),
     }
+    # The reason of a failure, so a caller of self.status sees why without
+    # reading the root-only log: text only, cut short.
+    if result.get("error"):
+        out["last_attempt"]["error"] = clip(result.get("error"))
     activation = result.get("activation")
+    rollback = result.get("rollback")
+    if not isinstance(rollback, dict) and isinstance(activation, dict):
+        rollback = activation.get("rollback")
+    if isinstance(rollback, dict):
+        out["last_attempt"]["rollback"] = {"result": rollback.get("result")}
+        if rollback.get("error"):
+            out["last_attempt"]["rollback"]["error"] = clip(rollback.get("error"))
     if isinstance(activation, dict) and activation.get("status") == "scheduled":
         out["pending_activation"] = activation
 elif result == "unreadable":

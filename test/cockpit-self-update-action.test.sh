@@ -222,7 +222,13 @@ case "\${1:-}" in
     if [ -e "$FIX/restart-fail-once" ]; then rm -f "$FIX/restart-fail-once"; exit 1; fi
     exit "\${FIX_RESTART_RC:-0}"
     ;;
-  is-active) exit "\${FIX_ISACTIVE_RC:-0}" ;;
+  is-active)
+    # S18: services still starting — the first N checks fail, then they are up
+    if [ -s "$FIX/isactive-fail-left" ]; then
+      left="\$(cat "$FIX/isactive-fail-left")"
+      if [ "\$left" -gt 0 ]; then echo "\$((left - 1))" > "$FIX/isactive-fail-left"; exit 3; fi
+    fi
+    exit "\${FIX_ISACTIVE_RC:-0}" ;;
   show) echo "Thu 2026-09-25 18:00:00 UTC"; exit 0 ;;
   *) exit 0 ;;
 esac
@@ -973,7 +979,45 @@ rm -f "$FIX/snap-restore-fails"
 check "S17e failing restore keeps 69" "$([ "$rc" -eq 69 ] && echo 0 || echo 1)" "rc=$rc"
 expect_json "S17e rollback failed" "$FIX/state/last-result.json" "rollback.result" "failed"
 check "S17e reason names the restore" "$(grep -q "restore broke" "$FIX/state/last-result.json" && echo 0 || echo 1)" "$(head -c 400 "$FIX/state/last-result.json")"
+"$HELPER" status > "$FIX/s17e-status.out" 2>&1; rc=$?
+check "S17e status rc=0" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "rc=$rc"
+check "S17e status shows the failure reason" \
+  "$(json_get "$FIX/s17e-status.out" last_attempt.error | grep -q "rollback incomplete" && echo 0 || echo 1)" "$(head -c 600 "$FIX/s17e-status.out")"
+expect_json "S17e status shows the rollback result" "$FIX/s17e-status.out" "last_attempt.rollback.result" "failed"
+check "S17e status shows the rollback reason" \
+  "$(json_get "$FIX/s17e-status.out" last_attempt.rollback.error | grep -q "restore broke" && echo 0 || echo 1)" "$(head -c 600 "$FIX/s17e-status.out")"
 export COCKPIT_SELF_UPDATE_SNAPSHOT="$FIX/no-snapshot-helper"
+
+# --------------------------------------------------------------------------
+# S18: services and broker sockets appear only after the first verify try
+# (right after the restart). Lab0 16.10.2026: a miss on try 1 was remembered
+# and failed the activation although try 2 found everything up.
+# --------------------------------------------------------------------------
+echo "--- S18: late services and sockets are no failure"
+reset_base > /dev/null
+C10="$(add_commit c10)"
+H10="$(review_hash "$C10" "$FIX/s18-diff10.out")"
+"$HELPER" "$C10" "$H10" > /dev/null 2> "$FIX/s18.err"; rc=$?
+check "S18 deploy rc=0" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "rc=$rc $(head -c 300 "$FIX/s18.err")"
+rm -f "$FIX/sock-late.sock"
+echo 1 > "$FIX/isactive-fail-left"
+( sleep 1.5; exec python3 "$FIX/mksock.py" 60 "$FIX/sock-late.sock" ) &
+LATE_PID=$!
+COCKPIT_SELF_UPDATE_SOCKETS="$FIX/sock-a.sock $FIX/sock-late.sock" COCKPIT_SELF_UPDATE_VERIFY_RETRIES=3 \
+  "$RUNNER" activate "$C10" > "$FIX/s18-act.out" 2>&1; rc=$?
+kill "$LATE_PID" 2>/dev/null; wait "$LATE_PID" 2>/dev/null
+rm -f "$FIX/isactive-fail-left"
+check "S18 activation with late services and sockets rc=0" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "rc=$rc $(tail -c 400 "$FIX/s18-act.out")"
+expect_json "S18 activation ok" "$FIX/state/last-result.json" "activation.status" "ok"
+expect_json "S18 services checked ok" "$FIX/state/last-result.json" "activation.checks.services" "ok"
+expect_json "S18 sockets checked ok" "$FIX/state/last-result.json" "activation.checks.sockets" "ok"
+
+# S18b: services that never come up still fail, and status says why
+FIX_ISACTIVE_RC=1 COCKPIT_SELF_UPDATE_VERIFY_RETRIES=1 "$RUNNER" activate "$C10" > "$FIX/s18b-act.out" 2>&1; rc=$?
+check "S18b dead services -> 68" "$([ "$rc" -eq 68 ] && echo 0 || echo 1)" "rc=$rc"
+"$HELPER" status > "$FIX/s18b-status.out" 2>&1
+check "S18b status names the dead services" \
+  "$(json_get "$FIX/s18b-status.out" last_attempt.error | grep -q "services not active: fixture-svc-a,fixture-svc-b" && echo 0 || echo 1)" "$(head -c 600 "$FIX/s18b-status.out")"
 
 echo
 echo "Gerüst: $FIX (wird beim Beenden entfernt)"

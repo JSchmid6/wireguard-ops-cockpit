@@ -870,25 +870,26 @@ def verify_phase(retries, delay, include_web, after_activation):
     if revision.returncode != 0 or revision.stdout.strip() != ACTIVE_SHA:
         raise Failure(68, "verify", "checkout HEAD is not the pinned commit (%s)" % (revision.stdout.strip() or "unreadable"))
     checks["revision"] = "ok"
-    last = ""
+    # for/else: only an exhausted loop is a breach — a miss on an early try
+    # (services still starting right after the restart) must not outlive the
+    # try that finds them up.
+    missing = []
     for _ in range(retries):
         missing = [name for name in SERVICES if run([SYSTEMCTL, "is-active", "--quiet", name], timeout=15).returncode != 0]
         if not missing:
             break
-        last = ",".join(missing)
         time.sleep(delay)
-    if last:
-        raise Failure(68, "verify", "services not active: %s" % last)
+    else:
+        raise Failure(68, "verify", "services not active: %s" % (",".join(missing) or "no check ran"))
     checks["services"] = "ok"
-    last = ""
+    missing = []
     for _ in range(retries):
         missing = [path for path in SOCKETS if not socket_ok(path)]
         if not missing:
             break
-        last = ",".join(missing)
         time.sleep(delay)
-    if last:
-        raise Failure(68, "verify", "broker sockets missing: %s" % last)
+    else:
+        raise Failure(68, "verify", "broker sockets missing: %s" % (",".join(missing) or "no check ran"))
     checks["sockets"] = "ok"
     healthy = False
     for _ in range(retries):
