@@ -111,7 +111,15 @@ runner only.
    retag since the deploy fails the activation with 68, nothing restarted).
    Then it restarts the services, verifies them again — including that the web
    container now runs exactly `web_image.id` — and writes
-   `activation.status=ok` (or `failed` with the reason).
+   `activation.status=ok` (or `failed` with the reason). Each check retries
+   (services and broker sockets need a few seconds after the restart); only a
+   check that is still failing on its last try fails the activation.
+
+   `cockpit-self-update-action status` shows the reason of the last failed
+   attempt in `last_attempt.error` and, after a rollback, its outcome in
+   `last_attempt.rollback` (`result`, `error`) — text only, cut at 500
+   characters — so the reason is readable through the Cockpit without the
+   root-only log.
 
    Note: until the timer fires, `systemctl show -p Result` of the scheduled
    `…-activate-…` service already says `success` (the default of a unit that
