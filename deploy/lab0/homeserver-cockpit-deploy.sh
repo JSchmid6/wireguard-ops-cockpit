@@ -582,6 +582,10 @@ install -m 755 -o root -g root "$COCKPIT_DIR/deploy/helpers/cockpit-host-run" \
   /usr/local/lib/wireguard-ops-cockpit/cockpit-host-run.mjs
 install -m 644 -o root -g root "$COCKPIT_DIR/deploy/helpers/cockpit-backup-guard.mjs" \
   /usr/local/lib/wireguard-ops-cockpit/cockpit-backup-guard.mjs
+# Zustandsschritte nie mittendrin abbrechen: die eine Erkennung, die der Helfer
+# importiert (fehlte bis 16.10.2026 → ERR_MODULE_NOT_FOUND im Root-Helfer).
+install -m 644 -o root -g root "$COCKPIT_DIR/deploy/helpers/cockpit-state-steps.mjs" \
+  /usr/local/lib/wireguard-ops-cockpit/cockpit-state-steps.mjs
 install -m 644 "$COCKPIT_DIR/deploy/systemd/wireguard-ops-cockpit-host-run-resume.service" \
   /etc/systemd/system/wireguard-ops-cockpit-host-run-resume.service
 
@@ -818,7 +822,9 @@ Rückbau (nur bei Bedarf, als root):
   # Tür (doc/setup/host-run.md):
   #   systemctl disable wireguard-ops-cockpit-host-run-resume.service
   #   rm -f /usr/local/lib/wireguard-ops-cockpit/cockpit-host-run.mjs /usr/local/lib/wireguard-ops-cockpit/cockpit-backup-guard.mjs \
+  #         /usr/local/lib/wireguard-ops-cockpit/cockpit-state-steps.mjs \
   #         /etc/systemd/system/wireguard-ops-cockpit-host-run-resume.service
+  #   (cockpit-borg-retention-rules.mjs nimmt der Aufräum-Block unten mit — Riegel und Dienst teilen sie.)
   # Aufräum-Dienst (nur mit Jochens Freigabe abschalten — doc/setup/borg-retention.md):
   #   systemctl disable --now cockpit-borg-retention.timer
   #   rm -f /usr/local/sbin/cockpit-borg-retention /usr/local/lib/wireguard-ops-cockpit/cockpit-borg-retention*.mjs \
