@@ -10,7 +10,8 @@ import { runBrokerAgent } from "./agent-broker.js";
 type SafetyVerdict = Extract<PlanReviewVerdict, "passed" | "approval_required" | "blocked">;
 
 const REVIEW_SCHEMA_VERSION = "runbook-safety-review/v1";
-const PARSER_VERSION = "line-schema/v1";
+const PARSER_VERSION = "line-schema/v2";
+const REPORT_KEYS = new Set(["VERDICT", "SUMMARY", "HAZARDS", "BLAST_RADIUS", "EXPECTED_IMPACT", "ROLLBACK_HINT", "OPERATOR_CHECKS"]);
 const COPILOT_TIMEOUT_MS = 30_000;
 const OPENCODE_TIMEOUT_MS = 60_000;
 const SECRET_ENV_VARS = [
@@ -76,7 +77,7 @@ export function buildRunbookSafetyPrompt(input: RunbookSafetyReviewInput): strin
   scriptContent = scriptContent.replace(/```/g, "[code]");
 
   return [
-    "Safety review: classify this runbook script. Return EXACTLY these 7 lines:",
+    "Safety review: classify this runbook script. Return EXACTLY these 7 lines and nothing else (no notes before or after):",
     "VERDICT: passed|approval_required|blocked",
     "SUMMARY: one sentence what the script does",
     "HAZARDS: list or none",
@@ -109,19 +110,20 @@ export function parseRunbookSafetyOutput(output: string): ParsedSafetyReport {
     .map((line) => line.trim())
     .filter(Boolean);
 
-  if (lines.length !== 7) {
-    throw new Error(`expected 7 non-empty lines, received ${lines.length}: ${lines.map(l=>l.substring(0,30)).join(" | ")}`);
-  }
-
+  // Tolerant against additional lines (16.10.2026: a trailing "Note: …" turned
+  // a passed report into blocked_policy), strict about the seven report lines:
+  // each must appear exactly once, and no additional line may speak about the
+  // verdict. Anything unclear fails closed — an unclear verdict never passes.
   const values = new Map<string, string>();
   for (const line of lines) {
     const separator = line.indexOf(":");
-    if (separator <= 0) {
-      throw new Error(`invalid review line: ${line}`);
+    const key = separator > 0 ? line.slice(0, separator).replace(/[*`#>\s-]/g, "").toUpperCase() : "";
+    if (!REPORT_KEYS.has(key)) {
+      if (/\bVERDICT\b/i.test(line)) throw new Error(`ambiguous verdict line: ${line.substring(0, 60)}`);
+      continue;
     }
-    const key = line.slice(0, separator).trim();
-    const value = line.slice(separator + 1).trim();
-    values.set(key, value);
+    if (values.has(key)) throw new Error(`duplicate ${key} line in the safety report`);
+    values.set(key, line.slice(separator + 1).trim());
   }
 
   const verdict = values.get("VERDICT");

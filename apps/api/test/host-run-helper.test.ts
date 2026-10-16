@@ -43,6 +43,8 @@ function hookEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
     // Paketwerkzeuge der Schritte (dpkg, apt-get, ss) sind Attrappen: kein Test
     // fasst die echte Paketverwaltung an, auch nicht der Aufräumweg.
     HOST_RUN_STEP_PATH: path.join(dir, "bin"),
+    // Kein Wiederholen gescheiterter Prüfschritte, ausser ein Test setzt das Fenster.
+    HOST_RUN_CHECK_SETTLE_SECONDS: "0",
     STUB_DIR: dir,
     ...extra,
   };
@@ -360,6 +362,53 @@ describe("cockpit-host-run: door", () => {
     expect(state.status).toBe("check_failed");
     expect(state.checks[0].status).toBe("failed");
   });
+
+  it("waits for a restarted service: a check that passes within the settle window passes", () => {
+    // Wie health-ok direkt nach dem restart: zwei Fehlversuche, dann gesund.
+    const counter = path.join(dir, "check-count");
+    const check = `n=$(cat ${counter} 2>/dev/null || echo 0); n=$((n+1)); echo $n > ${counter}; [ $n -ge 3 ]`;
+    run(["start"], request(manifest({ checks: [{ name: "health-ok", run: check, timeoutSeconds: 30 }] })), { HOST_RUN_CHECK_SETTLE_SECONDS: "10" });
+    const { state, logTail } = status();
+    expect(state.status).toBe("success");
+    expect(state.checks[0]).toMatchObject({ status: "passed", attempts: 3 });
+    expect(logTail).toContain("retry in 2 s (settle window 10 s)");
+  }, 30_000);
+
+  it("fails closed when a check is still failing at the end of the settle window", () => {
+    const counter = path.join(dir, "check-count");
+    const check = `n=$(cat ${counter} 2>/dev/null || echo 0); echo $((n+1)) > ${counter}; exit 7`;
+    const started = Date.now();
+    run(["start"], request(manifest({ checks: [{ name: "health-ok", run: check, timeoutSeconds: 30 }] })), { HOST_RUN_CHECK_SETTLE_SECONDS: "5" });
+    const { state, logTail } = status();
+    expect(state.status).toBe("check_failed");
+    expect(state.checks[0]).toMatchObject({ status: "failed", exitCode: 7 });
+    // Begrenzt: im 5-s-Fenster mit 2 s Takt höchstens drei Versuche, dann Schluss.
+    const attempts = Number(readFileSync(counter, "utf8").trim());
+    expect(attempts).toBe(state.checks[0].attempts);
+    expect(attempts).toBeGreaterThanOrEqual(2);
+    expect(attempts).toBeLessThanOrEqual(3);
+    expect(Date.now() - started).toBeLessThan(20_000);
+    expect(logTail).toContain("still failing after");
+  }, 30_000);
+
+  it("never retries a failing check of a read-only run", () => {
+    const counter = path.join(dir, "check-count");
+    const check = `n=$(cat ${counter} 2>/dev/null || echo 0); echo $((n+1)) > ${counter}; exit 1`;
+    run(["start"], request(manifest({ mutates: false, steps: [{ name: "look", run: "true", timeoutSeconds: 30 }], checks: [{ name: "health-ok", run: check, timeoutSeconds: 30 }] })), { HOST_RUN_CHECK_SETTLE_SECONDS: "10" });
+    const { state } = status();
+    expect(state.status).toBe("check_failed");
+    expect(readFileSync(counter, "utf8").trim()).toBe("1");
+  }, 30_000);
+
+  it("never retries a check that hit its time limit", () => {
+    const counter = path.join(dir, "check-count");
+    const check = `n=$(cat ${counter} 2>/dev/null || echo 0); echo $((n+1)) > ${counter}; sleep 5`;
+    run(["start"], request(manifest({ checks: [{ name: "hangs", run: check, timeoutSeconds: 1 }] })), { HOST_RUN_CHECK_SETTLE_SECONDS: "10" });
+    const { state } = status();
+    expect(state.status).toBe("check_failed");
+    expect(state.checks[0].timedOut).toBe(true);
+    expect(readFileSync(counter, "utf8").trim()).toBe("1");
+  }, 30_000);
 
   it("ends a private-key redaction without END line instead of blanking the rest of the log", () => {
     run(["start"], request(manifest({ steps: [

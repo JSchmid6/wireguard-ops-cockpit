@@ -79,6 +79,13 @@ const STEP_PATH = `${env.HOST_RUN_STEP_PATH ? `${env.HOST_RUN_STEP_PATH}:` : ""}
 // aber weiterhin kein Abbruch (Vorgabe Jochen, 11.10.2026).
 const HARD_CAP_SECONDS = Number.parseInt(env.HOST_RUN_HARD_CAP_SECONDS || "", 10) > 0 ? Number.parseInt(env.HOST_RUN_HARD_CAP_SECONDS, 10) : 6 * 3600;
 const REPAIR_LIMIT_SECONDS = Number.parseInt(env.HOST_RUN_REPAIR_LIMIT_SECONDS || "", 10) > 0 ? Number.parseInt(env.HOST_RUN_REPAIR_LIMIT_SECONDS, 10) : 3600;
+// Nach einem ändernden Lauf braucht ein neu gestarteter Dienst Sekunden, bis er
+// antwortet (16.10.2026: health-ok 100 ms nach dem restart, curl (7), 4 s später
+// gesund). Ein gescheiterter Prüfschritt wird darum bis zu diesem Fenster ab
+// seinem ersten Versuch wiederholt; danach gilt er als gescheitert (fail closed).
+// Ein Prüfschritt, der seine Zeitgrenze erreicht hat, wird nie wiederholt.
+const CHECK_SETTLE_SECONDS = /^\d+$/.test(env.HOST_RUN_CHECK_SETTLE_SECONDS || "") ? Number.parseInt(env.HOST_RUN_CHECK_SETTLE_SECONDS, 10) : 30;
+const CHECK_RETRY_MS = 2000;
 // Hat bash eines unterbrechungssicheren Schritts geendet, ein Hintergrundprozess
 // hält aber die Ausgabe offen: so lange noch lesen, dann ohne Abbruch weiter.
 const OUTPUT_GRACE_MS = 10_000;
@@ -680,9 +687,20 @@ async function payload(jobId) {
   for (const [index, check] of manifest.checks.entries()) {
     log(`== ${now()} check ${index + 1}/${manifest.checks.length}: ${check.name}`);
     // Prüfschritte lesen nur; trifft die Erkennung trotzdem etwas, gilt auch hier: kein Abbruch.
-    const result = await runScript(check.run, check.timeoutSeconds, { uninterruptible: stateStepKinds(`${check.name}\n${check.run}`).length > 0 });
+    const uninterruptible = stateStepKinds(`${check.name}\n${check.run}`).length > 0;
+    // Wiederholt wird nur nach einem ändernden Lauf; ein lesender Lauf hat nichts neu gestartet.
+    const settleUntil = Date.now() + (manifest.mutates ? CHECK_SETTLE_SECONDS * 1000 : 0);
+    let attempts = 1;
+    let result = await runScript(check.run, check.timeoutSeconds, { uninterruptible });
+    while ((result.code !== 0 && !result.timedOut) && Date.now() + CHECK_RETRY_MS <= settleUntil) {
+      log(`== ${now()} check ${index + 1}/${manifest.checks.length}: ${check.name} exited ${result.code}; retry in ${CHECK_RETRY_MS / 1000} s (settle window ${CHECK_SETTLE_SECONDS} s)`);
+      await new Promise((resolve) => setTimeout(resolve, CHECK_RETRY_MS));
+      attempts += 1;
+      result = await runScript(check.run, check.timeoutSeconds, { uninterruptible });
+    }
     const ok = result.code === 0 && !result.timedOut;
-    Object.assign(state.checks[index], { status: ok ? "passed" : "failed", exitCode: result.code, timedOut: result.timedOut, endedAt: now() });
+    if (!ok && attempts > 1) log(`== ${now()} check ${index + 1}/${manifest.checks.length}: ${check.name} still failing after ${attempts} attempts — failed`);
+    Object.assign(state.checks[index], { status: ok ? "passed" : "failed", exitCode: result.code, timedOut: result.timedOut, attempts, endedAt: now() });
     saveState(state);
     if (!ok) failed += 1;
   }

@@ -50,6 +50,35 @@ describe("runbook safety review", () => {
     });
   });
 
+  const REPORT = [
+    "VERDICT: passed",
+    "SUMMARY: Invokes the self-update helper.",
+    "HAZARDS: none",
+    "BLAST_RADIUS: none",
+    "EXPECTED_IMPACT: none",
+    "ROLLBACK_HINT: none needed",
+    "OPERATOR_CHECKS: none"
+  ];
+
+  it("tolerates an additional note line (Lab0 d7031e14: 8 instead of 7 lines)", () => {
+    const parsed = parseRunbookSafetyOutput([...REPORT, "Note: the bare-sha form is intentionally refused by the helper."].join("\n"));
+    expect(parsed.verdict).toBe("passed");
+    expect(parsed.summary).toBe("Invokes the self-update helper.");
+    expect(parseRunbookSafetyOutput(["Here is the report:", "", ...REPORT].join("\n")).verdict).toBe("passed");
+  });
+
+  it("fails closed on a missing, unclear, duplicate or contradicted verdict", () => {
+    const without = REPORT.filter((line) => !line.startsWith("VERDICT"));
+    expect(() => parseRunbookSafetyOutput([...without, "Note: looks fine"].join("\n"))).toThrow(/missing/);
+    expect(() => parseRunbookSafetyOutput(["VERDICT: passed?", ...REPORT.slice(1)].join("\n"))).toThrow(/invalid verdict/);
+    expect(() => parseRunbookSafetyOutput(["VERDICT: passed or blocked", ...REPORT.slice(1)].join("\n"))).toThrow(/invalid verdict/);
+    expect(() => parseRunbookSafetyOutput(["VERDICT:", ...REPORT.slice(1)].join("\n"))).toThrow();
+    expect(() => parseRunbookSafetyOutput([...REPORT, "VERDICT: blocked"].join("\n"))).toThrow(/duplicate VERDICT/);
+    expect(() => parseRunbookSafetyOutput([...REPORT, "**Verdict**: blocked"].join("\n"))).toThrow(/duplicate VERDICT/);
+    expect(() => parseRunbookSafetyOutput([...REPORT, "Note: the real verdict would be blocked"].join("\n"))).toThrow(/ambiguous verdict/);
+    expect(() => parseRunbookSafetyOutput([...REPORT, "SUMMARY: something else"].join("\n"))).toThrow(/duplicate SUMMARY/);
+  });
+
   it("fails closed for high-risk runbooks when the Copilot runtime is unavailable", async () => {
     const runbook = findRunbook("nextcloud-update-plan");
     expect(runbook).toBeDefined();
