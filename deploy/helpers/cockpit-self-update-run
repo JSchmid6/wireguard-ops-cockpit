@@ -34,7 +34,11 @@
 #           /var/lib/wireguard-ops-cockpit/self-update -> schedule the
 #           activation unit.
 #
-# activate: wait for the run lock (a running deployment or review diff) ->
+# activate: wait until the API reports no Hermes job a restart would
+#           interrupt (planning, review, execution outside the host door;
+#           bounded, then it activates anyway — the restarted API plans an
+#           interrupted planning again) -> wait for the run lock (a running
+#           deployment or review diff) ->
 #           skip when superseded -> check that the web image tag is still the
 #           image the deploy built -> restart the cockpit services (and the web
 #           unit, where the deploy script lists it) -> post-restart
@@ -214,6 +218,11 @@ ACTIVATION_DELAY = int(env("COCKPIT_SELF_UPDATE_ACTIVATION_DELAY", "600"))
 # well below this — its unit has no time limit since 11.10.2026 —, a review diff
 # up to 420 s) before it gives up loudly; the deployment itself is never ended.
 ACTIVATION_LOCK_WAIT = int(env("COCKPIT_SELF_UPDATE_ACTIVATION_LOCK_WAIT", "1900"))
+# How long the activation waits for Hermes jobs the restart would interrupt
+# (GET /api/health "jobs"), and how often it asks. The wait is outside the run
+# lock: a job under review needs that lock for its diff.
+ACTIVATION_JOBS_WAIT = int(env("COCKPIT_SELF_UPDATE_ACTIVATION_JOBS_WAIT", "1800"))
+ACTIVATION_JOBS_POLL = int(env("COCKPIT_SELF_UPDATE_ACTIVATION_JOBS_POLL", "15"))
 VERIFY_RETRIES = int(env("COCKPIT_SELF_UPDATE_VERIFY_RETRIES", "12"))
 VERIFY_DELAY = int(env("COCKPIT_SELF_UPDATE_VERIFY_DELAY", "5"))
 SERVICES = env("COCKPIT_SELF_UPDATE_SERVICES", "wireguard-ops-cockpit-api wireguard-ops-cockpit-agent wireguard-ops-cockpit-executor wireguard-ops-cockpit-ttyd").split()
@@ -1155,20 +1164,65 @@ def cmd_deploy(sha, reviewed_sha256):
         fail_with(result, exc)
 
 
+def interruptible_jobs():
+    """(active, phases) from the API's health answer; None when it cannot tell
+    (no answer, or an API from before the "jobs" field)."""
+    try:
+        jobs = json.loads(http_body(API_HEALTH_URL) or "{}").get("jobs")
+        active = int(jobs["active"])
+        phases = {str(key): int(value) for key, value in (jobs.get("phases") or {}).items()}
+    except Exception:
+        return None
+    return active, phases
+
+
+def wait_for_jobs(sha, logfile):
+    """Waits until no Hermes job would be interrupted by the restart, at most
+    ACTIVATION_JOBS_WAIT seconds; says what it waits for. Never refuses: a job
+    still planning is planned again by the restarted API, so the limit only
+    bounds the wait."""
+    begun = time.time()
+    deadline = begun + ACTIVATION_JOBS_WAIT
+    last = None
+    while True:
+        jobs = interruptible_jobs()
+        waited = int(time.time() - begun)
+        if jobs is None:
+            log("the API does not report its jobs; activating without waiting for them")
+            return {"outcome": "unknown", "waited_seconds": waited}
+        active, phases = jobs
+        if active == 0:
+            if last is not None:
+                log("no job is running any more after %ss; activating" % waited)
+            return {"outcome": "idle", "waited_seconds": waited}
+        described = ", ".join("%s %s" % (count, phase) for phase, count in sorted(phases.items()))
+        if jobs != last:
+            log("waiting for %d job(s) the restart would interrupt (%s), at most %ss" % (active, described, ACTIVATION_JOBS_WAIT))
+            if last is None:
+                note_history({"ts": utcnow(), "sha": sha, "phase": "activate", "result": "waiting-for-jobs",
+                              "jobs": phases, "log": logfile})
+            last = jobs
+        if time.time() >= deadline:
+            log("still %d job(s) after %ss (%s); activating anyway — the API plans an interrupted planning again"
+                % (active, waited, described))
+            return {"outcome": "timeout", "waited_seconds": waited, "jobs": phases}
+        time.sleep(min(ACTIVATION_JOBS_POLL, max(deadline - time.time(), 0.1)))
+
+
 def cmd_activate(sha):
     started = utcnow()
     ensure_dir(STATE_DIR)
     ensure_dir(LOG_DIR)
+    logfile = open_log("activate", sha)
+    jobs_wait = wait_for_jobs(sha, logfile)
     # The run lock is also held by a review diff, which schedules no activation of
     # its own: skipping here would leave the deployed code inactive with a unit that
     # still ends "success". So wait; a deployment that finishes meanwhile moved
     # deployed_commit on, and the superseded check below skips this activation.
     if acquire_run_lock(wait=ACTIVATION_LOCK_WAIT) is None:
-        logfile = open_log("activate", sha)
         log("the run lock stayed held for %ss; activation for %s NOT done" % (ACTIVATION_LOCK_WAIT, sha[:12]))
         note_history({"ts": utcnow(), "sha": sha, "phase": "activate", "result": "failed-busy", "log": logfile})
         sys.exit(66)
-    logfile = open_log("activate", sha)
     log("self-update activation %s (log %s)" % (sha, logfile))
     state = read_json(STATE_FILE)
     deployed = state.get("deployed_commit") if isinstance(state, dict) else None
@@ -1210,7 +1264,7 @@ def cmd_activate(sha):
     activation = {"status": "ok" if checks and not error else "failed",
                   "unit": "wireguard-ops-cockpit-self-update-activate-%s" % sha[:7],
                   "started_at": started, "finished_at": utcnow(),
-                  "checks": checks, "services": service_timestamps}
+                  "checks": checks, "services": service_timestamps, "jobs_wait": jobs_wait}
     if restart.returncode != 0:
         activation["status"] = "failed"
         activation["restart_exit_code"] = restart.returncode

@@ -201,6 +201,38 @@ function slugify(value: string): string {
 
 type HermesPhase = "queued" | "planning" | "reviewing" | "executing" | "verifying" | "finished";
 
+// What a Hermes job was asked for, recorded on the job (output.request), so
+// the job can be planned again after an API restart (recoverInterruptedJobs).
+interface ResearchRequest {
+  intent: string;
+  evidence: ReturnType<typeof normalizeEvidence>;
+  // The tmux session was created for this job and is removed with it.
+  ownedSession: boolean;
+}
+
+interface ChangeRequest extends ResearchRequest {
+  allowedCapabilities: CapabilityId[];
+  execute: boolean;
+}
+
+type JobSession = NonNullable<ReturnType<CockpitDatabase["getSessionRuntimeTargetForActor"]>>;
+
+// One entry per API restart the job lived through (output.restarts).
+interface JobRestart {
+  at: string;
+  phase: string;
+  action: "replanned" | "abandoned";
+  reason: string;
+}
+
+// Phases in which nothing has run on the host yet: planning and the reviews.
+const REPLANNABLE_PHASES = new Set(["queued", "planning", "reviewing"]);
+// A job is planned again at most this often; after that it fails with the reason.
+const MAX_JOB_REPLANS = 2;
+// A job whose last progress is older than this is not planned again: whoever
+// asked for it has moved on, and an old intent must not run unannounced.
+const REPLAN_WINDOW_MS = 60 * 60_000;
+
 interface HermesExplanation {
   phase: HermesPhase;
   intent: string;
@@ -1551,6 +1583,7 @@ export async function createApp(options: AppOptions = {}) {
   app.get("/api/health", async () => ({
     ok: true,
     tmuxBackend: tmux.backend,
+    jobs: interruptibleJobs(),
     security: {
       modelDiversity: config.opencodeModel !== config.safetyOpencodeModel,
       agentIsolation: Boolean(config.agentBrokerSocket && existsSync(config.agentBrokerSocket)),
@@ -2162,9 +2195,13 @@ export async function createApp(options: AppOptions = {}) {
   }
 
   function updateHermesJob(jobId: string, status: JobRecord["status"], detail: HermesExplanation, extra: Record<string, unknown> = {}): JobRecord {
+    // The request and the restart record stay with the job through every
+    // update: recovery needs the first, cockpit_einblick shows the second.
+    const previous = database.getJob(jobId)?.output || {};
+    const carried = Object.fromEntries(["request", "restarts"].filter((key) => key in previous).map((key) => [key, previous[key]]));
     const updated = database.updateJob(jobId, {
       status,
-      output: { ...extra, explanation: detail },
+      output: { ...carried, ...extra, explanation: detail },
       completedAt: ["running", "pending"].includes(status) ? null : new Date().toISOString(),
     });
     if (
@@ -2198,6 +2235,283 @@ export async function createApp(options: AppOptions = {}) {
     if (!createdSession) return;
     if (!/^cockpit-hermes-(?:rb-)?[a-z0-9]+$/i.test(tmuxSessionName)) return;
     spawnSync("tmux", ["kill-session", "-t", tmuxSessionName], { timeout: 5000, encoding: "utf8" });
+  }
+
+  // The research pipeline. The endpoint starts it; after an API restart the
+  // recovery below starts it again for a job that was still researching
+  // (read-only, nothing to undo), from the request recorded on the job.
+  async function runResearchJob(job: JobRecord, actor: UserSummary, session: JobSession, agent: AgentManifest, request: ResearchRequest): Promise<void> {
+    const { intent } = request;
+    const createdSession = request.ownedSession;
+    const agentTask = `${buildAgentTask(intent, request.evidence)}\n\nREAD_ONLY_RESEARCH_CONTRACT:\nInvestigate and report the current state. Never return an executable plan.`;
+    const startedAt = Date.now();
+    try {
+      if (session.tmuxBackend === "disabled") {
+        updateHermesJob(job.id, "blocked_prerequisite", explanation({
+          phase: "finished", intent, reason: "tmux is unavailable in this runtime.",
+          neededToContinue: ["Enable the tmux backend."], recommendedAction: "Restore the tmux runtime and retry.",
+        }));
+        return;
+      }
+      updateHermesJob(job.id, "running", explanation({ phase: "planning", intent, reason: "Planner is performing read-only research." }));
+      const raw = await runIsolatedAgent(actor, session, agent, "research", agentTask, "", 2 * 60_000);
+      const answer = filterSensitiveContent(extractCleanOutput(raw) || extractAnswer(raw));
+      if (!answer || answer.length < 20 || /^>\s*build\b/i.test(answer.trim())) {
+        updateHermesJob(job.id, "failed_verification", explanation({
+          phase: "finished", intent,
+          reason: "Planner process exited, but produced no meaningful research result.",
+          completed: ["Planner process", "Sensitive-output filtering"],
+          evidence: [`elapsedMs=${Date.now() - startedAt}`],
+          neededToContinue: ["Inspect planner/provider health; do not treat this job as a successful answer."],
+          recommendedAction: "Retry only after confirming the model provider returns content.",
+        }));
+        return;
+      }
+      updateHermesJob(job.id, "completed", explanation({
+        phase: "finished", intent, reason: "Research completed successfully.",
+        completed: ["Planner research", "Sensitive-output filtering"], evidence: [`elapsedMs=${Date.now() - startedAt}`],
+        recommendedAction: "Use the findings to decide whether a change job is needed.",
+      }), { answer, elapsedMs: Date.now() - startedAt });
+    } catch (error) {
+      updateHermesJob(job.id, "failed_execution", explanation({
+        phase: "finished", intent, reason: error instanceof Error ? error.message : "Research failed.",
+        neededToContinue: ["Inspect the job evidence and planner runtime."], recommendedAction: "Correct the prerequisite and retry.",
+      }));
+    } finally {
+      stopEphemeralSession(session.tmuxSessionName, createdSession);
+    }
+  }
+
+  // The change pipeline. The endpoint starts it; after an API restart the
+  // recovery below starts it again for a job that had not reached execution
+  // (planning and review run nothing on the host), from the request recorded
+  // on the job. A fresh plan gets a fresh review and a fresh envelope.
+  async function runChangeJob(job: JobRecord, actor: UserSummary, session: JobSession, request: ChangeRequest): Promise<void> {
+    const { intent, allowedCapabilities } = request;
+    const untrustedEvidence = request.evidence;
+    const shouldExecute = request.execute;
+    const createdSession = request.ownedSession;
+    const agentTask = `${buildAgentTask(intent, untrustedEvidence)}\n\nDYNAMIC CAPABILITY CONTRACT:\n${hostRunPlannerContract()}\n\n${capabilityPlannerContract()}`;
+    const startedAt = Date.now();
+    try {
+      const failureWindowStart = new Date(Date.now() - 60 * 60_000).toISOString();
+      const recentFailures = database.countAuditsSinceForRuntime("hermes.change.failed", failureWindowStart, changeRuntimeFingerprint);
+      if (recentFailures >= config.maxFailedChangesPerHour) {
+        updateHermesJob(job.id, "blocked_prerequisite", explanation({
+          phase: "finished", intent,
+          reason: `Circuit breaker is open after ${recentFailures} failed change jobs in the last hour.`,
+          evidence: [`failureCount=${recentFailures}`, `windowStart=${failureWindowStart}`, `runtimeFingerprint=${changeRuntimeFingerprint}`],
+          neededToContinue: ["Wait for the failure window to clear or have an operator diagnose the repeated failures."],
+          recommendedAction: "Do not retry automatically; inspect recent failed jobs first.",
+        }));
+        return;
+      }
+      if (session.tmuxBackend === "disabled") {
+        updateHermesJob(job.id, "blocked_prerequisite", explanation({
+          phase: "finished", intent, reason: "tmux is unavailable in this runtime.",
+          neededToContinue: ["Enable the tmux backend."], recommendedAction: "Restore the executor runtime and retry.",
+        }));
+        return;
+      }
+      // A host-run manifest in the trusted intent is the one that runs; a
+      // broken one stops here, before any planner time is spent.
+      const intentHostRun = intentHostRunManifest(intent);
+      const planner = findAgent("planner-agent", "opencode");
+      if (!planner) throw new Error("planner not available");
+      updateHermesJob(job.id, "running", explanation({ phase: "planning", intent, reason: "Planner is producing a structured change plan." }));
+      const plannerRaw = await runIsolatedAgent(actor, session, planner, "planner", agentTask, "", 5 * 60_000);
+      const planText = filterSensitiveContent(extractCleanOutput(plannerRaw));
+      if (!planText || planText.length < 20) throw new Error("planner produced no reviewable plan");
+
+      const proposalDir = path.join(path.dirname(config.dbPath), "proposals");
+      await mkdir(proposalDir, { recursive: true, mode: 0o700 });
+      const proposalPath = path.join(proposalDir, `${job.id}.md`);
+      await writeFile(proposalPath, planText, { encoding: "utf-8", mode: 0o600 });
+      const proposal: RunbookDefinition = {
+        id: `proposal-${job.id}`, name: intent.slice(0, 60), summary: intent,
+        requiresSession: true, requiresApproval: false, integration: "host-tmux",
+        privilegedHelperRequested: false, reviewStatus: "allowlisted", scriptIds: [proposalPath],
+        workflowSteps: [{ id: "execute", label: "Execute reviewed proposal", description: intent, kind: "runbook" }],
+      };
+
+      const manifest = parseCapabilityManifest(planText);
+      const hostRun = intentHostRun ?? parseHostRunManifest(planText);
+      const intentHostRunNote = intentHostRun ? `host-run manifest taken from the trusted intent; planner copy: ${plannerHostRunCopy(planText, intentHostRun)}` : null;
+      if (manifest && hostRun) throw new Error("the plan carries a capability manifest and a host-run manifest; one door per job");
+      const updateTargets = manifest || hostRun ? [] : reviewedUpdateTargets(planText);
+      let updateReview: Awaited<ReturnType<typeof reviewSelfUpdates>> | null = null;
+      if (updateTargets.length > 0) {
+        updateHermesJob(job.id, "running", explanation({
+          phase: "reviewing", intent, reason: `The running Cockpit is reviewing ${UPDATE_KINDS[updateTargets[0].kind].subject} before it can be installed.`,
+          completed: ["Structured planner proposal"], evidence: [proposalPath, ...updateTargets.map((target) => `${UPDATE_KINDS[target.kind].updateAction} ${target.sha}`)],
+        }), { plan: planText, proposalPath });
+        updateReview = await reviewSelfUpdates(job.id, updateTargets, proposalDir);
+      }
+      const reviewRecord = updateReview ? { updateReview: summarizeUpdateReview(updateReview.diffs, updateReview.outcome, updateReview.reviewPath) } : {};
+      const reviewedSteps = ["Planner proposal", ...(updateReview ? ["Pre-install code review"] : []), hostRun ? "Doorkeeper review" : "Safety review", "Policy evaluation"];
+
+      updateHermesJob(job.id, "running", explanation({
+        phase: "reviewing", intent, reason: "Independent safety review and hard-boundary policy are evaluating the proposal.",
+        completed: ["Structured planner proposal", ...(updateReview ? ["Pre-install code review"] : [])], evidence: [proposalPath],
+      }), { plan: planText, proposalPath, ...reviewRecord });
+      // The general host door has its own doorkeeper (host-run.ts): the
+      // deterministic hits are its focus, and only its evidenced findings —
+      // or an incomplete review — keep the run from starting. The other doors
+      // keep the plan safety review and the plan policy.
+      let review: ExecutionReview;
+      let policy: PlanPolicyResult;
+      if (hostRun) {
+        const hostRunReview = await reviewHostRun(job.id, hostRun, proposalDir);
+        policy = hostRunPolicy(hostRun, hostRunReview);
+        if (intentHostRunNote) policy = { ...policy, evidence: [...policy.evidence, intentHostRunNote] };
+        review = hostRunSafetyRecord(hostRun, hostRunReview, policy);
+      } else {
+        review = await safetyReviewRunner({
+          runbook: proposal, runbookVersionHash: computeRunbookVersionHash(proposal), riskClass: "moderate",
+          sessionId: session.id, trigger: "manual", scheduleId: null,
+        }, { ...config, opencodeModel: config.safetyOpencodeModel });
+        policy = evaluatePlanPolicy(planText, review.verdict);
+      }
+      const manifestHash = manifest ? capabilityManifestHash(manifest) : hostRun ? hostRunManifestHash(hostRun) : undefined;
+      const nextcloudMutationModes = new Set(["php-install", "php-enable", "exapp-catalog-refresh", "exapp-register", "exapp-reinitialize", "exapp-restart-reinitialize"]);
+      const contextMutationModes = new Set(["create-test", "search-test", "prompt-test"]);
+      const semanticMutation = manifest?.steps.some((step) =>
+        (step.argv[0] === "/usr/local/sbin/cockpit-nextcloud-app-action" && nextcloudMutationModes.has(step.argv[1] || ""))
+        || (step.argv[0] === "/usr/local/sbin/cockpit-nextcloud-context-action" && contextMutationModes.has(step.argv[1] || ""))
+      ) ?? false;
+      const capabilities: CapabilityId[] = hostRun ? ["host.run"]
+        : manifest ? [manifest.writablePaths.length > 0 || semanticMutation ? "filesystem.write" : "read.host"] : classifyCapabilities(planText);
+      const capabilityEscalation = capabilities.filter((capability) => !allowedCapabilities.includes(capability));
+      if (!manifest && !hostRun && policy.allowed && capabilityEscalation.length > 0) {
+        policy = {
+          ...policy,
+          zone: "red",
+          allowed: false,
+          status: "blocked_user_approval",
+          reason: "The proposed plan exceeds the capabilities authorized by the trusted request.",
+          evidence: [...policy.evidence, ...capabilityEscalation.map((capability) => `unauthorized capability: ${capability}`)],
+          neededToContinue: ["Authorize the exact capability from trusted operator intent or narrow the plan."],
+        };
+      }
+      if (!manifest && !hostRun && policy.allowed && capabilities.includes("shell.exception")) {
+        policy = {
+          ...policy,
+          zone: "red",
+          allowed: false,
+          status: "blocked_user_approval",
+          reason: "The plan requires unrestricted shell semantics outside the typed capability contract.",
+          evidence: [...policy.evidence, "capability: shell.exception"],
+          neededToContinue: ["Explicit operator approval or rewrite the plan using typed capabilities."],
+        };
+      }
+      const unsupportedAutonomousCapabilities = capabilities.filter((capability) =>
+        capability !== "read.host" && capability !== "service.manage" && capability !== "disk.manage" && capability !== "self.update"
+        && capability !== "dienste.update" && capability !== "borg.manage" && capability !== "shell.exception"
+      );
+      if (!manifest && !hostRun && policy.allowed && unsupportedAutonomousCapabilities.length > 0) {
+        policy = {
+          ...policy,
+          allowed: false,
+          status: "blocked_prerequisite",
+          reason: "The requested capability does not yet have a typed executor helper.",
+          evidence: unsupportedAutonomousCapabilities.map((capability) => `missing typed helper: ${capability}`),
+          neededToContinue: ["Install and review a narrow typed helper; do not fall back to agent shell execution."],
+        };
+      }
+      // Der borg-Repair-Riegel sitzt in evaluatePlanPolicy: er greift für
+      // jeden Plan — mit oder ohne Capability-Manifest — und liest genau das
+      // Skript, das der Executor ausführt (typedPlanScript/requestsBorgRepair).
+      // Den zweiten Riegel hält executeTypedCapabilities: kein Repair ohne die
+      // Freigabe des Operators für genau diesen Job.
+      if (manifest && policy.allowed && capabilityNeedsOperatorApproval(manifest)) {
+        policy = {
+          ...policy, zone: "red", allowed: false, status: "blocked_user_approval",
+          reason: "The dynamic capability can expose a service, lose existing data, or cross an identity/secret boundary.",
+          evidence: [
+            ...policy.evidence,
+            ...manifest.risk.map((risk) => `declared risk: ${risk}`),
+            `network: ${manifest.network}`,
+            ...readablePathsNeedingApproval(manifest).map((item) => `readable path needs operator approval: ${item}`),
+          ],
+          neededToContinue: ["Confirm this exact signed capability manifest."],
+        };
+      }
+      // The review of the new code decides only here, after every plan check:
+      // a stop turns an allowed plan into an operator decision.
+      if (updateReview) policy = applyUpdateReviewPolicy(policy, updateReview.outcome);
+      const envelope = createExecutionEnvelope({
+        jobId: job.id, actorId: actor.id, sessionId: session.id, intent,
+        evidence: [...untrustedEvidence, ...updateReviewEvidence(updateReview?.outcome.bindings ?? [])],
+        plan: planText, safety: review, policy, capabilities,
+        manifestHash, gatePassed: Boolean(hostRun && policy.allowed),
+        ttlMinutes: config.approvalTtlMinutes, signingSecret: config.executionEnvelopeSecret,
+      });
+      const provenance = {
+        trustedIntentHash: hashCanonical(intent),
+        untrustedEvidence: envelope.evidence,
+        allowedCapabilities,
+        injectionBoundary: "trusted-intent/untrusted-evidence-v1",
+      };
+      if (!policy.allowed) {
+        updateHermesJob(job.id, policy.status === "ready" ? "failed_execution" : policy.status, explanation({
+          phase: "finished", intent, reason: policy.reason,
+          completed: reviewedSteps,
+          evidence: [review.summary, ...policy.evidence], neededToContinue: policy.neededToContinue,
+          recommendedAction: policy.status === "blocked_user_approval" ? "Ask the operator to approve or narrow the plan." : "Revise the plan as indicated.",
+          rollbackAvailable: policy.rollbackAvailable,
+        }), { plan: planText, safety: review, policy, capabilities, manifest, hostRun, envelope, provenance, proposalPath, ...reviewRecord });
+        return;
+      }
+      if (!shouldExecute) {
+        updateHermesJob(job.id, "completed", explanation({
+          phase: "finished", intent, reason: "Plan-only request completed without execution.",
+          completed: reviewedSteps,
+          evidence: [review.summary, ...policy.evidence], recommendedAction: "Submit an execution request if this plan should run.",
+          rollbackAvailable: policy.rollbackAvailable,
+        }), { plan: planText, safety: review, policy, capabilities, manifest, hostRun, envelope, provenance, proposalPath, ...reviewRecord, result: "" });
+        return;
+      }
+
+      updateHermesJob(job.id, "running", explanation({
+        phase: "executing", intent, reason: policy.reason,
+        completed: reviewedSteps,
+        evidence: [review.summary, ...policy.evidence], rollbackAvailable: policy.rollbackAvailable,
+      }), { plan: planText, safety: review, policy, capabilities, manifest, hostRun, envelope, provenance, proposalPath, ...reviewRecord });
+      const typedResult = await executeTypedCapabilities(planText, envelope, manifest, updateReview?.outcome.bindings ?? [], hostRun);
+      const runnerRaw = typedResult || await runIsolatedRunner(actor, session, planner, proposalPath, planText);
+      const result = typedResult || filterSensitiveContent(extractRunnerHandoff(runnerRaw));
+      if (!result) throw new Error("runner produced no structured execution result");
+      const runnerSuccess = /STATUS:\s*success/i.test(result);
+      let verification = "VERIFICATION_STATUS: failed\nREASON: runner did not report success";
+      if (runnerSuccess) {
+        const verifierPrompt = buildAgentTask(
+          `You are the verifier-agent. Independently verify the requested target state for this intent. Do not trust the runner's STATUS claim. First evaluate the supplied signed runner handoff's raw command output; when it directly proves every requested condition, do not call redundant tools. Otherwise use focused read-only commands only. Do not repair anything. Your final response is mandatory and must end with exactly VERIFICATION_STATUS: passed or VERIFICATION_STATUS: failed, followed by EVIDENCE: and REASON:. Never stop after announcing an intended check. Intent: ${intent}`,
+          [{ source: "reviewed-plan", content: planText }, { source: "runner-handoff", content: result }],
+        );
+        const verifierRaw = await runIsolatedAgent(actor, session, planner, "verifier", verifierPrompt, "-verifier", 5 * 60_000, config.safetyOpencodeModel);
+        verification = filterSensitiveContent(extractCleanOutput(verifierRaw) || extractAnswer(verifierRaw));
+      }
+      const success = runnerSuccess && /VERIFICATION_STATUS:\s*passed/i.test(verification);
+      const retainedCapability = success ? await retainValidatedCapability(capabilityDir, job.id, manifest) : null;
+      updateHermesJob(job.id, success ? "completed" : "failed_verification", explanation({
+        phase: "finished", intent,
+        reason: success ? "Execution and runner verification completed." : "Execution finished but did not report a verified success.",
+        completed: [...reviewedSteps, "Runner execution", "Independent verification", "Result collection"],
+        evidence: [review.summary, ...policy.evidence, ...(retainedCapability ? [`validated capability: ${retainedCapability}`] : []), `elapsedMs=${Date.now() - startedAt}`],
+        neededToContinue: success ? [] : ["Inspect the structured runner result and complete the failed verification."],
+        recommendedAction: success ? "No further action is required." : "Correct the reported issue or perform rollback.",
+        rollbackAvailable: policy.rollbackAvailable,
+      }), { plan: planText, safety: review, policy, capabilities, manifest, hostRun, envelope, provenance, proposalPath, ...reviewRecord, retainedCapability, result, verification, elapsedMs: Date.now() - startedAt });
+    } catch (error) {
+      const preservedOutput = database.getJobForActor(job.id, actor.id)?.output || {};
+      updateHermesJob(job.id, "failed_execution", explanation({
+        phase: "finished", intent, reason: error instanceof Error ? error.message : "Change job failed.",
+        neededToContinue: ["Inspect the preserved proposal, session, and job evidence."],
+        recommendedAction: "Resolve the reported prerequisite before retrying.",
+      }), preservedOutput);
+    } finally {
+      stopEphemeralSession(session.tmuxSessionName, createdSession);
+    }
   }
 
   app.post("/api/hermes/research", async (request, reply) => {
@@ -2238,55 +2552,16 @@ export async function createApp(options: AppOptions = {}) {
     }
 
     const intent = requestedIntent;
-    const untrustedEvidence = normalizeEvidence(body.evidence);
-    const agentTask = `${buildAgentTask(intent, untrustedEvidence)}\n\nREAD_ONLY_RESEARCH_CONTRACT:\nInvestigate and report the current state. Never return an executable plan.`;
+    const researchRequest: ResearchRequest = { intent, evidence: normalizeEvidence(body.evidence), ownedSession: createdSession };
     const job = database.createJob({
       sessionId: session.id,
       kind: "agent",
       subjectId: "hermes-research",
       status: "running",
       requiresApproval: false,
-      output: { explanation: explanation({ phase: "queued", intent, reason: "Research job accepted." }) },
+      output: { explanation: explanation({ phase: "queued", intent, reason: "Research job accepted." }), request: researchRequest },
     });
-
-    void (async () => {
-      const startedAt = Date.now();
-      try {
-        if (session.tmuxBackend === "disabled") {
-          updateHermesJob(job.id, "blocked_prerequisite", explanation({
-            phase: "finished", intent, reason: "tmux is unavailable in this runtime.",
-            neededToContinue: ["Enable the tmux backend."], recommendedAction: "Restore the tmux runtime and retry.",
-          }));
-          return;
-        }
-        updateHermesJob(job.id, "running", explanation({ phase: "planning", intent, reason: "Planner is performing read-only research." }));
-        const raw = await runIsolatedAgent(actor, session, agent, "research", agentTask, "", 2 * 60_000);
-        const answer = filterSensitiveContent(extractCleanOutput(raw) || extractAnswer(raw));
-        if (!answer || answer.length < 20 || /^>\s*build\b/i.test(answer.trim())) {
-          updateHermesJob(job.id, "failed_verification", explanation({
-            phase: "finished", intent,
-            reason: "Planner process exited, but produced no meaningful research result.",
-            completed: ["Planner process", "Sensitive-output filtering"],
-            evidence: [`elapsedMs=${Date.now() - startedAt}`],
-            neededToContinue: ["Inspect planner/provider health; do not treat this job as a successful answer."],
-            recommendedAction: "Retry only after confirming the model provider returns content.",
-          }));
-          return;
-        }
-        updateHermesJob(job.id, "completed", explanation({
-          phase: "finished", intent, reason: "Research completed successfully.",
-          completed: ["Planner research", "Sensitive-output filtering"], evidence: [`elapsedMs=${Date.now() - startedAt}`],
-          recommendedAction: "Use the findings to decide whether a change job is needed.",
-        }), { answer, elapsedMs: Date.now() - startedAt });
-      } catch (error) {
-        updateHermesJob(job.id, "failed_execution", explanation({
-          phase: "finished", intent, reason: error instanceof Error ? error.message : "Research failed.",
-          neededToContinue: ["Inspect the job evidence and planner runtime."], recommendedAction: "Correct the prerequisite and retry.",
-        }));
-      } finally {
-        stopEphemeralSession(session.tmuxSessionName, createdSession);
-      }
-    })();
+    void runResearchJob(job, actor, session, agent, researchRequest);
 
     const current = await waitForHermesJob(job.id, actor.id, waitMs);
     if (current && !["pending", "running"].includes(current.status)) return current;
@@ -2939,237 +3214,16 @@ Follow these rules:
     }
 
     const intent = requestedIntent;
-    const untrustedEvidence = normalizeEvidence(body.evidence);
-    const allowedCapabilities = normalizeAllowedCapabilities(body.allowedCapabilities);
-    const agentTask = `${buildAgentTask(intent, untrustedEvidence)}\n\nDYNAMIC CAPABILITY CONTRACT:\n${hostRunPlannerContract()}\n\n${capabilityPlannerContract()}`;
+    const changeRequest: ChangeRequest = {
+      intent, evidence: normalizeEvidence(body.evidence), allowedCapabilities: normalizeAllowedCapabilities(body.allowedCapabilities),
+      execute: shouldExecute, ownedSession: createdSession,
+    };
     const job = database.createJob({
       sessionId: session.id, kind: "runbook", subjectId: "hermes-change",
       status: "running", requiresApproval: false,
-      output: { explanation: explanation({ phase: "queued", intent, reason: "Change job accepted." }) },
+      output: { explanation: explanation({ phase: "queued", intent, reason: "Change job accepted." }), request: changeRequest },
     });
-
-    void (async () => {
-      const startedAt = Date.now();
-      try {
-        const failureWindowStart = new Date(Date.now() - 60 * 60_000).toISOString();
-        const recentFailures = database.countAuditsSinceForRuntime("hermes.change.failed", failureWindowStart, changeRuntimeFingerprint);
-        if (recentFailures >= config.maxFailedChangesPerHour) {
-          updateHermesJob(job.id, "blocked_prerequisite", explanation({
-            phase: "finished", intent,
-            reason: `Circuit breaker is open after ${recentFailures} failed change jobs in the last hour.`,
-            evidence: [`failureCount=${recentFailures}`, `windowStart=${failureWindowStart}`, `runtimeFingerprint=${changeRuntimeFingerprint}`],
-            neededToContinue: ["Wait for the failure window to clear or have an operator diagnose the repeated failures."],
-            recommendedAction: "Do not retry automatically; inspect recent failed jobs first.",
-          }));
-          return;
-        }
-        if (session.tmuxBackend === "disabled") {
-          updateHermesJob(job.id, "blocked_prerequisite", explanation({
-            phase: "finished", intent, reason: "tmux is unavailable in this runtime.",
-            neededToContinue: ["Enable the tmux backend."], recommendedAction: "Restore the executor runtime and retry.",
-          }));
-          return;
-        }
-        // A host-run manifest in the trusted intent is the one that runs; a
-        // broken one stops here, before any planner time is spent.
-        const intentHostRun = intentHostRunManifest(intent);
-        const planner = findAgent("planner-agent", "opencode");
-        if (!planner) throw new Error("planner not available");
-        updateHermesJob(job.id, "running", explanation({ phase: "planning", intent, reason: "Planner is producing a structured change plan." }));
-        const plannerRaw = await runIsolatedAgent(actor, session, planner, "planner", agentTask, "", 5 * 60_000);
-        const planText = filterSensitiveContent(extractCleanOutput(plannerRaw));
-        if (!planText || planText.length < 20) throw new Error("planner produced no reviewable plan");
-
-        const proposalDir = path.join(path.dirname(config.dbPath), "proposals");
-        await mkdir(proposalDir, { recursive: true, mode: 0o700 });
-        const proposalPath = path.join(proposalDir, `${job.id}.md`);
-        await writeFile(proposalPath, planText, { encoding: "utf-8", mode: 0o600 });
-        const proposal: RunbookDefinition = {
-          id: `proposal-${job.id}`, name: intent.slice(0, 60), summary: intent,
-          requiresSession: true, requiresApproval: false, integration: "host-tmux",
-          privilegedHelperRequested: false, reviewStatus: "allowlisted", scriptIds: [proposalPath],
-          workflowSteps: [{ id: "execute", label: "Execute reviewed proposal", description: intent, kind: "runbook" }],
-        };
-
-        const manifest = parseCapabilityManifest(planText);
-        const hostRun = intentHostRun ?? parseHostRunManifest(planText);
-        const intentHostRunNote = intentHostRun ? `host-run manifest taken from the trusted intent; planner copy: ${plannerHostRunCopy(planText, intentHostRun)}` : null;
-        if (manifest && hostRun) throw new Error("the plan carries a capability manifest and a host-run manifest; one door per job");
-        const updateTargets = manifest || hostRun ? [] : reviewedUpdateTargets(planText);
-        let updateReview: Awaited<ReturnType<typeof reviewSelfUpdates>> | null = null;
-        if (updateTargets.length > 0) {
-          updateHermesJob(job.id, "running", explanation({
-            phase: "reviewing", intent, reason: `The running Cockpit is reviewing ${UPDATE_KINDS[updateTargets[0].kind].subject} before it can be installed.`,
-            completed: ["Structured planner proposal"], evidence: [proposalPath, ...updateTargets.map((target) => `${UPDATE_KINDS[target.kind].updateAction} ${target.sha}`)],
-          }), { plan: planText, proposalPath });
-          updateReview = await reviewSelfUpdates(job.id, updateTargets, proposalDir);
-        }
-        const reviewRecord = updateReview ? { updateReview: summarizeUpdateReview(updateReview.diffs, updateReview.outcome, updateReview.reviewPath) } : {};
-        const reviewedSteps = ["Planner proposal", ...(updateReview ? ["Pre-install code review"] : []), hostRun ? "Doorkeeper review" : "Safety review", "Policy evaluation"];
-
-        updateHermesJob(job.id, "running", explanation({
-          phase: "reviewing", intent, reason: "Independent safety review and hard-boundary policy are evaluating the proposal.",
-          completed: ["Structured planner proposal", ...(updateReview ? ["Pre-install code review"] : [])], evidence: [proposalPath],
-        }), { plan: planText, proposalPath, ...reviewRecord });
-        // The general host door has its own doorkeeper (host-run.ts): the
-        // deterministic hits are its focus, and only its evidenced findings —
-        // or an incomplete review — keep the run from starting. The other doors
-        // keep the plan safety review and the plan policy.
-        let review: ExecutionReview;
-        let policy: PlanPolicyResult;
-        if (hostRun) {
-          const hostRunReview = await reviewHostRun(job.id, hostRun, proposalDir);
-          policy = hostRunPolicy(hostRun, hostRunReview);
-          if (intentHostRunNote) policy = { ...policy, evidence: [...policy.evidence, intentHostRunNote] };
-          review = hostRunSafetyRecord(hostRun, hostRunReview, policy);
-        } else {
-          review = await safetyReviewRunner({
-            runbook: proposal, runbookVersionHash: computeRunbookVersionHash(proposal), riskClass: "moderate",
-            sessionId: session.id, trigger: "manual", scheduleId: null,
-          }, { ...config, opencodeModel: config.safetyOpencodeModel });
-          policy = evaluatePlanPolicy(planText, review.verdict);
-        }
-        const manifestHash = manifest ? capabilityManifestHash(manifest) : hostRun ? hostRunManifestHash(hostRun) : undefined;
-        const nextcloudMutationModes = new Set(["php-install", "php-enable", "exapp-catalog-refresh", "exapp-register", "exapp-reinitialize", "exapp-restart-reinitialize"]);
-        const contextMutationModes = new Set(["create-test", "search-test", "prompt-test"]);
-        const semanticMutation = manifest?.steps.some((step) =>
-          (step.argv[0] === "/usr/local/sbin/cockpit-nextcloud-app-action" && nextcloudMutationModes.has(step.argv[1] || ""))
-          || (step.argv[0] === "/usr/local/sbin/cockpit-nextcloud-context-action" && contextMutationModes.has(step.argv[1] || ""))
-        ) ?? false;
-        const capabilities: CapabilityId[] = hostRun ? ["host.run"]
-          : manifest ? [manifest.writablePaths.length > 0 || semanticMutation ? "filesystem.write" : "read.host"] : classifyCapabilities(planText);
-        const capabilityEscalation = capabilities.filter((capability) => !allowedCapabilities.includes(capability));
-        if (!manifest && !hostRun && policy.allowed && capabilityEscalation.length > 0) {
-          policy = {
-            ...policy,
-            zone: "red",
-            allowed: false,
-            status: "blocked_user_approval",
-            reason: "The proposed plan exceeds the capabilities authorized by the trusted request.",
-            evidence: [...policy.evidence, ...capabilityEscalation.map((capability) => `unauthorized capability: ${capability}`)],
-            neededToContinue: ["Authorize the exact capability from trusted operator intent or narrow the plan."],
-          };
-        }
-        if (!manifest && !hostRun && policy.allowed && capabilities.includes("shell.exception")) {
-          policy = {
-            ...policy,
-            zone: "red",
-            allowed: false,
-            status: "blocked_user_approval",
-            reason: "The plan requires unrestricted shell semantics outside the typed capability contract.",
-            evidence: [...policy.evidence, "capability: shell.exception"],
-            neededToContinue: ["Explicit operator approval or rewrite the plan using typed capabilities."],
-          };
-        }
-        const unsupportedAutonomousCapabilities = capabilities.filter((capability) =>
-          capability !== "read.host" && capability !== "service.manage" && capability !== "disk.manage" && capability !== "self.update"
-          && capability !== "dienste.update" && capability !== "borg.manage" && capability !== "shell.exception"
-        );
-        if (!manifest && !hostRun && policy.allowed && unsupportedAutonomousCapabilities.length > 0) {
-          policy = {
-            ...policy,
-            allowed: false,
-            status: "blocked_prerequisite",
-            reason: "The requested capability does not yet have a typed executor helper.",
-            evidence: unsupportedAutonomousCapabilities.map((capability) => `missing typed helper: ${capability}`),
-            neededToContinue: ["Install and review a narrow typed helper; do not fall back to agent shell execution."],
-          };
-        }
-        // Der borg-Repair-Riegel sitzt in evaluatePlanPolicy: er greift für
-        // jeden Plan — mit oder ohne Capability-Manifest — und liest genau das
-        // Skript, das der Executor ausführt (typedPlanScript/requestsBorgRepair).
-        // Den zweiten Riegel hält executeTypedCapabilities: kein Repair ohne die
-        // Freigabe des Operators für genau diesen Job.
-        if (manifest && policy.allowed && capabilityNeedsOperatorApproval(manifest)) {
-          policy = {
-            ...policy, zone: "red", allowed: false, status: "blocked_user_approval",
-            reason: "The dynamic capability can expose a service, lose existing data, or cross an identity/secret boundary.",
-            evidence: [
-              ...policy.evidence,
-              ...manifest.risk.map((risk) => `declared risk: ${risk}`),
-              `network: ${manifest.network}`,
-              ...readablePathsNeedingApproval(manifest).map((item) => `readable path needs operator approval: ${item}`),
-            ],
-            neededToContinue: ["Confirm this exact signed capability manifest."],
-          };
-        }
-        // The review of the new code decides only here, after every plan check:
-        // a stop turns an allowed plan into an operator decision.
-        if (updateReview) policy = applyUpdateReviewPolicy(policy, updateReview.outcome);
-        const envelope = createExecutionEnvelope({
-          jobId: job.id, actorId: actor.id, sessionId: session.id, intent,
-          evidence: [...untrustedEvidence, ...updateReviewEvidence(updateReview?.outcome.bindings ?? [])],
-          plan: planText, safety: review, policy, capabilities,
-          manifestHash, gatePassed: Boolean(hostRun && policy.allowed),
-          ttlMinutes: config.approvalTtlMinutes, signingSecret: config.executionEnvelopeSecret,
-        });
-        const provenance = {
-          trustedIntentHash: hashCanonical(intent),
-          untrustedEvidence: envelope.evidence,
-          allowedCapabilities,
-          injectionBoundary: "trusted-intent/untrusted-evidence-v1",
-        };
-        if (!policy.allowed) {
-          updateHermesJob(job.id, policy.status === "ready" ? "failed_execution" : policy.status, explanation({
-            phase: "finished", intent, reason: policy.reason,
-            completed: reviewedSteps,
-            evidence: [review.summary, ...policy.evidence], neededToContinue: policy.neededToContinue,
-            recommendedAction: policy.status === "blocked_user_approval" ? "Ask the operator to approve or narrow the plan." : "Revise the plan as indicated.",
-            rollbackAvailable: policy.rollbackAvailable,
-          }), { plan: planText, safety: review, policy, capabilities, manifest, hostRun, envelope, provenance, proposalPath, ...reviewRecord });
-          return;
-        }
-        if (!shouldExecute) {
-          updateHermesJob(job.id, "completed", explanation({
-            phase: "finished", intent, reason: "Plan-only request completed without execution.",
-            completed: reviewedSteps,
-            evidence: [review.summary, ...policy.evidence], recommendedAction: "Submit an execution request if this plan should run.",
-            rollbackAvailable: policy.rollbackAvailable,
-          }), { plan: planText, safety: review, policy, capabilities, manifest, hostRun, envelope, provenance, proposalPath, ...reviewRecord, result: "" });
-          return;
-        }
-
-        updateHermesJob(job.id, "running", explanation({
-          phase: "executing", intent, reason: policy.reason,
-          completed: reviewedSteps,
-          evidence: [review.summary, ...policy.evidence], rollbackAvailable: policy.rollbackAvailable,
-        }), { plan: planText, safety: review, policy, capabilities, manifest, hostRun, envelope, provenance, proposalPath, ...reviewRecord });
-        const typedResult = await executeTypedCapabilities(planText, envelope, manifest, updateReview?.outcome.bindings ?? [], hostRun);
-        const runnerRaw = typedResult || await runIsolatedRunner(actor, session, planner, proposalPath, planText);
-        const result = typedResult || filterSensitiveContent(extractRunnerHandoff(runnerRaw));
-        if (!result) throw new Error("runner produced no structured execution result");
-        const runnerSuccess = /STATUS:\s*success/i.test(result);
-        let verification = "VERIFICATION_STATUS: failed\nREASON: runner did not report success";
-        if (runnerSuccess) {
-          const verifierPrompt = buildAgentTask(
-            `You are the verifier-agent. Independently verify the requested target state for this intent. Do not trust the runner's STATUS claim. First evaluate the supplied signed runner handoff's raw command output; when it directly proves every requested condition, do not call redundant tools. Otherwise use focused read-only commands only. Do not repair anything. Your final response is mandatory and must end with exactly VERIFICATION_STATUS: passed or VERIFICATION_STATUS: failed, followed by EVIDENCE: and REASON:. Never stop after announcing an intended check. Intent: ${intent}`,
-            [{ source: "reviewed-plan", content: planText }, { source: "runner-handoff", content: result }],
-          );
-          const verifierRaw = await runIsolatedAgent(actor, session, planner, "verifier", verifierPrompt, "-verifier", 5 * 60_000, config.safetyOpencodeModel);
-          verification = filterSensitiveContent(extractCleanOutput(verifierRaw) || extractAnswer(verifierRaw));
-        }
-        const success = runnerSuccess && /VERIFICATION_STATUS:\s*passed/i.test(verification);
-        const retainedCapability = success ? await retainValidatedCapability(capabilityDir, job.id, manifest) : null;
-        updateHermesJob(job.id, success ? "completed" : "failed_verification", explanation({
-          phase: "finished", intent,
-          reason: success ? "Execution and runner verification completed." : "Execution finished but did not report a verified success.",
-          completed: [...reviewedSteps, "Runner execution", "Independent verification", "Result collection"],
-          evidence: [review.summary, ...policy.evidence, ...(retainedCapability ? [`validated capability: ${retainedCapability}`] : []), `elapsedMs=${Date.now() - startedAt}`],
-          neededToContinue: success ? [] : ["Inspect the structured runner result and complete the failed verification."],
-          recommendedAction: success ? "No further action is required." : "Correct the reported issue or perform rollback.",
-          rollbackAvailable: policy.rollbackAvailable,
-        }), { plan: planText, safety: review, policy, capabilities, manifest, hostRun, envelope, provenance, proposalPath, ...reviewRecord, retainedCapability, result, verification, elapsedMs: Date.now() - startedAt });
-      } catch (error) {
-        const preservedOutput = database.getJobForActor(job.id, actor.id)?.output || {};
-        updateHermesJob(job.id, "failed_execution", explanation({
-          phase: "finished", intent, reason: error instanceof Error ? error.message : "Change job failed.",
-          neededToContinue: ["Inspect the preserved proposal, session, and job evidence."],
-          recommendedAction: "Resolve the reported prerequisite before retrying.",
-        }), preservedOutput);
-      } finally {
-        stopEphemeralSession(session.tmuxSessionName, createdSession);
-      }
-    })();
+    void runChangeJob(job, actor, session, changeRequest);
 
     const current = await waitForHermesJob(job.id, actor.id, waitMs);
     if (current && !["pending", "running"].includes(current.status)) return withOperatorLink(current);
@@ -4218,6 +4272,26 @@ Follow these rules:
     };
   });
 
+  // A job whose host run was requested is followed across a restart, not planned again.
+  function followsHostRun(job: JobRecord): boolean {
+    return typeof job.output?.hostRunStartedAt === "string" || typeof job.output?.hostRunRequestedAt === "string";
+  }
+
+  // Running Hermes jobs a restart would interrupt, counted by phase. A job
+  // following a host run is left out: the run goes on in its own unit and the
+  // restarted API follows it. The self-update activation waits for zero.
+  function interruptibleJobs(): { active: number; phases: Record<string, number> } {
+    const phases: Record<string, number> = {};
+    let active = 0;
+    for (const job of [...database.listRunningJobs("hermes-change"), ...database.listRunningJobs("hermes-research")]) {
+      if (followsHostRun(job)) continue;
+      const phase = String((job.output?.explanation as Record<string, unknown> | undefined)?.phase || "unknown");
+      phases[phase] = (phases[phase] ?? 0) + 1;
+      active += 1;
+    }
+    return { active, phases };
+  }
+
   // A reboot step (and any restart of the API) ends the promise that was
   // following a host run. The run itself goes on in its own unit and reports
   // through host.status; these watchers take over from the job record and
@@ -4258,8 +4332,65 @@ Follow these rules:
     }
   }
 
-  for (const job of database.listRunningJobs("hermes-change")) {
-    if (typeof job.output?.hostRunStartedAt === "string" || typeof job.output?.hostRunRequestedAt === "string") void resumeHostRun(job);
+  // An API restart (a self-update activation, a crash, a reboot) ends every
+  // promise that was carrying a job; the record alone would stay "running"
+  // for ever. So at start-up every running Hermes job is taken up again or
+  // ended with its reason, and the restart is noted on the job (restarts):
+  //  - a started host run is followed (resumeHostRun);
+  //  - a job still planning or under review — nothing has run on the host —
+  //    is planned again from its recorded request, at most MAX_JOB_REPLANS
+  //    times and only while its last progress is recent;
+  //  - anything else may have run steps and is not repeated on its own.
+  function recoverInterruptedJob(job: JobRecord): void {
+    const output = job.output || {};
+    const detail = (output.explanation || {}) as Partial<HermesExplanation>;
+    const phase = String(detail.phase || "unknown");
+    const request = output.request as ChangeRequest | undefined;
+    const intent = String(detail.intent || request?.intent || "Hermes job");
+    const restarts = Array.isArray(output.restarts) ? output.restarts as JobRestart[] : [];
+    const replans = restarts.filter((entry) => entry.action === "replanned").length;
+    const ownerId = database.getJobOwnerId(job.id);
+    const actor = ownerId ? database.getUserById(ownerId) : null;
+    const session = job.sessionId && ownerId ? database.getSessionRuntimeTargetForActor(job.sessionId, ownerId) : null;
+    const planner = findAgent("planner-agent", "opencode");
+    const age = Date.now() - Date.parse(job.updatedAt);
+    const refusal = !REPLANNABLE_PHASES.has(phase) ? `it was in phase ${phase}, where steps may have run, so it is not repeated on its own`
+      : typeof request?.intent !== "string" ? "it has no recorded request to plan from"
+      : replans >= MAX_JOB_REPLANS ? `it was already planned again ${replans} times`
+      : !(age < REPLAN_WINDOW_MS) ? `its last progress is ${Math.round(age / 60_000)} min old`
+      : !actor || !session || !planner ? "its owner, session or planner is no longer available"
+      : null;
+    const at = new Date().toISOString();
+    if (refusal || !request || !actor || !session || !planner) {
+      const reason = `The Cockpit restarted while this job was running; ${refusal}.`;
+      // Not through updateHermesJob: a restart is not a failure of the change
+      // runtime and must not count towards its circuit breaker.
+      database.updateJob(job.id, {
+        status: "failed_execution", completedAt: at,
+        output: { ...output, restarts: [...restarts, { at, phase, action: "abandoned", reason: refusal ?? "" }], explanation: explanation({
+          phase: "finished", intent, reason, completed: detail.completed || [], evidence: detail.evidence || [],
+          neededToContinue: REPLANNABLE_PHASES.has(phase) ? ["Submit the request again."] : ["Read the job evidence and check the host's state before submitting the request again."],
+          recommendedAction: "Check what the job reached, then submit it again if it is still needed.",
+        }) },
+      });
+      database.createAudit({ actorId: null, action: "hermes.job.abandoned", targetType: "job", targetId: job.id, details: { phase, reason: refusal } });
+      return;
+    }
+    const restart: JobRestart = { at, phase, action: "replanned", reason: `restart during ${phase}` };
+    // Only the request and the restart record carry over: the old plan and its
+    // reviews belong to the interrupted attempt.
+    updateHermesJob(job.id, "running", explanation({
+      phase: "queued", intent,
+      reason: `The Cockpit restarted while the job was in phase ${phase}; nothing had run on the host, so it is planned again (${replans + 1} of at most ${MAX_JOB_REPLANS}).`,
+    }), { request, restarts: [...restarts, restart] });
+    database.createAudit({ actorId: null, action: "hermes.job.replanned", targetType: "job", targetId: job.id, details: { phase, attempt: replans + 1 } });
+    if (job.subjectId === "hermes-research") void runResearchJob(job, actor, session, planner, request);
+    else void runChangeJob(job, actor, session, request);
+  }
+
+  for (const job of [...database.listRunningJobs("hermes-change"), ...database.listRunningJobs("hermes-research")]) {
+    if (followsHostRun(job)) void resumeHostRun(job);
+    else recoverInterruptedJob(job);
   }
 
   return app;
