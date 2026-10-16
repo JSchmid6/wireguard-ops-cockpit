@@ -223,7 +223,19 @@ case "\${1:-}" in
     exit "\${FIX_RESTART_RC:-0}"
     ;;
   is-active)
-    # S18: services still starting — the first N checks fail, then they are up
+    # S18: services still starting — the first N checks fail, then they are
+    # up; the late broker socket comes up only with the call named in
+    # late-sock-at (the last service check of the successful try), so the
+    # first socket check, right after it, finds it still missing
+    if [ -s "$FIX/late-sock-at" ]; then
+      calls="\$(( \$(cat "$FIX/isactive-calls" 2>/dev/null || echo 0) + 1 ))"
+      echo "\$calls" > "$FIX/isactive-calls"
+      if [ "\$calls" -eq "\$(cat "$FIX/late-sock-at")" ]; then
+        rm -f "$FIX/late-sock-at"
+        ( sleep 0.5; exec python3 "$FIX/mksock.py" 60 "$FIX/sock-late.sock" ) > /dev/null 2>&1 &
+        echo "\$!" > "$FIX/late-sock.pid"
+      fi
+    fi
     if [ -s "$FIX/isactive-fail-left" ]; then
       left="\$(cat "$FIX/isactive-fail-left")"
       if [ "\$left" -gt 0 ]; then echo "\$((left - 1))" > "$FIX/isactive-fail-left"; exit 3; fi
@@ -999,14 +1011,15 @@ C10="$(add_commit c10)"
 H10="$(review_hash "$C10" "$FIX/s18-diff10.out")"
 "$HELPER" "$C10" "$H10" > /dev/null 2> "$FIX/s18.err"; rc=$?
 check "S18 deploy rc=0" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "rc=$rc $(head -c 300 "$FIX/s18.err")"
-rm -f "$FIX/sock-late.sock"
+rm -f "$FIX/sock-late.sock" "$FIX/isactive-calls" "$FIX/late-sock.pid"
+# try 1: svc-a down (call 1), svc-b up (call 2); try 2: both up (calls 3, 4)
 echo 1 > "$FIX/isactive-fail-left"
-( sleep 1.5; exec python3 "$FIX/mksock.py" 60 "$FIX/sock-late.sock" ) &
-LATE_PID=$!
+echo 4 > "$FIX/late-sock-at"
 COCKPIT_SELF_UPDATE_SOCKETS="$FIX/sock-a.sock $FIX/sock-late.sock" COCKPIT_SELF_UPDATE_VERIFY_RETRIES=3 \
   "$RUNNER" activate "$C10" > "$FIX/s18-act.out" 2>&1; rc=$?
-kill "$LATE_PID" 2>/dev/null; wait "$LATE_PID" 2>/dev/null
-rm -f "$FIX/isactive-fail-left"
+check "S18 late socket came up during the activation" "$([ -s "$FIX/late-sock.pid" ] && echo 0 || echo 1)" ""
+[ -s "$FIX/late-sock.pid" ] && kill "$(cat "$FIX/late-sock.pid")" 2>/dev/null
+rm -f "$FIX/isactive-fail-left" "$FIX/late-sock-at" "$FIX/isactive-calls" "$FIX/late-sock.pid"
 check "S18 activation with late services and sockets rc=0" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "rc=$rc $(tail -c 400 "$FIX/s18-act.out")"
 expect_json "S18 activation ok" "$FIX/state/last-result.json" "activation.status" "ok"
 expect_json "S18 services checked ok" "$FIX/state/last-result.json" "activation.checks.services" "ok"
