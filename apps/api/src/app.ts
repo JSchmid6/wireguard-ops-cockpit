@@ -194,6 +194,17 @@ export async function retainValidatedCapability(capabilityDir: string, jobId: st
   return capabilityPath;
 }
 
+// The one verifier instruction for every execution path (direct, after the
+// operator's approval, host run resumed after a restart). The verifier runs
+// isolated as cockpit-agent without root: root-only state (self.status reads
+// /var/lib/wireguard-ops-cockpit/self-update, host runs, borg status) reads as
+// "unreadable" or permission denied there — that is the sandbox, not evidence
+// against the signed handoff (16.10.2026, Lab0 c06456ce: failed_verification
+// although the root run had returned the full state).
+export function verifierInstruction(intent: string, targetNote = ""): string {
+  return `You are the verifier-agent. Independently verify the requested target state for this intent. Do not trust the runner's STATUS claim. First evaluate the supplied signed runner handoff's raw command output; when it directly proves every requested condition, do not call redundant tools. Otherwise use focused read-only commands only. Do not repair anything. You run without root: state that only root may read (for example cockpit-self-update-action status, host-run state, borg status) shows up for you as "unreadable", "permission denied" or "missing" — that is your sandbox, not evidence against the handoff; judge such state by the handoff's raw output. Your final response is mandatory and must end with exactly VERIFICATION_STATUS: passed or VERIFICATION_STATUS: failed, followed by EVIDENCE: and REASON:. Never stop after announcing an intended check.${targetNote ? ` ${targetNote}` : ""} Intent: ${intent}`;
+}
+
 function slugify(value: string): string {
   return value
     .trim()
@@ -1921,7 +1932,7 @@ export async function createApp(options: AppOptions = {}) {
     targetNote = "",
   ): Promise<string> {
     const verifierPrompt = buildAgentTask(
-      `You are the verifier-agent. Independently verify the requested target state for this intent using read-only commands only. Do not trust the runner's success claim. End with exactly VERIFICATION_STATUS: passed or VERIFICATION_STATUS: failed, followed by EVIDENCE: and REASON:.${targetNote ? ` ${targetNote}` : ""} Intent: ${intent}`,
+      verifierInstruction(intent, targetNote),
       [{ source: "reviewed-plan", content: reviewedPlan }, { source: "runner-handoff", content: runnerResult }],
     );
     const verifierRaw = await runIsolatedAgent(actor, session, planner, "verifier", verifierPrompt, "-verifier", 5 * 60_000, config.safetyOpencodeModel);
@@ -2496,7 +2507,7 @@ export async function createApp(options: AppOptions = {}) {
       let verification = "VERIFICATION_STATUS: failed\nREASON: runner did not report success";
       if (runnerSuccess) {
         const verifierPrompt = buildAgentTask(
-          `You are the verifier-agent. Independently verify the requested target state for this intent. Do not trust the runner's STATUS claim. First evaluate the supplied signed runner handoff's raw command output; when it directly proves every requested condition, do not call redundant tools. Otherwise use focused read-only commands only. Do not repair anything. Your final response is mandatory and must end with exactly VERIFICATION_STATUS: passed or VERIFICATION_STATUS: failed, followed by EVIDENCE: and REASON:. Never stop after announcing an intended check.${targetNote ? ` ${targetNote}` : ""} Intent: ${intent}`,
+          verifierInstruction(intent, targetNote),
           [{ source: "reviewed-plan", content: planText }, { source: "runner-handoff", content: result }],
         );
         const verifierRaw = await runIsolatedAgent(actor, session, planner, "verifier", verifierPrompt, "-verifier", 5 * 60_000, config.safetyOpencodeModel);

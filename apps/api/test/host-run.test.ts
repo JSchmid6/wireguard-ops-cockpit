@@ -273,6 +273,13 @@ describe("host run result", () => {
     expect(text).toContain("machine snapshot snap-42");
   });
 
+  it("names Lab0's host snapshot as such in the runner handoff", () => {
+    const lab0 = { ...state, role: "lab0", snapshot: { kind: "host", snapshotId: "cockpit-run-98a12e31" } };
+    const result = parseHostRunStatus(JSON.stringify({ ok: true, state: lab0, logTail: "" }));
+    expect(result.snapshotKind).toBe("host");
+    expect(hostRunResultText(parsed(), result)).toContain("host snapshot cockpit-run-98a12e31 (revert only with operator approval)");
+  });
+
   it("reports a failed run as failed, with its reason", () => {
     const result = parseHostRunStatus(JSON.stringify({ ok: true, state: { ...state, status: "preflight_failed", error: "the last borg backup is 30 h old" }, logTail: "" }));
     expect(result.success).toBe(false);

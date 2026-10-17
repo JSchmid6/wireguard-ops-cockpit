@@ -147,6 +147,10 @@ describe("host door through the API", () => {
     expect(start.payload.envelope.operatorApproved).toBeUndefined();
     expect(job.output?.result).toContain("STATUS: success");
     expect(flow.agentCalls.map((call) => call.role)).toEqual(["planner", "verifier"]);
+    // Root-only state is the sandbox's blind spot, not counter-evidence (Lab0 c06456ce, 16.10.2026).
+    const verifier = String(flow.agentCalls[1].prompt);
+    expect(verifier).toContain("First evaluate the supplied signed runner handoff's raw command output");
+    expect(verifier).toContain("You run without root: state that only root may read (for example cockpit-self-update-action status");
   });
 
   it("sends an evidenced finding to the operator, and runs exactly that plan after approval", async () => {
@@ -174,6 +178,11 @@ describe("host door through the API", () => {
     expect(start.payload.envelope.gatePassed).toBeUndefined();
     expect(start.payload.envelope).toMatchObject({ operatorApproved: true, manifestHash: (job.output?.envelope as Record<string, unknown>).manifestHash });
     expect(start.payload.manifest).toEqual(job.output?.hostRun);
+    // After the approval the same verifier instruction as on the direct path.
+    const verifier = flow.agentCalls.filter((call) => call.role === "verifier").map((call) => String(call.prompt));
+    expect(verifier).toHaveLength(1);
+    expect(verifier[0]).toContain("First evaluate the supplied signed runner handoff's raw command output");
+    expect(verifier[0]).toContain("that is your sandbox, not evidence against the handoff");
   });
 
   it("keeps a run that deletes backups for the operator although the doorkeeper passed it", async () => {
