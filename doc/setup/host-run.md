@@ -561,7 +561,9 @@ hebt. Der Normalfall ist Durchlaufen. Das gilt für beide Prüfungen: den Türst
   Host-Snapshot statt borg/Hoster — auch mit dem echten `cockpit-host-snapshot` —, Rolle fehlt,
   unbekannt, doppelt, schreibbar oder nur in der Umgebung → `preflight_failed`, Host-Snapshot
   scheitert oder fehlt → `preflight_failed`, nichts ausgeführt; lab0-Datensperre: ReadOnlyPaths an
-  der Unit, schreibbarer Datenpfad oder Untermount bzw. fehlende Sperre → `preflight_failed`), Tür (Fehler, Zeitlimit, Prüfschritte,
+  der Unit, schreibbarer Datenpfad oder Untermount, gestapelter rw-Mount, autofs auf oder unter
+  einem Datenpfad bzw. fehlende Sperre → `preflight_failed`; verdeckter rbind-Original-Mount zählt nicht;
+  nach dem Neustart erneut geprüft → `failed`), Tür (Fehler, Zeitlimit, Prüfschritte,
   Schwärzung, Neustart mit Fortsetzung, ein Lauf zur Zeit), unterbrechungssichere Schritte mit
   Attrappen für dpkg/apt-get/ss (langsamer apt überzieht ohne Abbruch, Meldung, harte Obergrenze
   mit Operator-Meldung, Erkennung schlägt `false`, Aufräumen sshd → dpkg → apt-get -f → Dienste;
