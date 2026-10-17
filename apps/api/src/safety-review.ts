@@ -6,7 +6,9 @@ import type { ExecutionReview, ExecutionRiskClass, PlanReviewVerdict, RunbookDef
 import type { AppConfig } from "./config.js";
 import { SCRIPTS } from "./registries.js";
 import { runBrokerAgent } from "./agent-broker.js";
-import { parseTypedDiensteUpdates, parseTypedSelfUpdates } from "./hermes-security.js";
+import { parseCapabilityManifest } from "./capability-manifest.js";
+import { parseHostRunManifest } from "./host-run.js";
+import { updateTargets } from "./update-review.js";
 
 type SafetyVerdict = Extract<PlanReviewVerdict, "passed" | "approval_required" | "blocked">;
 
@@ -106,12 +108,13 @@ export function buildRunbookSafetyPrompt(input: RunbookSafetyReviewInput): strin
 // sometimes read the bare sha as a helper that aborts with 65 and blocked
 // (Lab0 job 941fd516, 17.10.2026) — the same plan passed on the VPS. The note
 // states the mechanism only; it does not tell the model how to decide.
-function reviewedInstallNote(script: string): string | null {
-  const installs = [
-    ...parseTypedSelfUpdates(script).actions.filter((action) => action.action === "self.update"),
-    ...parseTypedDiensteUpdates(script).actions.filter((action) => action.action === "dienste.update"),
-  ];
-  if (installs.length === 0) return null;
+// It appears only when the API really reviews and binds an install for this
+// plan: the same source as app.ts (updateTargets reads typedPlanScript, the
+// first bash/sh fence) under the same door condition (a capability or host-run
+// manifest gets no update review). A sha in a second fence, a text fence or
+// prose is never bound, so it gets no note.
+function reviewedInstallNote(plan: string): string | null {
+  if (!reviewsInstall(plan)) return null;
   return [
     "Reviewed install (fact about the platform, not about this plan's correctness):",
     "the typed line `/usr/local/sbin/cockpit-self-update-action <sha>` (or `cockpit-dienste-update-action <sha>`) carries no diff hash by design.",
@@ -120,6 +123,15 @@ function reviewedInstallNote(script: string): string | null {
     "If no review can be bound, the job continues only with operator approval.",
     "A missing hash in the plan line is therefore neither an inconsistency nor a helper failure (exit 65); assess every other effect of the plan as usual.",
   ].join(" ");
+}
+
+function reviewsInstall(plan: string): boolean {
+  try {
+    if (parseCapabilityManifest(plan) || parseHostRunManifest(plan)) return false;
+  } catch {
+    return false; // a malformed manifest stops the job in app.ts before any review
+  }
+  return updateTargets(plan).length > 0;
 }
 
 export function parseRunbookSafetyOutput(output: string): ParsedSafetyReport {

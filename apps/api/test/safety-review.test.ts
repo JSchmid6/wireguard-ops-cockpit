@@ -3,6 +3,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import type { RunbookDefinition } from "@wireguard-ops-cockpit/domain";
 import { describe, expect, it } from "vitest";
+import { parseCapabilityManifest } from "../src/capability-manifest.js";
+import { parseHostRunManifest } from "../src/host-run.js";
 import { computeRunbookVersionHash, findRunbook } from "../src/registries.js";
 import {
   buildRunbookSafetyPrompt,
@@ -72,6 +74,54 @@ describe("runbook safety review", () => {
         "```bash\n/usr/local/sbin/cockpit-self-update-action status\n```",
         "```bash\n/usr/local/sbin/cockpit-self-update-action a8f0a1b\n```",
         "```bash\nsystemctl status nginx\n```",
+      ]) {
+        expect(promptFor(plan)).not.toContain(note);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("gives the reviewed-install note only where the API reviews and binds the install", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "safety-prompt-"));
+    try {
+      const sha = "a8f0a1b083c8b4f3d33353f34ce610e54250bac2";
+      const promptFor = (plan: string) => {
+        const proposalPath = path.join(dir, "proposal.md");
+        writeFileSync(proposalPath, plan);
+        const proposal: RunbookDefinition = {
+          id: "proposal-test", name: "test", summary: "test", requiresSession: true, requiresApproval: false,
+          integration: "host-tmux", privilegedHelperRequested: false, reviewStatus: "allowlisted", scriptIds: [proposalPath],
+          workflowSteps: [{ id: "execute", label: "Execute reviewed proposal", description: "test", kind: "runbook" }],
+        };
+        return buildRunbookSafetyPrompt({
+          runbook: proposal, runbookVersionHash: computeRunbookVersionHash(proposal), riskClass: "moderate",
+          sessionId: "session-1", trigger: "manual", scheduleId: null,
+        });
+      };
+      const note = "carries no diff hash by design";
+
+      // The note follows the API, not the text: only the first bash/sh fence
+      // (typedPlanScript) is reviewed and bound, and a capability or host-run
+      // manifest gets no update review at all. A sha anywhere else gets no note.
+      const install = `/usr/local/sbin/cockpit-self-update-action ${sha}`;
+      const capability = JSON.stringify({
+        version: "cockpit-capability/v1", name: "read", purpose: "read a file", steps: [{ argv: ["/usr/bin/true"], cwd: "/tmp", runAsUser: "nobody" }],
+        readablePaths: [], writablePaths: [], network: "none", expectedEffects: ["none"], verification: ["exit 0"], rollback: ["none needed"], risk: ["contained"],
+      });
+      const hostRun = JSON.stringify({
+        version: "cockpit-host-run/v1", name: "check", purpose: "check disk space", mutates: false,
+        steps: [{ name: "df", run: "df -h /" }], checks: [{ name: "c", run: "true" }], rollback: ["none needed"], risk: ["contained"],
+      });
+      // Both manifests are valid, so the case tests the door, not a parse error.
+      expect(parseCapabilityManifest(["```capability", capability, "```"].join("\n"))).not.toBeNull();
+      expect(parseHostRunManifest(["```host-run", hostRun, "```"].join("\n"))).not.toBeNull();
+      for (const plan of [
+        ["```bash", "systemctl status nginx", "```", "```bash", install, "```"].join("\n"),
+        ["```text", install, "```"].join("\n"),
+        ["Rollback note:", install, "", "```bash", "systemctl status nginx", "```"].join("\n"),
+        ["```bash", install, "```", "```capability", capability, "```"].join("\n"),
+        ["```bash", install, "```", "```host-run", hostRun, "```"].join("\n"),
       ]) {
         expect(promptFor(plan)).not.toContain(note);
       }
