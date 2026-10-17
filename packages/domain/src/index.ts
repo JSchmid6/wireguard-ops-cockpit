@@ -1,6 +1,8 @@
 export type UserRole = "admin" | "automation";
 export type TmuxBackend = "tmux" | "disabled";
-export type SessionStatus = "active";
+// "ended": the session's tmux session is gone (finished job, API restart).
+// The record stays (jobs refer to it); the next launch into it revives it.
+export type SessionStatus = "active" | "ended";
 export type JobKind = "session.ensure" | "execution.plan" | "runbook" | "agent";
 export type JobStatus =
   | "pending"

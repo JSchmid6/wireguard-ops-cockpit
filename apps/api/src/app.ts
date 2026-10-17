@@ -18,7 +18,7 @@ import type {
   ScheduledRunbookMode,
   UserSummary
 } from "@wireguard-ops-cockpit/domain";
-import { createTmuxAdapter } from "@wireguard-ops-cockpit/tmux-adapter";
+import { createTmuxAdapter, type TmuxAdapter } from "@wireguard-ops-cockpit/tmux-adapter";
 import { AUTH_COOKIE, clearAuthCookie, parseCookies, serializeAuthCookie } from "./auth.js";
 import { loadConfig, type AppConfig } from "./config.js";
 import { CockpitDatabase } from "./db.js";
@@ -129,6 +129,9 @@ interface AppOptions {
   // Der Aufräum-Dienst auf Lab0 (`borg.retention.*`, doc/setup/borg-retention.md).
   // Vorgabe ist der typisierte Executor-Weg; Tests geben die Helfer-Ausgabe vor.
   borgRetentionRunner?: (action: string, target: string) => Promise<string>;
+  // The tmux runtime. Defaults to the local tmux (config.tmuxMode); tests
+  // inject one to stand for a tmux server that did not survive a restart.
+  tmuxAdapter?: TmuxAdapter;
 }
 
 interface LoginAttemptState {
@@ -764,7 +767,7 @@ export async function createApp(options: AppOptions = {}) {
   }
 
   const database = new CockpitDatabase(config.dbPath);
-  const tmux = createTmuxAdapter(config.tmuxMode);
+  const tmux = options.tmuxAdapter || createTmuxAdapter(config.tmuxMode);
   const agents = listAgents(config.plannerRuntime);
   const scripts = listScripts();
   const safetyReviewRunner = options.safetyReviewRunner || generateRunbookSafetyReview;
@@ -1388,6 +1391,7 @@ export async function createApp(options: AppOptions = {}) {
 
     const dispatch = buildRunbookDispatch(config.repoRoot, runbook);
     const launch = tmux.launchCommand(session.tmuxSessionName, dispatch.windowName, dispatch.command);
+    if (launch.started) database.setSessionStatus(session.id, "active");
 
     const job = database.createJob({
       sessionId: session.id,
@@ -1484,6 +1488,7 @@ export async function createApp(options: AppOptions = {}) {
     // Log and launch agent in tmux
     const windowName = slugify(`agent-${agent.id}${windowSuffix}`);
     const launch = tmux.launchCommand(session.tmuxSessionName, windowName, command);
+    if (launch.started) database.setSessionStatus(session.id, "active");
     const job = database.createJob({
       sessionId: session.id,
       kind: "agent",
@@ -2233,10 +2238,11 @@ export async function createApp(options: AppOptions = {}) {
     return database.getJobForActor(jobId, actorId);
   }
 
-  function stopEphemeralSession(tmuxSessionName: string, createdSession: boolean): void {
+  function stopEphemeralSession(session: { id: string; tmuxSessionName: string }, createdSession: boolean): void {
     if (!createdSession) return;
-    if (!/^cockpit-hermes-(?:rb-)?[a-z0-9]+$/i.test(tmuxSessionName)) return;
-    spawnSync("tmux", ["kill-session", "-t", tmuxSessionName], { timeout: 5000, encoding: "utf8" });
+    if (!/^cockpit-hermes-(?:rb-)?[a-z0-9]+$/i.test(session.tmuxSessionName)) return;
+    spawnSync("tmux", ["kill-session", "-t", session.tmuxSessionName], { timeout: 5000, encoding: "utf8" });
+    database.setSessionStatus(session.id, "ended");
   }
 
   // The research pipeline. The endpoint starts it; after an API restart the
@@ -2280,7 +2286,7 @@ export async function createApp(options: AppOptions = {}) {
         neededToContinue: ["Inspect the job evidence and planner runtime."], recommendedAction: "Correct the prerequisite and retry.",
       }));
     } finally {
-      stopEphemeralSession(session.tmuxSessionName, createdSession);
+      stopEphemeralSession(session, createdSession);
     }
   }
 
@@ -2515,7 +2521,7 @@ export async function createApp(options: AppOptions = {}) {
         recommendedAction: "Resolve the reported prerequisite before retrying.",
       }), preservedOutput);
     } finally {
-      stopEphemeralSession(session.tmuxSessionName, createdSession);
+      stopEphemeralSession(session, createdSession);
     }
   }
 
@@ -3283,6 +3289,7 @@ Follow these rules:
     const cleanup = () => {
       if (createdSession) {
         try { execSync(`tmux kill-session -t "${session.tmuxSessionName}" 2>/dev/null || true`, { timeout: 5000 }); } catch {}
+        database.setSessionStatus(session.id, "ended");
       }
     };
 
@@ -4393,6 +4400,21 @@ Follow these rules:
     database.createAudit({ actorId: null, action: "hermes.job.replanned", targetType: "job", targetId: job.id, details: { phase, attempt: replans + 1 } });
     if (job.subjectId === "hermes-research") void runResearchJob(job, actor, session, planner, request);
     else void runChangeJob(job, actor, session, request);
+  }
+
+  // The tmux server runs in the API's cgroup (KillMode=control-group), so an
+  // API restart ends it and every session in it. That is intended: its windows
+  // carry only the work of the process that ended (agents, runbooks), possibly
+  // of the old code after a self-update, and the recovery below starts that
+  // work again from the record — a surviving window would run beside it and
+  // write the same agent log. What must not survive is the record saying
+  // "active": every tmux-backed session is set to what tmux shows now. A later
+  // launch into an ended session creates its tmux session again and revives it.
+  if (tmux.backend === "tmux") {
+    const ended = database.syncTmuxSessionStatus(tmux.listSessions());
+    if (ended.length > 0) {
+      database.createAudit({ actorId: null, action: "session.ended", targetType: "session", targetId: null, details: { reason: "tmux session missing at start-up", count: ended.length, sessionIds: ended } });
+    }
   }
 
   for (const job of [...database.listRunningJobs("hermes-change"), ...database.listRunningJobs("hermes-research")]) {
