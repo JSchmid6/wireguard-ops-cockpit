@@ -10,7 +10,7 @@ import type { AppConfig } from "../src/config.js";
 import { CockpitDatabase } from "../src/db.js";
 
 // 17.10.2026 (rollout t_d465b58e): the tmux server runs in the API's cgroup
-// (KillMode=control-group), so restarting the API ended every tmux session —
+// (KillMode=control-group), so restarting the API ended every tmux session --
 // on purpose, the restarted API starts the interrupted work again from the
 // record. But the session records kept saying "active" for ever (also after a
 // finished job had killed its own tmux session), and /api/pipeline/health
