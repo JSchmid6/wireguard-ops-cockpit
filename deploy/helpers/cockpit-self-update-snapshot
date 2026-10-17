@@ -15,8 +15,8 @@
 # repository, borgmatic or anything outside the list below. A self-update
 # changes only the Cockpit's own files, so the copy of exactly those files is
 # the complete return path for it. It is NOT a net for general host changes
-# (packages, kernel): the general door (cockpit-host-run) keeps failing its
-# preflight on Lab0 for mutating runs, on purpose.
+# (packages, kernel): the general door (cockpit-host-run) has its own net on
+# Lab0 (cockpit-host-snapshot, doc/setup/host-run.md "Netz je Instanzrolle").
 #
 # Footprint (what homeserver-cockpit-deploy.sh writes; nothing else):
 #   trees  the checkout incl. build output and node_modules, the helper
@@ -24,9 +24,10 @@
 #   globs  root helpers in /usr/local/sbin, the Cockpit's units, the retention
 #          service/timer
 #   files  sudoers file, nginx site, nginx drop-in, the agent's opencode
-#          config, the self-update state.json
+#          config, the self-update state.json, the door's instance role
 # Secrets in /etc/wireguard-ops-cockpit are not copied: the deploy script only
-# creates missing ones and never rewrites them.
+# creates missing ones and never rewrites them. The instance role there is no
+# secret and the deploy script rewrites it, so it is part of the footprint.
 #
 # The store (/var/lib/wireguard-ops-cockpit-self-update-snapshots, root 0700)
 # is deliberately not below /var/lib/wireguard-ops-cockpit (wgops writes there).
@@ -74,6 +75,7 @@ FILES = (
     "/etc/systemd/system/nginx.service.d/wait-wg0.conf",
     "/var/lib/wireguard-ops-agent/.config/opencode/opencode.jsonc",
     "/var/lib/wireguard-ops-cockpit/self-update/state.json",
+    "/etc/wireguard-ops-cockpit/instance-role.env",
 )
 
 

@@ -42,7 +42,7 @@
 #         Grenze (Zweitprüfung James): Verändernde Läufe (mutates: true) scheitern auf
 #         Lab0 im Preflight. Der Helfer ruft fest cockpit-vps-snapshot und
 #         cockpit-borg-action, die es nur auf dem VPS gibt. Lab0 fährt durch die Tür
-#         nur lesende Pläne (bleibt so, siehe 13.10.2026).
+#         nur lesende Pläne (überholt am 16.10.2026, siehe dort).
 #         02.10.2026 (Kanban t_e50a1db7): Aufräum-Dienst des borg-Repos
 #         (cockpit-borg-retention: Helfer, Grenzen, Service + Timer, Vertrag
 #         doc/setup/borg-retention.md). Braucht einen Stand mit diesem Modul
@@ -60,9 +60,19 @@
 #         Update, Rückfall bei Fehler (doc/setup/self-update.md, "Lab0: snapshot and
 #         rollback"). Danach kommt Lab0 als Cockpit-Job auf neue Stände
 #         (/usr/local/sbin/cockpit-self-update-action <sha>), ohne Root-Handarbeit.
-#         Die Kopie deckt nur das Cockpit ab, keine Host-Änderungen: die allgemeine
-#         Tür bleibt auf Lab0 für verändernde Läufe zu. Bootstrap-Kopie (NC
-#         /Documents, vpsdrop) = diese Datei; abweichen darf nur der Pin-Default.
+#         Die Kopie deckt nur das Cockpit ab, keine Host-Änderungen. Bootstrap-Kopie
+#         (NC /Documents, vpsdrop) = diese Datei; abweichen darf nur der Pin-Default.
+#         16.10.2026 (Kanban t_f92a44f9): die allgemeine Tür öffnet auf Lab0 auch für
+#         verändernde Läufe (Jochens Abnahme: Neustart android-adb/-emulator per
+#         host.run). Netz je Instanzrolle (doc/setup/host-run.md): das Skript legt die
+#         Rolle lab0 root-eigen nach /etc/wireguard-ops-cockpit/instance-role.env und
+#         installiert cockpit-host-snapshot (lokale Kopie von /etc, Paketstand,
+#         Unit-Zuständen vor jedem verändernden Lauf; Ablage
+#         /var/lib/wireguard-ops-cockpit-host-snapshots). borg-Frische und
+#         Hoster-Snapshot gibt es nur auf dem VPS. Fehlt Rolle oder Snapshot oder
+#         scheitert er, läuft kein Schritt (preflight_failed). Ausrollen per
+#         self.update: der erste Lauf führt noch das alte installierte Skript aus und
+#         installiert erst dieses; Rolle + Helfer kommen mit dem nächsten self.update.
 #
 # Aufruf (als root AUF DER KISTE):
 #   bash homeserver-cockpit-deploy.sh
@@ -588,6 +598,18 @@ install -m 644 -o root -g root "$COCKPIT_DIR/deploy/helpers/cockpit-state-steps.
   /usr/local/lib/wireguard-ops-cockpit/cockpit-state-steps.mjs
 install -m 644 "$COCKPIT_DIR/deploy/systemd/wireguard-ops-cockpit-host-run-resume.service" \
   /etc/systemd/system/wireguard-ops-cockpit-host-run-resume.service
+# Netz der Tür auf Lab0 (doc/setup/host-run.md, „Netz je Instanzrolle“, 16.10.2026):
+# Rolle lab0 aus dieser root-eigenen Datei, Sicherung = lokaler Host-Snapshot
+# (Konfiguration, Paketstand, Unit-Zustände) statt borg-Frische + Hoster-Snapshot.
+# Ohne Rolle oder Snapshot-Helfer scheitert jeder verändernde Lauf im Preflight.
+for f in deploy/helpers/cockpit-host-snapshot deploy/lab0/instance-role.env; do
+  [ -f "$COCKPIT_DIR/$f" ] \
+    || die "$f fehlt im Checkout ($REPO_COMMIT) — Skript mit REPO_COMMIT=<merge-sha> erneut ausführen."
+done
+install -m 644 -o root -g root "$COCKPIT_DIR/deploy/helpers/cockpit-host-snapshot" \
+  /usr/local/lib/wireguard-ops-cockpit/cockpit-host-snapshot
+install -d -m 0700 -o root -g root /var/lib/wireguard-ops-cockpit-host-snapshots
+install -m 600 -o root -g root "$COCKPIT_DIR/deploy/lab0/instance-role.env" "$ENV_DIR/instance-role.env"
 
 # Aufräum-Dienst des borg-Repos (Vertrag + Grenzen: doc/setup/borg-retention.md).
 # Läuft als borg (Besitzer des Repos); die Passphrase legt Jochen/Claude einmalig
@@ -823,7 +845,9 @@ Rückbau (nur bei Bedarf, als root):
   #   systemctl disable wireguard-ops-cockpit-host-run-resume.service
   #   rm -f /usr/local/lib/wireguard-ops-cockpit/cockpit-host-run.mjs /usr/local/lib/wireguard-ops-cockpit/cockpit-backup-guard.mjs \
   #         /usr/local/lib/wireguard-ops-cockpit/cockpit-state-steps.mjs \
+  #         /usr/local/lib/wireguard-ops-cockpit/cockpit-host-snapshot /etc/wireguard-ops-cockpit/instance-role.env \
   #         /etc/systemd/system/wireguard-ops-cockpit-host-run-resume.service
+  #   rm -rf /var/lib/wireguard-ops-cockpit-host-snapshots   # Host-Snapshots der Tür (Rückweg, nur nach Prüfung)
   #   (cockpit-borg-retention-rules.mjs nimmt der Aufräum-Block unten mit — Riegel und Dienst teilen sie.)
   # Aufräum-Dienst (nur mit Jochens Freigabe abschalten — doc/setup/borg-retention.md):
   #   systemctl disable --now cockpit-borg-retention.timer
