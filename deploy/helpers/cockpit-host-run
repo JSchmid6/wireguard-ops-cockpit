@@ -600,21 +600,52 @@ function instanceRole() {
   return { ok: true, role: roles[0] };
 }
 
-// Die Datensperre muss in diesem Mount-Namensraum wirklich stehen: jeder
-// vorhandene Datenpfad ist selbst ein ro-Mount, und jeder Mount darunter
-// (z. B. /media/RAID mit dem borg-Repo) ist es auch. Sonst kein Schritt.
+// Die Datensperre muss in diesem Mount-Namensraum wirklich stehen. Gewertet
+// wird, wohin ein Pfad tatsächlich auflöst (Mount-Baum über Mount- und
+// Parent-ID, Komponente für Komponente, gestapelte Mounts bis oben): ein vom
+// rbind verdeckter Original-Mount (/media/RAID unter dem ro-/media) zählt
+// nicht. Jeder vorhandene Datenpfad muss selbst ein ro-Mount sein, jeder
+// Mountpunkt darunter muss auf einen ro-Mount auflösen. Ein autofs darunter
+// hängt seinen echten Mount erst beim Zugriff ein, beschreibbar: kein Schritt.
 function dataLockHeld() {
   let lines;
   try { lines = readFileSync(MOUNTINFO, "utf8").split("\n").filter(Boolean); } catch { return { ok: false, why: `the data lock cannot be checked (${MOUNTINFO} unreadable)` }; }
   const unescape = (text) => text.replace(/\\([0-7]{3})/g, (_, octal) => String.fromCharCode(Number.parseInt(octal, 8)));
-  const mounts = lines.map((line) => line.split(" ")).filter((fields) => fields.length > 5)
-    .map((fields) => ({ point: unescape(fields[4]), readOnly: fields[5].split(",").includes("ro") }));
+  const mounts = lines.map((line) => line.split(" ")).filter((fields) => fields.length > 6).map((fields) => ({
+    id: fields[0], parent: fields[1], point: unescape(fields[4]), readOnly: fields[5].split(",").includes("ro"),
+    fsType: fields[fields.indexOf("-") + 1] || "",
+  }));
+  const ids = new Set(mounts.map((mount) => mount.id));
+  // Der letzte passende Eintrag liegt oben (neuere Mounts stehen weiter hinten).
+  const onTop = (parent, point) => {
+    let current = parent;
+    for (;;) {
+      const next = mounts.findLast((mount) => mount.parent === current.id && mount.point === point && mount !== current);
+      if (!next) return current;
+      current = next;
+    }
+  };
+  const base = mounts.find((mount) => mount.point === "/" && !ids.has(mount.parent));
+  if (!base) return { ok: false, why: "the data lock cannot be checked (no root mount in the mount table)" };
+  const root = onTop(base, "/");
+  const resolve = (target) => {
+    let current = root;
+    let prefix = "";
+    for (const part of target.split("/").filter(Boolean)) {
+      prefix += `/${part}`;
+      current = onTop(current, prefix);
+    }
+    return current;
+  };
   for (const dataPath of DATA_PATHS) {
     if (!existsSync(dataPath)) continue;
-    const below = mounts.filter((mount) => mount.point === dataPath || mount.point.startsWith(`${dataPath}/`));
-    if (!below.some((mount) => mount.point === dataPath)) return { ok: false, why: `the data lock is missing: ${dataPath} is not mounted read-only for this run` };
-    const writable = below.find((mount) => !mount.readOnly);
-    if (writable) return { ok: false, why: `the data lock is missing: ${writable.point} is writable for this run` };
+    const own = resolve(dataPath);
+    if (own.point !== dataPath || !own.readOnly) return { ok: false, why: `the data lock is missing: ${dataPath} is not mounted read-only for this run` };
+    for (const point of new Set(mounts.filter((mount) => mount.point.startsWith(`${dataPath}/`)).map((mount) => mount.point))) {
+      const seen = resolve(point);
+      if (seen.fsType === "autofs") return { ok: false, why: `the data lock cannot hold: ${point} is an automount (its real mount would arrive writable)` };
+      if (!seen.readOnly) return { ok: false, why: `the data lock is missing: ${point} is writable for this run` };
+    }
   }
   return { ok: true };
 }
@@ -697,12 +728,13 @@ async function payload(jobId) {
     // Nach dem Hochfahren: erst weiter, wenn der Start des Systems durch ist.
     state.phase = "running";
     saveState(state);
-    // Auch die neue Unit nach dem Neustart steht unter der Datensperre.
+    spawnSync(SYSTEMCTL, ["is-system-running", "--wait"], { encoding: "utf8", timeout: 600000 });
+    // Auch die neue Unit nach dem Neustart steht unter der Datensperre — geprüft,
+    // wenn der Start des Systems durch ist (später eingehängte Mounts kämen sonst rw dazu).
     if (state.mutates && NETS[state.role]?.dataLock) {
       const lock = dataLockHeld();
       if (!lock.ok) return finish(state, "failed", `${lock.why}; the run stops before step ${state.nextStep + 1}`);
     }
-    spawnSync(SYSTEMCTL, ["is-system-running", "--wait"], { encoding: "utf8", timeout: 600000 });
   }
 
   for (let index = state.nextStep; index < manifest.steps.length; index += 1) {

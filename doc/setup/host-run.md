@@ -398,16 +398,21 @@ Maschinen-Snapshot passen dort nicht (Lauf 98a12e31 vom 16.10.2026 scheiterte ge
 3. **Datensperre** (Jochen, 17.10.2026 — G5 für die Rolle lab0): die Lauf-Unit hängt die Datenpfade
    `/media` (mit dem borg-Repo `/media/RAID/backup_VServer/borg`), `/home`, `/mnt` und `/srv`
    schreibgeschützt ein (`systemd-run --property=ReadOnlyPaths=-<pfad>`, fehlende Pfade entfallen).
-   Vor dem ersten Schritt — und nach einem Neustart vor dem nächsten — prüft der Lauf in
-   `/proc/self/mountinfo`, dass jeder vorhandene Datenpfad ein eigener ro-Mount ist und jeder Mount
-   darunter (`/media/RAID`) ebenfalls; sonst `preflight_failed`, kein Schritt.
+   Vor dem ersten Schritt prüft der Lauf in `/proc/self/mountinfo`, wohin jeder Pfad wirklich
+   auflöst (Mount-Baum über Mount- und Parent-ID; der vom rbind verdeckte Original-Mount
+   `/media/RAID` zählt nicht): jeder vorhandene Datenpfad ist ein eigener ro-Mount, jeder
+   Mountpunkt darunter löst auf einen ro-Mount auf, kein autofs darunter (dessen echter Mount käme
+   erst beim Zugriff, beschreibbar). Sonst `preflight_failed`, kein Schritt. Nach einem Neustart
+   prüft die neue Unit dasselbe, wenn der Systemstart durch ist, vor dem nächsten Schritt; sonst
+   endet der Lauf `failed`.
 
 Ehrliche Grenze von lab0: der Host-Snapshot ist kein Maschinen-Snapshot. Er deckt Konfiguration,
 Paketstand und Unit-Zustände, keine Daten und keinen Paketinhalt (ein Downgrade braucht die alte
 Version aus dem Archiv). Die Daten schützt statt eines Rückwegs die Datensperre: ein Lauf schreibt
 dort nicht. Sie fängt Versehen, nicht Absicht — root kann über eine andere Unit (`systemd-run`, ein
 Dienst, den der Plan startet oder ändert), ein `mount -o remount`, `nsenter` oder einen Pfad außerhalb
-der vier doch an Daten; solche Wege sind Sache des Türstehers (X4). `/var/lib` bleibt beschreibbar
+der vier doch an Daten; solche Wege sind Sache des Türstehers (X4). Ein Mount, den der Host erst
+nach der Prüfung einhängt (Hotplug, ein spätes `nofail`), erscheint in der Lauf-Unit beschreibbar. `/var/lib` bleibt beschreibbar
 (dpkg, systemd), ist also nicht gesperrt. Dienste, die ein Lauf nur startet oder stoppt (etwa
 `android-emulator`), laufen in ihrer eigenen Unit und sind von der Sperre nicht betroffen.
 

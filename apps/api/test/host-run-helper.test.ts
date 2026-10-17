@@ -55,11 +55,17 @@ function hookEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   };
 }
 
-// /proc/self/mountinfo, wie die Lauf-Unit es mit der Datensperre sieht; rw: Pfade ohne Sperre.
-function mountinfo(extra: string[] = [], rw: string[] = []) {
-  return ["/", "/media", "/home", "/mnt", "/srv", ...extra]
-    .map((point, index) => `${index + 20} 1 8:1 / ${point.replace(/ /g, "\\040")} ${point === "/" || rw.includes(point) ? "rw" : "ro"},relatime shared:1 - ext4 /dev/sda1 rw`)
-    .join("\n") + "\n";
+// /proc/self/mountinfo, wie die Lauf-Unit es mit der Datensperre sieht: "/" (id 1,
+// rw), darunter je Datenpfad ein ro-Mount (id 10..13). rw: Datenpfade ohne Sperre.
+// extra: weitere Einträge [id, parent, point, opts, fstype] hinter den Grundzeilen.
+type MountRow = [number, number, string, string, string?];
+const DATA_MOUNT_IDS: Record<string, number> = { "/media": 10, "/home": 11, "/mnt": 12, "/srv": 13 };
+function mountinfo(extra: MountRow[] = [], rw: string[] = [], without: string[] = []) {
+  const rows: MountRow[] = [[1, 0, "/", "rw"],
+    ...Object.entries(DATA_MOUNT_IDS).filter(([point]) => !without.includes(point))
+      .map(([point, id]): MountRow => [id, 1, point, rw.includes(point) ? "rw" : "ro"]), ...extra];
+  return rows.map(([id, parent, point, opts, fstype = "ext4"]) =>
+    `${id} ${parent} 8:1 / ${point.replace(/ /g, "\\040")} ${opts},relatime shared:1 - ${fstype} /dev/sda1 rw`).join("\n") + "\n";
 }
 
 function run(args: string[], input = "", extra: Record<string, string> = {}) {
@@ -402,20 +408,63 @@ describe("cockpit-host-run: safety net per instance role", () => {
     expect(existsSync(path.join(dir, "readonly.log"))).toBe(false);
   });
 
-  it("lab0: a writable data path stops the run before any step", () => {
+  it.skipIf(!existsSync("/media"))("lab0: the original mount hidden under systemd's read-only rbind of /media does not count", () => {
+    setRole("COCKPIT_INSTANCE_ROLE=lab0\n");
+    // /media/RAID (id 5) hängt am Root und bleibt rw, ist aber vom ro-/media (id 10) verdeckt;
+    // sichtbar ist seine ro-Kopie unter /media (id 20). Ohne die Kopie wäre er ebenfalls verdeckt.
+    write(path.join(dir, "mountinfo"), mountinfo([[5, 1, "/media/RAID", "rw", "fuseblk"], [20, 10, "/media/RAID", "ro", "fuseblk"]]), 0o644);
+    run(["start"], request(manifest()));
+    expect(status().state.status).toBe("success");
+    // Gegenprobe: ist die sichtbare Kopie rw, stoppt der Lauf.
+    rmSync(path.join(dir, "runs"), { recursive: true, force: true });
+    write(path.join(dir, "mountinfo"), mountinfo([[5, 1, "/media/RAID", "rw", "fuseblk"], [20, 10, "/media/RAID", "rw", "fuseblk"]]), 0o644);
+    run(["start"], request(manifest()));
+    expect(status().state.error).toContain("/media/RAID is writable for this run");
+  });
+
+  it.skipIf(!existsSync("/media"))("lab0: an automount below a data path stops the run (its real mount would arrive writable)", () => {
+    setRole("COCKPIT_INSTANCE_ROLE=lab0\n");
+    write(path.join(dir, "mountinfo"), mountinfo([[20, 10, "/media/RAID", "ro", "autofs"]]), 0o644);
+    run(["start"], request(manifest()));
+    const { state } = status();
+    expect(state.status).toBe("preflight_failed");
+    expect(state.error).toContain("/media/RAID is an automount");
+    nothingRan();
+  });
+
+  it.skipIf(!existsSync("/mnt"))("lab0: after a reboot the new unit is locked again and checked before the next step", () => {
+    setRole("COCKPIT_INSTANCE_ROLE=lab0\n");
+    run(["start"], request(manifest({ steps: [
+      { name: "before", run: `touch ${dir}/before`, timeoutSeconds: 30 },
+      { name: "reboot", reboot: true },
+      { name: "after", run: `touch ${dir}/after`, timeoutSeconds: 30 },
+    ] })));
+    expect(status().state.phase).toBe("rebooting");
+    writeFileSync(path.join(dir, "boot_id"), "boot-b\n");
+    write(path.join(dir, "mountinfo"), mountinfo([], ["/mnt"]), 0o644);
+    expect(run(["resume"]).code).toBe(0);
+    const { state } = status();
+    expect(state.status).toBe("failed");
+    expect(state.error).toContain("/mnt is not mounted read-only for this run; the run stops before step 3");
+    expect(existsSync(path.join(dir, "before"))).toBe(true);
+    expect(existsSync(path.join(dir, "after"))).toBe(false);
+    // Beide Units (Start und Fortsetzung) bekamen die vier ReadOnlyPaths.
+    expect(readFileSync(path.join(dir, "readonly.log"), "utf8").trim().split("\n")).toHaveLength(8);
+  });
+
+  it.skipIf(!existsSync("/home"))("lab0: a writable data path stops the run before any step", () => {
     setRole("COCKPIT_INSTANCE_ROLE=lab0\n");
     write(path.join(dir, "mountinfo"), mountinfo([], ["/home"]), 0o644);
     run(["start"], request(manifest()));
     const { state } = status();
     expect(state.status).toBe("preflight_failed");
-    expect(state.error).toContain("/home is writable for this run");
+    expect(state.error).toContain("/home is not mounted read-only for this run");
     nothingRan();
   });
 
-  it("lab0: a writable mount below a data path (the borg repo's RAID) stops the run", () => {
-    if (!existsSync("/media")) return; // Prüfung gilt nur für vorhandene Pfade
+  it.skipIf(!existsSync("/media"))("lab0: a writable mount below a data path (the borg repo's RAID) stops the run", () => {
     setRole("COCKPIT_INSTANCE_ROLE=lab0\n");
-    write(path.join(dir, "mountinfo"), mountinfo(["/media/RAID"], ["/media/RAID"]), 0o644);
+    write(path.join(dir, "mountinfo"), mountinfo([[20, 10, "/media/RAID", "rw"]]), 0o644);
     run(["start"], request(manifest()));
     const { state } = status();
     expect(state.status).toBe("preflight_failed");
@@ -423,10 +472,9 @@ describe("cockpit-host-run: safety net per instance role", () => {
     nothingRan();
   });
 
-  it("lab0: a data path without its own read-only mount stops the run (lock not applied)", () => {
-    if (!existsSync("/home")) return; // Prüfung gilt nur für vorhandene Pfade
+  it.skipIf(!existsSync("/home"))("lab0: a data path without its own read-only mount stops the run (lock not applied)", () => {
     setRole("COCKPIT_INSTANCE_ROLE=lab0\n");
-    write(path.join(dir, "mountinfo"), mountinfo().split("\n").filter((line) => !line.includes(" /home ")).join("\n"), 0o644);
+    write(path.join(dir, "mountinfo"), mountinfo([], [], ["/home"]), 0o644);
     run(["start"], request(manifest()));
     const { state } = status();
     expect(state.status).toBe("preflight_failed");
