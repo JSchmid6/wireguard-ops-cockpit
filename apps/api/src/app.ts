@@ -198,11 +198,17 @@ export async function retainValidatedCapability(capabilityDir: string, jobId: st
 // operator's approval, host run resumed after a restart). The verifier runs
 // isolated as cockpit-agent without root: root-only state (self.status reads
 // /var/lib/wireguard-ops-cockpit/self-update, host runs, borg status) reads as
-// "unreadable" or permission denied there — that is the sandbox, not evidence
-// against the signed handoff (16.10.2026, Lab0 c06456ce: failed_verification
-// although the root run had returned the full state).
-export function verifierInstruction(intent: string, targetNote = ""): string {
-  return `You are the verifier-agent. Independently verify the requested target state for this intent. Do not trust the runner's STATUS claim. First evaluate the supplied signed runner handoff's raw command output; when it directly proves every requested condition, do not call redundant tools. Otherwise use focused read-only commands only. Do not repair anything. You run without root: state that only root may read (for example cockpit-self-update-action status, host-run state, borg status) shows up for you as "unreadable", "permission denied" or "missing" — that is your sandbox, not evidence against the handoff; judge such state by the handoff's raw output. Your final response is mandatory and must end with exactly VERIFICATION_STATUS: passed or VERIFICATION_STATUS: failed, followed by EVIDENCE: and REASON:. Never stop after announcing an intended check.${targetNote ? ` ${targetNote}` : ""} Intent: ${intent}`;
+// "unreadable" or permission denied there (16.10.2026, Lab0 c06456ce:
+// failed_verification although the root run had returned the full state).
+// Only a handoff the Cockpit built itself from the executor's output
+// (typed capability or host run) may stand in for such state. A handoff the
+// runner agent wrote is its own text: there an unreadable state stays
+// unproven (PR #52 review).
+export function verifierInstruction(intent: string, targetNote = "", apiHandoff = false): string {
+  const handoff = apiHandoff
+    ? `First evaluate the supplied signed runner handoff's raw command output; when it directly proves every requested condition, do not call redundant tools. Otherwise use focused read-only commands only. Do not repair anything. You run without root: state that only root may read (for example cockpit-self-update-action status, host-run state, borg status) shows up for you as "unreadable", "permission denied" or "missing" — that is your sandbox, not evidence against the handoff; judge such state by the handoff's raw output.`
+    : `The supplied runner handoff is the runner agent's own text and proves nothing by itself: confirm every requested condition with focused read-only commands. Do not repair anything. A condition you cannot read yourself is unproven, not passed.`;
+  return `You are the verifier-agent. Independently verify the requested target state for this intent. Do not trust the runner's STATUS claim. ${handoff} Your final response is mandatory and must end with exactly VERIFICATION_STATUS: passed or VERIFICATION_STATUS: failed, followed by EVIDENCE: and REASON:. Never stop after announcing an intended check.${targetNote ? ` ${targetNote}` : ""} Intent: ${intent}`;
 }
 
 function slugify(value: string): string {
@@ -1930,9 +1936,10 @@ export async function createApp(options: AppOptions = {}) {
     reviewedPlan: string,
     runnerResult: string,
     targetNote = "",
+    apiHandoff = false,
   ): Promise<string> {
     const verifierPrompt = buildAgentTask(
-      verifierInstruction(intent, targetNote),
+      verifierInstruction(intent, targetNote, apiHandoff),
       [{ source: "reviewed-plan", content: reviewedPlan }, { source: "runner-handoff", content: runnerResult }],
     );
     const verifierRaw = await runIsolatedAgent(actor, session, planner, "verifier", verifierPrompt, "-verifier", 5 * 60_000, config.safetyOpencodeModel);
@@ -2507,7 +2514,7 @@ export async function createApp(options: AppOptions = {}) {
       let verification = "VERIFICATION_STATUS: failed\nREASON: runner did not report success";
       if (runnerSuccess) {
         const verifierPrompt = buildAgentTask(
-          verifierInstruction(intent, targetNote),
+          verifierInstruction(intent, targetNote, typedResult !== null),
           [{ source: "reviewed-plan", content: planText }, { source: "runner-handoff", content: result }],
         );
         const verifierRaw = await runIsolatedAgent(actor, session, planner, "verifier", verifierPrompt, "-verifier", 5 * 60_000, config.safetyOpencodeModel);
@@ -2734,7 +2741,7 @@ export async function createApp(options: AppOptions = {}) {
         const runnerSuccess = /STATUS:\s*success/i.test(result);
         const pendingActivations = typed?.pendingActivations ?? [];
         const verification = runnerSuccess
-          ? await runIndependentVerification(actor, session, planner, intent, reviewedPlan, result, selfUpdateVerifierNote(pendingActivations))
+          ? await runIndependentVerification(actor, session, planner, intent, reviewedPlan, result, selfUpdateVerifierNote(pendingActivations), typedResult !== null)
           : "VERIFICATION_STATUS: failed\nREASON: runner did not report success";
         const success = runnerSuccess && /VERIFICATION_STATUS:\s*passed/i.test(verification);
         const retainedCapability = success ? await retainValidatedCapability(capabilityDir, job.id, manifest) : null;
@@ -4337,7 +4344,7 @@ Follow these rules:
       const planner = findAgent("planner-agent", "opencode");
       const runnerSuccess = /STATUS:\s*success/i.test(result);
       const verification = runnerSuccess && actor && session && planner
-        ? await runIndependentVerification(actor, session, planner, intent, planText, result)
+        ? await runIndependentVerification(actor, session, planner, intent, planText, result, "", true)
         : `VERIFICATION_STATUS: failed\nREASON: ${runnerSuccess ? "the verifier runtime is unavailable after the restart" : "the host run did not report success"}`;
       const success = runnerSuccess && /VERIFICATION_STATUS:\s*passed/i.test(verification);
       updateHermesJob(job.id, success ? "completed" : "failed_verification", explanation({

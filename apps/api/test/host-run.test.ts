@@ -131,7 +131,9 @@ describe("buildHostRunReviewPrompt", () => {
     const lab0 = buildHostRunReviewPrompt(parsed(), { nonce: "n", role: "lab0" }).prompt;
     expect(none).toBe(vps);
     expect(vps.startsWith(HOST_RUN_REVIEW_INSTRUCTIONS)).toBe(true);
-    expect(vps).toContain("the steps below run as root on the production host — Nextcloud");
+    expect(vps).toContain("the door's instance role (/etc/wireguard-ops-cockpit/instance-role.env");
+    // Without a role the opening paragraph is word for word the one before the roles.
+    expect(vps.startsWith("You are the doorkeeper of the Cockpit's general host door. If you answer VERDICT: pass, the steps below run as root on the production host — Nextcloud with the family's data, GitLab, WordPress, the mail archive, WireGuard, the Cockpit itself. There is no sandbox behind you. You are the security boundary for this run.\n\nUnderneath you")).toBe(true);
     expect(lab0).toContain("general host door on Lab0 (10.0.0.5)");
     expect(lab0).toContain("The borg repository here is family data");
     expect(lab0).not.toContain("run as root on the production host");
