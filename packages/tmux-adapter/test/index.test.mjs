@@ -171,7 +171,7 @@ test("tmux adapter surfaces tmux errors and invalid launch inputs", (t) => {
 
   const adapter = createTmuxAdapter();
 
-  assert.deepEqual(adapter.listSessions(), []);
+  assert.throws(() => adapter.listSessions(), /tmux list-sessions failed: failed to list/);
   assert.throws(() => adapter.launchCommand("incident-debug", "bad name", { executable: "node", args: [] }), /window name must match/);
   assert.throws(
     () =>
@@ -189,4 +189,27 @@ test("tmux adapter surfaces tmux errors and invalid launch inputs", (t) => {
       }),
     /window failed/
   );
+});
+
+test("tmux adapter reads 'no server' as no sessions and throws on any other list failure", (t) => {
+  let listResult = { status: 0, stdout: "", stderr: "" };
+  t.mock.method(__tmuxTestHarness, "spawnSync", (command, args) => {
+    if (args[0] === "-V") return { status: 0, stdout: "tmux 3.4", stderr: "" };
+    if (args[0] === "list-sessions") return listResult;
+    throw new Error(`Unexpected tmux args: ${args.join(" ")}`);
+  });
+
+  const adapter = createTmuxAdapter();
+
+  listResult = { status: 1, stdout: "", stderr: "no server running on /tmp/tmux-1000/default\n" };
+  assert.deepEqual(adapter.listSessions(), []);
+  listResult = { status: 1, stdout: "", stderr: "error connecting to /tmp/tmux-1000/default (No such file or directory)\n" };
+  assert.deepEqual(adapter.listSessions(), []);
+
+  listResult = { status: 1, stdout: "", stderr: "error connecting to /tmp/tmux-1000/default (Permission denied)\n" };
+  assert.throws(() => adapter.listSessions(), /tmux list-sessions failed: error connecting .*Permission denied/);
+  listResult = { status: 1, stdout: "server exited unexpectedly", stderr: "" };
+  assert.throws(() => adapter.listSessions(), /tmux list-sessions failed: server exited unexpectedly/);
+  listResult = { status: null, stdout: "", stderr: "" };
+  assert.throws(() => adapter.listSessions(), /tmux list-sessions failed: exit status null/);
 });

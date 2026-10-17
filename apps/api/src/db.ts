@@ -17,6 +17,7 @@ import type {
   ScheduledRunbook,
   ScheduledRunbookMode,
   ScheduledRunbookStatus,
+  SessionStatus,
   TerminalBridge,
   TmuxBackend,
   UserSummary
@@ -575,7 +576,7 @@ export class CockpitDatabase {
       this.database
         .prepare(
           `UPDATE cockpit_sessions
-           SET owner_id = ?, tmux_session_name = ?, tmux_backend = ?, terminal_url = ?, updated_at = ?, last_activity_at = ?
+           SET status = 'active', owner_id = ?, tmux_session_name = ?, tmux_backend = ?, terminal_url = ?, updated_at = ?, last_activity_at = ?
            WHERE id = ?`
         )
         .run(
@@ -610,6 +611,29 @@ export class CockpitDatabase {
       );
 
     return this.getSessionById(id)!;
+  }
+
+  setSessionStatus(sessionId: string, status: SessionStatus): void {
+    this.database
+      .prepare("UPDATE cockpit_sessions SET status = ?, updated_at = ? WHERE id = ? AND status <> ?")
+      .run(status, now(), sessionId, status);
+  }
+
+  // Brings the status of every tmux-backed session in line with the tmux
+  // sessions that actually exist (liveNames). Returns the ids it ended.
+  syncTmuxSessionStatus(liveNames: string[]): string[] {
+    const live = new Set(liveNames);
+    const rows = this.database
+      .prepare("SELECT id, status, tmux_session_name FROM cockpit_sessions WHERE tmux_backend = 'tmux'")
+      .all() as Array<Pick<SessionRow, "id" | "status" | "tmux_session_name">>;
+    const ended: string[] = [];
+    for (const row of rows) {
+      const status: SessionStatus = live.has(row.tmux_session_name) ? "active" : "ended";
+      if (row.status === status) continue;
+      this.setSessionStatus(row.id, status);
+      if (status === "ended") ended.push(row.id);
+    }
+    return ended;
   }
 
   recordSessionActivity(sessionId: string): void {
@@ -1124,7 +1148,7 @@ export class CockpitDatabase {
     return {
       id: row.id,
       name: row.name,
-      status: "active",
+      status: row.status === "ended" ? "ended" : "active",
       tmuxSessionName: row.tmux_session_name,
       tmuxBackend: row.tmux_backend,
       createdAt: row.created_at,

@@ -30,6 +30,11 @@ export const __tmuxTestHarness = {
 
 const SAFE_NAME = /^[a-z0-9][a-z0-9-_]{1,31}$/i;
 
+// What tmux prints when no server is running: "no server running on <socket>",
+// or "error connecting to <socket> (No such file or directory)" when the
+// socket does not exist yet.
+const NO_SERVER = /no server running|error connecting to .*\(No such file or directory\)/i;
+
 function assertSafeName(value: string, label: string): void {
   if (!SAFE_NAME.test(value)) {
     throw new Error(`${label} must match ${SAFE_NAME.source}`);
@@ -92,8 +97,12 @@ class LocalTmuxAdapter implements TmuxAdapter {
       encoding: "utf8"
     });
 
+    // No server (or no socket yet) means no sessions. Any other failure says
+    // nothing about which sessions exist, so it must not read as "none".
     if (result.status !== 0) {
-      return [];
+      const detail = (result.stderr || result.stdout || "").trim();
+      if (NO_SERVER.test(detail)) return [];
+      throw new Error(`tmux list-sessions failed: ${detail || `exit status ${result.status}`}`);
     }
 
     return result.stdout
