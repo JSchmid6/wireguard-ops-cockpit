@@ -395,11 +395,26 @@ Maschinen-Snapshot passen dort nicht (Lauf 98a12e31 vom 16.10.2026 scheiterte ge
    nicht liegen. Die fünf jüngsten bleiben, rotiert wird nur die eigene Namensform; zu wenig
    Platz (< 256 MB) verweigert.
 2. Keine borg-Prüfung: das Backup, das auf Lab0 liegt, sichert den VPS, nicht Lab0.
+3. **Datensperre** (Jochen, 17.10.2026 — G5 für die Rolle lab0): die Lauf-Unit hängt die Datenpfade
+   `/media` (mit dem borg-Repo `/media/RAID/backup_VServer/borg`), `/home`, `/mnt` und `/srv`
+   schreibgeschützt ein (`systemd-run --property=ReadOnlyPaths=-<pfad>`, fehlende Pfade entfallen).
+   Vor dem ersten Schritt prüft der Lauf in `/proc/self/mountinfo`, wohin jeder Pfad wirklich
+   auflöst (Mount-Baum über Mount- und Parent-ID; der vom rbind verdeckte Original-Mount
+   `/media/RAID` zählt nicht): jeder vorhandene Datenpfad ist ein eigener ro-Mount, jeder
+   Mountpunkt darunter löst auf einen ro-Mount auf, kein autofs darunter (dessen echter Mount käme
+   erst beim Zugriff, beschreibbar). Sonst `preflight_failed`, kein Schritt. Nach einem Neustart
+   prüft die neue Unit dasselbe, wenn der Systemstart durch ist, vor dem nächsten Schritt; sonst
+   endet der Lauf `failed`.
 
 Ehrliche Grenze von lab0: der Host-Snapshot ist kein Maschinen-Snapshot. Er deckt Konfiguration,
-Paketstand und Unit-Zustände, **keine Daten** (`/media`, `/home`, `/var/lib`, das borg-Repo) und
-keinen Paketinhalt (ein Downgrade braucht die alte Version aus dem Archiv). Für Läufe, die dort
-Daten ändern, bleibt der Türsteher die Grenze (X4: Verlust jenseits des Netzes).
+Paketstand und Unit-Zustände, keine Daten und keinen Paketinhalt (ein Downgrade braucht die alte
+Version aus dem Archiv). Die Daten schützt statt eines Rückwegs die Datensperre: ein Lauf schreibt
+dort nicht. Sie fängt Versehen, nicht Absicht — root kann über eine andere Unit (`systemd-run`, ein
+Dienst, den der Plan startet oder ändert), ein `mount -o remount`, `nsenter` oder einen Pfad außerhalb
+der vier doch an Daten; solche Wege sind Sache des Türstehers (X4). Ein Mount, den der Host erst
+nach der Prüfung einhängt (Hotplug, ein spätes `nofail`), erscheint in der Lauf-Unit beschreibbar. `/var/lib` bleibt beschreibbar
+(dpkg, systemd), ist also nicht gesperrt. Dienste, die ein Lauf nur startet oder stoppt (etwa
+`android-emulator`), laufen in ihrer eigenen Unit und sind von der Sperre nicht betroffen.
 
 Scheitert ein Teil des Netzes, läuft kein Schritt (`preflight_failed`). Scheitert später ein Schritt
 oder eine Prüfung, nennt das Protokoll die Snapshot-Kennung (`machine snapshot …` bzw.
@@ -415,6 +430,13 @@ bleibt alt), der zweite den Helfer, die Texte für Türsteher und Update-Review 
 Commit, dann self.update auf den Merge — so fehlt die Rolle nie, wenn der neue Helfer sie verlangt.
 Ein self.update direkt auf den Merge hinterlässt den neuen Helfer ohne Rolle: verändernde Läufe
 scheitern dann sicher (`no instance role`), bis ein weiterer self.update das neue Skript laufen lässt.
+
+Ausrollen der Datensperre (17.10.2026) folgt demselben Muster: auf Lab0 zuerst self.update auf den
+Commit mit der Sperre (das alte Skript installiert neues Skript und neuen Helfer; bis zum nächsten
+Schritt scheitern verändernde Läufe sicher an der fehlenden Rolle), dann self.update auf den Merge
+(das neue Skript legt die Rolle). Das erste Update prüft noch das alte Update-Review mit dem G5 von
+vor dem 16.10.; sein Befund geht einmal an Jochen. Auf dem VPS (schon auf dem ersten Commit von
+#52, Rolle liegt) genügt ein self.update auf den Merge.
 
 Das Cockpit selbst kommt auf Lab0 weiterhin über das typisierte Selbst-Update mit eigener Kopie und
 Rückfall (`doc/setup/self-update.md`, „Lab0: snapshot and rollback“), nicht durch diese Tür.
@@ -538,7 +560,10 @@ hebt. Der Normalfall ist Durchlaufen. Das gilt für beide Prüfungen: den Türst
   alt/gescheitert, Snapshot scheitert, lesender Lauf; je Instanzrolle: vps unverändert, lab0 mit
   Host-Snapshot statt borg/Hoster — auch mit dem echten `cockpit-host-snapshot` —, Rolle fehlt,
   unbekannt, doppelt, schreibbar oder nur in der Umgebung → `preflight_failed`, Host-Snapshot
-  scheitert oder fehlt → `preflight_failed`, nichts ausgeführt), Tür (Fehler, Zeitlimit, Prüfschritte,
+  scheitert oder fehlt → `preflight_failed`, nichts ausgeführt; lab0-Datensperre: ReadOnlyPaths an
+  der Unit, schreibbarer Datenpfad oder Untermount, gestapelter rw-Mount, autofs auf oder unter
+  einem Datenpfad bzw. fehlende Sperre → `preflight_failed`; verdeckter rbind-Original-Mount zählt nicht;
+  nach dem Neustart erneut geprüft → `failed`), Tür (Fehler, Zeitlimit, Prüfschritte,
   Schwärzung, Neustart mit Fortsetzung, ein Lauf zur Zeit), unterbrechungssichere Schritte mit
   Attrappen für dpkg/apt-get/ss (langsamer apt überzieht ohne Abbruch, Meldung, harte Obergrenze
   mit Operator-Meldung, Erkennung schlägt `false`, Aufräumen sshd → dpkg → apt-get -f → Dienste;

@@ -30,7 +30,13 @@
 //                      rotiert den ältesten cockpit-eigenen);
 //                lab0  das borg-Ziel, kein borg-Client, ohne Hoster: ein lokaler
 //                      Host-Snapshot (cockpit-host-snapshot: /etc, Paketstand,
-//                      Unit-Zustände).
+//                      Unit-Zustände). Die Daten deckt er nicht ab — darum
+//                      hängt die Lauf-Unit die Datenpfade (DATA_PATHS: /media
+//                      mit dem borg-Repo, /home, /mnt, /srv) schreibgeschützt
+//                      ein (ReadOnlyPaths), und der Lauf prüft vor dem ersten
+//                      Schritt in /proc/self/mountinfo, dass jeder vorhandene
+//                      Datenpfad samt Untermounts wirklich ro ist (Datensperre,
+//                      Jochen 17.10.2026).
 //              Fehlt die Rolle, ist sie unbekannt oder scheitert ein Teil des
 //              Netzes, läuft kein Schritt (preflight_failed).
 //   Kein Abbruch  Ein Schritt, der Zustand ändert (Pakete, GitLab,
@@ -83,9 +89,13 @@ const HOST_SNAPSHOT = env.HOST_RUN_HOST_SNAPSHOT ? [env.HOST_RUN_HOST_SNAPSHOT] 
 // Beide Snapshot-Werkzeuge antworten in derselben Form ({snapshot: {snapshotId}}).
 const NETS = {
   vps: { borg: true, kind: "machine", snapshot: SNAPSHOT, args: ["--wait", "900"] },
-  lab0: { borg: false, kind: "host", snapshot: HOST_SNAPSHOT, args: [] },
+  lab0: { borg: false, kind: "host", snapshot: HOST_SNAPSHOT, args: [], dataLock: true },
 };
 const ROLE_FILE = "instance-role.env";
+// Datensperre auf Lab0: Pfade, die der Host-Snapshot nicht abdeckt. Ein Lauf
+// schreibt dort nie (fehlt ein Pfad, entfällt er: ReadOnlyPaths=-…).
+const DATA_PATHS = ["/media", "/home", "/mnt", "/srv"];
+const MOUNTINFO = env.HOST_RUN_MOUNTINFO || "/proc/self/mountinfo";
 const BOOT_ID_FILE = env.HOST_RUN_BOOT_ID_FILE || "/proc/sys/kernel/random/boot_id";
 const SELF = fileURLToPath(import.meta.url);
 const STEP_PATH = `${env.HOST_RUN_STEP_PATH ? `${env.HOST_RUN_STEP_PATH}:` : ""}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
@@ -284,9 +294,13 @@ function log(text) {
 }
 
 function startUnit(jobId, runtimeSeconds) {
+  // Die Datensperre hängt an der Rolle, nicht am Plan; ob sie greift, prüft der
+  // Lauf selbst (dataLockHeld) — ohne gültige Rolle läuft ohnehin kein ändernder Schritt.
+  const role = instanceRole();
+  const lock = role.ok && NETS[role.role].dataLock ? DATA_PATHS.map((p) => `--property=ReadOnlyPaths=-${p}`) : [];
   const started = spawnSync(SYSTEMD_RUN, [
     `--unit=${unitName(jobId)}`, "--collect", "--quiet", "--property=Type=exec",
-    `--property=RuntimeMaxSec=${runtimeSeconds ?? "infinity"}`, "--property=KillMode=control-group",
+    `--property=RuntimeMaxSec=${runtimeSeconds ?? "infinity"}`, "--property=KillMode=control-group", ...lock,
     `--description=Cockpit host run ${jobId}`, "--setenv=COCKPIT_HOST_RUN_IN_UNIT=1",
     "--", process.execPath, SELF, "--payload", jobId,
   ], { encoding: "utf8", timeout: 60000 });
@@ -586,6 +600,57 @@ function instanceRole() {
   return { ok: true, role: roles[0] };
 }
 
+// Die Datensperre muss in diesem Mount-Namensraum wirklich stehen. Gewertet
+// wird, wohin ein Pfad tatsächlich auflöst (Mount-Baum über Mount- und
+// Parent-ID, Komponente für Komponente, gestapelte Mounts bis oben): ein vom
+// rbind verdeckter Original-Mount (/media/RAID unter dem ro-/media) zählt
+// nicht. Jeder vorhandene Datenpfad muss selbst ein ro-Mount sein, jeder
+// Mountpunkt darunter muss auf einen ro-Mount auflösen. Ein autofs darunter
+// hängt seinen echten Mount erst beim Zugriff ein, beschreibbar: kein Schritt.
+function dataLockHeld() {
+  let lines;
+  try { lines = readFileSync(MOUNTINFO, "utf8").split("\n").filter(Boolean); } catch { return { ok: false, why: `the data lock cannot be checked (${MOUNTINFO} unreadable)` }; }
+  const unescape = (text) => text.replace(/\\([0-7]{3})/g, (_, octal) => String.fromCharCode(Number.parseInt(octal, 8)));
+  const mounts = lines.map((line) => line.split(" ")).filter((fields) => fields.length > 6).map((fields) => ({
+    id: fields[0], parent: fields[1], point: unescape(fields[4]), readOnly: fields[5].split(",").includes("ro"),
+    fsType: fields[fields.indexOf("-") + 1] || "",
+  }));
+  const ids = new Set(mounts.map((mount) => mount.id));
+  // Der letzte passende Eintrag liegt oben (neuere Mounts stehen weiter hinten).
+  const onTop = (parent, point) => {
+    let current = parent;
+    for (;;) {
+      const next = mounts.findLast((mount) => mount.parent === current.id && mount.point === point && mount !== current);
+      if (!next) return current;
+      current = next;
+    }
+  };
+  const base = mounts.find((mount) => mount.point === "/" && !ids.has(mount.parent));
+  if (!base) return { ok: false, why: "the data lock cannot be checked (no root mount in the mount table)" };
+  const root = onTop(base, "/");
+  const resolve = (target) => {
+    let current = root;
+    let prefix = "";
+    for (const part of target.split("/").filter(Boolean)) {
+      prefix += `/${part}`;
+      current = onTop(current, prefix);
+    }
+    return current;
+  };
+  for (const dataPath of DATA_PATHS) {
+    if (!existsSync(dataPath)) continue;
+    const own = resolve(dataPath);
+    if (own.fsType === "autofs") return { ok: false, why: `the data lock cannot hold: ${dataPath} is an automount (its real mount would arrive writable)` };
+    if (own.point !== dataPath || !own.readOnly) return { ok: false, why: `the data lock is missing: ${dataPath} is not mounted read-only for this run` };
+    for (const point of new Set(mounts.filter((mount) => mount.point.startsWith(`${dataPath}/`)).map((mount) => mount.point))) {
+      const seen = resolve(point);
+      if (seen.fsType === "autofs") return { ok: false, why: `the data lock cannot hold: ${point} is an automount (its real mount would arrive writable)` };
+      if (!seen.readOnly) return { ok: false, why: `the data lock is missing: ${point} is writable for this run` };
+    }
+  }
+  return { ok: true };
+}
+
 // last_run_end is the newest "Finished borgmatic…" line: systemd writes it
 // only when the oneshot backup unit completed successfully. last_run_result
 // (systemd's Result) must also be success, so a later failed run blocks too.
@@ -646,6 +711,11 @@ async function payload(jobId) {
       } else {
         log(`== instance role ${role.role}: the borg target, not a borg client — no backup age check; a local host snapshot instead`);
       }
+      if (net.dataLock) {
+        const lock = dataLockHeld();
+        if (!lock.ok) return finish(state, "preflight_failed", `${lock.why}; nothing was executed`);
+        log(`== data lock: ${DATA_PATHS.join(", ")} read-only for this run (where present)`);
+      }
       const snap = takeSnapshot(jobId, net);
       if (!snap.ok) return finish(state, "preflight_failed", `${snap.why}; nothing was executed`);
       state.snapshot = snap.record;
@@ -660,6 +730,12 @@ async function payload(jobId) {
     state.phase = "running";
     saveState(state);
     spawnSync(SYSTEMCTL, ["is-system-running", "--wait"], { encoding: "utf8", timeout: 600000 });
+    // Auch die neue Unit nach dem Neustart steht unter der Datensperre — geprüft,
+    // wenn der Start des Systems durch ist (später eingehängte Mounts kämen sonst rw dazu).
+    if (state.mutates && NETS[state.role]?.dataLock) {
+      const lock = dataLockHeld();
+      if (!lock.ok) return finish(state, "failed", `${lock.why}; the run stops before step ${state.nextStep + 1}`);
+    }
   }
 
   for (let index = state.nextStep; index < manifest.steps.length; index += 1) {
