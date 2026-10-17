@@ -426,6 +426,13 @@ Commit, dann self.update auf den Merge — so fehlt die Rolle nie, wenn der neue
 Ein self.update direkt auf den Merge hinterlässt den neuen Helfer ohne Rolle: verändernde Läufe
 scheitern dann sicher (`no instance role`), bis ein weiterer self.update das neue Skript laufen lässt.
 
+Ausrollen der Datensperre (17.10.2026) folgt demselben Muster: auf Lab0 zuerst self.update auf den
+Commit mit der Sperre (das alte Skript installiert neues Skript und neuen Helfer; bis zum nächsten
+Schritt scheitern verändernde Läufe sicher an der fehlenden Rolle), dann self.update auf den Merge
+(das neue Skript legt die Rolle). Das erste Update prüft noch das alte Update-Review mit dem G5 von
+vor dem 16.10.; sein Befund geht einmal an Jochen. Auf dem VPS (schon auf dem ersten Commit von
+#52, Rolle liegt) genügt ein self.update auf den Merge.
+
 Das Cockpit selbst kommt auf Lab0 weiterhin über das typisierte Selbst-Update mit eigener Kopie und
 Rückfall (`doc/setup/self-update.md`, „Lab0: snapshot and rollback“), nicht durch diese Tür.
 
