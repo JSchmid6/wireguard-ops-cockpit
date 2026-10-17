@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildHostRunReviewPrompt,
+  HOST_RUN_REVIEW_INSTRUCTIONS,
   classifyHostRunFocus,
   hostRunManifestHash,
   hostRunPlannerContract,
@@ -124,6 +125,20 @@ describe("doorkeeper focus", () => {
 });
 
 describe("buildHostRunReviewPrompt", () => {
+  it("names the host of the door: production text by default and for vps, Lab0 text only for role lab0", () => {
+    const vps = buildHostRunReviewPrompt(parsed(), { nonce: "n", role: "vps" }).prompt;
+    const none = buildHostRunReviewPrompt(parsed(), { nonce: "n" }).prompt;
+    const lab0 = buildHostRunReviewPrompt(parsed(), { nonce: "n", role: "lab0" }).prompt;
+    expect(none).toBe(vps);
+    expect(vps.startsWith(HOST_RUN_REVIEW_INSTRUCTIONS)).toBe(true);
+    expect(vps).toContain("the steps below run as root on the production host — Nextcloud");
+    expect(lab0).toContain("general host door on Lab0 (10.0.0.5)");
+    expect(lab0).toContain("The borg repository here is family data");
+    expect(lab0).not.toContain("run as root on the production host");
+    // Everything after the opening paragraph is the same contract on both hosts.
+    expect(lab0.slice(lab0.indexOf("Underneath you"))).toBe(vps.slice(vps.indexOf("Underneath you")));
+  });
+
   it("shows every step and check line with its id between nonce markers", () => {
     const material = buildHostRunReviewPrompt(parsed(), { nonce: "n0nce" });
     expect(material.complete).toBe(true);

@@ -2066,7 +2066,7 @@ export async function createApp(options: AppOptions = {}) {
   // The reviewer prompt is kept next to the proposal (<jobId>-host-run-review.md,
   // 0600): exactly what the doorkeeper read.
   async function reviewHostRun(jobId: string, manifest: HostRunManifest, proposalDir: string): Promise<HostRunReviewOutcome> {
-    const material = buildHostRunReviewPrompt(manifest);
+    const material = buildHostRunReviewPrompt(manifest, { role: config.instanceRole ?? null });
     const outcome: HostRunReviewOutcome = { manifestHash: hostRunManifestHash(manifest), complete: material.complete, missing: material.missing, focus: material.focus };
     if (!material.complete) return outcome;
     outcome.reviewPath = path.join(proposalDir, `${jobId}-host-run-review.md`);

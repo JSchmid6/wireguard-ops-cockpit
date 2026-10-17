@@ -363,6 +363,14 @@ Rolle (sudo setzt die Umgebung zurück; der Helfer liest nur diese Datei). Fail 
 Datei, gehört sie nicht root, ist sie für Gruppe/andere schreibbar, steht keine, eine unbekannte
 oder mehr als eine Rolle darin, scheitert der Lauf mit `preflight_failed`, kein Schritt läuft.
 
+Dieselbe Datei sagt dem **Türsteher**, auf welchem Host er steht: Die API-Unit liest sie als
+optionales `EnvironmentFile=-` (systemd liest als root, die API sieht nur `COCKPIT_INSTANCE_ROLE`).
+Mit Rolle `lab0` beginnt seine Anweisung mit Lab0 (Backup-Ziel, borg-Repository = Familiendaten,
+X1/X4), sonst — `vps`, fehlende oder unbekannte Rolle — mit dem strengsten Text, dem
+Produktionshost. Der Rest des Vertrags (X1–X6, Antwortformat) ist auf beiden Hosts gleich. Grund:
+Auf Lab0 hielt der Türsteher einen Lab0-Plan für einen Widerspruch zum Produktionshost (X5) und
+stoppte jeden verändernden Lauf. Die Rolle ändert nur den Text, nie Schloss, Netz oder Riegel.
+
 **vps** (unverändert):
 
 1. `cockpit-borg-action status`: das letzte borg-Backup muss erfolgreich und jünger als 24 h

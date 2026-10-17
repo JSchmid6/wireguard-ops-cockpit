@@ -73,7 +73,7 @@ const planWith = (...manifests: Array<{ version: string }>) => [
   "## Intent", "Keep the host's packages current.",
 ].join("\n");
 
-async function setup(options: { plan: string; doorkeeper: string; intent?: string; ownedByAutomation?: boolean; hostState?: () => Record<string, unknown> | null }) {
+async function setup(options: { plan: string; doorkeeper: string; intent?: string; ownedByAutomation?: boolean; hostState?: () => Record<string, unknown> | null; instanceRole?: "vps" | "lab0" | null }) {
   const dir = mkdtempSync(path.join(tmpdir(), "host-run-flow-"));
   cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
   const seed = new CockpitDatabase(path.join(dir, "cockpit.sqlite"));
@@ -103,7 +103,7 @@ async function setup(options: { plan: string; doorkeeper: string; intent?: strin
     : { ok: true, output: "VERIFICATION_STATUS: passed\nEVIDENCE: no upgradable packages\nREASON: done" });
   const doorkeeperPrompts: string[] = [];
   const app = await createApp({
-    config: config(dir, { executorBrokerSocket: path.join(dir, "executor.sock"), executorBrokerSecret: BROKER_SECRET, agentBrokerSocket: path.join(dir, "agent.sock") }),
+    config: config(dir, { executorBrokerSocket: path.join(dir, "executor.sock"), executorBrokerSecret: BROKER_SECRET, agentBrokerSocket: path.join(dir, "agent.sock"), instanceRole: options.instanceRole ?? null }),
     hostRunReviewRunner: async (prompt) => { doorkeeperPrompts.push(prompt); return options.doorkeeper; },
     hostRunPollMs: 10,
   });
@@ -134,6 +134,17 @@ async function setup(options: { plan: string; doorkeeper: string; intent?: strin
 }
 
 describe("host door through the API", () => {
+  it("tells the doorkeeper on which host it stands: Lab0 from the instance role, the production host without one", async () => {
+    const lab0 = await setup({ plan: planWith(hostRun), doorkeeper: "VERDICT: pass", instanceRole: "lab0" });
+    await lab0.submit();
+    expect(lab0.doorkeeperPrompts[0]).toContain("general host door on Lab0 (10.0.0.5)");
+    expect(lab0.doorkeeperPrompts[0]).not.toContain("run as root on the production host");
+    const unknown = await setup({ plan: planWith(hostRun), doorkeeper: "VERDICT: pass" });
+    await unknown.submit();
+    expect(unknown.doorkeeperPrompts[0]).toContain("run as root on the production host");
+    expect(unknown.doorkeeperPrompts[0]).not.toContain("door on Lab0");
+  });
+
   it("starts the run on the doorkeeper's pass, although rules would have flagged the plan", async () => {
     const flow = await setup({ plan: planWith(hostRun), doorkeeper: "VERDICT: pass\nNOTES: routine apt maintenance" });
     const job = await flow.submit();
