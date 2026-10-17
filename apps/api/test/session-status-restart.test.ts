@@ -96,6 +96,29 @@ describe("session status across an API restart", () => {
     expect(inspect.listAudits().some((entry) => entry.action === "session.ended")).toBe(false);
   });
 
+  it("leaves every session alone and records why when tmux cannot list its sessions at start-up", async () => {
+    const { dir, db, admin } = tempDb();
+    const first = db.upsertSession({ name: "ops", ownerId: admin.id, tmuxSessionName: "cockpit-ops", tmuxBackend: "tmux", terminalUrl: null });
+    const second = db.upsertSession({ name: "hermes-rb-x", ownerId: admin.id, tmuxSessionName: "cockpit-hermes-rb-x", tmuxBackend: "tmux", terminalUrl: null });
+    db.close();
+
+    const failing: TmuxAdapter = {
+      ...fakeTmux([]),
+      listSessions: () => { throw new Error("tmux list-sessions failed: error connecting to /tmp/tmux-0/default (Permission denied)"); },
+    };
+    const app = await createApp({ config: config(dir), tmuxAdapter: failing });
+    cleanup.push(() => app.close());
+    const inspect = new CockpitDatabase(path.join(dir, "cockpit.sqlite"));
+    cleanup.push(() => inspect.close());
+
+    expect(inspect.getSessionById(first.id)?.status).toBe("active");
+    expect(inspect.getSessionById(second.id)?.status).toBe("active");
+    const audits = inspect.listAudits();
+    expect(audits.some((entry) => entry.action === "session.ended")).toBe(false);
+    const skipped = audits.find((entry) => entry.action === "session.sync_skipped");
+    expect(skipped?.details).toEqual(expect.objectContaining({ error: expect.stringContaining("Permission denied") }));
+  });
+
   it("revives an ended session when it is ensured again or tmux shows it again", () => {
     const { db, admin } = tempDb();
     cleanup.push(() => db.close());

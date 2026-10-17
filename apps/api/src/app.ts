@@ -4410,8 +4410,17 @@ Follow these rules:
   // write the same agent log. What must not survive is the record saying
   // "active": every tmux-backed session is set to what tmux shows now. A later
   // launch into an ended session creates its tmux session again and revives it.
+  // listSessions() throws when tmux fails for another reason than "no server";
+  // then nothing is known about the sessions and no record is touched.
   if (tmux.backend === "tmux") {
-    const ended = database.syncTmuxSessionStatus(tmux.listSessions());
+    let liveNames: string[] | null = null;
+    try {
+      liveNames = tmux.listSessions();
+    } catch (error) {
+      const reason = (error instanceof Error ? error.message : String(error)).slice(0, 300);
+      database.createAudit({ actorId: null, action: "session.sync_skipped", targetType: "session", targetId: null, details: { reason: "tmux list-sessions failed at start-up; session status left unchanged", error: reason } });
+    }
+    const ended = liveNames ? database.syncTmuxSessionStatus(liveNames) : [];
     if (ended.length > 0) {
       database.createAudit({ actorId: null, action: "session.ended", targetType: "session", targetId: null, details: { reason: "tmux session missing at start-up", count: ended.length, sessionIds: ended } });
     }
