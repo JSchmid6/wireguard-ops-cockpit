@@ -432,6 +432,26 @@ describe("cockpit-host-run: safety net per instance role", () => {
     nothingRan();
   });
 
+  it.skipIf(!existsSync("/home"))("lab0: an automount on a data path itself stops the run", () => {
+    setRole("COCKPIT_INSTANCE_ROLE=lab0\n");
+    write(path.join(dir, "mountinfo"), mountinfo([[11, 1, "/home", "ro", "autofs"]], [], ["/home"]), 0o644);
+    run(["start"], request(manifest()));
+    const { state } = status();
+    expect(state.status).toBe("preflight_failed");
+    expect(state.error).toContain("/home is an automount");
+    nothingRan();
+  });
+
+  it.skipIf(!existsSync("/home"))("lab0: a writable mount stacked on top of the read-only data path counts, not the one below", () => {
+    setRole("COCKPIT_INSTANCE_ROLE=lab0\n");
+    write(path.join(dir, "mountinfo"), mountinfo([[30, 11, "/home", "rw"]]), 0o644);
+    run(["start"], request(manifest()));
+    const { state } = status();
+    expect(state.status).toBe("preflight_failed");
+    expect(state.error).toContain("/home is not mounted read-only for this run");
+    nothingRan();
+  });
+
   it.skipIf(!existsSync("/mnt"))("lab0: after a reboot the new unit is locked again and checked before the next step", () => {
     setRole("COCKPIT_INSTANCE_ROLE=lab0\n");
     run(["start"], request(manifest({ steps: [

@@ -640,6 +640,7 @@ function dataLockHeld() {
   for (const dataPath of DATA_PATHS) {
     if (!existsSync(dataPath)) continue;
     const own = resolve(dataPath);
+    if (own.fsType === "autofs") return { ok: false, why: `the data lock cannot hold: ${dataPath} is an automount (its real mount would arrive writable)` };
     if (own.point !== dataPath || !own.readOnly) return { ok: false, why: `the data lock is missing: ${dataPath} is not mounted read-only for this run` };
     for (const point of new Set(mounts.filter((mount) => mount.point.startsWith(`${dataPath}/`)).map((mount) => mount.point))) {
       const seen = resolve(point);
