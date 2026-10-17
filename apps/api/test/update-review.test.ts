@@ -142,7 +142,7 @@ describe("self-update pre-install review", () => {
     expect(text).toMatch(/G2 Lock[^\n]*at the start and again on every resume[^\n]*manifestHash[^\n]*an envelope signed for a blocked job never opens/);
     expect(text).toMatch(/G3 Doors: [^\n]*a second general door/);
     expect(text).toMatch(/G5 Sandbox and safety net: [^\n]*on the VPS \(role vps\) it requires a successful borg backup younger than 24 hours and creates a machine snapshot, on Lab0 \(role lab0[^\n]*complete local host snapshot[^\n]*the role comes only from the root-owned instance-role\.env[^\n]*a missing, foreign-writable or unknown role stops the run; if any part fails, no step runs/);
-    expect(text).toMatch(/G5 [^\n]*a role the caller can choose, a missing role treated as a default\) or bypassing the net is a finding/);
+    expect(text).toMatch(/G5 [^\n]*a role the caller can choose, a missing role treated as a default, a data path left writable\) or bypassing the net is a finding/);
     expect(text).toMatch(/G6 Secrets: [^\n]*redacted line by line/);
     expect(text).toMatch(/G9 Doorkeeper: [^\n]*stays isolated[^\n]*A pass counts only with complete material/);
     expect(text).toMatch(/G10 Backup bolt: [^\n]*starts only with operatorApproved, even when the doorkeeper passes[^\n]*three places/);
@@ -153,8 +153,8 @@ describe("self-update pre-install review", () => {
 
   it("stops when a focus-area file is larger than a whole pass", () => {
     const big = section("apps/api/src/hermes-security.ts", ["@@ -1,400 +1,400 @@", ...Array.from({ length: 400 }, (_, index) => `+line ${index} ${"x".repeat(60)}`)]);
-    const { prompts, coverage } = buildUpdateReviewPrompt([diff({ excerpt: [big] })], { nonce: NONCE, limit: 15_000 });
-    expect(prompts.every((prompt) => Buffer.byteLength(prompt) <= 15_000)).toBe(true);
+    const { prompts, coverage } = buildUpdateReviewPrompt([diff({ excerpt: [big] })], { nonce: NONCE, limit: 16_000 });
+    expect(prompts.every((prompt) => Buffer.byteLength(prompt) <= 16_000)).toBe(true);
     // Never cut into pieces: left out whole, and that stops.
     expect(coverage[0]).toMatchObject({ incomplete: ["apps/api/src/hermes-security.ts"], cut: [], omitted: ["apps/api/src/hermes-security.ts"] });
     expect(prompts.join("\n")).toContain("The excerpt is INCOMPLETE. Cut: none. Left out: apps/api/src/hermes-security.ts.");
@@ -299,7 +299,7 @@ describe("self-update pre-install review", () => {
     const { prompts, coverage } = buildUpdateReviewPrompt([diff({
       files: [...diff().files, { status: "M", path: "Dockerfile.api", added: 400, deleted: 400, class: "other" }],
       filesTotal: 3, excerpt: [...diff().excerpt, huge],
-    })], { nonce: NONCE, limit: 15_000 });
+    })], { nonce: NONCE, limit: 16_000 });
     expect(coverage[0]).toMatchObject({ cut: [], omitted: ["Dockerfile.api"], incomplete: ["Dockerfile.api"] });
     expect(prompts.join("\n")).toContain("Left out: Dockerfile.api.");
     const policy = applyUpdateReviewPolicy(readyPolicy, outcome({ coverage, answer: parseUpdateReviewAnswer("VERDICT: approve") }));
@@ -379,7 +379,7 @@ describe("self-update pre-install review", () => {
       files: [{ status: "D", path: "test/example.test.sh", added: 0, deleted: 400, class: "test-deleted" }], filesTotal: 1,
       focusAreas: [area("tests-deleted", ["test/example.test.sh"], [])],
       excerpt: [section("test/example.test.sh", ["@@ -1,400 +0,0 @@", ...Array.from({ length: 400 }, (_, index) => `-check ${index} ${"z".repeat(60)}`)])],
-    })], { nonce: NONCE, limit: 15_000 });
+    })], { nonce: NONCE, limit: 16_000 });
     expect(deleted.coverage[0].incomplete).toEqual(["test/example.test.sh"]);
   });
 

@@ -395,11 +395,21 @@ Maschinen-Snapshot passen dort nicht (Lauf 98a12e31 vom 16.10.2026 scheiterte ge
    nicht liegen. Die fünf jüngsten bleiben, rotiert wird nur die eigene Namensform; zu wenig
    Platz (< 256 MB) verweigert.
 2. Keine borg-Prüfung: das Backup, das auf Lab0 liegt, sichert den VPS, nicht Lab0.
+3. **Datensperre** (Jochen, 17.10.2026 — G5 für die Rolle lab0): die Lauf-Unit hängt die Datenpfade
+   `/media` (mit dem borg-Repo `/media/RAID/backup_VServer/borg`), `/home`, `/mnt` und `/srv`
+   schreibgeschützt ein (`systemd-run --property=ReadOnlyPaths=-<pfad>`, fehlende Pfade entfallen).
+   Vor dem ersten Schritt — und nach einem Neustart vor dem nächsten — prüft der Lauf in
+   `/proc/self/mountinfo`, dass jeder vorhandene Datenpfad ein eigener ro-Mount ist und jeder Mount
+   darunter (`/media/RAID`) ebenfalls; sonst `preflight_failed`, kein Schritt.
 
 Ehrliche Grenze von lab0: der Host-Snapshot ist kein Maschinen-Snapshot. Er deckt Konfiguration,
-Paketstand und Unit-Zustände, **keine Daten** (`/media`, `/home`, `/var/lib`, das borg-Repo) und
-keinen Paketinhalt (ein Downgrade braucht die alte Version aus dem Archiv). Für Läufe, die dort
-Daten ändern, bleibt der Türsteher die Grenze (X4: Verlust jenseits des Netzes).
+Paketstand und Unit-Zustände, keine Daten und keinen Paketinhalt (ein Downgrade braucht die alte
+Version aus dem Archiv). Die Daten schützt statt eines Rückwegs die Datensperre: ein Lauf schreibt
+dort nicht. Sie fängt Versehen, nicht Absicht — root kann über eine andere Unit (`systemd-run`, ein
+Dienst, den der Plan startet oder ändert), ein `mount -o remount`, `nsenter` oder einen Pfad außerhalb
+der vier doch an Daten; solche Wege sind Sache des Türstehers (X4). `/var/lib` bleibt beschreibbar
+(dpkg, systemd), ist also nicht gesperrt. Dienste, die ein Lauf nur startet oder stoppt (etwa
+`android-emulator`), laufen in ihrer eigenen Unit und sind von der Sperre nicht betroffen.
 
 Scheitert ein Teil des Netzes, läuft kein Schritt (`preflight_failed`). Scheitert später ein Schritt
 oder eine Prüfung, nennt das Protokoll die Snapshot-Kennung (`machine snapshot …` bzw.
@@ -538,7 +548,8 @@ hebt. Der Normalfall ist Durchlaufen. Das gilt für beide Prüfungen: den Türst
   alt/gescheitert, Snapshot scheitert, lesender Lauf; je Instanzrolle: vps unverändert, lab0 mit
   Host-Snapshot statt borg/Hoster — auch mit dem echten `cockpit-host-snapshot` —, Rolle fehlt,
   unbekannt, doppelt, schreibbar oder nur in der Umgebung → `preflight_failed`, Host-Snapshot
-  scheitert oder fehlt → `preflight_failed`, nichts ausgeführt), Tür (Fehler, Zeitlimit, Prüfschritte,
+  scheitert oder fehlt → `preflight_failed`, nichts ausgeführt; lab0-Datensperre: ReadOnlyPaths an
+  der Unit, schreibbarer Datenpfad oder Untermount bzw. fehlende Sperre → `preflight_failed`), Tür (Fehler, Zeitlimit, Prüfschritte,
   Schwärzung, Neustart mit Fortsetzung, ein Lauf zur Zeit), unterbrechungssichere Schritte mit
   Attrappen für dpkg/apt-get/ss (langsamer apt überzieht ohne Abbruch, Meldung, harte Obergrenze
   mit Operator-Meldung, Erkennung schlägt `false`, Aufräumen sshd → dpkg → apt-get -f → Dienste;

@@ -43,6 +43,8 @@ function hookEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
     HOST_RUN_SNAPSHOT: path.join(dir, "snapshot"),
     HOST_RUN_HOST_SNAPSHOT: path.join(dir, "host-snapshot"),
     HOST_RUN_BOOT_ID_FILE: path.join(dir, "boot_id"),
+    // Lab0-Datensperre: die Mounts, wie systemd sie mit ReadOnlyPaths anlegt.
+    HOST_RUN_MOUNTINFO: path.join(dir, "mountinfo"),
     // Paketwerkzeuge der Schritte (dpkg, apt-get, ss) sind Attrappen: kein Test
     // fasst die echte Paketverwaltung an, auch nicht der Aufräumweg.
     HOST_RUN_STEP_PATH: path.join(dir, "bin"),
@@ -51,6 +53,13 @@ function hookEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
     STUB_DIR: dir,
     ...extra,
   };
+}
+
+// /proc/self/mountinfo, wie die Lauf-Unit es mit der Datensperre sieht; rw: Pfade ohne Sperre.
+function mountinfo(extra: string[] = [], rw: string[] = []) {
+  return ["/", "/media", "/home", "/mnt", "/srv", ...extra]
+    .map((point, index) => `${index + 20} 1 8:1 / ${point.replace(/ /g, "\\040")} ${point === "/" || rw.includes(point) ? "rw" : "ro"},relatime shared:1 - ext4 /dev/sda1 rw`)
+    .join("\n") + "\n";
 }
 
 function run(args: string[], input = "", extra: Record<string, string> = {}) {
@@ -127,11 +136,12 @@ beforeEach(() => {
   // Die Instanzrolle legt das Deploy; ohne Angabe im Test ist es der VPS (wie bisher).
   write(path.join(dir, "etc", "instance-role.env"), "COCKPIT_INSTANCE_ROLE=vps\n", 0o600);
   write(path.join(dir, "boot_id"), "boot-a\n", 0o644);
+  write(path.join(dir, "mountinfo"), mountinfo(), 0o644);
   // systemd-run: record the unit, run the command after `--` in the foreground.
   write(path.join(dir, "systemd-run"), [
     "#!/bin/bash",
     "[ -n \"${STUB_SYSTEMD_RUN_FAIL:-}\" ] && { echo 'Failed to start transient service' >&2; exit 1; }",
-    "for a in \"$@\"; do case \"$a\" in --unit=*) echo \"${a#--unit=}\" >> \"$STUB_DIR/units.log\";; --property=RuntimeMaxSec=*) echo \"${a#--property=}\" >> \"$STUB_DIR/runtime.log\";; esac; done",
+    "for a in \"$@\"; do case \"$a\" in --unit=*) echo \"${a#--unit=}\" >> \"$STUB_DIR/units.log\";; --property=RuntimeMaxSec=*) echo \"${a#--property=}\" >> \"$STUB_DIR/runtime.log\";; --property=ReadOnlyPaths=*) echo \"${a#--property=}\" >> \"$STUB_DIR/readonly.log\";; esac; done",
     "while [ \"$1\" != -- ]; do shift; done; shift",
     "COCKPIT_HOST_RUN_IN_UNIT=1 \"$@\"",
   ].join("\n"));
@@ -374,6 +384,54 @@ describe("cockpit-host-run: safety net per instance role", () => {
     expect(existsSync(path.join(dir, "snapshot.log"))).toBe(false);
     expect(logTail).toContain("instance role lab0: the borg target, not a borg client");
     expect(logTail).toContain("== host snapshot cockpit-run-job-1");
+  });
+
+  it("lab0: the run unit mounts the data paths read-only and the run confirms the lock", () => {
+    setRole("COCKPIT_INSTANCE_ROLE=lab0\n");
+    run(["start"], request(manifest()));
+    const { state, logTail } = status();
+    expect(state.status).toBe("success");
+    expect(readFileSync(path.join(dir, "readonly.log"), "utf8").trim().split("\n"))
+      .toEqual(["ReadOnlyPaths=-/media", "ReadOnlyPaths=-/home", "ReadOnlyPaths=-/mnt", "ReadOnlyPaths=-/srv"]);
+    expect(logTail).toContain("== data lock: /media, /home, /mnt, /srv read-only");
+  });
+
+  it("vps: no data lock on the run unit (borg and the machine snapshot cover the data)", () => {
+    run(["start"], request(manifest()));
+    expect(status().state.status).toBe("success");
+    expect(existsSync(path.join(dir, "readonly.log"))).toBe(false);
+  });
+
+  it("lab0: a writable data path stops the run before any step", () => {
+    setRole("COCKPIT_INSTANCE_ROLE=lab0\n");
+    write(path.join(dir, "mountinfo"), mountinfo([], ["/home"]), 0o644);
+    run(["start"], request(manifest()));
+    const { state } = status();
+    expect(state.status).toBe("preflight_failed");
+    expect(state.error).toContain("/home is writable for this run");
+    nothingRan();
+  });
+
+  it("lab0: a writable mount below a data path (the borg repo's RAID) stops the run", () => {
+    if (!existsSync("/media")) return; // Prüfung gilt nur für vorhandene Pfade
+    setRole("COCKPIT_INSTANCE_ROLE=lab0\n");
+    write(path.join(dir, "mountinfo"), mountinfo(["/media/RAID"], ["/media/RAID"]), 0o644);
+    run(["start"], request(manifest()));
+    const { state } = status();
+    expect(state.status).toBe("preflight_failed");
+    expect(state.error).toContain("/media/RAID is writable for this run");
+    nothingRan();
+  });
+
+  it("lab0: a data path without its own read-only mount stops the run (lock not applied)", () => {
+    if (!existsSync("/home")) return; // Prüfung gilt nur für vorhandene Pfade
+    setRole("COCKPIT_INSTANCE_ROLE=lab0\n");
+    write(path.join(dir, "mountinfo"), mountinfo().split("\n").filter((line) => !line.includes(" /home ")).join("\n"), 0o644);
+    run(["start"], request(manifest()));
+    const { state } = status();
+    expect(state.status).toBe("preflight_failed");
+    expect(state.error).toContain("/home is not mounted read-only");
+    nothingRan();
   });
 
   it("lab0: names the host snapshot as the return path when a step fails", () => {
