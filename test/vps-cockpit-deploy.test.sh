@@ -88,7 +88,7 @@ chmod 755 "$FIX/stub/"*
 
 targets() { grep -oE '^  "[^"|]+\|[^"|]+\|' "$SCRIPT" | cut -d'|' -f2 | sed -E \
   -e 's#\$LIB#/usr/local/lib/wireguard-ops-cockpit#' -e 's#\$SBIN#/usr/local/sbin#' \
-  -e 's#\$UNITS#/etc/systemd/system#' -e 's#\$SUDOERS#/etc/sudoers.d/cockpit-executor#'; }
+  -e 's#\$UNITS#/etc/systemd/system#' -e 's#\$SUDOERS#/etc/sudoers.d/cockpit-executor#' -e 's#^\$ROOT##'; }
 fresh_host() { # host root: half the targets with old bytes, the other half absent; repo at A
   rm -rf "$FIX/root" "$FIX/repo" "$FIX/calls.log" "$FIX/fail-visudo" "$FIX/fail-build" "$FIX/fail-webbuild" "$FIX/web-active" \
     "$FIX/web-built" "$FIX/web-swapped" "$FIX/web-stale" "$FIX/fail-webps"
@@ -125,6 +125,7 @@ start_before_build() { awk '/systemctl start wireguard-ops-cockpit-web/{s=NR} /c
 fresh_host; code=0; deploy "$B" now || code=$?
 check "Erfolg: Exit 0" '[ "$code" = 0 ]'
 check "Erfolg: alle Ziele mit neuen Bytes (außer dem Skript selbst)" '[ "$(count_B)" = "$(( $(targets | wc -l) - 1 ))" ]'
+check "Erfolg: Instanzrolle der Tür installiert (root, 0600)" '[ "$(stat -c "%a %U" "$FIX/root/etc/wireguard-ops-cockpit/instance-role.env")" = "600 root" ] && grep -q "^B deploy/vps/instance-role.env" "$FIX/root/etc/wireguard-ops-cockpit/instance-role.env"'
 check "Erfolg: self-update.env mit Web-Unit in der Dienstliste" 'grep -q "COCKPIT_SELF_UPDATE_SERVICES=.*wireguard-ops-cockpit-web" "$FIX/root/etc/wireguard-ops-cockpit/self-update.env"'
 check "Erfolg: state.json verbucht B" 'grep -q "\"deployed_commit\": \"$B\"" "$FIX/root/var/lib/wireguard-ops-cockpit/self-update/state.json"'
 check "Erfolg: Web-Abbild gebaut, nicht per up umgeschaltet" 'grep -q "^docker compose .* build web" "$FIX/calls.log" && ! grep -q "^docker compose .* up" "$FIX/calls.log"'

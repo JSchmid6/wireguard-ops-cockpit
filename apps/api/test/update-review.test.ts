@@ -141,7 +141,8 @@ describe("self-update pre-install review", () => {
     expect(text).toMatch(/G1 Approval: [^\n]*Bearer tokens \(the agent\) can never approve[^\n]*never set operatorApproved or gatePassed/);
     expect(text).toMatch(/G2 Lock[^\n]*at the start and again on every resume[^\n]*manifestHash[^\n]*an envelope signed for a blocked job never opens/);
     expect(text).toMatch(/G3 Doors: [^\n]*a second general door/);
-    expect(text).toMatch(/G5 Sandbox and safety net: [^\n]*successful borg backup younger than 24 hours and creates a machine snapshot; if either fails, no step runs/);
+    expect(text).toMatch(/G5 Sandbox and safety net: [^\n]*on the VPS \(role vps\) it requires a successful borg backup younger than 24 hours and creates a machine snapshot, on Lab0 \(role lab0[^\n]*complete local host snapshot[^\n]*the role comes only from the root-owned instance-role\.env[^\n]*a missing, foreign-writable or unknown role stops the run; if any part fails, no step runs/);
+    expect(text).toMatch(/G5 [^\n]*a role the caller can choose, a missing role treated as a default\) or bypassing the net is a finding/);
     expect(text).toMatch(/G6 Secrets: [^\n]*redacted line by line/);
     expect(text).toMatch(/G9 Doorkeeper: [^\n]*stays isolated[^\n]*A pass counts only with complete material/);
     expect(text).toMatch(/G10 Backup bolt: [^\n]*starts only with operatorApproved, even when the doorkeeper passes[^\n]*three places/);

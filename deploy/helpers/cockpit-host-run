@@ -22,11 +22,17 @@
 //              dieselbe Erkennung wie in der API; installiert neben diesem
 //              Helfer). Was der Riegel nur als Hinweis für den Türsteher meldet
 //              (backupGuardFocus), hat der Türsteher schon gelesen.
-//   Netz       Vor einem Lauf, der den Systemzustand ändert (mutates, Standard):
-//              das letzte borg-Backup muss jünger als 24 h sein, dann ein
-//              Maschinen-Snapshot beim Hoster (cockpit-vps-snapshot, rotiert den
-//              ältesten cockpit-eigenen). Scheitert eines davon, läuft kein
-//              Schritt.
+//   Netz       Vor einem Lauf, der den Systemzustand ändert (mutates, Standard),
+//              je Instanzrolle (vom Deploy root-eigen in instance-role.env gelegt,
+//              nie aus Plan, Manifest oder Umgebung des Aufrufers):
+//                vps   das letzte borg-Backup muss jünger als 24 h sein, dann ein
+//                      Maschinen-Snapshot beim Hoster (cockpit-vps-snapshot,
+//                      rotiert den ältesten cockpit-eigenen);
+//                lab0  das borg-Ziel, kein borg-Client, ohne Hoster: ein lokaler
+//                      Host-Snapshot (cockpit-host-snapshot: /etc, Paketstand,
+//                      Unit-Zustände).
+//              Fehlt die Rolle, ist sie unbekannt oder scheitert ein Teil des
+//              Netzes, läuft kein Schritt (preflight_failed).
 //   Kein Abbruch  Ein Schritt, der Zustand ändert (Pakete, GitLab,
 //              Migrationen, docker compose, Umschalten), wird am Zeitlimit nie
 //              beendet: der Helfer meldet „läuft länger als geplant“ und
@@ -58,7 +64,7 @@
 // test/cockpit-host-run.test.sh um. Über sudo kommen sie nie an (env_reset),
 // und die Units setzen nur COCKPIT_HOST_RUN_IN_UNIT.
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, openSync, fsyncSync, closeSync } from "node:fs";
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, openSync, fsyncSync, closeSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -72,6 +78,14 @@ const SYSTEMD_RUN = env.HOST_RUN_SYSTEMD_RUN || "/usr/bin/systemd-run";
 const SYSTEMCTL = env.HOST_RUN_SYSTEMCTL || "/usr/bin/systemctl";
 const BORG_STATUS = env.HOST_RUN_BORG_STATUS ? [env.HOST_RUN_BORG_STATUS] : ["/usr/local/sbin/cockpit-borg-action", "status"];
 const SNAPSHOT = env.HOST_RUN_SNAPSHOT ? [env.HOST_RUN_SNAPSHOT] : ["/usr/bin/python3", "/usr/local/lib/wireguard-ops-cockpit/cockpit-vps-snapshot"];
+const HOST_SNAPSHOT = env.HOST_RUN_HOST_SNAPSHOT ? [env.HOST_RUN_HOST_SNAPSHOT] : ["/usr/bin/python3", "/usr/local/lib/wireguard-ops-cockpit/cockpit-host-snapshot"];
+// Das Netz je Instanzrolle (doc/setup/host-run.md, „Netz je Instanzrolle“).
+// Beide Snapshot-Werkzeuge antworten in derselben Form ({snapshot: {snapshotId}}).
+const NETS = {
+  vps: { borg: true, kind: "machine", snapshot: SNAPSHOT, args: ["--wait", "900"] },
+  lab0: { borg: false, kind: "host", snapshot: HOST_SNAPSHOT, args: [] },
+};
+const ROLE_FILE = "instance-role.env";
 const BOOT_ID_FILE = env.HOST_RUN_BOOT_ID_FILE || "/proc/sys/kernel/random/boot_id";
 const SELF = fileURLToPath(import.meta.url);
 const STEP_PATH = `${env.HOST_RUN_STEP_PATH ? `${env.HOST_RUN_STEP_PATH}:` : ""}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
@@ -338,7 +352,7 @@ function startLocked(manifest, envelope) {
     mutates: manifest.mutates, phase: "preflight", status: "running", nextStep: 0, boots: [bootId()],
     steps: manifest.steps.map((step, index) => ({ index: index + 1, name: step.name, reboot: step.reboot === true, status: "pending" })),
     checks: manifest.checks.map((check, index) => ({ index: index + 1, name: check.name, status: "pending" })),
-    borg: null, snapshot: null, error: null, startedAt: now(), updatedAt: now(), finishedAt: null,
+    role: null, borg: null, snapshot: null, error: null, startedAt: now(), updatedAt: now(), finishedAt: null,
   };
   saveStateStrict(state);
   const problem = startUnit(envelope.jobId, runtimeBudget(manifest));
@@ -549,8 +563,27 @@ function finish(state, status, error = null) {
   saveState(state);
   log(`== ${now()} run finished: ${status}${error ? ` — ${error}` : ""}`);
   if (state.snapshot?.snapshotId && status !== "success") {
-    log(`== return path: machine snapshot ${state.snapshot.snapshotId} (revert only with operator approval)`);
+    log(`== return path: ${state.snapshot.kind || "machine"} snapshot ${state.snapshot.snapshotId} (revert only with operator approval)`);
   }
+}
+
+// Die Rolle kommt nur aus der Datei, die das Deploy root-eigen in CONFIG_DIR legt
+// (vps-cockpit-deploy.sh bzw. homeserver-cockpit-deploy.sh). Sie muss dem
+// gehören, der diesen Helfer ausführt (root: sudo und die Lauf-Unit), und darf
+// für Gruppe und andere nicht schreibbar sein. Fehlt sie, ist sie fremd oder
+// unbekannt: kein Netz, kein Lauf.
+function instanceRole() {
+  const file = `${CONFIG_DIR}/${ROLE_FILE}`;
+  let info;
+  try { info = lstatSync(file); } catch { return { ok: false, why: `no instance role (${ROLE_FILE} is missing; the deploy script installs it)` }; }
+  if (!info.isFile() || info.uid !== process.getuid() || (info.mode & 0o022) !== 0) {
+    return { ok: false, why: `the instance role file ${ROLE_FILE} is not a root-owned regular file without group/other write` };
+  }
+  const roles = envValues(ROLE_FILE).filter(([key]) => key === "COCKPIT_INSTANCE_ROLE").map(([, value]) => value);
+  if (roles.length !== 1 || !Object.hasOwn(NETS, roles[0])) {
+    return { ok: false, why: `unknown instance role (${roles.length === 1 ? JSON.stringify(roles[0].slice(0, 40)) : `${roles.length} entries`})` };
+  }
+  return { ok: true, role: roles[0] };
 }
 
 // last_run_end is the newest "Finished borgmatic…" line: systemd writes it
@@ -571,19 +604,20 @@ function borgFresh() {
   return { ok: true, record };
 }
 
-function takeSnapshot(jobId) {
+function takeSnapshot(jobId, net) {
   // Der Hoster nimmt höchstens 30 Zeichen (10.10.2026: HTTP 400 bei
   // cockpit-run-<volle UUID>, 48 Zeichen). Die ersten 8 Zeichen der Job-ID
   // genügen zum Wiederfinden; die Snapshot-ID steht ohnehin im Laufzustand.
   const name = `cockpit-run-${jobId.slice(0, 8)}`.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, SNAPSHOT_NAME_MAX);
-  const made = spawnSync(SNAPSHOT[0], [...SNAPSHOT.slice(1), "create", name, "--wait", "900"], {
+  const what = `${net.kind} snapshot`;
+  const made = spawnSync(net.snapshot[0], [...net.snapshot.slice(1), "create", name, ...net.args], {
     encoding: "utf8", timeout: 1000000, maxBuffer: 1024 * 1024, env: { PATH: STEP_PATH, LANG: "C.UTF-8" },
   });
-  if (made.status !== 0) return { ok: false, why: `machine snapshot failed: ${(made.stderr || "").trim().slice(-400)}` };
+  if (made.status !== 0) return { ok: false, why: `${what} failed: ${(made.stderr || made.error?.message || `exit ${made.status}`).trim().slice(-400)}` };
   let result;
-  try { result = JSON.parse(made.stdout); } catch { return { ok: false, why: "machine snapshot returned no result" }; }
-  if (!result?.snapshot?.snapshotId) return { ok: false, why: "machine snapshot returned no id" };
-  return { ok: true, record: { snapshotId: result.snapshot.snapshotId, name: result.snapshot.name, rotated: result.rotated || null, seconds: result.seconds ?? null } };
+  try { result = JSON.parse(made.stdout); } catch { return { ok: false, why: `${what} returned no result` }; }
+  if (!result?.snapshot?.snapshotId) return { ok: false, why: `${what} returned no id` };
+  return { ok: true, record: { kind: net.kind, snapshotId: result.snapshot.snapshotId, name: result.snapshot.name, rotated: result.rotated || null, seconds: result.seconds ?? null } };
 }
 
 async function payload(jobId) {
@@ -598,15 +632,24 @@ async function payload(jobId) {
   if (state.phase === "preflight") {
     log(`== ${now()} host run ${jobId}: ${manifest.name} (ordered by ${state.actorId}, unit ${state.unit})`);
     if (manifest.mutates) {
-      const borg = borgFresh();
-      state.borg = borg.record || null;
+      const role = instanceRole();
+      state.role = role.role || null;
       saveState(state);
-      if (!borg.ok) return finish(state, "preflight_failed", `${borg.why}; nothing was executed`);
-      log(`== borg: last backup ${borg.record.lastRunEnd} (${borg.record.ageHours} h ago)`);
-      const snap = takeSnapshot(jobId);
+      if (!role.ok) return finish(state, "preflight_failed", `${role.why}; nothing was executed`);
+      const net = NETS[role.role];
+      if (net.borg) {
+        const borg = borgFresh();
+        state.borg = borg.record || null;
+        saveState(state);
+        if (!borg.ok) return finish(state, "preflight_failed", `${borg.why}; nothing was executed`);
+        log(`== instance role ${role.role}; borg: last backup ${borg.record.lastRunEnd} (${borg.record.ageHours} h ago)`);
+      } else {
+        log(`== instance role ${role.role}: the borg target, not a borg client — no backup age check; a local host snapshot instead`);
+      }
+      const snap = takeSnapshot(jobId, net);
       if (!snap.ok) return finish(state, "preflight_failed", `${snap.why}; nothing was executed`);
       state.snapshot = snap.record;
-      log(`== machine snapshot ${snap.record.snapshotId}${snap.record.rotated ? ` (rotated ${snap.record.rotated.snapshotId})` : ""}`);
+      log(`== ${net.kind} snapshot ${snap.record.snapshotId}${snap.record.rotated ? ` (rotated ${snap.record.rotated.snapshotId})` : ""}`);
     } else {
       log("== declared read-only (mutates false): no snapshot, no backup check");
     }

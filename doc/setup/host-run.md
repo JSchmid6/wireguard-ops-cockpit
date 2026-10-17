@@ -33,7 +33,8 @@ Planer ──► Plan mit einem ```host-run-Manifest (cockpit-host-run/v1)
         ──► Executor-Broker host.run ──► sudo cockpit-host-run.mjs start
               prüft das Schloss, legt /var/lib/wireguard-ops-cockpit/host-runs/<job>/ an,
               startet die Unit cockpit-host-run-<job> und kehrt sofort zurück
-        ──► Unit: borg jünger als 24 h? Snapshot beim Hoster. Schritte. Prüfschritte.
+        ──► Unit: Netz je Instanzrolle (VPS: borg jünger als 24 h? Snapshot beim Hoster.
+              Lab0: lokaler Host-Snapshot). Schritte. Prüfschritte.
         ──► API folgt mit host.status, danach unabhängige Verifikation wie bisher
 ```
 
@@ -349,7 +350,28 @@ sshd lief nicht mehr.
 ## 4. Netz darunter
 
 Vor jedem Lauf mit `mutates: true` (Standard; nur ein ausdrücklich lesender Plan setzt `false`,
-und das prüft der Türsteher):
+und das prüft der Türsteher) spannt der Helfer das Netz seiner Instanz.
+
+### Netz je Instanzrolle (16.10.2026)
+
+Es bleibt **eine** Tür, ein Helfer und ein Envelope; nur das Netz hängt an der Rolle der Instanz.
+Die Rolle steht in `/etc/wireguard-ops-cockpit/instance-role.env` (`COCKPIT_INSTANCE_ROLE=vps|lab0`,
+root, 0600). Diese Datei legt **nur das Deploy** ab — `vps-cockpit-deploy.sh` aus
+`deploy/vps/instance-role.env` (Tabelle, mit Rückfall), `homeserver-cockpit-deploy.sh` aus
+`deploy/lab0/instance-role.env`. Plan, Manifest, Envelope und Umgebung des Aufrufers tragen keine
+Rolle (sudo setzt die Umgebung zurück; der Helfer liest nur diese Datei). Fail closed: fehlt die
+Datei, gehört sie nicht root, ist sie für Gruppe/andere schreibbar, steht keine, eine unbekannte
+oder mehr als eine Rolle darin, scheitert der Lauf mit `preflight_failed`, kein Schritt läuft.
+
+Dieselbe Datei sagt dem **Türsteher**, auf welchem Host er steht: Die API-Unit liest sie als
+optionales `EnvironmentFile=-` (systemd liest als root, die API sieht nur `COCKPIT_INSTANCE_ROLE`).
+Mit Rolle `lab0` beginnt seine Anweisung mit Lab0 (Backup-Ziel, borg-Repository = Familiendaten,
+X1/X4), sonst — `vps`, fehlende oder unbekannte Rolle — mit dem strengsten Text, dem
+Produktionshost. Der Rest des Vertrags (X1–X6, Antwortformat) ist auf beiden Hosts gleich. Grund:
+Auf Lab0 hielt der Türsteher einen Lab0-Plan für einen Widerspruch zum Produktionshost (X5) und
+stoppte jeden verändernden Lauf. Die Rolle ändert nur den Text, nie Schloss, Netz oder Riegel.
+
+**vps** (unverändert):
 
 1. `cockpit-borg-action status`: das letzte borg-Backup muss erfolgreich und jünger als 24 h
    sein. `last_run_end` ist die jüngste „Finished borgmatic…“-Zeile, die systemd nur beim
@@ -358,14 +380,44 @@ und das prüft der Türsteher):
 2. `cockpit-vps-snapshot create cockpit-run-<job> --wait 900`: Maschinen-Snapshot beim Hoster;
    ist das Kontingent voll, rotiert das Werkzeug den ältesten cockpit-eigenen Snapshot.
 
-Scheitert eines davon, läuft kein Schritt (`preflight_failed`). Scheitert später ein Schritt oder
-eine Prüfung, nennt das Protokoll die Snapshot-Kennung; zurückgespielt wird er nur mit Jochens
-Freigabe (ein Revert nimmt alles seit dem Snapshot mit).
+**lab0**: Lab0 ist das borg-**Ziel**, kein borg-Client, und hat keinen Hoster — borg-Frische und
+Maschinen-Snapshot passen dort nicht (Lauf 98a12e31 vom 16.10.2026 scheiterte genau daran:
+„borg status failed (exit null)“, die VPS-Werkzeuge fehlen auf Lab0). Stattdessen:
 
-Auf Lab0 gibt es keins von beiden (Lab0 ist selbst die Backup-Kiste): verändernde Läufe scheitern
-dort im Preflight, gewollt. Das Cockpit selbst kommt auf Lab0 über das typisierte Selbst-Update mit
-eigener Kopie und Rückfall (`doc/setup/self-update.md`, „Lab0: snapshot and rollback“), nicht durch
-diese Tür.
+1. `cockpit-host-snapshot create cockpit-run-<job>`
+   (`/usr/local/lib/wireguard-ops-cockpit/cockpit-host-snapshot`, Muster wie
+   `cockpit-self-update-snapshot`): lokale Kopie dessen, was ein Verwaltungslauf ändert —
+   ganz `/etc` (damit Units und Drop-ins unter `/etc/systemd`), die Paketauswahl mit Versionen
+   (`dpkg-query`) und welche Units eingeschaltet und aktiv waren (`systemctl list-unit-files`,
+   `list-units --all`). Ablage `/var/lib/wireguard-ops-cockpit-host-snapshots/<name>/` (0700,
+   Dateien 0600 — `/etc` enthält Geheimnisse), das `/etc`-Archiv wird gleich nach dem Schreiben
+   zurückgelesen, das Manifest (`complete: true`) entsteht zuletzt; ein halber Snapshot bleibt
+   nicht liegen. Die fünf jüngsten bleiben, rotiert wird nur die eigene Namensform; zu wenig
+   Platz (< 256 MB) verweigert.
+2. Keine borg-Prüfung: das Backup, das auf Lab0 liegt, sichert den VPS, nicht Lab0.
+
+Ehrliche Grenze von lab0: der Host-Snapshot ist kein Maschinen-Snapshot. Er deckt Konfiguration,
+Paketstand und Unit-Zustände, **keine Daten** (`/media`, `/home`, `/var/lib`, das borg-Repo) und
+keinen Paketinhalt (ein Downgrade braucht die alte Version aus dem Archiv). Für Läufe, die dort
+Daten ändern, bleibt der Türsteher die Grenze (X4: Verlust jenseits des Netzes).
+
+Scheitert ein Teil des Netzes, läuft kein Schritt (`preflight_failed`). Scheitert später ein Schritt
+oder eine Prüfung, nennt das Protokoll die Snapshot-Kennung (`machine snapshot …` bzw.
+`host snapshot …`); zurückgespielt wird nur mit Jochens Freigabe — beim Maschinen-Snapshot ein
+Revert (nimmt alles seit dem Snapshot mit), beim Host-Snapshot gezielt einzelne Dateien
+(`tar -xzf <ablage>/<name>/etc.tar.gz -C / etc/<pfad>`) bzw. Paket-/Unit-Stand nach den Listen.
+
+Ausrollen: Rolle und Lab0-Werkzeug installiert das jeweils **neue** Deploy-Skript. self.update ruft
+aber das **installierte** Skript auf; der erste self.update auf einen Stand mit diesem Netz läuft
+also noch mit dem alten Skript, das nur das neue Skript (und den neuen Helfer) installiert. Deshalb
+liegt das Netz in zwei Commits: der erste bringt Deploy-Skripte, Rolle und Werkzeug (der Helfer
+bleibt alt), der zweite den Helfer, die Texte für Türsteher und Update-Review und diese Doku. Reihenfolge je Instanz: self.update auf den ersten
+Commit, dann self.update auf den Merge — so fehlt die Rolle nie, wenn der neue Helfer sie verlangt.
+Ein self.update direkt auf den Merge hinterlässt den neuen Helfer ohne Rolle: verändernde Läufe
+scheitern dann sicher (`no instance role`), bis ein weiterer self.update das neue Skript laufen lässt.
+
+Das Cockpit selbst kommt auf Lab0 weiterhin über das typisierte Selbst-Update mit eigener Kopie und
+Rückfall (`doc/setup/self-update.md`, „Lab0: snapshot and rollback“), nicht durch diese Tür.
 
 Der Plan braucht Prüfschritte und einen Rückweg (`rollback`, Pflichtfeld). Ein Neustart ist ein
 gewöhnlicher Schritt (`{"name":"reboot","reboot":true}`, höchstens drei): der Lauf schreibt
@@ -483,7 +535,10 @@ hebt. Der Normalfall ist Durchlaufen. Das gilt für beide Prüfungen: den Türst
 
 - `apps/api/test/host-run-helper.test.ts`: der echte Helfer mit Stubs für systemd-run,
   systemctl, borg und Snapshot — Schloss (Signatur, Ablauf, Drift, Capability), Netz (borg zu
-  alt/gescheitert, Snapshot scheitert, lesender Lauf), Tür (Fehler, Zeitlimit, Prüfschritte,
+  alt/gescheitert, Snapshot scheitert, lesender Lauf; je Instanzrolle: vps unverändert, lab0 mit
+  Host-Snapshot statt borg/Hoster — auch mit dem echten `cockpit-host-snapshot` —, Rolle fehlt,
+  unbekannt, doppelt, schreibbar oder nur in der Umgebung → `preflight_failed`, Host-Snapshot
+  scheitert oder fehlt → `preflight_failed`, nichts ausgeführt), Tür (Fehler, Zeitlimit, Prüfschritte,
   Schwärzung, Neustart mit Fortsetzung, ein Lauf zur Zeit), unterbrechungssichere Schritte mit
   Attrappen für dpkg/apt-get/ss (langsamer apt überzieht ohne Abbruch, Meldung, harte Obergrenze
   mit Operator-Meldung, Erkennung schlägt `false`, Aufräumen sshd → dpkg → apt-get -f → Dienste;
@@ -500,4 +555,8 @@ hebt. Der Normalfall ist Durchlaufen. Das gilt für beide Prüfungen: den Türst
 - `apps/api/test/host-run-resume.test.ts`: API-Neustart während eines Laufs (Broker als Fakes),
   auch wenn die API zwischen Start und Startmarke starb (`hostRunRequestedAt`).
 - `apps/executor-broker/test/index.test.mjs`: `host.run`/`host.status`.
-- `test/vps-cockpit-deploy.test.sh`: Helfer und Resume-Unit in der Deploy-Tabelle, Unit aktiviert.
+- `apps/api/test/host-snapshot.test.ts`: `cockpit-host-snapshot` selbst — vollständige, private
+  Kopie (`/etc`-Archiv gelesen, Paket- und Unit-Listen, Manifest zuletzt), Rotation nur der eigenen
+  Namensform, Name/Bestand/Platz verweigert, kein halber Snapshot bei einem Fehler.
+- `test/vps-cockpit-deploy.test.sh`: Helfer, Resume-Unit und Instanzrolle in der Deploy-Tabelle
+  (Rolle root 0600, Rückfall bytegenau), Unit aktiviert.

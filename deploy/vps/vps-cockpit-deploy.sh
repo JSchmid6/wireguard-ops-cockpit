@@ -104,6 +104,9 @@ readonly TABLE=(
   # Zustandsschritte nie mittendrin abbrechen: die eine Erkennung, die der Helfer importiert.
   "deploy/helpers/cockpit-state-steps.mjs|$LIB/cockpit-state-steps.mjs|644"
   "deploy/systemd/wireguard-ops-cockpit-host-run-resume.service|$UNITS/wireguard-ops-cockpit-host-run-resume.service|644"
+  # Instanzrolle der Tür (Netz je Rolle, doc/setup/host-run.md): vps = borg-Frische +
+  # Hoster-Snapshot. Ohne diese Datei scheitert jeder verändernde Lauf im Preflight.
+  "deploy/vps/instance-role.env|$ROOT/etc/wireguard-ops-cockpit/instance-role.env|600"
 )
 
 log() { echo "[vps-cockpit-deploy $(date -u +%H:%M:%S)] $*"; }

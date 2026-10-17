@@ -135,6 +135,10 @@ HOST_DOOR_FILES = (
     "deploy/helpers/cockpit-borg-retention-rules.mjs",
     "deploy/helpers/cockpit-state-steps.mjs",
     "deploy/systemd/wireguard-ops-cockpit-host-run-resume.service",
+    # The net per instance role: Lab0's host snapshot and the deploy-installed roles.
+    "deploy/helpers/cockpit-host-snapshot",
+    "deploy/lab0/instance-role.env",
+    "deploy/vps/instance-role.env",
 )
 # File-level focus: (kind, guarantees, reason, matcher).
 FILE_AREAS = (

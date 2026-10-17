@@ -218,11 +218,14 @@ copy is complete, so a failed copy (e.g. no space) leaves the live tree as it
 was.
 
 **What this is not:** a net for general host changes. The general door
-(`cockpit-host-run`) keeps requiring a borg backup and a machine snapshot for
-`mutates: true`; on Lab0 neither exists, so mutating host runs keep failing
-their preflight there, on purpose — a copy of the Cockpit's files is no way back
-for packages or a kernel. Cockpit code reaches Lab0 only through this typed
-self-update (doorkeeper X2 sends Cockpit code changes here anyway).
+(`cockpit-host-run`) has its own net per instance role since 16.10.2026
+(`doc/setup/host-run.md`, „Netz je Instanzrolle“): on the VPS a borg backup and
+a machine snapshot, on Lab0 a local host snapshot (`cockpit-host-snapshot`:
+`/etc`, package selection, unit states). The role file
+`/etc/wireguard-ops-cockpit/instance-role.env` belongs to this footprint, so a
+rolled-back update removes or restores it with the helper it belongs to. Cockpit
+code reaches Lab0 only through this typed self-update (doorkeeper X2 sends
+Cockpit code changes here anyway).
 
 **Rollout on Lab0.** The runner calls the installed
 `/usr/local/lib/wireguard-ops-cockpit/homeserver-cockpit-deploy.sh`; the
@@ -265,7 +268,7 @@ Flow of a Hermes change job whose plan contains `self.update <sha>` lines:
    | `update-mechanism` | G7 | the self-update helper, runner, snapshot helper, Lab0 deploy script, unit, `update-review.ts`, `update-review-prompt.ts` |
    | `envelope-signing` | G2 | hunks touching `signEnvelope`, `verifyExecutionEnvelopeSignature`, `approveExecutionEnvelope`, `createExecutionEnvelope`, `validateExecutionEnvelope`, and `verifyEnvelope` in the capability helper |
    | `broker-validation` | G3 | hunks touching `validateRequest`/`signature` in the executor broker |
-   | `host-door` | G2/G5/G6/G9/G10 | the general door: `apps/api/src/host-run.ts`, `deploy/helpers/cockpit-host-run`, `cockpit-backup-guard.mjs`, `cockpit-borg-retention-rules.mjs`, `cockpit-state-steps.mjs`, the host-run resume unit |
+   | `host-door` | G2/G5/G6/G9/G10 | the general door: `apps/api/src/host-run.ts`, `deploy/helpers/cockpit-host-run`, `cockpit-backup-guard.mjs`, `cockpit-borg-retention-rules.mjs`, `cockpit-state-steps.mjs`, the host-run resume unit, Lab0's net `cockpit-host-snapshot` and the two deploy-installed role files `deploy/{vps,lab0}/instance-role.env` |
    | `approval-and-auth`, `brokers-and-agents`, `capability-sandbox`, `root-helpers`, `ci` | G1/G6, G3/G6, G5, G4/G5, G7 | file-level areas |
    | `dependencies` | G8 | `package.json` hunks; lockfiles are summarized as a package list with install scripts and non-registry sources first |
    | `tests-deleted` | — | deleted test files |
@@ -411,7 +414,7 @@ finding names a concrete way **past** one of its guards, or a weakening of it:
 | G2 Lock | HMAC envelope (timing-safe, host secret), bound to plan and `manifestHash`, with expiry, capability and the job id (its form; the run directory is named by it); the root helper checks it at the start and on every resume; a blocked job's envelope never opens. |
 | G3 Doors | `host.run` is the one general door; every other action stays typed and narrow. No second general door, no way into `host.run` past G2, G9, G10. |
 | G4 Root helpers and sudoers | narrow, typed; the host-run helper keeps exactly `start` and `status <job>`. |
-| G5 Sandbox and safety net | the special doors' sandbox is not broader; `host.run` has none by design, but before every run with `mutates: true` a fresh successful borg backup (< 24 h) and a machine snapshot, otherwise no step runs. Snapshot revert/delete stays the operator's decision (at the door through the doorkeeper's X4, not a rule). |
+| G5 Sandbox and safety net | the special doors' sandbox is not broader; `host.run` has none by design, but before every run with `mutates: true` the net of the instance role, otherwise no step runs: role `vps` a fresh successful borg backup (< 24 h) and a machine snapshot; role `lab0` (the borg target, no hoster) a complete local host snapshot (`/etc`, packages, unit states). The role comes only from the root-owned `instance-role.env` the deploy installs; missing, foreign-writable or unknown → no step runs (16.10.2026). Snapshot revert/delete stays the operator's decision (at the door through the doorkeeper's X4, not a rule). |
 | G6 Secrets | redaction of outputs, logs and prompts; the host-run log redacted line by line and 0600. The doorkeeper's unredacted material is intended. |
 | G7, G8 | unchanged (self-update path, dependencies). |
 | G9 Doorkeeper | isolated safety review; a pass only with complete material; incomplete or unreadable review and findings without evidence stop without a pass; its finding classes (secrets/egress, authority, exposure, loss of the way back, false read-only claim, hidden code, injection) do not narrow. |

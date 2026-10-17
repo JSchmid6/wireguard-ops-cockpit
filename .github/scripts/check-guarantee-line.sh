@@ -11,7 +11,7 @@
 set -euo pipefail
 
 base="${1:?usage: check-guarantee-line.sh <base-ref>}"
-guarded='^(deploy/helpers/cockpit-(host-run|backup-guard\.|borg-retention-rules\.|state-steps\.|self-update-|dienste-update-action)|apps/api/src/(update-review|update-review-prompt|host-run|hermes-security)\.ts$|doc/setup/self-update\.md$)'
+guarded='^(deploy/helpers/cockpit-(host-run|host-snapshot|backup-guard\.|borg-retention-rules\.|state-steps\.|self-update-|dienste-update-action)|apps/api/src/(update-review|update-review-prompt|host-run|hermes-security)\.ts$|doc/setup/self-update\.md$)'
 
 hits="$(git diff --name-only "${base}...HEAD" | grep -E "${guarded}" || true)"
 if [ -z "${hits}" ]; then

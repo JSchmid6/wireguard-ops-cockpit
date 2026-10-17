@@ -1,0 +1,182 @@
+#!/usr/bin/python3
+# cockpit-host-snapshot — the safety net of the general door on Lab0
+# (doc/setup/host-run.md, "Netz je Instanzrolle").
+#
+# Not a sudo target and not meant to be run by hand: only cockpit-host-run
+# calls it (as root, inside the run unit), before the first step of a run with
+# mutates true on an instance whose deploy-installed role is lab0.
+#
+#   create <name>   copy the host state a host run can change into <store>/<name>/
+#   list            the snapshots in the store (JSON)
+#
+# Why not borg and the hoster snapshot as on the VPS: Lab0 *is* the borg
+# backup target, not a borg client, and has no hoster. Its net is this local
+# copy of what an administrative run changes: the whole configuration (/etc,
+# including units and drop-ins below /etc/systemd), the package selection with
+# versions, and which units were enabled and active. It is not a copy of data
+# (/media, /home, /var/lib) and never touches the borg repository.
+#
+# Return path: the operator's decision, like a revert of the VPS snapshot.
+#   tar -xzf <store>/<name>/etc.tar.gz -C / etc/<path>   one file back
+#   packages.tsv, unit-files.txt, units.txt               the state before the run
+#
+# The store (/var/lib/wireguard-ops-cockpit-host-snapshots, 0700, owned by the
+# user running this helper — root) holds secrets from /etc and is therefore not
+# below /var/lib/wireguard-ops-cockpit (wgops writes there). `create` keeps the
+# newest KEEP snapshots (default 5) and removes only snapshots of its own name
+# form; it refuses when the free space is too small. A snapshot counts only with
+# its manifest (written last, complete: true); /etc must have been archived and
+# read back.
+#
+# Output of `create` is the shape cockpit-vps-snapshot prints, so the host-run
+# helper reads both the same way:
+#   {"snapshot": {"snapshotId", "name", "path"}, "rotated": {"snapshotId"}|null, "seconds"}
+#
+# Exit codes: 0 ok, 64 usage, 65 refused (name, store), 66 no space,
+# 67 copy failed.
+#
+# Harness hooks (test only, never set in production; cockpit-host-run starts this
+# helper with a clean environment): COCKPIT_HOST_SNAPSHOT_ROOT prefixes /etc,
+# COCKPIT_HOST_SNAPSHOT_STORE moves the store, _KEEP and _MARGIN as named.
+import datetime
+import hashlib
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import time
+
+ROOT = os.environ.get("COCKPIT_HOST_SNAPSHOT_ROOT", "").rstrip("/")
+STORE = os.environ.get("COCKPIT_HOST_SNAPSHOT_STORE") or "/var/lib/wireguard-ops-cockpit-host-snapshots"
+KEEP = int(os.environ.get("COCKPIT_HOST_SNAPSHOT_KEEP", "5"))
+MARGIN = int(os.environ.get("COCKPIT_HOST_SNAPSHOT_MARGIN", str(256 * 1024 * 1024)))
+# cockpit-host-run names it cockpit-run-<first 8 characters of the job id>.
+NAME_RE = re.compile(r"^cockpit-run-[A-Za-z0-9._-]{1,40}$")
+
+
+class Failure(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def utcnow():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def check_store():
+    if os.path.lexists(STORE):
+        info = os.lstat(STORE)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise Failure(65, "snapshot store %s is not a directory of the running user" % STORE)
+    else:
+        os.makedirs(STORE, mode=0o700)
+    os.chmod(STORE, 0o700)
+
+
+def run(argv, path):
+    with open(path, "w", encoding="utf-8") as handle:
+        done = subprocess.run(argv, stdout=handle, stderr=subprocess.PIPE, text=True)
+    if done.returncode != 0:
+        raise Failure(67, "%s failed (exit %s): %s" % (argv[0], done.returncode, done.stderr.strip()[-300:]))
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def snapshots():
+    """Complete snapshots of our name form, oldest first."""
+    found = []
+    for name in os.listdir(STORE):
+        manifest = os.path.join(STORE, name, "manifest.json")
+        if not NAME_RE.match(name) or not os.path.isfile(manifest):
+            continue
+        try:
+            with open(manifest, encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if data.get("complete") is True:
+            found.append((data.get("createdAt", ""), name, data))
+    return sorted(found)
+
+
+def create(name):
+    if not NAME_RE.match(name):
+        raise Failure(64, "snapshot name must look like cockpit-run-<job>")
+    check_store()
+    target = os.path.join(STORE, name)
+    if os.path.lexists(target):
+        raise Failure(65, "snapshot %s exists already" % name)
+    if shutil.disk_usage(STORE).free < MARGIN:
+        raise Failure(66, "less than %d MB free in %s" % (MARGIN // (1024 * 1024), STORE))
+    started = time.monotonic()
+    work = os.path.join(STORE, ".new-" + name)
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work, mode=0o700)
+    try:
+        archive = os.path.join(work, "etc.tar.gz")
+        # GNU tar exit 1 = a file changed while it was read (logs, resolv.conf): the
+        # archive is complete; 2 is fatal. Read back right after, or it does not count.
+        packed = subprocess.run(["tar", "--create", "--gzip", "--numeric-owner", "--file", archive,
+                                 "-C", ROOT + "/", "etc"], capture_output=True, text=True)
+        if packed.returncode not in (0, 1):
+            raise Failure(67, "archiving /etc failed (exit %s): %s" % (packed.returncode, packed.stderr.strip()[-300:]))
+        listed = subprocess.run(["tar", "--list", "--gzip", "--file", archive], capture_output=True, text=True)
+        entries = [line for line in listed.stdout.splitlines() if line.strip()]
+        if listed.returncode != 0 or not entries:
+            raise Failure(67, "the /etc archive does not read back (exit %s)" % listed.returncode)
+        run(["dpkg-query", "-W", "-f", "${Package}\t${Version}\t${db:Status-Abbrev}\n"], os.path.join(work, "packages.tsv"))
+        run(["systemctl", "list-unit-files", "--no-legend", "--no-pager"], os.path.join(work, "unit-files.txt"))
+        run(["systemctl", "list-units", "--all", "--no-legend", "--no-pager", "--plain"], os.path.join(work, "units.txt"))
+        files = sorted(os.listdir(work))
+        for item in files:
+            os.chmod(os.path.join(work, item), 0o600)
+        manifest = {"version": 1, "name": name, "createdAt": utcnow(), "etcEntries": len(entries),
+                    "files": {item: sha256(os.path.join(work, item)) for item in files}, "complete": True}
+        with open(os.path.join(work, "manifest.json"), "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, indent=1)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(os.path.join(work, "manifest.json"), 0o600)
+        os.rename(work, target)
+    except BaseException:
+        shutil.rmtree(work, ignore_errors=True)
+        raise
+    rotated = None
+    for _, old, _ in snapshots()[:-KEEP] if KEEP > 0 else []:
+        if old == name:
+            continue
+        shutil.rmtree(os.path.join(STORE, old), ignore_errors=True)
+        rotated = rotated or {"snapshotId": old}
+    return {"snapshot": {"snapshotId": name, "name": name, "path": target}, "rotated": rotated,
+            "seconds": round(time.monotonic() - started, 1)}
+
+
+def main(argv):
+    if len(argv) == 2 and argv[0] == "create":
+        result = create(argv[1])
+    elif len(argv) == 1 and argv[0] == "list":
+        check_store()
+        result = {"snapshots": [{"name": name, "createdAt": created, "etcEntries": data.get("etcEntries")}
+                                for created, name, data in snapshots()]}
+    else:
+        raise Failure(64, "usage: cockpit-host-snapshot create <name> | list")
+    sys.stdout.write(json.dumps(result) + "\n")
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except Failure as failure:
+        sys.stderr.write(json.dumps({"ok": False, "code": failure.code, "error": failure.message}) + "\n")
+        sys.exit(failure.code)

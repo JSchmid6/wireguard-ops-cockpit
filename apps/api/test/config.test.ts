@@ -3,6 +3,13 @@ import { describe, expect, it } from "vitest";
 import { loadConfig } from "../src/config.js";
 
 describe("loadConfig", () => {
+  it("reads the instance role only as vps or lab0", () => {
+    expect(loadConfig({}).instanceRole).toBeNull();
+    expect(loadConfig({ COCKPIT_INSTANCE_ROLE: "lab0" }).instanceRole).toBe("lab0");
+    expect(loadConfig({ COCKPIT_INSTANCE_ROLE: " vps\n" }).instanceRole).toBe("vps");
+    expect(loadConfig({ COCKPIT_INSTANCE_ROLE: "dev" }).instanceRole).toBeNull();
+  });
+
   it("provides safe local defaults", () => {
     const config = loadConfig({});
 

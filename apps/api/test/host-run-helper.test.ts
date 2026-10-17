@@ -19,6 +19,8 @@ const GUARD = fileURLToPath(new URL("../../../deploy/helpers/cockpit-backup-guar
 // Der Riegel importiert die Grenzen des Aufräum-Diensts; installiert liegen beide nebeneinander.
 const RETENTION_RULES = fileURLToPath(new URL("../../../deploy/helpers/cockpit-borg-retention-rules.mjs", import.meta.url));
 const STATE_STEPS = fileURLToPath(new URL("../../../deploy/helpers/cockpit-state-steps.mjs", import.meta.url));
+const HOST_SNAPSHOT = fileURLToPath(new URL("../../../deploy/helpers/cockpit-host-snapshot", import.meta.url));
+const REPO = fileURLToPath(new URL("../../../", import.meta.url));
 const SECRET = "test-envelope-secret-0123456789";
 const HOSTER_SECRET = "hoster-client-secret-abcdef";
 
@@ -39,6 +41,7 @@ function hookEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
     HOST_RUN_SYSTEMCTL: path.join(dir, "systemctl"),
     HOST_RUN_BORG_STATUS: path.join(dir, "borg-status"),
     HOST_RUN_SNAPSHOT: path.join(dir, "snapshot"),
+    HOST_RUN_HOST_SNAPSHOT: path.join(dir, "host-snapshot"),
     HOST_RUN_BOOT_ID_FILE: path.join(dir, "boot_id"),
     // Paketwerkzeuge der Schritte (dpkg, apt-get, ss) sind Attrappen: kein Test
     // fasst die echte Paketverwaltung an, auch nicht der Aufräumweg.
@@ -121,6 +124,8 @@ beforeEach(() => {
   mkdirSync(path.join(dir, "etc"));
   write(path.join(dir, "etc", "api.env"), `COCKPIT_EXECUTION_ENVELOPE_SECRET=${SECRET}\n`, 0o600);
   write(path.join(dir, "etc", "contabo.env"), `CONTABO_CLIENT_SECRET=${HOSTER_SECRET}\n`, 0o600);
+  // Die Instanzrolle legt das Deploy; ohne Angabe im Test ist es der VPS (wie bisher).
+  write(path.join(dir, "etc", "instance-role.env"), "COCKPIT_INSTANCE_ROLE=vps\n", 0o600);
   write(path.join(dir, "boot_id"), "boot-a\n", 0o644);
   // systemd-run: record the unit, run the command after `--` in the foreground.
   write(path.join(dir, "systemd-run"), [
@@ -157,6 +162,13 @@ beforeEach(() => {
     `echo "$*" >> "${dir}/snapshot.log"`,
     `[ -e "${dir}/snapshot-fail" ] && { echo 'the hoster API refused' >&2; exit 70; }`,
     "echo '{\"snapshot\":{\"snapshotId\":\"snap-42\",\"name\":\"'\"$2\"'\"},\"rotated\":{\"snapshotId\":\"snap-old\"},\"seconds\":12}'",
+  ].join("\n"));
+  // Lab0's local host snapshot (cockpit-host-snapshot): same answer shape, own log.
+  write(path.join(dir, "host-snapshot"), [
+    "#!/bin/bash",
+    `echo "$*" >> "${dir}/host-snapshot.log"`,
+    `[ -e "${dir}/host-snapshot-fail" ] && { echo '{"ok": false, "code": 66, "error": "less than 256 MB free"}' >&2; exit 66; }`,
+    "echo '{\"snapshot\":{\"snapshotId\":\"'\"$2\"'\",\"name\":\"'\"$2\"'\"},\"rotated\":null,\"seconds\":1}'",
   ].join("\n"));
 });
 
@@ -322,6 +334,161 @@ describe("cockpit-host-run: safety net", () => {
     expect(status().state.status).toBe("success");
     expect(existsSync(path.join(dir, "borg.log"))).toBe(false);
     expect(existsSync(path.join(dir, "snapshot.log"))).toBe(false);
+  });
+});
+
+// Netz je Instanzrolle (16.10.2026, Lauf 98a12e31 auf Lab0: „borg status failed
+// (exit null)“ — cockpit-borg-action und cockpit-vps-snapshot gibt es nur auf dem VPS).
+describe("cockpit-host-run: safety net per instance role", () => {
+  const roleFile = () => path.join(dir, "etc", "instance-role.env");
+  const setRole = (text: string, mode = 0o600) => write(roleFile(), text, mode);
+  const nothingRan = () => {
+    expect(existsSync(path.join(dir, "step-one"))).toBe(false);
+    expect(existsSync(path.join(dir, "step-two"))).toBe(false);
+  };
+
+  it("vps (unchanged): borg check and machine snapshot, never the host snapshot", () => {
+    run(["start"], request(manifest()));
+    const { state, logTail } = status();
+    expect(state.status).toBe("success");
+    expect(state.role).toBe("vps");
+    expect(state.borg.lastRunResult).toBe("success");
+    expect(state.snapshot).toMatchObject({ kind: "machine", snapshotId: "snap-42" });
+    expect(readFileSync(path.join(dir, "borg.log"), "utf8").trim()).toBe("borg");
+    expect(readFileSync(path.join(dir, "snapshot.log"), "utf8")).toContain("create cockpit-run-job-1 --wait 900");
+    expect(existsSync(path.join(dir, "host-snapshot.log"))).toBe(false);
+    expect(logTail).toContain("instance role vps; borg: last backup");
+  });
+
+  it("lab0: takes the local host snapshot instead of borg and hoster, then runs the steps", () => {
+    setRole("# vom Deploy\nCOCKPIT_INSTANCE_ROLE=lab0\n");
+    run(["start"], request(manifest()));
+    const { state, logTail } = status();
+    expect(state.status).toBe("success");
+    expect(state.role).toBe("lab0");
+    expect(state.steps.map((step: { status: string }) => step.status)).toEqual(["success", "success"]);
+    expect(state.borg).toBeNull();
+    expect(state.snapshot).toMatchObject({ kind: "host", snapshotId: "cockpit-run-job-1" });
+    expect(readFileSync(path.join(dir, "host-snapshot.log"), "utf8").trim()).toBe("create cockpit-run-job-1");
+    expect(existsSync(path.join(dir, "borg.log"))).toBe(false);
+    expect(existsSync(path.join(dir, "snapshot.log"))).toBe(false);
+    expect(logTail).toContain("instance role lab0: the borg target, not a borg client");
+    expect(logTail).toContain("== host snapshot cockpit-run-job-1");
+  });
+
+  it("lab0: names the host snapshot as the return path when a step fails", () => {
+    setRole("COCKPIT_INSTANCE_ROLE=lab0\n");
+    run(["start"], request(manifest({ steps: [{ name: "fails", run: "exit 3", timeoutSeconds: 30 }] })));
+    const { state, logTail } = status();
+    expect(state.status).toBe("failed");
+    expect(logTail).toContain("return path: host snapshot cockpit-run-job-1 (revert only with operator approval)");
+  });
+
+  it("lab0: a failing host snapshot stops the run before any step", () => {
+    setRole("COCKPIT_INSTANCE_ROLE=lab0\n");
+    writeFileSync(path.join(dir, "host-snapshot-fail"), "");
+    run(["start"], request(manifest()));
+    const { state } = status();
+    expect(state.status).toBe("preflight_failed");
+    expect(state.error).toContain("host snapshot failed");
+    expect(state.error).toContain("nothing was executed");
+    expect(state.snapshot).toBeNull();
+    nothingRan();
+  });
+
+  it("lab0: a missing host snapshot tool stops the run before any step", () => {
+    setRole("COCKPIT_INSTANCE_ROLE=lab0\n");
+    rmSync(path.join(dir, "host-snapshot"));
+    run(["start"], request(manifest()));
+    const { state } = status();
+    expect(state.status).toBe("preflight_failed");
+    expect(state.error).toContain("host snapshot failed");
+    nothingRan();
+  });
+
+  it("no role file: preflight_failed, nothing executed, no net asked", () => {
+    rmSync(roleFile());
+    run(["start"], request(manifest()));
+    const { state } = status();
+    expect(state.status).toBe("preflight_failed");
+    expect(state.error).toContain("no instance role");
+    expect(state.role).toBeNull();
+    nothingRan();
+    for (const tool of ["borg.log", "snapshot.log", "host-snapshot.log"]) expect(existsSync(path.join(dir, tool))).toBe(false);
+  });
+
+  it.each([
+    ["an unknown role", "COCKPIT_INSTANCE_ROLE=kiste\n"],
+    ["an empty role", "COCKPIT_INSTANCE_ROLE=\n"],
+    ["two roles", "COCKPIT_INSTANCE_ROLE=lab0\nCOCKPIT_INSTANCE_ROLE=vps\n"],
+    ["no role line", "# leer\n"],
+  ])("%s: preflight_failed, nothing executed", (_name, text) => {
+    setRole(text);
+    run(["start"], request(manifest()));
+    const { state } = status();
+    expect(state.status).toBe("preflight_failed");
+    expect(state.error).toContain("unknown instance role");
+    nothingRan();
+    for (const tool of ["borg.log", "snapshot.log", "host-snapshot.log"]) expect(existsSync(path.join(dir, tool))).toBe(false);
+  });
+
+  it("a group- or world-writable role file does not count", () => {
+    setRole("COCKPIT_INSTANCE_ROLE=lab0\n", 0o620);
+    run(["start"], request(manifest()));
+    const { state } = status();
+    expect(state.status).toBe("preflight_failed");
+    expect(state.error).toContain("not a root-owned regular file");
+    nothingRan();
+  });
+
+  it("the role never comes from the caller's environment", () => {
+    rmSync(roleFile());
+    run(["start"], request(manifest()), { COCKPIT_INSTANCE_ROLE: "lab0", HOST_RUN_ROLE: "lab0" });
+    expect(status().state.status).toBe("preflight_failed");
+    nothingRan();
+  });
+
+  it("a read-only run needs no role (no net before it)", () => {
+    rmSync(roleFile());
+    run(["start"], request(manifest({ mutates: false })));
+    expect(status().state.status).toBe("success");
+  });
+
+  it("lab0 end to end with the real cockpit-host-snapshot: a complete copy of /etc before the steps", () => {
+    setRole("COCKPIT_INSTANCE_ROLE=lab0\n");
+    const etc = path.join(dir, "fake-root", "etc", "systemd", "system");
+    mkdirSync(etc, { recursive: true });
+    writeFileSync(path.join(etc, "android-adb.service"), "[Service]\nExecStart=/bin/true\n");
+    mkdirSync(path.join(dir, "snapbin"));
+    write(path.join(dir, "snapbin", "dpkg-query"), "#!/bin/bash\nprintf 'adb\\t1:34\\tii \\n'\n");
+    write(path.join(dir, "snapbin", "systemctl"), "#!/bin/bash\necho \"android-adb.service enabled enabled\"\n");
+    // The helper starts the tool with a clean environment: the wrapper carries the hooks.
+    write(path.join(dir, "host-snapshot"), [
+      "#!/bin/bash",
+      `export PATH="${dir}/snapbin:$PATH" COCKPIT_HOST_SNAPSHOT_ROOT="${dir}/fake-root" COCKPIT_HOST_SNAPSHOT_STORE="${dir}/host-snapshots" COCKPIT_HOST_SNAPSHOT_MARGIN=0`,
+      `exec python3 "${HOST_SNAPSHOT}" "$@"`,
+    ].join("\n"));
+    run(["start"], request(manifest()));
+    const { state } = status();
+    expect(state.status).toBe("success");
+    expect(state.snapshot).toMatchObject({ kind: "host", snapshotId: "cockpit-run-job-1" });
+    const stored = JSON.parse(readFileSync(path.join(dir, "host-snapshots", "cockpit-run-job-1", "manifest.json"), "utf8"));
+    expect(stored.complete).toBe(true);
+    expect(Object.keys(stored.files).sort()).toEqual(["etc.tar.gz", "packages.tsv", "unit-files.txt", "units.txt"]);
+    const listed = spawnSync("tar", ["--list", "--gzip", "--file", path.join(dir, "host-snapshots", "cockpit-run-job-1", "etc.tar.gz")], { encoding: "utf8" });
+    expect(listed.stdout).toContain("etc/systemd/system/android-adb.service");
+  });
+
+  it("each deploy script installs its own role, root-owned 0600, and Lab0 the host snapshot tool", () => {
+    expect(readFileSync(path.join(REPO, "deploy/vps/instance-role.env"), "utf8")).toMatch(/^COCKPIT_INSTANCE_ROLE=vps$/m);
+    expect(readFileSync(path.join(REPO, "deploy/lab0/instance-role.env"), "utf8")).toMatch(/^COCKPIT_INSTANCE_ROLE=lab0$/m);
+    const vps = readFileSync(path.join(REPO, "deploy/vps/vps-cockpit-deploy.sh"), "utf8");
+    expect(vps).toContain('"deploy/vps/instance-role.env|$ROOT/etc/wireguard-ops-cockpit/instance-role.env|600"');
+    expect(vps).not.toContain("deploy/lab0/instance-role.env");
+    const lab0 = readFileSync(path.join(REPO, "deploy/lab0/homeserver-cockpit-deploy.sh"), "utf8");
+    expect(lab0).toContain('install -m 600 -o root -g root "$COCKPIT_DIR/deploy/lab0/instance-role.env" "$ENV_DIR/instance-role.env"');
+    expect(lab0).toContain("/usr/local/lib/wireguard-ops-cockpit/cockpit-host-snapshot");
+    expect(lab0).not.toContain("deploy/vps/instance-role.env");
   });
 });
 

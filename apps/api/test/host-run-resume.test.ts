@@ -118,6 +118,9 @@ describe("host run across an API restart", () => {
     expect(String(finished.output?.verification)).toContain("VERIFICATION_STATUS: passed");
     expect(executorCalls.every((call) => call.payload.action === "host.status" && call.payload.target === job.id)).toBe(true);
     expect(agentCalls.map((call) => call.role)).toEqual(["verifier"]);
+    // Same verifier instruction as the direct path: the handoff first, root-only state is no counter-evidence.
+    expect(String(agentCalls[0].prompt)).toContain("First evaluate the supplied signed runner handoff's raw command output");
+    expect(String(agentCalls[0].prompt)).toContain("that is your sandbox, not evidence against the handoff");
     expect(inspect.getJob(other.id)?.status).toBe("failed_execution");
     expect(agentCalls.filter((call) => call.role === "planner")).toHaveLength(0);
   });

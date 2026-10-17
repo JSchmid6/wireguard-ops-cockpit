@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { createApp } from "../src/app.js";
+import { createApp, verifierInstruction } from "../src/app.js";
 import type { AppConfig } from "../src/config.js";
 import { CockpitDatabase } from "../src/db.js";
 
@@ -73,7 +73,7 @@ const planWith = (...manifests: Array<{ version: string }>) => [
   "## Intent", "Keep the host's packages current.",
 ].join("\n");
 
-async function setup(options: { plan: string; doorkeeper: string; intent?: string; ownedByAutomation?: boolean; hostState?: () => Record<string, unknown> | null }) {
+async function setup(options: { plan: string; doorkeeper: string; intent?: string; ownedByAutomation?: boolean; hostState?: () => Record<string, unknown> | null; instanceRole?: "vps" | "lab0" | null }) {
   const dir = mkdtempSync(path.join(tmpdir(), "host-run-flow-"));
   cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
   const seed = new CockpitDatabase(path.join(dir, "cockpit.sqlite"));
@@ -103,7 +103,7 @@ async function setup(options: { plan: string; doorkeeper: string; intent?: strin
     : { ok: true, output: "VERIFICATION_STATUS: passed\nEVIDENCE: no upgradable packages\nREASON: done" });
   const doorkeeperPrompts: string[] = [];
   const app = await createApp({
-    config: config(dir, { executorBrokerSocket: path.join(dir, "executor.sock"), executorBrokerSecret: BROKER_SECRET, agentBrokerSocket: path.join(dir, "agent.sock") }),
+    config: config(dir, { executorBrokerSocket: path.join(dir, "executor.sock"), executorBrokerSecret: BROKER_SECRET, agentBrokerSocket: path.join(dir, "agent.sock"), instanceRole: options.instanceRole ?? null }),
     hostRunReviewRunner: async (prompt) => { doorkeeperPrompts.push(prompt); return options.doorkeeper; },
     hostRunPollMs: 10,
   });
@@ -133,7 +133,31 @@ async function setup(options: { plan: string; doorkeeper: string; intent?: strin
   return { app, cookie, executorCalls, agentCalls, doorkeeperPrompts, submit, submitted, settled, inspect };
 }
 
+describe("verifier instruction", () => {
+  it("lets only a handoff the Cockpit built stand in for root-only state; a runner agent's text proves nothing", () => {
+    const api = verifierInstruction("i", "", true);
+    const agent = verifierInstruction("i");
+    expect(api).toContain("that is your sandbox, not evidence against the handoff");
+    expect(api).toContain("signed runner handoff");
+    expect(agent).not.toContain("your sandbox");
+    expect(agent).not.toContain("signed");
+    expect(agent).toContain("A condition you cannot read yourself is unproven, not passed.");
+    expect(agent).toContain("Do not trust the runner's STATUS claim.");
+  });
+});
+
 describe("host door through the API", () => {
+  it("tells the doorkeeper on which host it stands: Lab0 from the instance role, the production host without one", async () => {
+    const lab0 = await setup({ plan: planWith(hostRun), doorkeeper: "VERDICT: pass", instanceRole: "lab0" });
+    await lab0.submit();
+    expect(lab0.doorkeeperPrompts[0]).toContain("general host door on Lab0 (10.0.0.5)");
+    expect(lab0.doorkeeperPrompts[0]).not.toContain("run as root on the production host");
+    const unknown = await setup({ plan: planWith(hostRun), doorkeeper: "VERDICT: pass" });
+    await unknown.submit();
+    expect(unknown.doorkeeperPrompts[0]).toContain("run as root on the production host");
+    expect(unknown.doorkeeperPrompts[0]).not.toContain("door on Lab0");
+  });
+
   it("starts the run on the doorkeeper's pass, although rules would have flagged the plan", async () => {
     const flow = await setup({ plan: planWith(hostRun), doorkeeper: "VERDICT: pass\nNOTES: routine apt maintenance" });
     const job = await flow.submit();
@@ -147,6 +171,10 @@ describe("host door through the API", () => {
     expect(start.payload.envelope.operatorApproved).toBeUndefined();
     expect(job.output?.result).toContain("STATUS: success");
     expect(flow.agentCalls.map((call) => call.role)).toEqual(["planner", "verifier"]);
+    // Root-only state is the sandbox's blind spot, not counter-evidence (Lab0 c06456ce, 16.10.2026).
+    const verifier = String(flow.agentCalls[1].prompt);
+    expect(verifier).toContain("First evaluate the supplied signed runner handoff's raw command output");
+    expect(verifier).toContain("You run without root: state that only root may read (for example cockpit-self-update-action status");
   });
 
   it("sends an evidenced finding to the operator, and runs exactly that plan after approval", async () => {
@@ -174,6 +202,11 @@ describe("host door through the API", () => {
     expect(start.payload.envelope.gatePassed).toBeUndefined();
     expect(start.payload.envelope).toMatchObject({ operatorApproved: true, manifestHash: (job.output?.envelope as Record<string, unknown>).manifestHash });
     expect(start.payload.manifest).toEqual(job.output?.hostRun);
+    // After the approval the same verifier instruction as on the direct path.
+    const verifier = flow.agentCalls.filter((call) => call.role === "verifier").map((call) => String(call.prompt));
+    expect(verifier).toHaveLength(1);
+    expect(verifier[0]).toContain("First evaluate the supplied signed runner handoff's raw command output");
+    expect(verifier[0]).toContain("that is your sandbox, not evidence against the handoff");
   });
 
   it("keeps a run that deletes backups for the operator although the doorkeeper passed it", async () => {
