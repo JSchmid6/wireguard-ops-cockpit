@@ -130,7 +130,7 @@ async function setup(options: { plan: string; doorkeeper: string; intent?: strin
     expect(created.statusCode).toBe(202);
     return created.json().jobId as string;
   };
-  return { app, cookie, bearer, executorCalls, agentCalls, doorkeeperPrompts, submit, submitted, settled, inspect };
+  return { dir, app, cookie, bearer, executorCalls, agentCalls, doorkeeperPrompts, submit, submitted, settled, inspect };
 }
 
 describe("verifier instruction", () => {
@@ -228,6 +228,29 @@ describe("host door through the API", () => {
     expect(flow.doorkeeperPrompts).toHaveLength(0);
     expect(flow.executorCalls.some((call) => call.payload.action === "host.run")).toBe(false);
     expect(job.output?.hostRun ?? null).toBeNull();
+  });
+
+  // B1 of the second review (t_4e06a3e2): the cleaner had its own bash-fence
+  // regex and cut a shell fence in front of the JSON fence out of the stored
+  // plan, so the job went through the door. The door is decided only by the
+  // plan's script, the FIRST bash/sh fence.
+  it("keeps a shell fence in front of a JSON bash fence on the legacy path", async () => {
+    const flow = await setup({ plan: "```bash\nsystemctl stop android-emulator.service\n```\n```bash\n" + JSON.stringify(hostRun) + "\n```\n## Intent\nKeep the host's packages current.", doorkeeper: "VERDICT: pass" });
+    const job = await flow.submit();
+    expect(flow.doorkeeperPrompts).toHaveLength(0);
+    expect(flow.executorCalls.some((call) => call.payload.action === "host.run")).toBe(false);
+    expect(job.output?.hostRun ?? null).toBeNull();
+  });
+
+  it("stores the shell fence in front of a JSON bash fence in the plan", async () => {
+    const flow = await setup({ plan: "## Intent\nKeep the host's packages current.\n## Plan\n```bash\nsystemctl stop android-emulator.service\n```\n```bash\n" + JSON.stringify(hostRun) + "\n```\n## Risk Zone\nyellow", doorkeeper: "VERDICT: pass" });
+    const job = await flow.submit();
+    expect(flow.doorkeeperPrompts).toHaveLength(0);
+    expect(flow.executorCalls.some((call) => call.payload.action === "host.run")).toBe(false);
+    expect(job.output?.hostRun ?? null).toBeNull();
+    const plan = readFileSync(path.join(flow.dir, "proposals", `${job.id}.md`), "utf-8");
+    expect(plan).toContain("```bash\nsystemctl stop android-emulator.service\n```");
+    expect(plan.indexOf("systemctl stop")).toBeLessThan(plan.indexOf("cockpit-host-run/v1"));
   });
 
   it("sends an evidenced finding to the operator, and runs exactly that plan after approval", async () => {

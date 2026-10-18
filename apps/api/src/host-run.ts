@@ -113,7 +113,7 @@ const HOST_RUN_JSON_FENCE = /```(?:json)?\s*\n([\s\S]*?"version"\s*:\s*"cockpit-
 // run that text anyway, so it is the host door. Shell code never qualifies,
 // not even when it mentions the version string: the whole script must parse
 // as one JSON object that names cockpit-host-run/v1.
-function shellFenceManifest(plan: string): string | null {
+export function shellFenceManifest(plan: string): string | null {
   const script = typedPlanScript(plan).trim();
   if (!script.startsWith("{") || !script.endsWith("}")) return null;
   try {

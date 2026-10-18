@@ -100,6 +100,7 @@ import {
   intentHostRunManifest,
   parseHostRunManifest,
   plannerHostRunCopy,
+  shellFenceManifest,
   parseHostRunReviewAnswer,
   parseHostRunStatus,
   stateStepKinds,
@@ -1803,10 +1804,16 @@ export async function createApp(options: AppOptions = {}) {
       .filter(l => !l.startsWith("timestamp=") && !l.startsWith("tee:") && l.trim() !== "")
       .join("\n");
     // Planner output: preserve a dynamic capability fence even when it precedes legacy markdown sections.
-    // A host-run manifest in a bash/sh fence counts too (parseHostRunManifest, Lab0 job 4553505c).
-    const capabilityStart = noTimestamps.search(
-      /(?:^|\n)```(?:capability|host-run|json)?\s*\n(?=\s*\{[\s\S]{0,1000}?"version"\s*:\s*"cockpit-(?:capability|host-run)\/v1")|(?:^|\n)```(?:bash|sh)\s*\n(?=\s*\{[\s\S]{0,1000}?"version"\s*:\s*"cockpit-host-run\/v1")/i
+    const fenceStart = noTimestamps.search(
+      /(?:^|\n)```(?:capability|host-run|json)?\s*\n(?=\s*\{[\s\S]{0,1000}?"version"\s*:\s*"cockpit-(?:capability|host-run)\/v1")/i
     );
+    // A host-run manifest in a bash/sh fence (Lab0 job 4553505c): the cleaner has
+    // no bash detection of its own. Only when the door's own reader
+    // (shellFenceManifest on typedPlanScript) takes the plan's script as the
+    // manifest is the text kept from the FIRST bash/sh fence on — so a shell
+    // fence in front of a JSON fence is never cut away.
+    const shellStart = shellFenceManifest(noTimestamps) ? noTimestamps.search(/(?:^|\n)```(?:bash|sh)\s*\n/i) : -1;
+    const capabilityStart = fenceStart >= 0 && shellStart >= 0 ? Math.min(fenceStart, shellStart) : Math.max(fenceStart, shellStart);
     const modelStart = noTimestamps.search(/(?:^|\n)## /);
     const contentStart = capabilityStart >= 0 ? capabilityStart + (noTimestamps[capabilityStart] === "\n" ? 1 : 0)
       : modelStart >= 0 ? modelStart + (noTimestamps[modelStart] === "\n" ? 1 : 0) : -1;
