@@ -248,6 +248,8 @@ interface JobRestart {
 
 // Phases in which nothing has run on the host yet: planning and the reviews.
 const REPLANNABLE_PHASES = new Set(["queued", "planning", "reviewing"]);
+// Endstände ohne Lauf auf dem Host, aus denen James einen eigenen Job zurückziehen darf.
+const WITHDRAWABLE_STATUSES = new Set(["pending", "pending_approval", "blocked_user_approval", "blocked_policy", "blocked_prerequisite"]);
 // A job is planned again at most this often; after that it fails with the reason.
 const MAX_JOB_REPLANS = 2;
 // A job whose last progress is older than this is not planned again: whoever
@@ -2222,7 +2224,11 @@ export async function createApp(options: AppOptions = {}) {
   function updateHermesJob(jobId: string, status: JobRecord["status"], detail: HermesExplanation, extra: Record<string, unknown> = {}): JobRecord {
     // The request and the restart record stay with the job through every
     // update: recovery needs the first, cockpit_einblick shows the second.
-    const previous = database.getJob(jobId)?.output || {};
+    const stored = database.getJob(jobId);
+    // Zurückgezogen ist endgültig: Ein Lauf, der noch plant oder prüft, schreibt
+    // danach nichts mehr in den Job (auch kein failed_* für den Circuit Breaker).
+    if (stored?.status === "withdrawn") return stored;
+    const previous = stored?.output || {};
     const carried = Object.fromEntries(["request", "restarts"].filter((key) => key in previous).map((key) => [key, previous[key]]));
     const updated = database.updateJob(jobId, {
       status,
@@ -2498,11 +2504,14 @@ export async function createApp(options: AppOptions = {}) {
         return;
       }
 
-      updateHermesJob(job.id, "running", explanation({
+      const executing = updateHermesJob(job.id, "running", explanation({
         phase: "executing", intent, reason: policy.reason,
         completed: reviewedSteps,
         evidence: [review.summary, ...policy.evidence], rollbackAvailable: policy.rollbackAvailable,
       }), { plan: planText, safety: review, policy, capabilities, manifest, hostRun, envelope, provenance, proposalPath, ...reviewRecord });
+      // James hat den Job zurückgezogen, während er plante oder geprüft wurde:
+      // dann läuft nichts. Zwischen dieser Prüfung und dem Start liegt kein await.
+      if (executing.status === "withdrawn") return;
       const typed = await executeTypedCapabilities(planText, envelope, manifest, updateReview?.outcome.bindings ?? [], hostRun);
       const typedResult = typed?.result ?? null;
       const runnerRaw = typedResult || await runIsolatedRunner(actor, session, planner, proposalPath, planText);
@@ -2819,6 +2828,57 @@ export async function createApp(options: AppOptions = {}) {
       job: withOperatorLink(updated),
       reactivation: { count, remaining: REACTIVATION_MAX_COUNT - count, expiresAt: renewed.expiresAt, notAfter: new Date(notAfter).toISOString() },
     };
+  });
+
+  // Zurückziehen: James nimmt einen eigenen Job zurück, solange auf dem Host
+  // nichts gelaufen ist — er wartet auf Jochen, ist an Policy/Voraussetzung
+  // hängen geblieben oder plant bzw. wird noch geprüft. Das ist keine
+  // Entscheidung über den Plan (die bleibt Jochens Freigabe-Route), sondern der
+  // Besteller zieht seine Bestellung zurück. Nur das Automation-Konto, nur der
+  // eigene Job, Grund Pflicht, auditiert; fremde, laufende und fertige Jobs: 403.
+  app.post("/api/hermes/jobs/:jobId/withdraw", async (request, reply) => {
+    const actor = await requireActor(request, reply, database);
+    if (!actor) return;
+    if (actor.role !== "automation") return reply.code(403).send({ message: "only the ordering automation account withdraws its own job; the operator rejects" });
+    const { jobId } = request.params as { jobId: string };
+    const body = (request.body || {}) as { reason?: unknown };
+    if (typeof body.reason !== "string" || !body.reason.trim()) {
+      return reply.code(400).send({ message: "a reason is required to withdraw a job" });
+    }
+    const reason = body.reason.trim().slice(0, 500);
+    const job = database.getJob(jobId);
+    if (!job || !["hermes-change", "hermes-research"].includes(job.subjectId ?? "")) return reply.code(404).send({ message: "job not found" });
+    if (database.getJobOwnerId(jobId) !== actor.id) {
+      database.createAudit({ actorId: actor.id, action: "hermes.job.withdraw_refused", targetType: "job", targetId: jobId, details: { reason: "foreign job" } });
+      return reply.code(403).send({ message: "only the job's own orderer can withdraw it" });
+    }
+    const phase = String((job.output?.explanation as Record<string, unknown> | undefined)?.phase || "");
+    const output = job.output || {};
+    const startedOnHost = typeof output.hostRunStartedAt === "string" || typeof output.hostRunRequestedAt === "string";
+    const withdrawable = !output.approval && !startedOnHost && (
+      WITHDRAWABLE_STATUSES.has(job.status)
+      || (job.status === "running" && REPLANNABLE_PHASES.has(phase))
+    );
+    if (!withdrawable) {
+      database.createAudit({ actorId: actor.id, action: "hermes.job.withdraw_refused", targetType: "job", targetId: jobId, details: { status: job.status, phase } });
+      return reply.code(403).send({ message: "a job that is executing, decided or finished cannot be withdrawn", status: job.status, phase });
+    }
+    const at = new Date().toISOString();
+    const intent = String((output.explanation as Record<string, unknown> | undefined)?.intent || "Hermes job");
+    const withdrawal = { at, actorId: actor.id, actorName: actor.username, reason, previousStatus: job.status, previousPhase: phase || null };
+    // Nicht über updateHermesJob: Zurückziehen ist kein Fehlschlag der
+    // Änderungslaufzeit und zählt nicht zum Circuit Breaker.
+    const updated = database.updateJob(job.id, {
+      status: "withdrawn", completedAt: at,
+      output: { ...output, withdrawal, explanation: explanation({
+        phase: "finished", intent, reason: `Withdrawn by its orderer: ${reason}`,
+        completed: Array.isArray((output.explanation as Record<string, unknown> | undefined)?.completed)
+          ? (output.explanation as { completed: string[] }).completed : [],
+        recommendedAction: "Nothing ran on the host. Order a new job if the change is still needed.",
+      }) },
+    });
+    database.createAudit({ actorId: actor.id, action: "hermes.job.withdrawn", targetType: "job", targetId: job.id, details: { reason, previousStatus: job.status, previousPhase: phase || null } });
+    return { job: updated };
   });
 
   app.get("/api/pipeline/health", async (request, reply) => {
@@ -4058,8 +4118,9 @@ Follow these rules:
     // A real review finding over a plan that was blocked anyway (prerequisite
     // or policy): nothing to approve — an approval never lifts that block —
     // but the operator must know, and a revised plan whose new review passes
-    // must not bury it. Listed for seven days; James forwards it.
-    const reviewFindings = (["blocked_prerequisite", "blocked_policy"] as const)
+    // must not bury it. Listed for seven days; James forwards it. A job James
+    // withdrew keeps its finding listed: withdrawing must not hide it either.
+    const reviewFindings = (["blocked_prerequisite", "blocked_policy", "withdrawn"] as const)
       .flatMap((status) => database.listJobsByStatus("hermes-change", status))
       .filter((job) => visible(job.id) && Date.parse(job.updatedAt) >= now - 7 * 24 * 3_600_000)
       .flatMap((job) => {

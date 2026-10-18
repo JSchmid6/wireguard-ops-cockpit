@@ -73,7 +73,7 @@ const planWith = (...manifests: Array<{ version: string }>) => [
   "## Intent", "Keep the host's packages current.",
 ].join("\n");
 
-async function setup(options: { plan: string; doorkeeper: string; intent?: string; ownedByAutomation?: boolean; hostState?: () => Record<string, unknown> | null; instanceRole?: "vps" | "lab0" | null }) {
+async function setup(options: { plan: string; doorkeeper: string; intent?: string; ownedByAutomation?: boolean; hostState?: () => Record<string, unknown> | null; instanceRole?: "vps" | "lab0" | null; doorkeeperWait?: Promise<void> }) {
   const dir = mkdtempSync(path.join(tmpdir(), "host-run-flow-"));
   cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
   const seed = new CockpitDatabase(path.join(dir, "cockpit.sqlite"));
@@ -83,7 +83,7 @@ async function setup(options: { plan: string; doorkeeper: string; intent?: strin
   // Im Betrieb bestellt James mit seinem Automation-Konto; die Sitzung gehört
   // dann ihm, freigeben tut Jochens Admin-Sitzung.
   const owner = options.ownedByAutomation ? seed.createUser("hermes-automation", "unusable-random-password", "automation") : admin;
-  const bearer = options.ownedByAutomation ? seed.rotateApiToken(owner.id, "hermes", ["POST /api/hermes/runbook"]) : null;
+  const bearer = options.ownedByAutomation ? seed.rotateApiToken(owner.id, "hermes", ["POST /api/hermes/runbook", "POST /api/hermes/jobs/:jobId/withdraw"]) : null;
   const session = seed.upsertSession({ name: "hermes-flow", ownerId: owner.id, tmuxSessionName: "cockpit-hermes-flow", tmuxBackend: "tmux", terminalUrl: null });
   seed.close();
 
@@ -104,7 +104,7 @@ async function setup(options: { plan: string; doorkeeper: string; intent?: strin
   const doorkeeperPrompts: string[] = [];
   const app = await createApp({
     config: config(dir, { executorBrokerSocket: path.join(dir, "executor.sock"), executorBrokerSecret: BROKER_SECRET, agentBrokerSocket: path.join(dir, "agent.sock"), instanceRole: options.instanceRole ?? null }),
-    hostRunReviewRunner: async (prompt) => { doorkeeperPrompts.push(prompt); return options.doorkeeper; },
+    hostRunReviewRunner: async (prompt) => { doorkeeperPrompts.push(prompt); await options.doorkeeperWait; return options.doorkeeper; },
     hostRunPollMs: 10,
   });
   cleanup.push(() => app.close());
@@ -130,7 +130,7 @@ async function setup(options: { plan: string; doorkeeper: string; intent?: strin
     expect(created.statusCode).toBe(202);
     return created.json().jobId as string;
   };
-  return { app, cookie, executorCalls, agentCalls, doorkeeperPrompts, submit, submitted, settled, inspect };
+  return { app, cookie, bearer, executorCalls, agentCalls, doorkeeperPrompts, submit, submitted, settled, inspect };
 }
 
 describe("verifier instruction", () => {
@@ -156,6 +156,31 @@ describe("host door through the API", () => {
     await unknown.submit();
     expect(unknown.doorkeeperPrompts[0]).toContain("run as root on the production host");
     expect(unknown.doorkeeperPrompts[0]).not.toContain("door on Lab0");
+  });
+
+  it("runs nothing when James withdraws the job while the doorkeeper still reviews it", async () => {
+    let release!: () => void;
+    const doorkeeperWait = new Promise<void>((resolve) => { release = resolve; });
+    const flow = await setup({ plan: planWith(hostRun), doorkeeper: "VERDICT: pass", ownedByAutomation: true, doorkeeperWait });
+    const jobId = await flow.submitted();
+    const deadline = Date.now() + 10_000;
+    while (flow.doorkeeperPrompts.length === 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(flow.inspect.getJob(jobId)?.output?.explanation).toMatchObject({ phase: "reviewing" });
+
+    const withdrawn = await flow.app.inject({ method: "POST", url: `/api/hermes/jobs/${jobId}/withdraw`, headers: { authorization: `Bearer ${flow.bearer}` }, payload: { reason: "Karte erledigt, Auftrag neu bestellt" } });
+    expect(withdrawn.statusCode).toBe(200);
+    release();
+    // Nach der Freigabe des Tuersteherlaufs: Policy, Envelope, Startpruefung -- ohne
+    // weitere Agentenaufrufe; 500 ms reichen um Groessenordnungen (Red-Check: ohne
+    // Waechter steht der Job in dieser Zeit schon auf "completed").
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    const job = flow.inspect.getJob(jobId)!;
+    expect(job.status).toBe("withdrawn");
+    expect(job.output?.withdrawal).toMatchObject({ reason: "Karte erledigt, Auftrag neu bestellt", previousStatus: "running", previousPhase: "reviewing" });
+    expect(flow.executorCalls.some((call) => call.payload.action === "host.run")).toBe(false);
+    expect(flow.agentCalls.map((call) => call.role)).toEqual(["planner"]);
+    expect(flow.inspect.hasAudit("hermes.change.failed", jobId)).toBe(false);
   });
 
   it("starts the run on the doorkeeper's pass, although rules would have flagged the plan", async () => {

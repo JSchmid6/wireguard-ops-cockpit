@@ -1,10 +1,16 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { formatOutput, request } from "./lib";
+import { formatOutput, request, withdrawalReason } from "./lib";
 
 describe("web request helpers", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+  });
+
+  it("shows the reason of a job James withdrew", () => {
+    expect(withdrawalReason({ withdrawal: { reason: " Karte erledigt " } })).toBe(": Karte erledigt");
+    expect(withdrawalReason({ withdrawal: {} })).toBe("");
+    expect(withdrawalReason(null)).toBe("");
   });
 
   it("formats structured output for the job timeline", () => {
