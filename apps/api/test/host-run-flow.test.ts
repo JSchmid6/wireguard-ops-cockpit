@@ -130,7 +130,7 @@ async function setup(options: { plan: string; doorkeeper: string; intent?: strin
     expect(created.statusCode).toBe(202);
     return created.json().jobId as string;
   };
-  return { app, cookie, bearer, executorCalls, agentCalls, doorkeeperPrompts, submit, submitted, settled, inspect };
+  return { dir, app, cookie, bearer, executorCalls, agentCalls, doorkeeperPrompts, submit, submitted, settled, inspect };
 }
 
 describe("verifier instruction", () => {
@@ -200,6 +200,120 @@ describe("host door through the API", () => {
     const verifier = String(flow.agentCalls[1].prompt);
     expect(verifier).toContain("First evaluate the supplied signed runner handoff's raw command output");
     expect(verifier).toContain("You run without root: state that only root may read (for example cockpit-self-update-action status");
+  });
+
+  // Lab0 job 4553505c (18.10.2026): the same manifest in a bash fence went to
+  // the legacy path (service.manage + shell.exception, blocked_user_approval).
+  it("takes a host-run manifest from a bash fence through the door", async () => {
+    const flow = await setup({ plan: "```bash\n" + JSON.stringify(hostRun) + "\n```\n## Intent\nKeep the host's packages current.", doorkeeper: "VERDICT: pass\nNOTES: routine" });
+    const job = await flow.submit();
+    expect(job.status).toBe("completed");
+    expect(flow.doorkeeperPrompts).toHaveLength(1);
+    const start = flow.executorCalls.find((call) => call.payload.action === "host.run")!;
+    expect(start.payload.envelope).toMatchObject({ gatePassed: true, capabilities: ["host.run"], jobId: job.id });
+    expect(flow.agentCalls.some((call) => call.role === "runner")).toBe(false);
+  });
+
+  it("takes it as well when the plan's sections come before the bash fence", async () => {
+    const flow = await setup({ plan: "## Intent\nKeep the host's packages current.\n## Plan\n```bash\n" + JSON.stringify(hostRun) + "\n```\n## Risk Zone\nyellow", doorkeeper: "VERDICT: pass" });
+    const job = await flow.submit();
+    expect(job.status).toBe("completed");
+    expect(flow.executorCalls.find((call) => call.payload.action === "host.run")!.payload.manifest).toEqual(job.output?.hostRun);
+  });
+
+  it("leaves shell code in a bash fence on the legacy path, even when it carries the manifest text", async () => {
+    const script = `echo '${JSON.stringify(hostRun)}' > /tmp/m.json\nsystemctl stop android-emulator.service`;
+    const flow = await setup({ plan: "```bash\n" + script + "\n```\n## Intent\nKeep the host's packages current.", doorkeeper: "VERDICT: pass" });
+    const job = await flow.submit();
+    expect(flow.doorkeeperPrompts).toHaveLength(0);
+    expect(flow.executorCalls.some((call) => call.payload.action === "host.run")).toBe(false);
+    expect(job.output?.hostRun ?? null).toBeNull();
+  });
+
+  // B1 of the second review (t_4e06a3e2): the cleaner had its own bash-fence
+  // regex and cut a shell fence in front of the JSON fence out of the stored
+  // plan, so the job went through the door. The door is decided only by the
+  // plan's script, the FIRST bash/sh fence.
+  it("keeps a shell fence in front of a JSON bash fence on the legacy path", async () => {
+    const flow = await setup({ plan: "```bash\nsystemctl stop android-emulator.service\n```\n```bash\n" + JSON.stringify(hostRun) + "\n```\n## Intent\nKeep the host's packages current.", doorkeeper: "VERDICT: pass" });
+    const job = await flow.submit();
+    expect(flow.doorkeeperPrompts).toHaveLength(0);
+    expect(flow.executorCalls.some((call) => call.payload.action === "host.run")).toBe(false);
+    expect(job.output?.hostRun ?? null).toBeNull();
+  });
+
+  it("stores the shell fence in front of a JSON bash fence in the plan", async () => {
+    const flow = await setup({ plan: "## Intent\nKeep the host's packages current.\n## Plan\n```bash\nsystemctl stop android-emulator.service\n```\n```bash\n" + JSON.stringify(hostRun) + "\n```\n## Risk Zone\nyellow", doorkeeper: "VERDICT: pass" });
+    const job = await flow.submit();
+    expect(flow.doorkeeperPrompts).toHaveLength(0);
+    expect(flow.executorCalls.some((call) => call.payload.action === "host.run")).toBe(false);
+    expect(job.output?.hostRun ?? null).toBeNull();
+    const plan = readFileSync(path.join(flow.dir, "proposals", `${job.id}.md`), "utf-8");
+    expect(plan).toContain("```bash\nsystemctl stop android-emulator.service\n```");
+    expect(plan.indexOf("systemctl stop")).toBeLessThan(plan.indexOf("cockpit-host-run/v1"));
+  });
+
+  // B2 of the second review (t_14f50acc): the cleaner cut at the next fence at
+  // a line start, typedPlanScript reads the first fence anywhere. With the
+  // first fence in mid-line, "## Intent" and the JSON fence vanished from the
+  // stored plan. Now the cut comes from typedPlanScriptStart.
+  it("keeps the sections and the JSON fence in the stored plan when the first bash fence starts in mid-line (P5)", async () => {
+    const flow = await setup({ plan: "## Intent\nx\nPlan: ```bash\n" + JSON.stringify(hostRun) + "\n```\n```bash\nsystemctl stop android-emulator.service\n```\n## Risk Zone\nyellow", doorkeeper: "VERDICT: pass" });
+    const job = await flow.submit();
+    const plan = readFileSync(path.join(flow.dir, "proposals", `${job.id}.md`), "utf-8");
+    expect(plan.startsWith("## Intent\nx\nPlan: ```bash\n")).toBe(true);
+    expect(plan).toContain(JSON.stringify(hostRun));
+    expect(plan).toContain("```bash\nsystemctl stop android-emulator.service\n```");
+    expect(plan.indexOf("cockpit-host-run/v1")).toBeLessThan(plan.indexOf("systemctl stop"));
+    // The door is decided on the stored plan's script — the JSON fence — as for
+    // every other reader of typedPlanScript.
+    expect(flow.doorkeeperPrompts).toHaveLength(1);
+    expect(flow.executorCalls.find((call) => call.payload.action === "host.run")!.payload.manifest).toEqual(job.output?.hostRun);
+  });
+
+  // B3 of the second review (t_070249eb): the cut at "## " held for every
+  // fence, so a capability or host-run plan kept the shell fence in front of
+  // it, and typedPlanScript read that shell fence. As on main the stored plan
+  // starts at the capability/host-run fence; only a bash manifest keeps the
+  // sections in front of it.
+  const readCapability = {
+    version: "cockpit-capability/v1", name: "read", purpose: "read a file", steps: [{ argv: ["/usr/bin/true"], cwd: "/tmp", runAsUser: "nobody" }],
+    readablePaths: [], writablePaths: [], network: "none", expectedEffects: ["none"], verification: ["exit 0"], rollback: ["none needed"], risk: ["contained"],
+  };
+  const storedPlan = (flow: { dir: string }, jobId: string) => readFileSync(path.join(flow.dir, "proposals", `${jobId}.md`), "utf-8");
+
+  it("starts the stored plan at a host-run fence behind sections and a shell fence (P10)", async () => {
+    const flow = await setup({ plan: "## Intent\nx\n## Plan\n```bash\nsystemctl stop foo.service\n```\n```host-run\n" + JSON.stringify(hostRun) + "\n```", doorkeeper: "VERDICT: pass" });
+    const job = await flow.submit();
+    expect(job.status).toBe("completed");
+    expect(flow.executorCalls.map((call) => call.payload.action)).toEqual(["host.run", "host.status"]);
+    expect(storedPlan(flow, job.id)).toBe("```host-run\n" + JSON.stringify(hostRun) + "\n```");
+  });
+
+  it("starts the stored plan at a capability fence behind sections and a shell fence (P11)", async () => {
+    const flow = await setup({ plan: "## Intent\nread\n## Plan\n```bash\nsystemctl stop foo.service\n```\n```capability\n" + JSON.stringify(readCapability) + "\n```", doorkeeper: "VERDICT: pass" });
+    const job = await flow.submit();
+    expect(job.status).toBe("completed");
+    expect(flow.doorkeeperPrompts).toHaveLength(0);
+    expect(flow.executorCalls.map((call) => call.payload.action)).toEqual(["capability.execute"]);
+    expect(storedPlan(flow, job.id)).toBe("```capability\n" + JSON.stringify(readCapability) + "\n```");
+  });
+
+  it("does not let a shell fence in front of a capability fence trip the borg repair bolt (P12)", async () => {
+    const flow = await setup({ plan: "## Intent\nread\n## Plan\n```bash\n/usr/local/sbin/cockpit-borg-action repair\n```\n```capability\n" + JSON.stringify(readCapability) + "\n```", doorkeeper: "VERDICT: pass" });
+    const job = await flow.submit();
+    expect(job.status).toBe("completed");
+    expect(flow.executorCalls.map((call) => call.payload.action)).toEqual(["capability.execute"]);
+    expect(storedPlan(flow, job.id)).not.toContain("cockpit-borg-action");
+  });
+
+  it("keeps \"## Intent\" in front of a bash manifest in the stored plan (P13)", async () => {
+    const flow = await setup({ plan: "## Intent\nx\n```bash\n" + JSON.stringify(hostRun) + "\n```", doorkeeper: "VERDICT: pass" });
+    const job = await flow.submit();
+    expect(job.status).toBe("completed");
+    expect(flow.doorkeeperPrompts).toHaveLength(1);
+    expect(flow.executorCalls.find((call) => call.payload.action === "host.run")!.payload.manifest).toEqual(job.output?.hostRun);
+    expect(storedPlan(flow, job.id)).toBe("## Intent\nx\n```bash\n" + JSON.stringify(hostRun) + "\n```");
   });
 
   it("sends an evidenced finding to the operator, and runs exactly that plan after approval", async () => {

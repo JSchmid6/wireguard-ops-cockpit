@@ -66,6 +66,7 @@ import {
   parseTypedBorgActions,
   requestsBorgRepair,
   typedPlanScript,
+  typedPlanScriptStart,
   verifyExecutionEnvelopeSignature,
   type CapabilityId,
   type ExecutionEnvelope,
@@ -100,6 +101,7 @@ import {
   intentHostRunManifest,
   parseHostRunManifest,
   plannerHostRunCopy,
+  shellFenceManifest,
   parseHostRunReviewAnswer,
   parseHostRunStatus,
   stateStepKinds,
@@ -1803,12 +1805,31 @@ export async function createApp(options: AppOptions = {}) {
       .filter(l => !l.startsWith("timestamp=") && !l.startsWith("tee:") && l.trim() !== "")
       .join("\n");
     // Planner output: preserve a dynamic capability fence even when it precedes legacy markdown sections.
-    const capabilityStart = noTimestamps.search(
+    const fenceStart = noTimestamps.search(
       /(?:^|\n)```(?:capability|host-run|json)?\s*\n(?=\s*\{[\s\S]{0,1000}?"version"\s*:\s*"cockpit-(?:capability|host-run)\/v1")/i
     );
+    // A host-run manifest in a bash/sh fence (Lab0 job 4553505c): the cleaner has
+    // no bash detection of its own. Only when the door's own reader
+    // (shellFenceManifest on typedPlanScript) takes the plan's script as the
+    // manifest is the text kept from that very fence on (typedPlanScriptStart,
+    // the same regex) — so a shell fence in front of a JSON fence is never cut
+    // away, and a fence in mid-line is the same fence for both.
+    const shellStart = shellFenceManifest(noTimestamps) ? typedPlanScriptStart(noTimestamps) : -1;
+    const lineStart = (index: number) => {
+      const at = noTimestamps[index] === "\n" ? index + 1 : index;
+      return noTimestamps.lastIndexOf("\n", at - 1) + 1;
+    };
     const modelStart = noTimestamps.search(/(?:^|\n)## /);
-    const contentStart = capabilityStart >= 0 ? capabilityStart + (noTimestamps[capabilityStart] === "\n" ? 1 : 0)
-      : modelStart >= 0 ? modelStart + (noTimestamps[modelStart] === "\n" ? 1 : 0) : -1;
+    // A capability/host-run/json fence keeps main's cut: the plan starts at the
+    // fence, so shell blocks in front of it never reach typedPlanScript. Only the
+    // bash manifest is cut at the start of its line and never behind the model's
+    // first section: a bash fence after "## Intent" keeps the sections in front of it.
+    const cuts = [
+      ...(fenceStart >= 0 ? [lineStart(fenceStart)] : []),
+      ...(shellStart >= 0 ? [Math.min(...[shellStart, modelStart].filter((index) => index >= 0).map(lineStart))] : []),
+    ];
+    const contentStart = cuts.length > 0 ? Math.min(...cuts)
+      : modelStart >= 0 ? lineStart(modelStart) : -1;
     if (contentStart >= 0) {
       let output = noTimestamps.slice(contentStart);
       // Stop at trailing debug wrap noise

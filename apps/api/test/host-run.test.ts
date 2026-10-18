@@ -73,6 +73,38 @@ describe("parseHostRunManifest", () => {
     expect(parseHostRunManifest("## Intent\nno manifest here\n```bash\nuptime\n```")).toBeNull();
   });
 
+  // Lab0 job 4553505c (18.10.2026): the planner put a valid manifest into a
+  // bash fence and the job fell into the legacy runbook path.
+  it("takes a bash or sh fence whose whole script is a host-run manifest", () => {
+    expect(parseHostRunManifest(plan(aptManifest, "bash"))).toEqual(parsed());
+    expect(parseHostRunManifest(plan(aptManifest, "sh"))).toEqual(parsed());
+    const pretty = ["## Plan", "```bash", JSON.stringify(aptManifest, null, 2), "```"].join("\n");
+    expect(parseHostRunManifest(pretty)).toEqual(parsed());
+  });
+
+  it("reads the recorded Lab0 plan of job 4553505c as a host-run manifest", () => {
+    const recorded = readFileSync(new URL("./fixtures/host-run-bash-fence-4553505c.md", import.meta.url), "utf8");
+    const manifest = parseHostRunManifest(recorded);
+    expect(manifest?.name).toBe("stop-android-workbench-lab0");
+    expect(manifest?.steps).toEqual([{ name: "stop-android-services", run: "systemctl stop android-emulator.service android-adb.service", timeoutSeconds: 120, uninterruptible: false }]);
+  });
+
+  it("never turns shell code in a bash fence into a host-run manifest", () => {
+    const line = JSON.stringify(aptManifest);
+    for (const script of [
+      `echo '${line}' > /tmp/m.json`,
+      `cat <<'JSON'\n${line}\nJSON`,
+      `${line}\nsystemctl stop android-emulator.service`,
+      `systemctl stop android-emulator.service\n${line}`,
+      "systemctl stop android-emulator.service android-adb.service",
+      `{ systemctl stop android-emulator.service; echo '"version":"cockpit-host-run/v1"'; }`,
+      JSON.stringify({ ...aptManifest, version: "cockpit-capability/v1" }),
+      JSON.stringify([aptManifest]),
+    ]) {
+      expect(parseHostRunManifest(["## Plan", "```bash", script, "```"].join("\n"))).toBeNull();
+    }
+  });
+
   it("accepts a reboot as a step", () => {
     const manifest = parsed({ ...aptManifest, steps: [...aptManifest.steps, { name: "reboot", reboot: true }] });
     expect(manifest.steps[2]).toEqual({ name: "reboot", reboot: true });
