@@ -1815,15 +1815,20 @@ export async function createApp(options: AppOptions = {}) {
     // the same regex) — so a shell fence in front of a JSON fence is never cut
     // away, and a fence in mid-line is the same fence for both.
     const shellStart = shellFenceManifest(noTimestamps) ? typedPlanScriptStart(noTimestamps) : -1;
-    // Cut at the start of a line, and never behind the model's first section:
-    // a fence after "## Intent" keeps the sections in front of it.
     const lineStart = (index: number) => {
       const at = noTimestamps[index] === "\n" ? index + 1 : index;
       return noTimestamps.lastIndexOf("\n", at - 1) + 1;
     };
-    const capabilityStarts = [fenceStart, shellStart].filter((index) => index >= 0);
     const modelStart = noTimestamps.search(/(?:^|\n)## /);
-    const contentStart = capabilityStarts.length > 0 ? Math.min(...[...capabilityStarts, modelStart].filter((index) => index >= 0).map(lineStart))
+    // A capability/host-run/json fence keeps main's cut: the plan starts at the
+    // fence, so shell blocks in front of it never reach typedPlanScript. Only the
+    // bash manifest is cut at the start of its line and never behind the model's
+    // first section: a bash fence after "## Intent" keeps the sections in front of it.
+    const cuts = [
+      ...(fenceStart >= 0 ? [lineStart(fenceStart)] : []),
+      ...(shellStart >= 0 ? [Math.min(...[shellStart, modelStart].filter((index) => index >= 0).map(lineStart))] : []),
+    ];
+    const contentStart = cuts.length > 0 ? Math.min(...cuts)
       : modelStart >= 0 ? lineStart(modelStart) : -1;
     if (contentStart >= 0) {
       let output = noTimestamps.slice(contentStart);

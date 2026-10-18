@@ -271,6 +271,51 @@ describe("host door through the API", () => {
     expect(flow.executorCalls.find((call) => call.payload.action === "host.run")!.payload.manifest).toEqual(job.output?.hostRun);
   });
 
+  // B3 of the second review (t_070249eb): the cut at "## " held for every
+  // fence, so a capability or host-run plan kept the shell fence in front of
+  // it, and typedPlanScript read that shell fence. As on main the stored plan
+  // starts at the capability/host-run fence; only a bash manifest keeps the
+  // sections in front of it.
+  const readCapability = {
+    version: "cockpit-capability/v1", name: "read", purpose: "read a file", steps: [{ argv: ["/usr/bin/true"], cwd: "/tmp", runAsUser: "nobody" }],
+    readablePaths: [], writablePaths: [], network: "none", expectedEffects: ["none"], verification: ["exit 0"], rollback: ["none needed"], risk: ["contained"],
+  };
+  const storedPlan = (flow: { dir: string }, jobId: string) => readFileSync(path.join(flow.dir, "proposals", `${jobId}.md`), "utf-8");
+
+  it("starts the stored plan at a host-run fence behind sections and a shell fence (P10)", async () => {
+    const flow = await setup({ plan: "## Intent\nx\n## Plan\n```bash\nsystemctl stop foo.service\n```\n```host-run\n" + JSON.stringify(hostRun) + "\n```", doorkeeper: "VERDICT: pass" });
+    const job = await flow.submit();
+    expect(job.status).toBe("completed");
+    expect(flow.executorCalls.map((call) => call.payload.action)).toEqual(["host.run", "host.status"]);
+    expect(storedPlan(flow, job.id)).toBe("```host-run\n" + JSON.stringify(hostRun) + "\n```");
+  });
+
+  it("starts the stored plan at a capability fence behind sections and a shell fence (P11)", async () => {
+    const flow = await setup({ plan: "## Intent\nread\n## Plan\n```bash\nsystemctl stop foo.service\n```\n```capability\n" + JSON.stringify(readCapability) + "\n```", doorkeeper: "VERDICT: pass" });
+    const job = await flow.submit();
+    expect(job.status).toBe("completed");
+    expect(flow.doorkeeperPrompts).toHaveLength(0);
+    expect(flow.executorCalls.map((call) => call.payload.action)).toEqual(["capability.execute"]);
+    expect(storedPlan(flow, job.id)).toBe("```capability\n" + JSON.stringify(readCapability) + "\n```");
+  });
+
+  it("does not let a shell fence in front of a capability fence trip the borg repair bolt (P12)", async () => {
+    const flow = await setup({ plan: "## Intent\nread\n## Plan\n```bash\n/usr/local/sbin/cockpit-borg-action repair\n```\n```capability\n" + JSON.stringify(readCapability) + "\n```", doorkeeper: "VERDICT: pass" });
+    const job = await flow.submit();
+    expect(job.status).toBe("completed");
+    expect(flow.executorCalls.map((call) => call.payload.action)).toEqual(["capability.execute"]);
+    expect(storedPlan(flow, job.id)).not.toContain("cockpit-borg-action");
+  });
+
+  it("keeps \"## Intent\" in front of a bash manifest in the stored plan (P13)", async () => {
+    const flow = await setup({ plan: "## Intent\nx\n```bash\n" + JSON.stringify(hostRun) + "\n```", doorkeeper: "VERDICT: pass" });
+    const job = await flow.submit();
+    expect(job.status).toBe("completed");
+    expect(flow.doorkeeperPrompts).toHaveLength(1);
+    expect(flow.executorCalls.find((call) => call.payload.action === "host.run")!.payload.manifest).toEqual(job.output?.hostRun);
+    expect(storedPlan(flow, job.id)).toBe("## Intent\nx\n```bash\n" + JSON.stringify(hostRun) + "\n```");
+  });
+
   it("sends an evidenced finding to the operator, and runs exactly that plan after approval", async () => {
     const flow = await setup({ plan: planWith(hostRunWithRepair), doorkeeper: [
       "VERDICT: flag",
