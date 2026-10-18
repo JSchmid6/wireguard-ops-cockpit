@@ -66,6 +66,7 @@ import {
   parseTypedBorgActions,
   requestsBorgRepair,
   typedPlanScript,
+  typedPlanScriptStart,
   verifyExecutionEnvelopeSignature,
   type CapabilityId,
   type ExecutionEnvelope,
@@ -1810,13 +1811,20 @@ export async function createApp(options: AppOptions = {}) {
     // A host-run manifest in a bash/sh fence (Lab0 job 4553505c): the cleaner has
     // no bash detection of its own. Only when the door's own reader
     // (shellFenceManifest on typedPlanScript) takes the plan's script as the
-    // manifest is the text kept from the FIRST bash/sh fence on — so a shell
-    // fence in front of a JSON fence is never cut away.
-    const shellStart = shellFenceManifest(noTimestamps) ? noTimestamps.search(/(?:^|\n)```(?:bash|sh)\s*\n/i) : -1;
-    const capabilityStart = fenceStart >= 0 && shellStart >= 0 ? Math.min(fenceStart, shellStart) : Math.max(fenceStart, shellStart);
+    // manifest is the text kept from that very fence on (typedPlanScriptStart,
+    // the same regex) — so a shell fence in front of a JSON fence is never cut
+    // away, and a fence in mid-line is the same fence for both.
+    const shellStart = shellFenceManifest(noTimestamps) ? typedPlanScriptStart(noTimestamps) : -1;
+    // Cut at the start of a line, and never behind the model's first section:
+    // a fence after "## Intent" keeps the sections in front of it.
+    const lineStart = (index: number) => {
+      const at = noTimestamps[index] === "\n" ? index + 1 : index;
+      return noTimestamps.lastIndexOf("\n", at - 1) + 1;
+    };
+    const capabilityStarts = [fenceStart, shellStart].filter((index) => index >= 0);
     const modelStart = noTimestamps.search(/(?:^|\n)## /);
-    const contentStart = capabilityStart >= 0 ? capabilityStart + (noTimestamps[capabilityStart] === "\n" ? 1 : 0)
-      : modelStart >= 0 ? modelStart + (noTimestamps[modelStart] === "\n" ? 1 : 0) : -1;
+    const contentStart = capabilityStarts.length > 0 ? Math.min(...[...capabilityStarts, modelStart].filter((index) => index >= 0).map(lineStart))
+      : modelStart >= 0 ? lineStart(modelStart) : -1;
     if (contentStart >= 0) {
       let output = noTimestamps.slice(contentStart);
       // Stop at trailing debug wrap noise

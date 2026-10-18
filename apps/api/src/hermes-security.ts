@@ -313,8 +313,17 @@ export function buildAgentTask(intent: string, evidence: UntrustedEvidence[]): s
 // can ever be evaluated on a different text than the one that is executed.
 // (G1 finding of the 28.09.2026 borg rollout: the repair gate kept its own copy
 // of this regex and was switched off as soon as the plan carried a manifest.)
+const TYPED_PLAN_FENCE = /```(?:bash|sh)\s*\n([\s\S]*?)```/i;
+
 export function typedPlanScript(planText: string): string {
-  return planText.match(/```(?:bash|sh)\s*\n([\s\S]*?)```/i)?.[1] || "";
+  return planText.match(TYPED_PLAN_FENCE)?.[1] || "";
+}
+
+// Where that fence starts in the plan text (-1 without one) — for the output
+// cleaner, so that it cuts at the very fence the readers above take and keeps
+// no bash-fence regex of its own (B2 of the second review t_14f50acc).
+export function typedPlanScriptStart(planText: string): number {
+  return planText.match(TYPED_PLAN_FENCE)?.index ?? -1;
 }
 
 export function classifyCapabilities(plan: string): CapabilityId[] {

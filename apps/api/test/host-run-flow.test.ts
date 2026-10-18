@@ -253,6 +253,24 @@ describe("host door through the API", () => {
     expect(plan.indexOf("systemctl stop")).toBeLessThan(plan.indexOf("cockpit-host-run/v1"));
   });
 
+  // B2 of the second review (t_14f50acc): the cleaner cut at the next fence at
+  // a line start, typedPlanScript reads the first fence anywhere. With the
+  // first fence in mid-line, "## Intent" and the JSON fence vanished from the
+  // stored plan. Now the cut comes from typedPlanScriptStart.
+  it("keeps the sections and the JSON fence in the stored plan when the first bash fence starts in mid-line (P5)", async () => {
+    const flow = await setup({ plan: "## Intent\nx\nPlan: ```bash\n" + JSON.stringify(hostRun) + "\n```\n```bash\nsystemctl stop android-emulator.service\n```\n## Risk Zone\nyellow", doorkeeper: "VERDICT: pass" });
+    const job = await flow.submit();
+    const plan = readFileSync(path.join(flow.dir, "proposals", `${job.id}.md`), "utf-8");
+    expect(plan.startsWith("## Intent\nx\nPlan: ```bash\n")).toBe(true);
+    expect(plan).toContain(JSON.stringify(hostRun));
+    expect(plan).toContain("```bash\nsystemctl stop android-emulator.service\n```");
+    expect(plan.indexOf("cockpit-host-run/v1")).toBeLessThan(plan.indexOf("systemctl stop"));
+    // The door is decided on the stored plan's script — the JSON fence — as for
+    // every other reader of typedPlanScript.
+    expect(flow.doorkeeperPrompts).toHaveLength(1);
+    expect(flow.executorCalls.find((call) => call.payload.action === "host.run")!.payload.manifest).toEqual(job.output?.hostRun);
+  });
+
   it("sends an evidenced finding to the operator, and runs exactly that plan after approval", async () => {
     const flow = await setup({ plan: planWith(hostRunWithRepair), doorkeeper: [
       "VERDICT: flag",
