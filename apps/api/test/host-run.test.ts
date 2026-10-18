@@ -82,6 +82,13 @@ describe("parseHostRunManifest", () => {
     expect(parseHostRunManifest(pretty)).toEqual(parsed());
   });
 
+  it("reads the recorded Lab0 plan of job 4553505c as a host-run manifest", () => {
+    const recorded = readFileSync(new URL("./fixtures/host-run-bash-fence-4553505c.md", import.meta.url), "utf8");
+    const manifest = parseHostRunManifest(recorded);
+    expect(manifest?.name).toBe("stop-android-workbench-lab0");
+    expect(manifest?.steps).toEqual([{ name: "stop-android-services", run: "systemctl stop android-emulator.service android-adb.service", timeoutSeconds: 120, uninterruptible: false }]);
+  });
+
   it("never turns shell code in a bash fence into a host-run manifest", () => {
     const line = JSON.stringify(aptManifest);
     for (const script of [
