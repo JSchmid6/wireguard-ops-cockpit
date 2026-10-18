@@ -170,7 +170,10 @@ describe("host door through the API", () => {
     const withdrawn = await flow.app.inject({ method: "POST", url: `/api/hermes/jobs/${jobId}/withdraw`, headers: { authorization: `Bearer ${flow.bearer}` }, payload: { reason: "Karte erledigt, Auftrag neu bestellt" } });
     expect(withdrawn.statusCode).toBe(200);
     release();
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    // Nach der Freigabe des Tuersteherlaufs: Policy, Envelope, Startpruefung -- ohne
+    // weitere Agentenaufrufe; 500 ms reichen um Groessenordnungen (Red-Check: ohne
+    // Waechter steht der Job in dieser Zeit schon auf "completed").
+    await new Promise((resolve) => setTimeout(resolve, 500));
 
     const job = flow.inspect.getJob(jobId)!;
     expect(job.status).toBe("withdrawn");

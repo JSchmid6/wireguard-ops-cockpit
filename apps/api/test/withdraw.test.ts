@@ -77,6 +77,7 @@ async function setup() {
     completed: make(jamesSession.id, "completed", "finished"),
     rejected: make(jamesSession.id, "rejected", "finished"),
     failed: make(jamesSession.id, "failed_execution", "finished"),
+    finding: make(jamesSession.id, "blocked_policy", "finished", { updateReview: { result: "finding", findings: [{ title: "Riegel offen", guarantee: "D3", file: "x.ts" }] } }),
     foreign: make(adminSession.id, "blocked_user_approval", "finished"),
   };
   database.close();
@@ -147,6 +148,14 @@ describe("POST /api/hermes/jobs/:jobId/withdraw", () => {
     const db = inspect();
     for (const job of refused) expect(db.getJob(job.id)!.status).toBe(job.status);
     db.close();
+  });
+
+  it("keeps a real review finding in the inbox after James withdrew the job", async () => {
+    const { app, jobs, withdraw, james, admin } = await setup();
+    expect((await withdraw(jobs.finding.id, james)).statusCode).toBe(200);
+    const inbox = await app.inject({ method: "GET", url: "/api/inbox", headers: admin });
+    expect(inbox.statusCode).toBe(200);
+    expect(inbox.json().reviewFindings).toEqual([expect.objectContaining({ jobId: jobs.finding.id, status: "withdrawn", findings: [expect.objectContaining({ title: "Riegel offen" })] })]);
   });
 
   it("withdraws only once: a withdrawn job is final", async () => {

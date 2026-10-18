@@ -4118,8 +4118,9 @@ Follow these rules:
     // A real review finding over a plan that was blocked anyway (prerequisite
     // or policy): nothing to approve — an approval never lifts that block —
     // but the operator must know, and a revised plan whose new review passes
-    // must not bury it. Listed for seven days; James forwards it.
-    const reviewFindings = (["blocked_prerequisite", "blocked_policy"] as const)
+    // must not bury it. Listed for seven days; James forwards it. A job James
+    // withdrew keeps its finding listed: withdrawing must not hide it either.
+    const reviewFindings = (["blocked_prerequisite", "blocked_policy", "withdrawn"] as const)
       .flatMap((status) => database.listJobsByStatus("hermes-change", status))
       .filter((job) => visible(job.id) && Date.parse(job.updatedAt) >= now - 7 * 24 * 3_600_000)
       .flatMap((job) => {

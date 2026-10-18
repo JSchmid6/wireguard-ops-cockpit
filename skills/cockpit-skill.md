@@ -64,7 +64,7 @@ The authoritative explanation contains:
 - `recommendedAction`: next safe action
 - `rollbackAvailable`: whether the reviewed plan contains rollback
 
-Terminal statuses include `completed`, `blocked_user_approval`, `blocked_policy`, `blocked_prerequisite`, `failed_execution`, and `failed_verification`. Treat only `completed` as success.
+Terminal statuses include `completed`, `blocked_user_approval`, `blocked_policy`, `blocked_prerequisite`, `failed_execution`, `failed_verification`, `rejected`, and `withdrawn` (withdrawn by Hermes itself). Treat only `completed` as success.
 
 A `self.update` or `dienste.update` job whose pre-install review came out incomplete (evidence `pre-install review result: incomplete`: review input unavailable or incomplete, reviewer failure, unreadable answer, only `UNVERIFIABLE` points) ends in `blocked_prerequisite`. That is a tool-chain fault for you to clear and resubmit, not an approval request; only `blocked_user_approval` (a real finding or a hard plan block) goes to the operator.
 
