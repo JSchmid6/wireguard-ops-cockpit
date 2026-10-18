@@ -38,6 +38,13 @@ Planer ──► Plan mit einem ```host-run-Manifest (cockpit-host-run/v1)
         ──► API folgt mit host.status, danach unabhängige Verifikation wie bisher
 ```
 
+Den Block erkennt `parseHostRunManifest` an ```` ```host-run ```` oder ```` ```json ```` mit der
+Version. Steckt der Planer das Manifest in einen ```` ```bash ````/```` ```sh ````-Block (Lab0-Job
+4553505c, 18.10.2026), gilt es ebenfalls — aber nur, wenn das Skript des Plans (`typedPlanScript`,
+der erste bash/sh-Block) als Ganzes ein JSON-Objekt mit `cockpit-host-run/v1` ist. Shell-Code wird
+nie zum Manifest, auch nicht, wenn er den Manifest-Text enthält (`echo '{…}'`, Heredoc, JSON plus
+weitere Zeilen); er bleibt auf dem Runbook-Weg.
+
 ## 1. Schloss
 
 Nur ein Envelope der Cockpit-API öffnet (`hermes-execution-envelope/v1`, HMAC-SHA256 mit

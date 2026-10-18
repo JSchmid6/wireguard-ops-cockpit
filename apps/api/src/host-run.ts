@@ -6,7 +6,7 @@ import { backupGuardFocus, backupGuardHits, type BackupGuardHit } from "../../..
 import { stateStepKinds, stepUninterruptible, type StepUninterruptible } from "../../../deploy/helpers/cockpit-state-steps.mjs";
 
 import { READABLE_PROTECTED_PATH } from "./capability-manifest.js";
-import { hashCanonical } from "./hermes-security.js";
+import { hashCanonical, typedPlanScript } from "./hermes-security.js";
 import { redactSecrets } from "./update-review.js";
 
 // The general host door (doc/setup/host-run.md).
@@ -107,10 +107,27 @@ function script(value: unknown, where: string): string {
 const HOST_RUN_FENCE = /```(?:json\s+)?host-run\s*\n([\s\S]*?)```/i;
 const HOST_RUN_JSON_FENCE = /```(?:json)?\s*\n([\s\S]*?"version"\s*:\s*"cockpit-host-run\/v1"[\s\S]*?)```/i;
 
+// A manifest the planner put into the shell fence (Lab0 job 4553505c,
+// 18.10.2026): the plan's script — the one text every legacy reader takes,
+// typedPlanScript — is nothing but a host-run/v1 JSON object. Bash could not
+// run that text anyway, so it is the host door. Shell code never qualifies,
+// not even when it mentions the version string: the whole script must parse
+// as one JSON object that names cockpit-host-run/v1.
+function shellFenceManifest(plan: string): string | null {
+  const script = typedPlanScript(plan).trim();
+  if (!script.startsWith("{") || !script.endsWith("}")) return null;
+  try {
+    const value: unknown = JSON.parse(script);
+    return value && typeof value === "object" && (value as Record<string, unknown>).version === HOST_RUN_VERSION ? script : null;
+  } catch {
+    return null;
+  }
+}
+
 // The manifest a plan carries, normalized to the exact form that is hashed,
 // signed and executed — or null when the plan has none.
 export function parseHostRunManifest(plan: string): HostRunManifest | null {
-  const manifestText = plan.match(HOST_RUN_FENCE)?.[1] || plan.match(HOST_RUN_JSON_FENCE)?.[1] || null;
+  const manifestText = plan.match(HOST_RUN_FENCE)?.[1] || plan.match(HOST_RUN_JSON_FENCE)?.[1] || shellFenceManifest(plan);
   if (!manifestText) return null;
   let raw: unknown;
   try { raw = JSON.parse(manifestText); } catch { throw new Error("host-run manifest is not valid JSON"); }

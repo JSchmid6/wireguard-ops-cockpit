@@ -1803,8 +1803,9 @@ export async function createApp(options: AppOptions = {}) {
       .filter(l => !l.startsWith("timestamp=") && !l.startsWith("tee:") && l.trim() !== "")
       .join("\n");
     // Planner output: preserve a dynamic capability fence even when it precedes legacy markdown sections.
+    // A host-run manifest in a bash/sh fence counts too (parseHostRunManifest, Lab0 job 4553505c).
     const capabilityStart = noTimestamps.search(
-      /(?:^|\n)```(?:capability|host-run|json)?\s*\n(?=\s*\{[\s\S]{0,1000}?"version"\s*:\s*"cockpit-(?:capability|host-run)\/v1")/i
+      /(?:^|\n)```(?:capability|host-run|json)?\s*\n(?=\s*\{[\s\S]{0,1000}?"version"\s*:\s*"cockpit-(?:capability|host-run)\/v1")|(?:^|\n)```(?:bash|sh)\s*\n(?=\s*\{[\s\S]{0,1000}?"version"\s*:\s*"cockpit-host-run\/v1")/i
     );
     const modelStart = noTimestamps.search(/(?:^|\n)## /);
     const contentStart = capabilityStart >= 0 ? capabilityStart + (noTimestamps[capabilityStart] === "\n" ? 1 : 0)

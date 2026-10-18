@@ -202,6 +202,34 @@ describe("host door through the API", () => {
     expect(verifier).toContain("You run without root: state that only root may read (for example cockpit-self-update-action status");
   });
 
+  // Lab0 job 4553505c (18.10.2026): the same manifest in a bash fence went to
+  // the legacy path (service.manage + shell.exception, blocked_user_approval).
+  it("takes a host-run manifest from a bash fence through the door", async () => {
+    const flow = await setup({ plan: "```bash\n" + JSON.stringify(hostRun) + "\n```\n## Intent\nKeep the host's packages current.", doorkeeper: "VERDICT: pass\nNOTES: routine" });
+    const job = await flow.submit();
+    expect(job.status).toBe("completed");
+    expect(flow.doorkeeperPrompts).toHaveLength(1);
+    const start = flow.executorCalls.find((call) => call.payload.action === "host.run")!;
+    expect(start.payload.envelope).toMatchObject({ gatePassed: true, capabilities: ["host.run"], jobId: job.id });
+    expect(flow.agentCalls.some((call) => call.role === "runner")).toBe(false);
+  });
+
+  it("takes it as well when the plan's sections come before the bash fence", async () => {
+    const flow = await setup({ plan: "## Intent\nKeep the host's packages current.\n## Plan\n```bash\n" + JSON.stringify(hostRun) + "\n```\n## Risk Zone\nyellow", doorkeeper: "VERDICT: pass" });
+    const job = await flow.submit();
+    expect(job.status).toBe("completed");
+    expect(flow.executorCalls.find((call) => call.payload.action === "host.run")!.payload.manifest).toEqual(job.output?.hostRun);
+  });
+
+  it("leaves shell code in a bash fence on the legacy path, even when it carries the manifest text", async () => {
+    const script = `echo '${JSON.stringify(hostRun)}' > /tmp/m.json\nsystemctl stop android-emulator.service`;
+    const flow = await setup({ plan: "```bash\n" + script + "\n```\n## Intent\nKeep the host's packages current.", doorkeeper: "VERDICT: pass" });
+    const job = await flow.submit();
+    expect(flow.doorkeeperPrompts).toHaveLength(0);
+    expect(flow.executorCalls.some((call) => call.payload.action === "host.run")).toBe(false);
+    expect(job.output?.hostRun ?? null).toBeNull();
+  });
+
   it("sends an evidenced finding to the operator, and runs exactly that plan after approval", async () => {
     const flow = await setup({ plan: planWith(hostRunWithRepair), doorkeeper: [
       "VERDICT: flag",
