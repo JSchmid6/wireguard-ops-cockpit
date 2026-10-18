@@ -16,6 +16,8 @@ export type JobStatus =
   | "failed_verification"
   | "rollback_completed"
   | "rejected"
+  // Vom Besteller (James) zurückgezogen, bevor auf dem Host etwas lief.
+  | "withdrawn"
   | "failed";
 export type ApprovalStatus = "pending" | "approved" | "rejected";
 export type PlanTargetType = "runbook" | "agent";

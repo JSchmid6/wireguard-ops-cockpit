@@ -162,12 +162,37 @@ Automation-Kontos — eine Freigabe durch Jochen endete deshalb in `blocked_prer
 Auftraggebers (`jobOwnerId`), an den auch der Envelope gebunden ist. Schloss, Türsteher und Riegel
 bleiben unverändert: Der Envelope wird genauso geprüft wie vorher.
 
+## Eigene Bestellung zurückziehen (James, seit 18.10.2026)
+
+Jochen (18.10.2026): „Wenn du den Job bestellt hast, fände ich das Abbrechen eigentlich ok.“
+`POST /api/hermes/jobs/:id/withdraw` mit Body `{ "reason": "<warum>" }` (James' Token mit genau
+diesem Scope). **Zurückziehen ist kein Ablehnen:** Der Besteller nimmt seine Bestellung zurück; über
+einen Plan entscheidet weiter nur Jochen über die Freigabe-Route.
+
+- Nur das Automation-Konto, nur der **eigene** Job (Besitzer = anfragende Token-Identität), nur
+  `hermes-change`/`hermes-research`. Fremder Job: 403 (Audit `hermes.job.withdraw_refused`);
+  Jochens Sitzung: 403 — er lehnt ab.
+- Nur solange auf dem Host nichts lief: `pending`, `pending_approval`, `blocked_user_approval`,
+  `blocked_policy`, `blocked_prerequisite` oder `running` in den Phasen `queued`/`planning`/
+  `reviewing`. Nie mit einer Entscheidung (`approval`) und nie nach einem angestoßenen Tür-Lauf
+  (`hostRunRequestedAt`/`hostRunStartedAt`). Alles andere (ausführend, fertig, abgelehnt,
+  fehlgeschlagen, schon zurückgezogen): 403.
+- Grund Pflicht (400 ohne). Ergebnis: Status `withdrawn` (endgültig), `output.withdrawal` (wann,
+  wer, Grund, vorheriger Status/Phase), Audit `hermes.job.withdrawn`. Zählt nicht zum Circuit
+  Breaker. Die Karte verschwindet aus „Wartet auf dich"; die Job-Zeitleiste zeigt
+  „zurückgezogen von James: <Grund>".
+- Ein Job, der beim Zurückziehen noch plant oder geprüft wird, läuft im Hintergrund zu Ende,
+  schreibt aber nichts mehr in den Job und startet nichts: `updateHermesJob` lässt einen
+  `withdrawn`-Job unverändert, und vor dem Start der Ausführung wird ohne `await` dazwischen
+  geprüft. Eine späte Freigabe Jochens auf einen zurückgezogenen Job endet mit 409.
+
 ## API
 
 | Route | Wer | Was |
 |---|---|---|
 | `GET /api/inbox` | Sitzung; Automation nur mit Scope | `cards`, `status` (`lastRuns`, `backup`, `disk`), `reorders`, `attention`, `reviewFindings`, `generatedAt` |
 | `POST /api/hermes/jobs/:jobId/reactivate` | James' Token mit Scope, oder Sitzung | abgelaufenen, nie entschiedenen Job mit neuer Frist versehen (keine Freigabe; max. 3×, max. 72 h) |
+| `POST /api/hermes/jobs/:jobId/withdraw` | James' Token mit Scope (nur Automation) | eigenen Job zurückziehen, solange auf dem Host nichts lief; Body `{ reason }` (Pflicht); Status `withdrawn` |
 | `POST /api/inbox/jobs/:jobId/reorder` | Sitzung (nicht Automation) | abgelaufenen Job schließen, Neubestellung anmelden; Body `{ note? }` |
 | `POST /api/inbox/retention/:anomalyId/keep` | Admin-Sitzung | Anomalie ablehnen = angehalten lassen; Body `{ reason }` |
 
@@ -179,6 +204,9 @@ bleiben unverändert: Der Envelope wird genauso geprüft wie vorher.
 - `apps/api/test/reactivate.test.ts` — Reaktivieren nur abgelaufen und unentschieden, gleicher
   Envelope-Inhalt, nie `operatorApproved`, Obergrenzen (Anzahl, 72 h), Drift stoppt, keine
   Selbstfreigabe per Token.
+- `apps/api/test/withdraw.test.ts` — Zurückziehen nur eigener, noch nicht laufender Jobs; fremd,
+  laufend, entschieden, fertig: 403; Grund Pflicht; Freigabe-Route bleibt für Tokens 403; späte
+  Freigabe auf einen zurückgezogenen Job: 409.
 - `apps/api/test/host-run-flow.test.ts` — James bestellt mit seinem Token, Jochen gibt als Admin
   frei, der Lauf startet in James' Sitzung (vorher: `blocked_prerequisite`).
 - `apps/web/src/Inbox.test.tsx` — Startseite nur mit Art, Frist, Absicht und „Details" (kein

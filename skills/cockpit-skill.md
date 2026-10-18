@@ -82,7 +82,7 @@ POST /api/hermes/jobs/<jobId>/approval
 {"decision":"approved","reason":"operator rationale"}
 ```
 
-or `"rejected"`. This route refuses every automation token (403) — Hermes never approves. If the approval window expired before the operator decided, Hermes may call `POST /api/hermes/jobs/<jobId>/reactivate` (scope required): it renews only the deadline of the unchanged, never-decided job (at most 3 times, never beyond 72 h after creation) and never approves; then forward the `operatorLink` again. Approval is audited but never creates privilege: execution still runs as the bounded `wgops` service account and can use only static, administrator-installed helpers.
+or `"rejected"`. This route refuses every automation token (403) — Hermes never approves. If the approval window expired before the operator decided, Hermes may call `POST /api/hermes/jobs/<jobId>/reactivate` (scope required): it renews only the deadline of the unchanged, never-decided job (at most 3 times, never beyond 72 h after creation) and never approves; then forward the `operatorLink` again. Hermes may also withdraw its **own** job that has not run on the host yet (`POST /api/hermes/jobs/<jobId>/withdraw` with a required `reason`, scope required): allowed while it plans, is reviewed or waits in `blocked_user_approval`/`blocked_policy`/`blocked_prerequisite`; a foreign, executing, decided or finished job answers 403. Withdrawing is not rejecting — the operator still decides about every plan. Approval is audited but never creates privilege: execution still runs as the bounded `wgops` service account and can use only static, administrator-installed helpers.
 
 ## Security invariants
 

@@ -28,3 +28,8 @@ export function formatOutput(output: Record<string, unknown> | null): string {
   );
   return lines.join("\n");
 }
+// Ein von James zurückgezogener Job trägt den Grund unter output.withdrawal.
+export function withdrawalReason(output: Record<string, unknown> | null | undefined): string {
+  const withdrawal = output?.withdrawal as { reason?: unknown } | undefined;
+  return typeof withdrawal?.reason === "string" && withdrawal.reason.trim() ? `: ${withdrawal.reason.trim()}` : "";
+}

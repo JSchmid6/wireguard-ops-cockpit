@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { formatOutput, request } from "./lib";
+import { formatOutput, request, withdrawalReason } from "./lib";
 import BorgPanel from "./BorgPanel";
 import RetentionPanel from "./RetentionPanel";
 import Inbox from "./Inbox";
@@ -737,7 +737,7 @@ export default function App() {
 
                   return (
                     <li key={job.id}>
-                      <strong>{job.kind}</strong> · {job.status}
+                      <strong>{job.kind}</strong> · {job.status === "withdrawn" ? `zurückgezogen von James${withdrawalReason(job.output)}` : job.status}
                       {checkpoints.length > 0 ? (
                         <div className="workflow-block">
                           <strong>Checkpoint state</strong>
