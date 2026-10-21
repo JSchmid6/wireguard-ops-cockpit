@@ -14,10 +14,14 @@ test("agent broker accepts only bounded roles and prompts", () => {
   assert.throws(() => validateRequest({ requestId: "12345678", role: "root", prompt: "inspect" }), /invalid agent role/);
 });
 
-test("only the safety role gets the larger budget for the pre-install review", () => {
+test("only the safety and verifier roles get the larger budget", () => {
   const review = "d".repeat(90000);
   assert.equal(validateRequest({ requestId: "12345678", role: "safety", prompt: review }).prompt.length, 90000);
+  assert.equal(validateRequest({ requestId: "12345678", role: "verifier", prompt: review }).prompt.length, 90000);
+  assert.throws(() => validateRequest({ requestId: "12345678", role: "verifier", prompt: "d".repeat(100001) }), /prompt length is invalid/);
   assert.throws(() => validateRequest({ requestId: "12345678", role: "planner", prompt: review }), /prompt length is invalid/);
+  assert.throws(() => validateRequest({ requestId: "12345678", role: "runner", prompt: review }), /prompt length is invalid/);
+  assert.throws(() => validateRequest({ requestId: "12345678", role: "verifier", prompt: "" }), /prompt length is invalid/);
   assert.throws(() => validateRequest({ requestId: "12345678", role: "safety", prompt: "d".repeat(100001) }), /prompt length is invalid/);
   // 50,000 three-byte characters stay under the character limit but exceed
   // the single-argv byte bound opencode is started with.

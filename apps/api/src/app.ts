@@ -42,6 +42,7 @@ import {
 } from "./registries.js";
 import { generateRunbookSafetyReview, type SafetyReviewRunner } from "./safety-review.js";
 import { activationAction, activationReason, capabilityExecution, hostRunExecution, selfUpdateVerifierNote, typedActionsExecution, type TypedActionOutput, type TypedExecution } from "./self-update-activation.js";
+import { boundedVerifierPrompt } from "./verifier-prompt.js";
 import { runBrokerAgent } from "./agent-broker.js";
 import { runDynamicCapability, runExecutorAction, type ExecutorActionKind } from "./executor-broker.js";
 import { borgStatusRequestDigest, createBorgStatusService } from "./borg-status.js";
@@ -211,6 +212,18 @@ export function verifierInstruction(intent: string, targetNote = "", apiHandoff 
     ? `First evaluate the supplied signed runner handoff's raw command output; when it directly proves every requested condition, do not call redundant tools. Otherwise use focused read-only commands only. Do not repair anything. You run without root: state that only root may read (for example cockpit-self-update-action status, host-run state, borg status) shows up for you as "unreadable", "permission denied" or "missing" — that is your sandbox, not evidence against the handoff; judge such state by the handoff's raw output.`
     : `The supplied runner handoff is the runner agent's own text and proves nothing by itself: confirm every requested condition with focused read-only commands. Do not repair anything. A condition you cannot read yourself is unproven, not passed.`;
   return `You are the verifier-agent. Independently verify the requested target state for this intent. Do not trust the runner's STATUS claim. ${handoff} Your final response is mandatory and must end with exactly VERIFICATION_STATUS: passed or VERIFICATION_STATUS: failed, followed by EVIDENCE: and REASON:. Never stop after announcing an intended check.${targetNote ? ` ${targetNote}` : ""} Intent: ${intent}`;
+}
+
+// A runner that did not report success is not verified; the handoff's NOTES
+// line (for a host run: "run check_failed — 1 check(s) failed") says why.
+export function unreportedSuccess(handoff: string): string {
+  const notes = handoff.match(/^NOTES:\s*(.+)$/m)?.[1]?.trim().slice(0, 300);
+  return `VERIFICATION_STATUS: failed\nREASON: runner did not report success${notes ? ` (${notes})` : ""}`;
+}
+
+// The verifier's REASON for the job's reason line, bounded.
+export function verificationReason(verification: string): string {
+  return verification.match(/^REASON:\s*(.+)$/m)?.[1]?.trim().slice(0, 400) || "the verifier gave no reason";
 }
 
 function slugify(value: string): string {
@@ -1961,14 +1974,18 @@ export async function createApp(options: AppOptions = {}) {
     targetNote = "",
     apiHandoff = false,
   ): Promise<string> {
-    const verifierPrompt = buildAgentTask(
-      verifierInstruction(intent, targetNote, apiHandoff),
-      [{ source: "reviewed-plan", content: reviewedPlan }, { source: "runner-handoff", content: runnerResult }],
-    );
-    const verifierRaw = await runIsolatedAgent(actor, session, planner, "verifier", verifierPrompt, "-verifier", 5 * 60_000, config.safetyOpencodeModel);
-    return verifierRaw
-      ? filterSensitiveContent(extractCleanOutput(verifierRaw) || extractAnswer(verifierRaw))
-      : "VERIFICATION_STATUS: failed\nREASON: verifier timeout";
+    // The run has happened: whatever stops the verifier now (its prompt bound,
+    // the broker, a timeout) is a verification that did not pass, never a job
+    // that failed before execution (21.10.2026, ba5196ee/a86a0577).
+    try {
+      const { prompt } = boundedVerifierPrompt(verifierInstruction(intent, targetNote, apiHandoff), reviewedPlan, runnerResult);
+      const verifierRaw = await runIsolatedAgent(actor, session, planner, "verifier", prompt, "-verifier", 5 * 60_000, config.safetyOpencodeModel);
+      return verifierRaw
+        ? filterSensitiveContent(extractCleanOutput(verifierRaw) || extractAnswer(verifierRaw))
+        : "VERIFICATION_STATUS: failed\nREASON: verifier timeout";
+    } catch (error) {
+      return `VERIFICATION_STATUS: failed\nREASON: the independent verification could not run: ${error instanceof Error ? error.message : "verifier failed"}`;
+    }
   }
 
   // The bounded runner role is ended by its broker at its time budget
@@ -2345,6 +2362,8 @@ export async function createApp(options: AppOptions = {}) {
     const shouldExecute = request.execute;
     const createdSession = request.ownedSession;
     const startedAt = Date.now();
+    // Once execution has started, a later failure still names what ran.
+    let executedSteps: string[] = [];
     try {
       const agentTask = `${buildAgentTask(intent, untrustedEvidence)}\n\nDYNAMIC CAPABILITY CONTRACT:\n${hostRunPlannerContract()}\n\n${capabilityPlannerContract()}`;
       const failureWindowStart = new Date(Date.now() - 60 * 60_000).toISOString();
@@ -2533,6 +2552,7 @@ export async function createApp(options: AppOptions = {}) {
       // James hat den Job zurückgezogen, während er plante oder geprüft wurde:
       // dann läuft nichts. Zwischen dieser Prüfung und dem Start liegt kein await.
       if (executing.status === "withdrawn") return;
+      executedSteps = [...reviewedSteps, "Runner execution"];
       const typed = await executeTypedCapabilities(planText, envelope, manifest, updateReview?.outcome.bindings ?? [], hostRun);
       const typedResult = typed?.result ?? null;
       const runnerRaw = typedResult || await runIsolatedRunner(actor, session, planner, proposalPath, planText);
@@ -2541,20 +2561,14 @@ export async function createApp(options: AppOptions = {}) {
       const runnerSuccess = /STATUS:\s*success/i.test(result);
       const pendingActivations = typed?.pendingActivations ?? [];
       const targetNote = selfUpdateVerifierNote(pendingActivations);
-      let verification = "VERIFICATION_STATUS: failed\nREASON: runner did not report success";
-      if (runnerSuccess) {
-        const verifierPrompt = buildAgentTask(
-          verifierInstruction(intent, targetNote, typedResult !== null),
-          [{ source: "reviewed-plan", content: planText }, { source: "runner-handoff", content: result }],
-        );
-        const verifierRaw = await runIsolatedAgent(actor, session, planner, "verifier", verifierPrompt, "-verifier", 5 * 60_000, config.safetyOpencodeModel);
-        verification = filterSensitiveContent(extractCleanOutput(verifierRaw) || extractAnswer(verifierRaw));
-      }
+      const verification = runnerSuccess
+        ? await runIndependentVerification(actor, session, planner, intent, planText, result, targetNote, typedResult !== null)
+        : unreportedSuccess(result);
       const success = runnerSuccess && /VERIFICATION_STATUS:\s*passed/i.test(verification);
       const retainedCapability = success ? await retainValidatedCapability(capabilityDir, job.id, manifest) : null;
       updateHermesJob(job.id, success ? "completed" : "failed_verification", explanation({
         phase: "finished", intent,
-        reason: success ? `Execution and runner verification completed.${activationReason(pendingActivations)}` : "Execution finished but did not report a verified success.",
+        reason: success ? `Execution and runner verification completed.${activationReason(pendingActivations)}` : `Execution finished but did not report a verified success: ${verificationReason(verification)}`,
         completed: [...reviewedSteps, "Runner execution", "Independent verification", "Result collection"],
         evidence: [review.summary, ...policy.evidence, ...(retainedCapability ? [`validated capability: ${retainedCapability}`] : []), `elapsedMs=${Date.now() - startedAt}`],
         neededToContinue: success ? [] : ["Inspect the structured runner result and complete the failed verification."],
@@ -2563,9 +2577,13 @@ export async function createApp(options: AppOptions = {}) {
       }), { plan: planText, safety: review, policy, capabilities, manifest, hostRun, envelope, provenance, proposalPath, ...reviewRecord, retainedCapability, result, verification, pendingActivations, elapsedMs: Date.now() - startedAt });
     } catch (error) {
       const preservedOutput = database.getJobForActor(job.id, actor.id)?.output || {};
+      const message = error instanceof Error ? error.message : "Change job failed.";
       updateHermesJob(job.id, "failed_execution", explanation({
-        phase: "finished", intent, reason: error instanceof Error ? error.message : "Change job failed.",
-        neededToContinue: ["Inspect the preserved proposal, session, and job evidence."],
+        phase: "finished", intent, completed: executedSteps,
+        reason: executedSteps.length ? `The execution started and then failed: ${message}` : message,
+        neededToContinue: executedSteps.length
+          ? ["The execution may have changed the host: inspect its result and log before retrying."]
+          : ["Inspect the preserved proposal, session, and job evidence."],
         recommendedAction: "Resolve the reported prerequisite before retrying.",
       }), preservedOutput);
     } finally {
@@ -2772,12 +2790,12 @@ export async function createApp(options: AppOptions = {}) {
         const pendingActivations = typed?.pendingActivations ?? [];
         const verification = runnerSuccess
           ? await runIndependentVerification(actor, session, planner, intent, reviewedPlan, result, selfUpdateVerifierNote(pendingActivations), typedResult !== null)
-          : "VERIFICATION_STATUS: failed\nREASON: runner did not report success";
+          : unreportedSuccess(result);
         const success = runnerSuccess && /VERIFICATION_STATUS:\s*passed/i.test(verification);
         const retainedCapability = success ? await retainValidatedCapability(capabilityDir, job.id, manifest) : null;
         updateHermesJob(job.id, success ? "completed" : "failed_verification", explanation({
           phase: "finished", intent,
-          reason: success ? `Approved execution and verification completed.${activationReason(pendingActivations)}` : "Approved execution did not report verified success.",
+          reason: success ? `Approved execution and verification completed.${activationReason(pendingActivations)}` : `Approved execution did not report verified success: ${verificationReason(verification)}`,
           completed: ["Planner proposal", "Safety review", "Policy evaluation", "Operator approval", "Runner execution", "Independent verification", "Result collection"],
           neededToContinue: success ? [] : ["Inspect the structured runner result and complete verification or rollback."],
           recommendedAction: success ? activationAction(pendingActivations) : "Resolve the reported verification issue.",
@@ -4427,11 +4445,11 @@ Follow these rules:
       const runnerSuccess = /STATUS:\s*success/i.test(result);
       const verification = runnerSuccess && actor && session && planner
         ? await runIndependentVerification(actor, session, planner, intent, planText, result, "", true)
-        : `VERIFICATION_STATUS: failed\nREASON: ${runnerSuccess ? "the verifier runtime is unavailable after the restart" : "the host run did not report success"}`;
+        : runnerSuccess ? "VERIFICATION_STATUS: failed\nREASON: the verifier runtime is unavailable after the restart" : unreportedSuccess(result);
       const success = runnerSuccess && /VERIFICATION_STATUS:\s*passed/i.test(verification);
       updateHermesJob(job.id, success ? "completed" : "failed_verification", explanation({
         phase: "finished", intent,
-        reason: success ? "Host run and verification completed (followed across a restart)." : "The host run finished without a verified success (followed across a restart).",
+        reason: success ? "Host run and verification completed (followed across a restart)." : `The host run finished without a verified success (followed across a restart): ${verificationReason(verification)}`,
         completed: [...completed, "Independent verification", "Result collection"],
         neededToContinue: success ? [] : ["Inspect the host-run result and its log; use the plan's rollback or the machine snapshot named there."],
         recommendedAction: success ? "No further action is required." : "Correct the reported issue or perform rollback.",
