@@ -105,7 +105,7 @@ describe("verifier prompt bound", () => {
     const clipped = clipHandoff(handoff(output), 5000);
     for (const section of clipped.slice(0, clipped.lastIndexOf("\nNOTES:")).split("\n== ").slice(1)) {
       const body = section.split("\n").slice(1).join("\n");
-      expect(body.length === 0 || /characters (of this section left out|cut)/.test(body) || body === "y".repeat(1000) || body === "z".repeat(1000)).toBe(true);
+      expect(/characters (of this section left out|cut)/.test(body) || body === "y".repeat(1000) || body === "z".repeat(1000)).toBe(true);
     }
     expect(clipped).toContain("NOTES: run success");
   });
