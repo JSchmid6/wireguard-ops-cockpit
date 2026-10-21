@@ -30,7 +30,9 @@ export function clipMiddle(text: string, limit: number): string {
   if (text.length <= limit) return text;
   const mark = marker(text.length);
   const room = limit - mark.length - 2;
-  if (room < 40) return limit >= mark.length ? mark : "";
+  // Too little room for head and end: the cut is still marked, if need be
+  // a little beyond the limit (the callers measure the result and shrink).
+  if (room < 40) return limit >= mark.length ? mark : `[... ${text.length} characters cut ...]`;
   const head = Math.ceil(room / 2);
   const tail = room - head;
   return `${text.slice(0, head)}\n${marker(text.length - head - tail)}\n${text.slice(text.length - tail)}`;

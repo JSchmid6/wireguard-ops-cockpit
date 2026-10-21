@@ -217,7 +217,7 @@ export function verifierInstruction(intent: string, targetNote = "", apiHandoff 
 // A runner that did not report success is not verified; the handoff's NOTES
 // line (for a host run: "run check_failed — 1 check(s) failed") says why.
 export function unreportedSuccess(handoff: string): string {
-  const notes = handoff.match(/^NOTES:\s*(.+)$/m)?.[1]?.trim().slice(0, 300);
+  const notes = handoff.match(/^NOTES:\s*(.+)$/m)?.[1]?.trim().replace(/VERIFICATION_STATUS/gi, "verification-status").slice(0, 300);
   return `VERIFICATION_STATUS: failed\nREASON: runner did not report success${notes ? ` (${notes})` : ""}`;
 }
 
@@ -1984,7 +1984,9 @@ export async function createApp(options: AppOptions = {}) {
         ? filterSensitiveContent(extractCleanOutput(verifierRaw) || extractAnswer(verifierRaw))
         : "VERIFICATION_STATUS: failed\nREASON: verifier timeout";
     } catch (error) {
-      return `VERIFICATION_STATUS: failed\nREASON: the independent verification could not run: ${error instanceof Error ? error.message : "verifier failed"}`;
+      // The message can carry the agent's stderr: it must never read as a verdict.
+      const message = (error instanceof Error ? error.message : "verifier failed").replace(/VERIFICATION_STATUS/gi, "verification-status").slice(0, 1000);
+      return `VERIFICATION_STATUS: failed\nREASON: the independent verification could not run: ${message}`;
     }
   }
 

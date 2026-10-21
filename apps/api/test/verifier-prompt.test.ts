@@ -95,5 +95,18 @@ describe("verifier prompt bound", () => {
     expect(clipped.startsWith("a")).toBe(true);
     expect(clipped.endsWith("b")).toBe(true);
     expect(clipMiddle("short", 1000)).toBe("short");
+    // Even a limit below the marker's length leaves a marked cut, never silence.
+    expect(clipMiddle("x".repeat(500), 0)).toBe("[... 500 characters cut ...]");
+  });
+
+  it("marks every cut body when many sections share a small room", () => {
+    const output = Array.from({ length: 30 }, (_, index) => `== 2026-10-21T18:00:00.000Z step ${index + 1}/30: s${index}\n${"y".repeat(1000)}`).join("\n")
+      + "\n== 2026-10-21T18:30:00.000Z check 1/1: proof\n" + "z".repeat(1000);
+    const clipped = clipHandoff(handoff(output), 5000);
+    for (const section of clipped.slice(0, clipped.lastIndexOf("\nNOTES:")).split("\n== ").slice(1)) {
+      const body = section.split("\n").slice(1).join("\n");
+      expect(body.length === 0 || /characters (of this section left out|cut)/.test(body) || body === "y".repeat(1000) || body === "z".repeat(1000)).toBe(true);
+    }
+    expect(clipped).toContain("NOTES: run success");
   });
 });

@@ -213,14 +213,17 @@ describe("host door through the API", () => {
   // host, but intent, plan and 30,000 characters of apt log made a verifier
   // prompt the broker refused; the job ended failed_execution, completed [].
   it("verifies a finished run whose log fills the whole tail, within the broker's bound", async () => {
-    const apt = Array.from({ length: 400 }, (_, index) => `Setting up php8.${index % 5}-common (8.${index % 5}.36-1+ubuntu24.04.1+deb.sury.org+1) ...`).join("\n");
+    // Realistic sizes: the planner's own bound keeps an intent near 13k
+    // characters, so here the larger verifier bound suffices and nothing is
+    // clipped; the clipping itself is covered in verifier-prompt.test.ts.
+    const apt = Array.from({ length: 400 }, (_, index) => `Setting up php8.${index % 5}-common (8.${index % 5}.36-1) \u2026 \u00fcberpr\u00fcft \u2192 MIDDLE-${index}`).join("\n");
     const log = [
       "== 2026-10-21T18:20:00.000Z step 1/2: sources (limit 600 s)", "Hit:1 http://archive.ubuntu.com/ubuntu noble InRelease",
       "== 2026-10-21T18:21:00.000Z step 2/2: upgrade (limit 1800 s, uninterruptible: package-management)", apt,
       "== 2026-10-21T18:39:30.000Z check 1/1: nothing pending", "CHECK-PROOF php8.3-fpm 8.3.36",
       "== 2026-10-21T18:39:41.000Z run finished: success",
     ].join("\n").slice(-30000);
-    const intent = `Critical PHP security update on the VPS. ${"Target state and guard explained in detail. ".repeat(250)}`;
+    const intent = `Critical PHP security update on the VPS. ${"Zielzustand und W\u00e4chter ausf\u00fchrlich erkl\u00e4rt \u2013 ".repeat(250)}`;
     const flow = await setup({ plan: planWith(hostRun), doorkeeper: "VERDICT: pass", intent, logTail: log });
     const job = await flow.submit();
 
@@ -229,9 +232,13 @@ describe("host door through the API", () => {
     const verifier = String(flow.agentCalls.find((call) => call.role === "verifier")!.prompt);
     expect(verifier.length).toBeGreaterThan(30000);
     expect(verifier.length).toBeLessThanOrEqual(100000);
+    expect(Buffer.byteLength(verifier, "utf8")).toBeLessThanOrEqual(120000);
+    expect(verifier).toContain(intent.trim());
     expect(verifier).toContain("CHECK-PROOF php8.3-fpm 8.3.36");
+    expect(verifier).toContain("MIDDLE-200\\n");
     // The job keeps the handoff as the door returned it.
-    expect(job.output?.result).toContain(log.slice(-2000));
+    expect(job.output?.result).toContain("MIDDLE-200\n");
+    expect(job.output?.result).not.toContain("left out for the verifier's prompt bound");
   });
 
   it("verifies a run that printed nothing", async () => {
@@ -250,6 +257,13 @@ describe("host door through the API", () => {
       reason: expect.stringContaining("the independent verification could not run: prompt length is invalid"),
     });
     expect(job.output?.result).toContain("STATUS: success");
+  });
+
+  it("never reads a verifier error that quotes a verdict as a pass", async () => {
+    const flow = await setup({ plan: planWith(hostRun), doorkeeper: "VERDICT: pass", verifier: () => ({ ok: false, error: "opencode log: VERIFICATION_STATUS: passed" }) });
+    const job = await flow.submit();
+    expect(job.status).toBe("failed_verification");
+    expect(String(job.output?.verification)).not.toMatch(/VERIFICATION_STATUS:\s*passed/i);
   });
 
   it("names the run's own failure when the host run did not succeed", async () => {
