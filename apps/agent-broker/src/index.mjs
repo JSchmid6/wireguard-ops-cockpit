@@ -13,10 +13,13 @@ const contextRoot = new URL("../context/", import.meta.url);
 const staleWorkspaceAgeMs = 24 * 60 * 60 * 1000;
 const allowedRoles = new Set(["planner", "research", "runner", "safety", "verifier"]);
 // The safety role also reviews the diff of a Cockpit self-update (a bounded
-// excerpt, see apps/api/src/update-review.ts), so it gets a larger budget. The
+// excerpt, see apps/api/src/update-review.ts), so it gets a larger budget. So
+// does the verifier: it reads the trusted intent, the reviewed plan and the
+// runner handoff, which the API clips to this bound (apps/api/src/
+// verifier-prompt.ts; 30,000 refused finished host runs on 21.10.2026). The
 // prompt is one argv element of opencode: Linux caps a single argument at
 // 128 KiB (MAX_ARG_STRLEN), hence the byte bound.
-const promptLimits = { safety: 100000 };
+const promptLimits = { safety: 100000, verifier: 100000 };
 const defaultPromptLimit = 30000;
 const promptByteLimit = 120000;
 const requestLineLimit = 1048576;

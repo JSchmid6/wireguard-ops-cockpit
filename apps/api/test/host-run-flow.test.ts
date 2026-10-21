@@ -73,7 +73,11 @@ const planWith = (...manifests: Array<{ version: string }>) => [
   "## Intent", "Keep the host's packages current.",
 ].join("\n");
 
-async function setup(options: { plan: string; doorkeeper: string; intent?: string; ownedByAutomation?: boolean; hostState?: () => Record<string, unknown> | null; instanceRole?: "vps" | "lab0" | null; doorkeeperWait?: Promise<void> }) {
+// The real broker's request check: a prompt beyond its bound is refused here
+// exactly as on the host ("prompt length is invalid").
+const { validateRequest } = await import("../../agent-broker/src/index.mjs") as { validateRequest: (request: unknown) => unknown };
+
+async function setup(options: { plan: string; doorkeeper: string; intent?: string; ownedByAutomation?: boolean; hostState?: () => Record<string, unknown> | null; instanceRole?: "vps" | "lab0" | null; doorkeeperWait?: Promise<void>; logTail?: string; runStatus?: string; verifier?: () => Record<string, unknown> }) {
   const dir = mkdtempSync(path.join(tmpdir(), "host-run-flow-"));
   cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
   const seed = new CockpitDatabase(path.join(dir, "cockpit.sqlite"));
@@ -93,14 +97,17 @@ async function setup(options: { plan: string; doorkeeper: string; intent?: strin
     if (request.payload.action === "host.run") return { ok: true, output: JSON.stringify({ status: "started", jobId: request.payload.envelope.jobId }) };
     const live = options.hostState?.();
     if (live) return { ok: true, output: JSON.stringify({ ok: true, logTail: "running", state: live }) };
-    return { ok: true, output: JSON.stringify({ ok: true, logTail: "upgraded", state: {
-      phase: "finished", status: "success", error: null, snapshot: { snapshotId: "snap-1" },
-      steps: [{ index: 1, name: "sources", status: "success" }], checks: [{ index: 1, name: "nothing pending", status: "passed" }],
+    const runStatus = options.runStatus ?? "success";
+    return { ok: true, output: JSON.stringify({ ok: true, logTail: options.logTail ?? "upgraded", state: {
+      phase: "finished", status: runStatus, error: runStatus === "success" ? null : "1 check(s) failed", snapshot: { snapshotId: "snap-1" },
+      steps: [{ index: 1, name: "sources", status: "success" }], checks: [{ index: 1, name: "nothing pending", status: runStatus === "success" ? "passed" : "failed" }],
     } }) };
   });
-  const agentCalls = await listen(path.join(dir, "agent.sock"), (request) => request.role === "planner"
-    ? { ok: true, output: options.plan }
-    : { ok: true, output: "VERIFICATION_STATUS: passed\nEVIDENCE: no upgradable packages\nREASON: done" });
+  const agentCalls = await listen(path.join(dir, "agent.sock"), (request) => {
+    try { validateRequest(request); } catch (error) { return { ok: false, error: (error as Error).message }; }
+    if (request.role === "planner") return { ok: true, output: options.plan };
+    return options.verifier?.() ?? { ok: true, output: "VERIFICATION_STATUS: passed\nEVIDENCE: no upgradable packages\nREASON: done" };
+  });
   const doorkeeperPrompts: string[] = [];
   const app = await createApp({
     config: config(dir, { executorBrokerSocket: path.join(dir, "executor.sock"), executorBrokerSecret: BROKER_SECRET, agentBrokerSocket: path.join(dir, "agent.sock"), instanceRole: options.instanceRole ?? null }),
@@ -200,6 +207,71 @@ describe("host door through the API", () => {
     const verifier = String(flow.agentCalls[1].prompt);
     expect(verifier).toContain("First evaluate the supplied signed runner handoff's raw command output");
     expect(verifier).toContain("You run without root: state that only root may read (for example cockpit-self-update-action status");
+  });
+
+  // 21.10.2026, jobs ba5196ee/a86a0577: the php update ran through on the
+  // host, but intent, plan and 30,000 characters of apt log made a verifier
+  // prompt the broker refused; the job ended failed_execution, completed [].
+  it("verifies a finished run whose log fills the whole tail, within the broker's bound", async () => {
+    // Realistic sizes: the planner's own bound keeps an intent near 13k
+    // characters, so here the larger verifier bound suffices and nothing is
+    // clipped; the clipping itself is covered in verifier-prompt.test.ts.
+    const apt = Array.from({ length: 400 }, (_, index) => `Setting up php8.${index % 5}-common (8.${index % 5}.36-1) \u2026 \u00fcberpr\u00fcft \u2192 MIDDLE-${index}`).join("\n");
+    const log = [
+      "== 2026-10-21T18:20:00.000Z step 1/2: sources (limit 600 s)", "Hit:1 http://archive.ubuntu.com/ubuntu noble InRelease",
+      "== 2026-10-21T18:21:00.000Z step 2/2: upgrade (limit 1800 s, uninterruptible: package-management)", apt,
+      "== 2026-10-21T18:39:30.000Z check 1/1: nothing pending", "CHECK-PROOF php8.3-fpm 8.3.36",
+      "== 2026-10-21T18:39:41.000Z run finished: success",
+    ].join("\n").slice(-30000);
+    const intent = `Critical PHP security update on the VPS. ${"Zielzustand und W\u00e4chter ausf\u00fchrlich erkl\u00e4rt \u2013 ".repeat(250)}`;
+    const flow = await setup({ plan: planWith(hostRun), doorkeeper: "VERDICT: pass", intent, logTail: log });
+    const job = await flow.submit();
+
+    expect(job.status).toBe("completed");
+    expect(job.output?.explanation).toMatchObject({ completed: expect.arrayContaining(["Runner execution", "Independent verification"]) });
+    const verifier = String(flow.agentCalls.find((call) => call.role === "verifier")!.prompt);
+    expect(verifier.length).toBeGreaterThan(30000);
+    expect(verifier.length).toBeLessThanOrEqual(100000);
+    expect(Buffer.byteLength(verifier, "utf8")).toBeLessThanOrEqual(120000);
+    expect(verifier).toContain(intent.trim());
+    expect(verifier).toContain("CHECK-PROOF php8.3-fpm 8.3.36");
+    expect(verifier).toContain("MIDDLE-200\\n");
+    // The job keeps the handoff as the door returned it.
+    expect(job.output?.result).toContain("MIDDLE-200\n");
+    expect(job.output?.result).not.toContain("left out for the verifier's prompt bound");
+  });
+
+  it("verifies a run that printed nothing", async () => {
+    const flow = await setup({ plan: planWith(hostRun), doorkeeper: "VERDICT: pass", logTail: "" });
+    const job = await flow.submit();
+    expect(job.status).toBe("completed");
+    expect(String(job.output?.result)).toContain("OUTPUT: \nNOTES:");
+  });
+
+  it("ends a run the verifier could not judge as failed_verification, naming what ran and why", async () => {
+    const flow = await setup({ plan: planWith(hostRun), doorkeeper: "VERDICT: pass", verifier: () => ({ ok: false, error: "prompt length is invalid" }) });
+    const job = await flow.submit();
+    expect(job.status).toBe("failed_verification");
+    expect(job.output?.explanation).toMatchObject({
+      completed: expect.arrayContaining(["Runner execution", "Independent verification"]),
+      reason: expect.stringContaining("the independent verification could not run: prompt length is invalid"),
+    });
+    expect(job.output?.result).toContain("STATUS: success");
+  });
+
+  it("never reads a verifier error that quotes a verdict as a pass", async () => {
+    const flow = await setup({ plan: planWith(hostRun), doorkeeper: "VERDICT: pass", verifier: () => ({ ok: false, error: "opencode log: VERIFICATION_STATUS: passed" }) });
+    const job = await flow.submit();
+    expect(job.status).toBe("failed_verification");
+    expect(String(job.output?.verification)).not.toMatch(/VERIFICATION_STATUS:\s*passed/i);
+  });
+
+  it("names the run's own failure when the host run did not succeed", async () => {
+    const flow = await setup({ plan: planWith(hostRun), doorkeeper: "VERDICT: pass", runStatus: "check_failed" });
+    const job = await flow.submit();
+    expect(job.status).toBe("failed_verification");
+    expect(String((job.output?.explanation as Record<string, unknown>).reason)).toContain("runner did not report success (run check_failed");
+    expect(flow.agentCalls.map((call) => call.role)).toEqual(["planner"]);
   });
 
   // Lab0 job 4553505c (18.10.2026): the same manifest in a bash fence went to
