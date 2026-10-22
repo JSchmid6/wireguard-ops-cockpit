@@ -124,6 +124,9 @@ interface AppOptions {
   hostRunReviewRunner?: (prompt: string) => Promise<string>;
   // Interval of host.status polls while a host run is going (tests shorten it).
   hostRunPollMs?: number;
+  // Takt und Höchstdauer des Wartens auf den Platz am Host (tests shorten them).
+  hostRunSlotPollMs?: number;
+  hostRunSlotWaitMs?: number;
   // The borg helper's status report (`borg.status`, read-only). Defaults to the
   // typed executor path; tests inject the helper's output instead of a host.
   borgStatusReader?: () => Promise<string>;
@@ -185,6 +188,19 @@ const BORG_STATUS_MIN_INTERVAL_MS = 60_000;
 // fails (executor restarting, host rebooting) is retried until then.
 const HOST_RUN_POLL_MS = 15_000;
 const HOST_RUN_REBOOT_ALLOWANCE_MS = 60 * 60 * 1000;
+// Platz am Host (Karte t_9c04b4de): Der Host-Run-Helfer lässt nur einen Lauf
+// zugleich zu und weist einen zweiten Start vor dem ersten Schritt ab (Exit 75,
+// „another host run is active: <id>“ bzw. „… is starting“). Das ist kein
+// Fehllauf: Der Job reiht sich ein und fragt im Takt erneut, längstens bis kurz
+// vor dem Ablauf seines Envelopes. Findet er keinen Platz, endet er als
+// blocked_runner_busy (wiederholbar, zählt nicht zum Circuit Breaker).
+const HOST_RUN_BUSY = /another host run is (?:active|starting)/;
+const HOST_RUN_SLOT_POLL_MS = 15_000;
+const HOST_RUN_SLOT_WAIT_MS = 25 * 60 * 1000;
+// Abstand zum Ablauf des Envelopes: Der Helfer prüft ihn beim Start.
+const HOST_RUN_SLOT_MARGIN_MS = 60_000;
+
+class HostRunBusyError extends Error {}
 
 // Keeps a validated capability manifest for reuse, only when the planner
 // declared the operation as recurring (`retain: true`); a one-off repair stays
@@ -269,9 +285,10 @@ interface JobRestart {
 }
 
 // Phases in which nothing has run on the host yet: planning and the reviews.
-const REPLANNABLE_PHASES = new Set(["queued", "planning", "reviewing"]);
+// waiting_for_host: Der Job wartet auf den Platz am Host, gestartet ist nichts.
+const REPLANNABLE_PHASES = new Set(["queued", "planning", "reviewing", "waiting_for_host"]);
 // Endstände ohne Lauf auf dem Host, aus denen James einen eigenen Job zurückziehen darf.
-const WITHDRAWABLE_STATUSES = new Set(["pending", "pending_approval", "blocked_user_approval", "blocked_policy", "blocked_prerequisite"]);
+const WITHDRAWABLE_STATUSES = new Set(["pending", "pending_approval", "blocked_user_approval", "blocked_policy", "blocked_prerequisite", "blocked_runner_busy"]);
 // A job is planned again at most this often; after that it fails with the reason.
 const MAX_JOB_REPLANS = 2;
 // A job whose last progress is older than this is not planned again: whoever
@@ -2131,6 +2148,8 @@ export async function createApp(options: AppOptions = {}) {
     return await runBrokerAgent(config.agentBrokerSocket, "safety", prompt);
   });
   const hostRunPollMs = options.hostRunPollMs ?? HOST_RUN_POLL_MS;
+  const hostRunSlotPollMs = options.hostRunSlotPollMs ?? HOST_RUN_SLOT_POLL_MS;
+  const hostRunSlotWaitMs = options.hostRunSlotWaitMs ?? HOST_RUN_SLOT_WAIT_MS;
 
   // The reviewer prompt is kept next to the proposal (<jobId>-host-run-review.md,
   // 0600): exactly what the doorkeeper read.
@@ -2202,20 +2221,66 @@ export async function createApp(options: AppOptions = {}) {
     throw new Error(`host run ${jobId} reported no result before its deadline${lastError ? ` (last status error: ${lastError})` : ""}`);
   }
 
+  // Startet den Lauf, sobald der Host frei ist. Eine Absage des Helfers, weil
+  // schon ein Lauf aktiv ist oder gerade startet, nimmt die Marken des Starts
+  // zurück (der Job hat auf dem Host nichts getan und zählt nicht zum Breaker),
+  // stellt den Job auf waiting_for_host und fragt im Takt erneut. Zieht James den
+  // Job beim Warten zurück, startet nichts mehr.
+  async function startHostRunWhenFree(envelope: ExecutionEnvelope, manifest: HostRunManifest): Promise<string> {
+    const jobId = envelope.jobId;
+    const waitUntil = Math.min(Date.now() + hostRunSlotWaitMs, Date.parse(envelope.expiresAt) - HOST_RUN_SLOT_MARGIN_MS);
+    let waitingSince = "";
+    let refusals = 0;
+    let waitingFrom: Record<string, unknown> | null = null;
+    for (;;) {
+      const before = database.getJob(jobId);
+      if (before?.status === "withdrawn") throw new Error("the job was withdrawn while it waited for the host; nothing was executed");
+      // Marked before the start: an API that dies between the helper's answer
+      // and the record below still follows the run after its restart.
+      markExecutionStarted(jobId);
+      const requested = database.getJob(jobId);
+      if (requested) {
+        const output: Record<string, unknown> = { ...requested.output, hostRunRequestedAt: new Date().toISOString() };
+        if (waitingFrom) output.explanation = waitingFrom;
+        database.updateJob(jobId, { status: requested.status, output });
+      }
+      try {
+        return await runDynamicCapability(config.executorBrokerSocket!, config.executorBrokerSecret!, {
+          action: "host.run", manifest, envelope, expiresAt: envelope.expiresAt, envelopeDigest: envelope.digest,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!HOST_RUN_BUSY.test(message)) throw error;
+        const refusal = (message.match(/another host run is (?:active: [A-Za-z0-9_-]{1,80}|starting)/) ?? [message])[0];
+        waitingSince ||= new Date().toISOString();
+        refusals += 1;
+        const queue = { waitingSince, refusals, lastRefusal: refusal };
+        const current = database.getJob(jobId);
+        if (current) {
+          const { executionStartedAt: _started, hostRunRequestedAt: _requested, ...output } = current.output || {};
+          const detail = (output.explanation || {}) as Record<string, unknown>;
+          waitingFrom ??= detail;
+          database.updateJob(jobId, { status: current.status, output: { ...output, hostRunQueue: queue, explanation: {
+            ...detail, phase: "waiting_for_host",
+            reason: `Waiting for the host: ${refusal}. Nothing was executed; the job starts as soon as the host is free.`,
+          } } });
+        }
+        if (refusals === 1) database.createAudit({ actorId: null, action: "hermes.host_run.queued", targetType: "job", targetId: jobId, details: { refusal } });
+        if (Date.now() + hostRunSlotPollMs >= waitUntil) {
+          throw new HostRunBusyError(`the host was busy with another run (${refusal}) for ${Math.round((Date.now() - Date.parse(waitingSince)) / 1000)} s, until the job's approval window closes; nothing was executed`);
+        }
+        await new Promise((resolve) => setTimeout(resolve, hostRunSlotPollMs));
+      }
+    }
+  }
+
   async function runHostRun(envelope: ExecutionEnvelope, manifest: HostRunManifest): Promise<string> {
     if (!config.executorBrokerSocket || !config.executorBrokerSecret) throw new Error("executor broker is not configured");
     // Backup bolt (host-run.ts): the policy already stops such a run for the
     // operator; this is the second check before the helper, which asks a third time.
     const backup = backupGuardHits(manifest);
     if (backup.length > 0 && !envelope.operatorApproved) throw new Error(`the host run touches the backups and runs only with the operator's approval (${backup[0].where} ${backup[0].reason})`);
-    // Marked before the start: an API that dies between the helper's answer
-    // and the record below still follows the run after its restart.
-    markExecutionStarted(envelope.jobId);
-    const requested = database.getJob(envelope.jobId);
-    if (requested) database.updateJob(envelope.jobId, { status: requested.status, output: { ...requested.output, hostRunRequestedAt: new Date().toISOString() } });
-    const started = await runDynamicCapability(config.executorBrokerSocket, config.executorBrokerSecret, {
-      action: "host.run", manifest, envelope, expiresAt: envelope.expiresAt, envelopeDigest: envelope.digest,
-    });
+    const started = await startHostRunWhenFree(envelope, manifest);
     const startedAt = Date.now();
     // Recorded on the job, so an API restart (a reboot step restarts it too)
     // can pick the run up again: resumeHostRuns below.
@@ -2282,6 +2347,17 @@ export async function createApp(options: AppOptions = {}) {
       : job;
   }
 
+  // Kein Platz am Host bis zum Ablauf des Freigabefensters: Auf dem Host lief
+  // nichts, der Job ist wiederholbar (startHostRunWhenFree).
+  function runnerBusyExplanation(intent: string, completed: string[], message: string): HermesExplanation {
+    return explanation({
+      phase: "finished", intent, completed: completed.filter((step) => step !== "Runner execution"),
+      reason: `The host run did not start: ${message}`,
+      neededToContinue: ["Submit the request again once the host's current run has finished; nothing ran on the host."],
+      recommendedAction: "Retry after the running host run has finished.",
+    });
+  }
+
   function updateHermesJob(jobId: string, status: JobRecord["status"], detail: HermesExplanation, extra: Record<string, unknown> = {}): JobRecord {
     // The request and the restart record stay with the job through every
     // update: recovery needs the first, cockpit_einblick shows the second.
@@ -2292,7 +2368,8 @@ export async function createApp(options: AppOptions = {}) {
     const previous = stored?.output || {};
     // executionStartedAt markiert den Beginn der Ausführung auf dem Host; er
     // bleibt am Job, damit ein späterer Fehlschlag als echter Fehllauf zählt.
-    const carried = Object.fromEntries(["request", "restarts", "executionStartedAt"].filter((key) => key in previous).map((key) => [key, previous[key]]));
+    // hostRunQueue belegt, wie lange der Job auf den Platz am Host wartete.
+    const carried = Object.fromEntries(["request", "restarts", "executionStartedAt", "hostRunQueue"].filter((key) => key in previous).map((key) => [key, previous[key]]));
     const output: Record<string, unknown> = { ...carried, ...extra, explanation: detail };
     const updated = database.updateJob(jobId, {
       status,
@@ -2633,6 +2710,10 @@ export async function createApp(options: AppOptions = {}) {
     } catch (error) {
       const preservedOutput = database.getJobForActor(job.id, actor.id)?.output || {};
       const message = error instanceof Error ? error.message : "Change job failed.";
+      if (error instanceof HostRunBusyError) {
+        updateHermesJob(job.id, "blocked_runner_busy", runnerBusyExplanation(intent, executedSteps, message), preservedOutput);
+        return;
+      }
       updateHermesJob(job.id, "failed_execution", explanation({
         phase: "finished", intent, completed: executedSteps,
         reason: executedSteps.length ? `The execution started and then failed: ${message}` : message,
@@ -2865,6 +2946,10 @@ export async function createApp(options: AppOptions = {}) {
           rollbackAvailable: Boolean((job.output?.policy as Record<string, unknown> | undefined)?.rollbackAvailable),
         }), { ...running.output, retainedCapability, result, verification, pendingActivations });
       } catch (error) {
+        if (error instanceof HostRunBusyError) {
+          updateHermesJob(job.id, "blocked_runner_busy", runnerBusyExplanation(intent, ["Planner proposal", "Safety review", "Policy evaluation", "Operator approval"], error.message), { ...(database.getJob(job.id)?.output ?? running.output) });
+          return;
+        }
         updateHermesJob(job.id, "failed_execution", explanation({
           phase: "finished", intent, reason: error instanceof Error ? error.message : "Approved execution failed.",
           neededToContinue: ["Inspect the preserved proposal and execution session."],
