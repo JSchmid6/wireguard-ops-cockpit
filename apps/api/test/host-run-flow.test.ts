@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
+import { agentPromptLimit } from "../src/agent-broker.js";
 import { createApp, verifierInstruction } from "../src/app.js";
 import type { AppConfig } from "../src/config.js";
 import { CockpitDatabase } from "../src/db.js";
@@ -74,7 +75,7 @@ const planWith = (...manifests: Array<{ version: string }>) => [
 ].join("\n");
 
 // The real broker's request check: a prompt beyond its bound is refused here
-// exactly as on the host ("prompt length is invalid").
+// exactly as on the host ("prompt length <n> exceeds verifier limit <bound>").
 const { validateRequest } = await import("../../agent-broker/src/index.mjs") as { validateRequest: (request: unknown) => unknown };
 
 async function setup(options: { plan: string; doorkeeper: string; intent?: string; ownedByAutomation?: boolean; hostState?: () => Record<string, unknown> | null; instanceRole?: "vps" | "lab0" | null; doorkeeperWait?: Promise<void>; logTail?: string; runStatus?: string; verifier?: () => Record<string, unknown> }) {
@@ -231,8 +232,7 @@ describe("host door through the API", () => {
     expect(job.output?.explanation).toMatchObject({ completed: expect.arrayContaining(["Runner execution", "Independent verification"]) });
     const verifier = String(flow.agentCalls.find((call) => call.role === "verifier")!.prompt);
     expect(verifier.length).toBeGreaterThan(30000);
-    expect(verifier.length).toBeLessThanOrEqual(100000);
-    expect(Buffer.byteLength(verifier, "utf8")).toBeLessThanOrEqual(120000);
+    expect(verifier.length).toBeLessThanOrEqual(agentPromptLimit("verifier"));
     expect(verifier).toContain(intent.trim());
     expect(verifier).toContain("CHECK-PROOF php8.3-fpm 8.3.36");
     expect(verifier).toContain("MIDDLE-200\\n");

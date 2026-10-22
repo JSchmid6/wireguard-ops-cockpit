@@ -1,9 +1,19 @@
 import net from "node:net";
 import { randomUUID } from "node:crypto";
+import { promptLimit, promptLimitProblem, type AgentRole } from "../../agent-broker/src/prompt-limits.mjs";
 
-export type AgentBrokerRole = "planner" | "research" | "runner" | "safety" | "verifier";
+export type AgentBrokerRole = AgentRole;
+
+// The broker's prompt bound for a role, from the one file the broker itself
+// enforces (prompt-limits.mjs): a requester builds its prompt within it.
+export function agentPromptLimit(role: AgentBrokerRole): number {
+  return promptLimit(role);
+}
 
 export async function runBrokerAgent(socketPath: string, role: AgentBrokerRole, prompt: string): Promise<string> {
+  // The same check as the broker's, before the socket: the error names bound and length.
+  const problem = promptLimitProblem(role, prompt);
+  if (problem) throw new Error(problem);
   return await new Promise((resolve, reject) => {
     const connection = net.createConnection(socketPath);
     let response = "";

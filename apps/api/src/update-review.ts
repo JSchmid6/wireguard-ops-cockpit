@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 
+import { agentPromptLimit } from "./agent-broker.js";
 import {
   hashCanonical,
   parseTypedDiensteUpdates,
@@ -40,9 +41,10 @@ import {
 // supervisor's own guarantees (D1-D8), and its bindings carry their own
 // evidence source, so a review of one repository never unlocks the other.
 
-// Bytes of one reviewer prompt (one review pass). Stays below the agent broker's
-// safety-role bounds (100,000 characters, 120,000 bytes: one argv element).
-export const UPDATE_REVIEW_PROMPT_LIMIT = 96_000;
+// Bytes of one reviewer prompt (one review pass): the agent broker's safety-role
+// bound (characters, apps/agent-broker/src/prompt-limits.mjs), counted in bytes,
+// so it holds for any text (a character is at least one byte).
+export const UPDATE_REVIEW_PROMPT_LIMIT = agentPromptLimit("safety");
 const FILE_LIST_BUDGET = 8_000;
 const NAME_LIST_BUDGET = 500;
 const EVIDENCE_ITEM_LIMIT = 4_000;

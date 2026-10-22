@@ -56,11 +56,13 @@ export function selfUpdateActivation(action: TypedActionOutput): PendingActivati
 }
 
 // The typed executor actions of a plan, all of which succeeded (a failed one
-// throws before this point).
+// throws before this point). Outputs go whole (the executor broker bounds each
+// one); the verifier's prompt chooses from them within its bound
+// (verifier-prompt.ts) instead of a blind cut here.
 export function typedActionsExecution(actions: TypedActionOutput[]): TypedExecution {
   const ran = actions.map((action) => `${action.action} ${action.target}`).join(", ");
   return {
-    result: `## EXECUTION RESULT\nSTATUS: success\nEXIT_CODE: 0\nWHAT_RAN: typed executor actions: ${ran}\nOUTPUT: ${actions.map((action) => action.output).join("\n").slice(-10000)}\nNOTES: executed by isolated capability broker`,
+    result: `## EXECUTION RESULT\nSTATUS: success\nEXIT_CODE: 0\nWHAT_RAN: typed executor actions: ${ran}\nOUTPUT: ${actions.map((action) => action.output).join("\n")}\nNOTES: executed by isolated capability broker`,
     pendingActivations: actions.map(selfUpdateActivation).filter((item): item is PendingActivation => item !== null),
   };
 }
@@ -69,7 +71,7 @@ export function typedActionsExecution(actions: TypedActionOutput[]): TypedExecut
 // so it never brings an activation.
 export function capabilityExecution(name: string, filteredOutput: string): TypedExecution {
   return {
-    result: `## EXECUTION RESULT\nSTATUS: success\nEXIT_CODE: 0\nWHAT_RAN: ${name}\nOUTPUT: ${filteredOutput.slice(-30000)}\nNOTES: executed from a signed, agent-authored capability manifest in the host-effect sandbox`,
+    result: `## EXECUTION RESULT\nSTATUS: success\nEXIT_CODE: 0\nWHAT_RAN: ${name}\nOUTPUT: ${filteredOutput}\nNOTES: executed from a signed, agent-authored capability manifest in the host-effect sandbox`,
     pendingActivations: [],
   };
 }
