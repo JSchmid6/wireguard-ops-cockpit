@@ -78,7 +78,7 @@ Planner runtime notes:
 - optional OpenCode model pin: `COCKPIT_OPENCODE_MODEL=openai/gpt-4o`
 - optional safety model pin: `COCKPIT_SAFETY_OPENCODE_MODEL=anthropic/claude-sonnet-4`; health warns when it matches the planner model
 - optional strict diversity: `COCKPIT_REQUIRE_MODEL_DIVERSITY=true`
-- approval TTL and circuit breaker: `COCKPIT_APPROVAL_TTL_MINUTES=30`, `COCKPIT_MAX_FAILED_CHANGES_PER_HOUR=3`
+- approval TTL and circuit breaker: `COCKPIT_APPROVAL_TTL_MINUTES=30`, `COCKPIT_MAX_FAILED_CHANGES_PER_HOUR=3` (per operation), `COCKPIT_MAX_FAILED_CHANGES_PER_HOUR_GLOBAL=10` (all operations); only failures after the execution started count (`doc/services/execution-control-model.md`)
 - optional public web address for direct links to "Wartet auf dich" cards: `COCKPIT_WEB_URL=http://10.0.0.1:5173` (not a secret; see `doc/setup/wartet-auf-dich.md`)
 - set a distinct `COCKPIT_EXECUTION_ENVELOPE_SECRET`; it HMAC-signs reviewed Hermes envelopes and is removed from planner, runner, and verifier environments
 - production uses two local Unix sockets: `COCKPIT_AGENT_BROKER_SOCKET` and `COCKPIT_EXECUTOR_BROKER_SOCKET`; neither opens a network listener

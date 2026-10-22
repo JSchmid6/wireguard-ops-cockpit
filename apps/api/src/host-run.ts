@@ -77,6 +77,8 @@ export interface HostRunManifest {
 }
 
 export const HOST_RUN_VERSION = "cockpit-host-run/v1";
+// The fields of the host-run contract; any other field is named in a refusal.
+const HOST_RUN_FIELDS = new Set(["version", "name", "purpose", "mutates", "steps", "checks", "rollback", "risk"]);
 const MAX_STEPS = 24;
 const MAX_CHECKS = 16;
 const MAX_REBOOTS = 3;
@@ -98,7 +100,7 @@ function timeout(value: unknown, fallback: number, maximum: number): number {
 }
 
 function script(value: unknown, where: string): string {
-  if (typeof value !== "string" || !value.trim()) throw new Error(`${where} requires a shell script in run`);
+  if (typeof value !== "string" || !value.trim()) throw new Error(`${where} requires a shell script in run (field run: non-empty string)`);
   if (value.length > MAX_SCRIPT) throw new Error(`${where} is longer than ${MAX_SCRIPT} characters`);
   if (value.includes("\0")) throw new Error(`${where} contains a NUL byte`);
   return value.replace(/\r\n/g, "\n").trim();
@@ -130,14 +132,25 @@ export function parseHostRunManifest(plan: string): HostRunManifest | null {
   const manifestText = plan.match(HOST_RUN_FENCE)?.[1] || plan.match(HOST_RUN_JSON_FENCE)?.[1] || shellFenceManifest(plan);
   if (!manifestText) return null;
   let raw: unknown;
-  try { raw = JSON.parse(manifestText); } catch { throw new Error("host-run manifest is not valid JSON"); }
-  if (!raw || typeof raw !== "object") throw new Error("host-run manifest must be an object");
+  try { raw = JSON.parse(manifestText); } catch (error) {
+    throw new Error(`host-run manifest is not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("host-run manifest must be an object");
   const value = raw as Record<string, unknown>;
-  if (value.version !== HOST_RUN_VERSION) throw new Error("unsupported host-run manifest version");
+  // Jede Abweisung nennt Feld und erwarteten Wert, und Felder, die der Vertrag
+  // nicht kennt (ein Tippfehler wie "step" statt "steps"), stehen dabei.
+  const unknown = Object.keys(value).filter((key) => !HOST_RUN_FIELDS.has(key));
+  function fail(message: string): never {
+    throw new Error(unknown.length ? `${message} (fields not in the contract, ignored: ${unknown.join(", ")})` : message);
+  }
+  if (value.version !== HOST_RUN_VERSION) fail(`unsupported host-run manifest version: field version must be "${HOST_RUN_VERSION}", got ${JSON.stringify(value.version ?? null)}`);
   const name = text(value.name, 120);
   const purpose = text(value.purpose, 2000);
-  if (!name || !purpose) throw new Error("host-run manifest requires name and purpose");
-  if (!Array.isArray(value.steps) || value.steps.length === 0 || value.steps.length > MAX_STEPS) throw new Error(`host-run manifest requires 1-${MAX_STEPS} steps`);
+  if (!name) fail("host-run manifest requires name and purpose: field name must be a non-empty string");
+  if (!purpose) fail("host-run manifest requires name and purpose: field purpose must be a non-empty string");
+  if (!Array.isArray(value.steps) || value.steps.length === 0 || value.steps.length > MAX_STEPS) {
+    fail(`host-run manifest requires 1-${MAX_STEPS} steps: field steps must be an array of 1-${MAX_STEPS} objects, got ${Array.isArray(value.steps) ? `${value.steps.length} entries` : JSON.stringify(typeof value.steps)}`);
+  }
   const steps = value.steps.map((candidate, index): HostRunStep => {
     if (!candidate || typeof candidate !== "object") throw new Error(`host-run step ${index + 1} is invalid`);
     const step = candidate as Record<string, unknown>;
@@ -159,15 +172,15 @@ export function parseHostRunManifest(plan: string): HostRunManifest | null {
   // snapshot, and the reviewer is told to check that claim.
   const mutates = value.mutates !== false;
   if (reboots > 0 && !mutates) throw new Error("a reboot changes the system; mutates cannot be false");
-  if (!Array.isArray(value.checks) || value.checks.length === 0) throw new Error("host-run manifest requires verification checks");
-  if (value.checks.length > MAX_CHECKS) throw new Error(`host-run manifest allows at most ${MAX_CHECKS} checks`);
+  if (!Array.isArray(value.checks) || value.checks.length === 0) fail(`host-run manifest requires verification checks: field checks must be an array of 1-${MAX_CHECKS} objects {name, run}`);
+  if (value.checks.length > MAX_CHECKS) fail(`host-run manifest allows at most ${MAX_CHECKS} checks: field checks has ${value.checks.length}`);
   const checks = value.checks.map((candidate, index): HostRunCheck => {
     if (!candidate || typeof candidate !== "object") throw new Error(`host-run check ${index + 1} is invalid`);
     const check = candidate as Record<string, unknown>;
     return { name: text(check.name, 120) || `check ${index + 1}`, run: script(check.run, `host-run check ${index + 1}`), timeoutSeconds: timeout(check.timeoutSeconds, CHECK_TIMEOUT_DEFAULT, CHECK_TIMEOUT_MAX) };
   });
   const rollback = Array.isArray(value.rollback) ? value.rollback.slice(0, 32).flatMap((item) => typeof item === "string" && item.trim() ? [item.trim().slice(0, 1000)] : []) : [];
-  if (rollback.length === 0) throw new Error("host-run manifest requires a rollback (the way back)");
+  if (rollback.length === 0) fail("host-run manifest requires a rollback (the way back): field rollback must be an array with at least one non-empty string");
   const validRisks = new Set<HostRunRisk>(["contained", "exposure", "data_loss", "identity_or_secret"]);
   const risk = Array.isArray(value.risk) ? value.risk.filter((item): item is HostRunRisk => typeof item === "string" && validRisks.has(item as HostRunRisk)) : [];
   return {

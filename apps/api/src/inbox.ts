@@ -118,7 +118,10 @@ export function hermesJobCard(job: JobRecord, now: number, webUrl: string | null
   const policy = record(output.policy);
   const envelope = record(output.envelope);
   const findings = jobFindings(output);
-  const expiresAt = str(envelope.expiresAt) || null;
+  // Ein Job am offenen Circuit Breaker hat noch keinen Envelope: freigeben
+  // lässt ihn durch, solange das Freigabefenster des Breakers offen ist.
+  const breaker = record(output.breaker);
+  const expiresAt = str(envelope.expiresAt) || str(breaker.approvalExpiresAt) || null;
   const id = `job-${job.id}`;
   const title = oneSentence(str(explanation.intent) || "Änderung von James");
   return {

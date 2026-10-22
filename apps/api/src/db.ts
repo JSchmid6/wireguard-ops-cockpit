@@ -1120,6 +1120,17 @@ export class CockpitDatabase {
     return row.count;
   }
 
+  // Für den Circuit Breaker: die Fehlläufe im Fenster unter dieser Laufzeit,
+  // mit Job, Zeitpunkt und Vorgangsschlüssel (ältere Einträge ohne Schlüssel).
+  listChangeFailuresSince(sinceIso: string, runtimeFingerprint: string): Array<{ jobId: string; at: string; key: string | null }> {
+    const rows = this.database
+      .prepare(
+        "SELECT target_id, created_at, json_extract(details_json, '$.breakerKey') AS breaker_key FROM audits WHERE action = 'hermes.change.failed' AND datetime(created_at) >= datetime(?) AND json_extract(details_json, '$.runtimeFingerprint') = ? ORDER BY datetime(created_at) ASC"
+      )
+      .all(sinceIso, runtimeFingerprint) as Array<{ target_id: string | null; created_at: string; breaker_key: string | null }>;
+    return rows.map((row) => ({ jobId: row.target_id ?? "", at: row.created_at, key: typeof row.breaker_key === "string" ? row.breaker_key : null }));
+  }
+
   // Für "Wartet auf dich": gibt es zu diesem Ziel schon eine Entscheidung?
   hasAudit(action: string, targetId: string): boolean {
     const row = this.database
