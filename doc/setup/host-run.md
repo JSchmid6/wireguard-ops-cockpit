@@ -279,8 +279,14 @@ Freigabe).
   `api.env`, `executor.env` und `contabo.env`,
 - ein Lauf zur Zeit (Prüfen, Anlegen und Unit-Start unter einer atomaren Sperre).
 
-`status <job>` liefert Zustand und Protokollende. Endet eine Unit ohne Ergebnis (Zeitlimit,
-Absturz), meldet `status` den Lauf als gescheitert.
+`status <job>` liefert Zustand, einen Protokollauszug (`logTail`, höchstens 30 000 Zeichen) und
+`log` mit Pfad und Länge des ganzen Protokolls. Der Auszug behält jede `== `-Zeile (Schritt,
+Prüfung, Netz, Ergebnis) und von jedem Abschnitt Kopf und Ende: kleine Abschnitte ganz, große
+teilen sich den Rest; jeder Schnitt ist markiert. Bis 22.10.2026 war es nur das Ende, und ein langer
+apt-Schritt schob die frühen Schritte aus dem Ergebnis (Job a45f57b1). Die API nennt den Pfad
+in den NOTES des Ergebnisses (`full log on the host: …`), aber nur, wenn er im Laufverzeichnis
+des Helfers liegt. Endet eine Unit ohne Ergebnis (Zeitlimit, Absturz), meldet `status` den Lauf
+als gescheitert.
 
 ## 3a. Unterbrechungssichere Schritte: nie mittendrin abbrechen
 
@@ -505,7 +511,7 @@ Weitere bekannte Grenzen:
   Fokusliste und die Pflicht zum Zitat verringern das, schließen es nicht aus.
 - Die Schwärzung arbeitet zeilenweise auf bekannten Mustern und den bekannten Cockpit-Werten.
   Ein Geheimnis in unbekannter Form kann im Protokoll landen. Das Protokoll bleibt root-eigen
-  (0600), aber sein Ende (bis 30 000 Zeichen) steht im Job-Ergebnis, und das kann der Besteller
+  (0600), aber ein Auszug daraus (bis 30 000 Zeichen) steht im Job-Ergebnis, und das kann der Besteller
   über `GET /api/hermes/jobs/:jobId` lesen — also genau der Agent, der manipuliert sein könnte.
   Eine Ausgabe ist damit auch ein Weg nach draußen; der Reviewer-Prompt behandelt das Lesen und
   Ausgeben von Geheimnissen deshalb als Befund, egal wohin die Ausgabe geht.

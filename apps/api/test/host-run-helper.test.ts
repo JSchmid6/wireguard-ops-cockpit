@@ -104,7 +104,7 @@ function request(m: Manifest, envelopePatch: Record<string, unknown> = {}, jobId
 function status(jobId = "job-1") {
   const out = run(["status", jobId]);
   expect(out.code).toBe(0);
-  return JSON.parse(out.stdout) as { ok: boolean; state: Record<string, any>; logTail: string };
+  return JSON.parse(out.stdout) as { ok: boolean; state: Record<string, any>; logTail: string; log: { path: string; chars: number } | null };
 }
 
 beforeEach(() => {
@@ -317,6 +317,40 @@ describe("cockpit-host-run: lock", () => {
     expect(run(["status", "."]).code).toBe(64);
     expect(run(["status", "unknown-job"]).code).toBe(66);
     expect(run(["start", "extra"], request(manifest())).code).toBe(64);
+  });
+});
+
+// Job a45f57b1 (22.10.2026): status gave only the log's last 30,000
+// characters, so a long apt step pushed the early steps (git rev-parse,
+// dpkg -l) out of the stored result.
+describe("cockpit-host-run: log digest", () => {
+  const big = (label: string, lines: number) => `for i in $(seq 1 ${lines}); do echo "${label} line $i ................................................"; done`;
+
+  it("keeps every == line and head and end of each section within 30,000 characters", () => {
+    const m = manifest({
+      steps: [
+        { name: "rev", run: `echo EARLY-REV-0123abc; ${big("rev", 400)}; echo REV-END`, timeoutSeconds: 30 },
+        { name: "small", run: "echo SMALL-STEP-WHOLE", timeoutSeconds: 30 },
+        { name: "apt", run: `${big("apt", 1200)}; echo APT-END`, timeoutSeconds: 30 },
+      ],
+      checks: [{ name: "proof", run: "echo CHECK-PROOF-OK", timeoutSeconds: 30 }],
+    });
+    expect(run(["start"], request(m)).code).toBe(0);
+    const out = status();
+    const full = readFileSync(path.join(dir, "runs", "job-1", "output.log"), "utf8");
+    expect(full.length).toBeGreaterThan(60000);
+    expect(out.log).toEqual({ path: path.join(dir, "runs", "job-1", "output.log"), chars: full.length });
+    expect(out.logTail.length).toBeLessThanOrEqual(30000);
+    for (const line of full.split("\n").filter((item) => item.startsWith("== "))) expect(out.logTail).toContain(line);
+    for (const mark of ["EARLY-REV-0123abc", "REV-END", "SMALL-STEP-WHOLE", "APT-END", "CHECK-PROOF-OK"]) expect(out.logTail).toContain(mark);
+    expect(out.logTail).toMatch(/\[\.\.\. \d+ characters of this section left out; the full log stays on the host \.\.\.\]/);
+  });
+
+  it("returns a short log whole", () => {
+    expect(run(["start"], request(manifest())).code).toBe(0);
+    const out = status();
+    expect(out.logTail).toBe(readFileSync(path.join(dir, "runs", "job-1", "output.log"), "utf8"));
+    expect(out.logTail).not.toContain("left out");
   });
 });
 

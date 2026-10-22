@@ -336,6 +336,21 @@ describe("host run result", () => {
     expect(hostRunResultText(parsed(), result)).toContain("30 h old");
   });
 
+  // Job a45f57b1 (22.10.2026): the handoff names where the whole log stays.
+  it("names the whole log on the host, only in the helper's own run directory", () => {
+    const log = { path: "/var/lib/wireguard-ops-cockpit/host-runs/a45f57b1-62bc-470d-a958-3aff860abf88/output.log", chars: 40332 };
+    const result = parseHostRunStatus(JSON.stringify({ ok: true, state, logTail: "digest", log }));
+    expect(result.log).toEqual(log);
+    expect(hostRunResultText(parsed(), result)).toContain(`; full log on the host: ${log.path} (40332 characters, root-only)`);
+    for (const foreign of [{ ...log, path: "/etc/shadow" }, { ...log, path: "/var/lib/wireguard-ops-cockpit/host-runs/../../../etc/output.log" }, { ...log, chars: "40332" }, null]) {
+      const other = parseHostRunStatus(JSON.stringify({ ok: true, state, logTail: "digest", log: foreign }));
+      expect(other.log).toBeNull();
+      expect(hostRunResultText(parsed(), other)).not.toContain("full log on the host");
+    }
+    // A helper before the digest sends no log field at all.
+    expect(parseHostRunStatus(JSON.stringify({ ok: true, state, logTail: "" })).log).toBeNull();
+  });
+
   it("keeps waiting while a run is still going", () => {
     expect(parseHostRunStatus(JSON.stringify({ ok: true, state: { ...state, phase: "rebooting", status: "running" } })).finished).toBe(false);
   });
