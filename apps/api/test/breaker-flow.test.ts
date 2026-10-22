@@ -376,4 +376,16 @@ describe("change circuit breaker through the API", () => {
     expect(flow.executorCalls.filter((call) => call.payload.action === "host.run").length).toBe(startsAtWithdrawal);
     expect(flow.inspect.hasAudit("hermes.change.failed", jobId)).toBe(false);
   });
+
+  it("waits no longer than the envelope allows: the helper checks it at the start", async () => {
+    // Freigabefenster 66 s, davon 60 s Abstand: höchstens ~6 s Warten, trotz 10 min waitMs.
+    const flow = await setup({ approvalTtlMinutes: 1.1 }, { pollMs: 50, waitMs: 600_000 });
+    flow.host.busy = Number.POSITIVE_INFINITY;
+    const started = Date.now();
+    const job = await flow.submit({ operation: "t_envelope" });
+    expect(job.status).toBe("blocked_runner_busy");
+    expect(Date.now() - started).toBeLessThan(9_500);
+    const envelope = job.output?.envelope as { expiresAt: string };
+    expect(Date.parse(String(job.completedAt))).toBeLessThan(Date.parse(envelope.expiresAt) - 55_000);
+  }, 15_000);
 });

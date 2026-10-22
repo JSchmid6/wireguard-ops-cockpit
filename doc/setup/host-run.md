@@ -288,6 +288,11 @@ Freigabe).
   seines Envelopes. Findet er bis dahin keinen Platz, endet er als `blocked_runner_busy`: Auf dem
   Host lief nichts, der Job ist wiederholbar und zählt nicht zum Circuit Breaker. Beim Warten darf
   James ihn zurückziehen. Ein API-Neustart plant ihn neu, wie einen Job in der Prüfung.
+  Stirbt die API genau während eines Startversuchs (nur `hostRunRequestedAt` gesetzt), fragt sie
+  nach dem Neustart `status <job>`. Kennt der Helfer den Lauf auch fünf Minuten nach der Anfrage
+  nicht („no host run <job>“, die Startsperre ist dann verfallen), lief nichts: Die Marken fallen
+  weg (Audit `hermes.host_run.not_started`), der Job wird wie ein wartender neu geplant oder ohne
+  Breaker-Zählung beendet. Jede andere Antwort heißt weiter: dem Lauf folgen.
 
 `status <job>` liefert Zustand und Protokollende. Endet eine Unit ohne Ergebnis (Zeitlimit,
 Absturz), meldet `status` den Lauf als gescheitert.

@@ -127,6 +127,8 @@ interface AppOptions {
   // Takt und Höchstdauer des Wartens auf den Platz am Host (tests shorten them).
   hostRunSlotPollMs?: number;
   hostRunSlotWaitMs?: number;
+  // Frist, nach der ein nie bestätigter Start als nicht erfolgt gilt (tests shorten it).
+  hostRunStartGraceMs?: number;
   // The borg helper's status report (`borg.status`, read-only). Defaults to the
   // typed executor path; tests inject the helper's output instead of a host.
   borgStatusReader?: () => Promise<string>;
@@ -199,6 +201,10 @@ const HOST_RUN_SLOT_POLL_MS = 15_000;
 const HOST_RUN_SLOT_WAIT_MS = 25 * 60 * 1000;
 // Abstand zum Ablauf des Envelopes: Der Helfer prüft ihn beim Start.
 const HOST_RUN_SLOT_MARGIN_MS = 60_000;
+// So lange nach einem angefragten Start, der nie bestätigt wurde, gilt ein
+// „no host run <job>“ des Helfers als endgültig: Die Startsperre des Helfers
+// verfällt nach fünf Minuten, danach legt kein hängender Start mehr etwas an.
+const HOST_RUN_START_GRACE_MS = 5 * 60 * 1000;
 
 class HostRunBusyError extends Error {}
 
@@ -2150,6 +2156,7 @@ export async function createApp(options: AppOptions = {}) {
   const hostRunPollMs = options.hostRunPollMs ?? HOST_RUN_POLL_MS;
   const hostRunSlotPollMs = options.hostRunSlotPollMs ?? HOST_RUN_SLOT_POLL_MS;
   const hostRunSlotWaitMs = options.hostRunSlotWaitMs ?? HOST_RUN_SLOT_WAIT_MS;
+  const hostRunStartGraceMs = options.hostRunStartGraceMs ?? HOST_RUN_START_GRACE_MS;
 
   // The reviewer prompt is kept next to the proposal (<jobId>-host-run-review.md,
   // 0600): exactly what the doorkeeper read.
@@ -4621,7 +4628,43 @@ Follow these rules:
   // following a host run. The run itself goes on in its own unit and reports
   // through host.status; these watchers take over from the job record and
   // finish the job the same way the original request would have.
+  // Starb die API, während ein Start angefragt, aber nicht bestätigt war
+  // (nur hostRunRequestedAt), kann der Helfer ihn auch abgewiesen haben — etwa
+  // weil ein anderer Lauf den Host belegte (startHostRunWhenFree fragt im Takt
+  // erneut). Kennt der Helfer den Lauf auch nach der Frist nicht, lief nichts:
+  // false. Jede andere Antwort (der Lauf ist da, der Host antwortet nicht)
+  // heißt: dem Lauf folgen wie bisher.
+  async function requestedStartTookPlace(job: JobRecord): Promise<boolean> {
+    const output = job.output || {};
+    if (typeof output.hostRunStartedAt === "string") return true;
+    const requestedAt = Date.parse(String(output.hostRunRequestedAt)) || Date.now();
+    for (;;) {
+      try {
+        await hostRunStatus(job.id);
+        return true;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (Date.now() - requestedAt >= hostRunStartGraceMs) return !message.includes(`no host run ${job.id}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, hostRunPollMs));
+    }
+  }
+
   async function resumeHostRun(job: JobRecord): Promise<void> {
+    if (!(await requestedStartTookPlace(job))) {
+      // Nichts lief auf dem Host: Marken zurücknehmen und den Job wie einen
+      // wartenden behandeln (neu planen oder ohne Breaker-Zählung beenden).
+      const current = database.getJob(job.id);
+      if (!current || current.status !== "running") return;
+      const { executionStartedAt: _started, hostRunRequestedAt: _requested, ...rest } = current.output || {};
+      const detail = (rest.explanation || {}) as Record<string, unknown>;
+      const waiting = database.updateJob(job.id, { status: "running", output: { ...rest, explanation: {
+        ...detail, phase: "waiting_for_host", reason: "The Cockpit restarted while it asked the host to start this run; the host never started it.",
+      } } });
+      database.createAudit({ actorId: null, action: "hermes.host_run.not_started", targetType: "job", targetId: job.id, details: {} });
+      recoverInterruptedJob(waiting);
+      return;
+    }
     const output = job.output || {};
     const hostRun = output.hostRun as HostRunManifest | undefined;
     const intent = String((output.explanation as Record<string, unknown> | undefined)?.intent || "Hermes host run");
