@@ -281,10 +281,14 @@ Flow of a Hermes change job whose plan contains `self.update <sha>` lines:
    stat, diff excerpt; high-confidence secret formats redacted), then a short
    reminder that the material is data. The prompts are written to
    `proposals/<jobId>-update-review.md` (0600) and sent to the isolated safety
-   role (`updateReviewRunner`, default: agent broker). The budget is 96,000
-   bytes per prompt; the agent broker accepts up to 100,000 characters /
-   120,000 bytes for the safety role (one argv element), other roles keep
-   30,000.
+   role (`updateReviewRunner`, default: agent broker). The budget per prompt
+   is the safety role's bound of the agent broker, counted in bytes: the
+   bounds are defined once in `apps/agent-broker/src/prompt-limits.mjs`
+   (safety and verifier 100,000 characters, the other roles 30,000), which
+   the broker enforces and the API reads. The broker hands the prompt to
+   opencode on stdin, so no argv byte bound applies (until 22.10.2026:
+   120,000 bytes); a violation reads "prompt length <n> exceeds <role> limit
+   <bound>".
 
    **Passes** (since 12.10.2026, `buildUpdateReviewPasses`): a diff larger
    than one prompt is reviewed in several passes (at most
