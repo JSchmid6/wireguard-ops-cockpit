@@ -22,7 +22,10 @@ export interface AppConfig {
   safetyOpencodeModel: string | null;
   requireModelDiversity: boolean;
   approvalTtlMinutes: number;
+  // Circuit Breaker: Fehlläufe pro Vorgang (Schlüssel aus dem Auftrag) und als
+  // höherer globaler Deckel über alle Vorgänge gegen echte Amok-Läufe.
   maxFailedChangesPerHour: number;
+  maxFailedChangesPerHourGlobal?: number;
   agentBrokerSocket: string | null;
   executorBrokerSocket: string | null;
   executorBrokerSecret: string | null;
@@ -34,6 +37,13 @@ export interface AppConfig {
   // der API-Unit als optionales EnvironmentFile gelesen). Sagt dem Türsteher,
   // auf welchem Host er steht; fehlt sie, gilt der strengste Text (VPS).
   instanceRole?: "vps" | "lab0" | null;
+}
+
+// A breaker limit from the environment: a positive whole number, else the
+// default (an unreadable value must neither disable nor break the breaker).
+function positiveCount(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return value && Number.isFinite(parsed) && parsed >= 1 ? Math.floor(parsed) : fallback;
 }
 
 function currentDirectory(): string {
@@ -73,7 +83,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     safetyOpencodeModel: env.COCKPIT_SAFETY_OPENCODE_MODEL?.trim() || env.COCKPIT_OPENCODE_MODEL?.trim() || null,
     requireModelDiversity: env.COCKPIT_REQUIRE_MODEL_DIVERSITY === "true",
     approvalTtlMinutes: Math.max(1, Number(env.COCKPIT_APPROVAL_TTL_MINUTES || "30")),
-    maxFailedChangesPerHour: Math.max(1, Number(env.COCKPIT_MAX_FAILED_CHANGES_PER_HOUR || "3")),
+    maxFailedChangesPerHour: positiveCount(env.COCKPIT_MAX_FAILED_CHANGES_PER_HOUR, 3),
+    maxFailedChangesPerHourGlobal: positiveCount(env.COCKPIT_MAX_FAILED_CHANGES_PER_HOUR_GLOBAL, 10),
     agentBrokerSocket: env.COCKPIT_AGENT_BROKER_SOCKET?.trim() || null,
     executorBrokerSocket: env.COCKPIT_EXECUTOR_BROKER_SOCKET?.trim() || null,
     executorBrokerSecret: env.COCKPIT_EXECUTOR_BROKER_SECRET?.trim() || null,

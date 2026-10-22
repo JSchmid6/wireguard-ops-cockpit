@@ -43,6 +43,7 @@ import {
 import { generateRunbookSafetyReview, type SafetyReviewRunner } from "./safety-review.js";
 import { activationAction, activationReason, capabilityExecution, hostRunExecution, selfUpdateVerifierNote, typedActionsExecution, type TypedActionOutput, type TypedExecution } from "./self-update-activation.js";
 import { boundedVerifierPrompt } from "./verifier-prompt.js";
+import { BREAKER_WINDOW_MS, OPERATION_PATTERN, breakerKeyFor, breakerReason, evaluateBreaker } from "./circuit-breaker.js";
 import { runBrokerAgent } from "./agent-broker.js";
 import { runDynamicCapability, runExecutorAction, type ExecutorActionKind } from "./executor-broker.js";
 import { borgStatusRequestDigest, createBorgStatusService } from "./borg-status.js";
@@ -249,6 +250,12 @@ interface ResearchRequest {
 interface ChangeRequest extends ResearchRequest {
   allowedCapabilities: CapabilityId[];
   execute: boolean;
+  // Vorgang, dem der Job gehört (z. B. die Kanban-Karte); fehlt er, gilt der Intent.
+  operation?: string | null;
+  // Schlüssel des Circuit Breakers (breakerKeyFor), beim Auftrag festgelegt.
+  breakerKey?: string;
+  // Der Operator hat genau diesen Job trotz offenem Breaker freigegeben.
+  breakerOverride?: { at: string; actorId: string; reason: string };
 }
 
 type JobSession = NonNullable<ReturnType<CockpitDatabase["getSessionRuntimeTargetForActor"]>>;
@@ -2015,10 +2022,22 @@ export async function createApp(options: AppOptions = {}) {
     ].join("\n");
   }
 
+  // Circuit Breaker: Ab hier geht der Auftrag an den Host (Executor-Broker oder
+  // Runner). Erst ein Fehlschlag nach dieser Marke ist ein echter Fehllauf; was
+  // die API vorher selbst abweist (Form, fehlender Broker, Riegel), zählt nicht.
+  // updateHermesJob trägt die Marke durch alle späteren Updates des Jobs.
+  function markExecutionStarted(jobId: string): void {
+    const job = database.getJob(jobId);
+    if (job && typeof job.output?.executionStartedAt !== "string") {
+      database.updateJob(jobId, { status: job.status, output: { ...job.output, executionStartedAt: new Date().toISOString() } });
+    }
+  }
+
   async function executeTypedCapabilities(planText: string, envelope: ExecutionEnvelope, manifest?: CapabilityManifest | null, reviewedUpdates: UpdateBinding[] = [], hostRun?: HostRunManifest | null): Promise<TypedExecution | null> {
     if (hostRun) return hostRunExecution(await runHostRun(envelope, hostRun));
     if (manifest) {
       if (!config.executorBrokerSocket || !config.executorBrokerSecret) throw new Error("sandbox executor broker is not configured");
+      markExecutionStarted(envelope.jobId);
       const output = await runDynamicCapability(config.executorBrokerSocket, config.executorBrokerSecret, {
         action: "capability.execute", manifest, envelope, expiresAt: envelope.expiresAt, envelopeDigest: envelope.digest,
       });
@@ -2070,6 +2089,7 @@ export async function createApp(options: AppOptions = {}) {
       actions.push(...borg.actions);
     }
     if (actions.length === 0) throw new Error("typed capability plan contains no typed action");
+    markExecutionStarted(envelope.jobId);
     const outputs: TypedActionOutput[] = [];
     for (const action of actions) {
       let diffSha256: string | null = null;
@@ -2190,6 +2210,7 @@ export async function createApp(options: AppOptions = {}) {
     if (backup.length > 0 && !envelope.operatorApproved) throw new Error(`the host run touches the backups and runs only with the operator's approval (${backup[0].where} ${backup[0].reason})`);
     // Marked before the start: an API that dies between the helper's answer
     // and the record below still follows the run after its restart.
+    markExecutionStarted(envelope.jobId);
     const requested = database.getJob(envelope.jobId);
     if (requested) database.updateJob(envelope.jobId, { status: requested.status, output: { ...requested.output, hostRunRequestedAt: new Date().toISOString() } });
     const started = await runDynamicCapability(config.executorBrokerSocket, config.executorBrokerSecret, {
@@ -2269,22 +2290,32 @@ export async function createApp(options: AppOptions = {}) {
     // danach nichts mehr in den Job (auch kein failed_* für den Circuit Breaker).
     if (stored?.status === "withdrawn") return stored;
     const previous = stored?.output || {};
-    const carried = Object.fromEntries(["request", "restarts"].filter((key) => key in previous).map((key) => [key, previous[key]]));
+    // executionStartedAt markiert den Beginn der Ausführung auf dem Host; er
+    // bleibt am Job, damit ein späterer Fehlschlag als echter Fehllauf zählt.
+    const carried = Object.fromEntries(["request", "restarts", "executionStartedAt"].filter((key) => key in previous).map((key) => [key, previous[key]]));
+    const output: Record<string, unknown> = { ...carried, ...extra, explanation: detail };
     const updated = database.updateJob(jobId, {
       status,
-      output: { ...carried, ...extra, explanation: detail },
+      output,
       completedAt: ["running", "pending"].includes(status) ? null : new Date().toISOString(),
     });
+    // Zum Circuit Breaker zählt nur ein echter Fehllauf: die Ausführung hatte
+    // begonnen. Eine Abweisung vor der Ausführung (Manifest, Policy, Türsteher)
+    // hat auf dem Host nichts getan und trägt ihre eigene Fehlermeldung.
     if (
       (status === "failed_execution" || status === "failed_verification") &&
-      updated.subjectId === "hermes-change"
+      updated.subjectId === "hermes-change" && typeof output.executionStartedAt === "string"
     ) {
+      const request = output.request as ChangeRequest | undefined;
       database.createAudit({
         actorId: null,
         action: "hermes.change.failed",
         targetType: "job",
         targetId: jobId,
-        details: { status, reason: detail.reason, runtimeFingerprint: changeRuntimeFingerprint },
+        details: {
+          status, reason: detail.reason, runtimeFingerprint: changeRuntimeFingerprint,
+          breakerKey: request?.breakerKey ?? breakerKeyFor(request?.operation, String(request?.intent ?? detail.intent ?? "")),
+        },
       });
     }
     return updated;
@@ -2368,16 +2399,36 @@ export async function createApp(options: AppOptions = {}) {
     let executedSteps: string[] = [];
     try {
       const agentTask = `${buildAgentTask(intent, untrustedEvidence)}\n\nDYNAMIC CAPABILITY CONTRACT:\n${hostRunPlannerContract()}\n\n${capabilityPlannerContract()}`;
-      const failureWindowStart = new Date(Date.now() - 60 * 60_000).toISOString();
-      const recentFailures = database.countAuditsSinceForRuntime("hermes.change.failed", failureWindowStart, changeRuntimeFingerprint);
-      if (recentFailures >= config.maxFailedChangesPerHour) {
-        updateHermesJob(job.id, "blocked_prerequisite", explanation({
+      const breakerKey = request.breakerKey ?? breakerKeyFor(request.operation, intent);
+      const now = Date.now();
+      const breaker = evaluateBreaker(
+        database.listChangeFailuresSince(new Date(now - BREAKER_WINDOW_MS).toISOString(), changeRuntimeFingerprint),
+        breakerKey,
+        { perOperation: config.maxFailedChangesPerHour, global: Math.max(config.maxFailedChangesPerHour, config.maxFailedChangesPerHourGlobal ?? 10) },
+        now,
+      );
+      if (breaker && request.breakerOverride) {
+        database.createAudit({
+          actorId: request.breakerOverride.actorId, action: "hermes.change.breaker_passed", targetType: "job", targetId: job.id,
+          details: { ...breaker, reason: request.breakerOverride.reason },
+        });
+      } else if (breaker) {
+        // Kein Endzustand: der Job wartet auf Jochen. Gibt er ihn über den
+        // Freigabe-Link frei, läuft genau dieser Job trotz offenem Breaker
+        // (Planung und Prüfungen wie immer); sonst bestellt James nach closesAt neu.
+        const approvalExpiresAt = new Date(now + config.approvalTtlMinutes * 60_000).toISOString();
+        updateHermesJob(job.id, "blocked_user_approval", explanation({
           phase: "finished", intent,
-          reason: `Circuit breaker is open after ${recentFailures} failed change jobs in the last hour.`,
-          evidence: [`failureCount=${recentFailures}`, `windowStart=${failureWindowStart}`, `runtimeFingerprint=${changeRuntimeFingerprint}`],
-          neededToContinue: ["Wait for the failure window to clear or have an operator diagnose the repeated failures."],
-          recommendedAction: "Do not retry automatically; inspect recent failed jobs first.",
-        }));
+          reason: breakerReason(breaker),
+          evidence: [
+            `scope=${breaker.scope}`, `breakerKey=${breakerKey}`, `failureCount=${breaker.count}`, `limit=${breaker.limit}`,
+            `failedJobs=${breaker.jobIds.join(",")}`, `windowStart=${breaker.windowStart}`, `closesAt=${breaker.closesAt}`,
+            `runtimeFingerprint=${changeRuntimeFingerprint}`,
+          ],
+          neededToContinue: [`Wait until ${breaker.closesAt} and submit again, or have the operator let this one job through (approval link).`],
+          recommendedAction: "Do not retry automatically; inspect the failed jobs named here first.",
+        }), { breaker: { ...breaker, approvalExpiresAt } });
+        database.createAudit({ actorId: null, action: "hermes.change.breaker_blocked", targetType: "job", targetId: job.id, details: { ...breaker } });
         return;
       }
       if (session.tmuxBackend === "disabled") {
@@ -2557,6 +2608,8 @@ export async function createApp(options: AppOptions = {}) {
       executedSteps = [...reviewedSteps, "Runner execution"];
       const typed = await executeTypedCapabilities(planText, envelope, manifest, updateReview?.outcome.bindings ?? [], hostRun);
       const typedResult = typed?.result ?? null;
+      // The isolated runner acts on the host itself: its failure is a real one.
+      if (!typedResult) markExecutionStarted(job.id);
       const runnerRaw = typedResult || await runIsolatedRunner(actor, session, planner, proposalPath, planText);
       const result = typedResult || filterSensitiveContent(extractRunnerHandoff(runnerRaw));
       if (!result) throw new Error("runner produced no structured execution result");
@@ -2708,6 +2761,13 @@ export async function createApp(options: AppOptions = {}) {
     const intent = typeof job.output?.explanation === "object" && job.output.explanation
       ? String((job.output.explanation as Record<string, unknown>).intent || "Approved Hermes change")
       : "Approved Hermes change";
+    // Notfall-Durchlass: Der Job wartet nicht auf einen geprüften Plan, sondern
+    // hängt am offenen Circuit Breaker. Freigeben lässt genau diesen Job durch —
+    // er wird geplant und geprüft wie jeder andere (der Breaker allein entfällt).
+    const breaker = job.output?.breaker as Record<string, unknown> | undefined;
+    if (breaker && typeof breaker === "object" && !job.output?.envelope) {
+      return decideBreakerOverride(job, jobOwnerId, actor, body.decision, body.reason.trim(), intent, breaker, reply);
+    }
     if (body.decision === "approved") {
       const envelopeErrors = envelopeErrorsFor(job, job.output?.envelope as ExecutionEnvelope | undefined, jobOwnerId, intent, true);
       if (envelopeErrors.length > 0) {
@@ -2786,6 +2846,7 @@ export async function createApp(options: AppOptions = {}) {
         const hostRun = running.output?.hostRun as HostRunManifest | null | undefined;
         const typed = await executeTypedCapabilities(reviewedPlan, envelope, manifest, reviewedUpdates, hostRun);
         const typedResult = typed?.result ?? null;
+        if (!typedResult) markExecutionStarted(job.id);
         const raw = typedResult || await runIsolatedRunner(actor, session, planner, proposalPath, reviewedPlan);
         const result = typedResult || filterSensitiveContent(extractRunnerHandoff(raw));
         const runnerSuccess = /STATUS:\s*success/i.test(result);
@@ -2813,6 +2874,45 @@ export async function createApp(options: AppOptions = {}) {
     })();
     return reply.code(202).send({ job: running, message: "Approval recorded; execution started. Poll the job endpoint." });
   });
+
+  async function decideBreakerOverride(
+    job: JobRecord, jobOwnerId: string, actor: UserSummary, decision: "approved" | "rejected", reason: string, intent: string,
+    breaker: Record<string, unknown>, reply: FastifyReply,
+  ) {
+    const request = job.output?.request as ChangeRequest | undefined;
+    if (decision === "rejected") {
+      database.createAudit({ actorId: actor.id, action: "hermes.change.breaker_override_rejected", targetType: "job", targetId: job.id, details: { reason, breaker } });
+      const rejected = updateHermesJob(job.id, "rejected", explanation({
+        phase: "finished", intent, reason: reason || "Operator kept the circuit breaker closed for this job.",
+        completed: ["Circuit breaker", "Operator decision"],
+        recommendedAction: "Inspect the failed jobs named by the breaker before submitting again.",
+      }), { ...job.output, approval: { decision: "rejected", reason, actorId: actor.id } });
+      return { job: rejected };
+    }
+    const expiresAt = typeof breaker.approvalExpiresAt === "string" ? Date.parse(breaker.approvalExpiresAt) : NaN;
+    if (!(Date.now() <= expiresAt)) {
+      return reply.code(409).send({ message: "the breaker override window expired; submit the change job again" });
+    }
+    const owner = database.getUserById(jobOwnerId);
+    const session = job.sessionId ? database.getSessionRuntimeTargetForActor(job.sessionId, jobOwnerId) : null;
+    if (!request || typeof request.intent !== "string" || !Array.isArray(request.evidence) || !owner || !session) {
+      return reply.code(409).send({ message: "the job has no recorded request, owner or session to run again; submit it again" });
+    }
+    if (database.getJob(job.id)?.status !== "blocked_user_approval") {
+      return reply.code(409).send({ message: "job is not awaiting operator approval" });
+    }
+    const override = { at: new Date().toISOString(), actorId: actor.id, reason };
+    database.createAudit({ actorId: actor.id, action: "hermes.change.breaker_override", targetType: "job", targetId: job.id, details: { reason, breaker } });
+    const overridden: ChangeRequest = { ...request, breakerOverride: override };
+    // Nur der Auftrag (mit dem Durchlass) geht weiter; Planung beginnt neu.
+    const queued = updateHermesJob(job.id, "running", explanation({
+      phase: "queued", intent,
+      reason: "The operator let this one job through the open circuit breaker; it is planned and reviewed as usual.",
+      completed: ["Circuit breaker", "Operator override"],
+    }), { request: overridden });
+    void runChangeJob(queued, owner, session, overridden);
+    return reply.code(202).send({ job: queued, message: "Breaker override recorded; the job is planned and reviewed now. Poll the job endpoint." });
+  }
 
   // Reaktivieren: Ein Job, der nur abgelaufen ist, bekommt eine neue Frist —
   // derselbe Plan, dieselbe Prüfung, derselbe Envelope-Inhalt, kein Freigeben.
@@ -3325,11 +3425,16 @@ Follow these rules:
   app.post("/api/hermes/runbook", async (request, reply) => {
     const actor = await requireActor(request, reply, database);
     if (!actor) return;
-    const body = (request.body || {}) as { prompt?: string; intent?: string; evidence?: unknown; allowedCapabilities?: unknown; sessionId?: string; timeoutMs?: number; execute?: boolean };
+    const body = (request.body || {}) as { prompt?: string; intent?: string; evidence?: unknown; allowedCapabilities?: unknown; sessionId?: string; timeoutMs?: number; execute?: boolean; operation?: unknown };
     const requestedIntent = (body.intent || body.prompt || "").trim();
     if (requestedIntent.length < 10) {
       return reply.code(400).send({ message: "intent or prompt is required (min 10 chars)" });
     }
+    // Der Vorgang (z. B. die Kanban-Karte) ist der Schlüssel des Circuit Breakers.
+    if (body.operation !== undefined && body.operation !== null && (typeof body.operation !== "string" || !OPERATION_PATTERN.test(body.operation))) {
+      return reply.code(400).send({ message: "field operation: expected 1-80 characters [A-Za-z0-9._:-], starting with a letter or digit (e.g. a kanban card id)", field: "operation" });
+    }
+    const operation = typeof body.operation === "string" ? body.operation : null;
     const waitMs = Math.min(Math.max(body.timeoutMs ?? 50_000, 0), 55_000);
     const shouldExecute = body.execute !== false;
     let createdSession = false;
@@ -3349,6 +3454,7 @@ Follow these rules:
     const changeRequest: ChangeRequest = {
       intent, evidence: normalizeEvidence(body.evidence), allowedCapabilities: normalizeAllowedCapabilities(body.allowedCapabilities),
       execute: shouldExecute, ownedSession: createdSession,
+      operation, breakerKey: breakerKeyFor(operation, intent),
     };
     const job = database.createJob({
       sessionId: session.id, kind: "runbook", subjectId: "hermes-change",

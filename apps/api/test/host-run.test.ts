@@ -393,7 +393,7 @@ describe("host-run manifest from the trusted intent", () => {
     expect(() => intentHostRunManifest(`${fittedIntent}\n${fittedIntent}`)).toThrow("more than one host-run manifest");
     expect(() => intentHostRunManifest(fittedIntent.replace("\"mutates\":true,", "\"mutates\":true"))).toThrow("the intent's host-run manifest is invalid: host-run manifest is not valid JSON");
     expect(() => intentHostRunManifest(fittedIntent.replace(/```\s*$/, ""))).toThrow("no closing fence");
-    expect(() => intentHostRunManifest(fittedIntent.replace("cockpit-host-run/v1", "cockpit-host-run/v2"))).toThrow("unsupported host-run manifest version");
+    expect(() => intentHostRunManifest(fittedIntent.replace("cockpit-host-run/v1", "cockpit-host-run/v2"))).toThrow('unsupported host-run manifest version: field version must be "cockpit-host-run/v1", got "cockpit-host-run/v2"');
   });
 
   it("compares the planner's copy only as evidence", () => {
@@ -401,7 +401,7 @@ describe("host-run manifest from the trusted intent", () => {
     expect(plannerHostRunCopy(block, expected)).toBe("identical");
     expect(plannerHostRunCopy("```host-run\n" + JSON.stringify(fitted, null, 2) + "\n```", expected)).toBe("identical");
     expect(plannerHostRunCopy(block.replace("{{.Names}}", "{{.ID}}"), expected)).toBe("differs");
-    expect(plannerHostRunCopy(block.replace('\\"$(dpkg --audit)\\"', '"$(dpkg --audit)"'), expected)).toBe("invalid (host-run manifest is not valid JSON)");
+    expect(plannerHostRunCopy(block.replace('\\"$(dpkg --audit)\\"', '"$(dpkg --audit)"'), expected)).toMatch(/^invalid \(host-run manifest is not valid JSON: .+\)$/);
     expect(plannerHostRunCopy("## Plan\nnothing", expected)).toBe("absent");
   });
 });

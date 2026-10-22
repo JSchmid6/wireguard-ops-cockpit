@@ -14,6 +14,7 @@ und mindestens 52 px hoch.
 | Karte | Quelle | Freigeben | Ablehnen |
 |---|---|---|---|
 | Änderung von James | `hermes-change`-Job in `blocked_user_approval` (Türsteher-Befund, Update-Prüfer-Stopp, Plan-Policy) | `POST /api/hermes/jobs/:id/approval` | derselbe Weg mit `rejected` |
+| Notfall-Durchlass | `hermes-change`-Job am offenen Circuit Breaker (`output.breaker`, noch ohne Plan): der Grund nennt die zählenden Jobs und wann der Breaker schließt; Frist = `breaker.approvalExpiresAt` | derselbe Weg: genau dieser Job wird geplant und geprüft wie jeder andere, nur der Breaker entfällt (Audit `hermes.change.breaker_override`) | derselbe Weg mit `rejected` |
 | Backup-Riegel | derselbe Job, wenn der Riegel (`cockpit-backup-guard.mjs`) angeschlagen hat — also auch ein `cockpit-borg-retention set` unter der Untergrenze, den James bestellt | wie oben | wie oben |
 | Freigabe | offener Eintrag in `approvals` (Runbook- und Agentenpläne) | `POST /api/approvals/:id/decision` | derselbe Weg mit `rejected` |
 | Aufräum-Dienst | Lab0-Dienst `angehalten` nach einer Anomalie (Archive fehlen, die er nicht selbst entfernt hat), solange er für genau diese Anomalie keine Freigabe trägt (nach `freigeben` bleibt er bis zum Ende seines Laufs `angehalten`) | `POST /api/borg/retention/resume` (Grund ≥ 10 Zeichen, wie bisher) | `POST /api/inbox/retention/:anomalyId/keep`: der Dienst bleibt angehalten, die Karte verschwindet, ein Audit hält den Grund fest |

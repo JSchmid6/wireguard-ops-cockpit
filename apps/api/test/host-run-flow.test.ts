@@ -574,7 +574,7 @@ describe("host door: the operator's manifest comes from the intent", () => {
     expect(job.output?.hostRun).toMatchObject({ name: fitted.name, mutates: true });
     expect(start.payload.envelope).toMatchObject({ gatePassed: true, capabilities: ["host.run"] });
     expect(flow.doorkeeperPrompts[0]).toContain("docker ps --format '{{.Names}}'");
-    expect(evidence(job)).toContain("host-run manifest taken from the trusted intent; planner copy: invalid (host-run manifest is not valid JSON)");
+    expect(evidence(job)).toContain("host-run manifest taken from the trusted intent; planner copy: invalid (host-run manifest is not valid JSON: ");
     expect(flow.agentCalls.map((call) => call.role)).toEqual(["planner", "verifier"]);
   });
 

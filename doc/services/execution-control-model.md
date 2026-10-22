@@ -76,6 +76,13 @@ The broker passes the root-controlled config through `OPENCODE_CONFIG=/var/lib/w
 
 The repeated-change circuit breaker counts failures per runtime fingerprint (planner model, safety model, capability contract, broker role contract, and semantic executor-boundary contract). A deployed and verified runtime repair therefore starts a fresh failure audit without erasing history; repeated failures under the unchanged runtime still stop autonomous retries.
 
+What counts and how far it reaches (since 22.10.2026, `apps/api/src/circuit-breaker.ts`; incident: three failures of one containment job blocked every unrelated change for an hour):
+
+- Only real host failures count: a job whose execution had started and then ended `failed_execution` or `failed_verification`. The mark (`output.executionStartedAt`) is set right before the job is handed to the executor broker (capability, typed action, host run) or to the isolated runner. A refusal before that — a malformed manifest, a policy or doorkeeper stop, a planner without a plan, an unsupported typed form, a missing broker — ran nothing on the host and does not count; its reason names the field and the expected value (e.g. `field version must be "cockpit-host-run/v1", got "cockpit-host-run/v2"`, `fields not in the contract, ignored: step`).
+- The breaker is per operation. `POST /api/hermes/runbook` takes an optional `operation` (1-80 characters `[A-Za-z0-9._:-]`, e.g. the kanban card id); without one, a hash of the intent is the key. `COCKPIT_MAX_FAILED_CHANGES_PER_HOUR` (default 3) applies per operation, `COCKPIT_MAX_FAILED_CHANGES_PER_HOUR_GLOBAL` (default 10, never below the per-operation limit) across all operations against a real runaway. Failures recorded before the change carry no key and count only towards the global cap.
+- An open breaker stops the job before planning as `blocked_user_approval` with `output.breaker` (scope, key, count, limit, the counting job ids, window start, `closesAt`, `approvalExpiresAt`). Its reason names the jobs and the time it closes. Audit `hermes.change.breaker_blocked`.
+- Emergency pass: the operator approves that job through the usual approval route (the card in "Wartet auf dich", the operator link). Exactly that job is then planned and reviewed as usual, only the breaker is skipped (audits `hermes.change.breaker_override`, `hermes.change.breaker_passed`); a later failure of it counts. Rejecting ends it (`hermes.change.breaker_override_rejected`). The window for the pass is the approval TTL; after it, James submits again.
+
 If a later execution or verification stage fails, the terminal job preserves the already reviewed plan, safety result, policy decision, capability manifest, signed envelope, and proposal path. Failure reporting must add its explanation rather than erase the evidence needed to diagnose or safely continue.
 
 Dynamic capabilities may declare minimal `readablePaths` and a non-root `runAsUser` per step. The executor performs the identity drop and read-only bind itself; manifests must not use `sudo`, `su`, or `runuser`. Container CLIs are evaluated by operation: read-only `ps`, `inspect`, `version`, and `info` are contained, while unknown or mutating subcommands require operator approval.
@@ -189,7 +196,7 @@ Hermes requests carry authenticated `intent` separately from `evidence`. Mail, w
 
 Planner output remains untrusted. Cockpit derives capabilities from the executable block and compares them with the trusted request. Capability escalation and unrestricted shell semantics stop for an operator decision. Intent, evidence digests, plan, safety result, policy result, capabilities, actor, session, and expiry are bound into an HMAC-SHA-256 execution envelope. The signing secret is stripped from agent child environments. Approval fails on signature mismatch, drift, or expiry.
 
-Runner success alone cannot close a mutation. A separate verifier receives plan and runner handoff as untrusted evidence, performs read-only checks, and must confirm the target state. Repeated execution or verification failures open a persisted one-hour circuit breaker.
+Runner success alone cannot close a mutation. A separate verifier receives plan and runner handoff as untrusted evidence, performs read-only checks, and must confirm the target state. Repeated execution or verification failures of one operation open a persisted one-hour circuit breaker for that operation (see above); the operator can let a single job through.
 
 ## Unix identity separation
 
