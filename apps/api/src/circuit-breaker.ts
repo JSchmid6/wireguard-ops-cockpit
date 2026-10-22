@@ -54,8 +54,11 @@ export function evaluateBreaker(
 ): BreakerState | null {
   const windowStart = new Date(now - windowMs).toISOString();
   const recent = failures.filter((failure) => Date.parse(failure.at) >= now - windowMs);
-  return openState("operation", key, recent.filter((failure) => failure.key === key), limits.perOperation, windowStart, windowMs)
-    ?? openState("global", null, recent, limits.global, windowStart, windowMs);
+  const operation = openState("operation", key, recent.filter((failure) => failure.key === key), limits.perOperation, windowStart, windowMs);
+  const global = openState("global", null, recent, limits.global, windowStart, windowMs);
+  // Sind beide offen, gilt der, der später schließt: closesAt muss stimmen.
+  if (operation && global) return Date.parse(global.closesAt) > Date.parse(operation.closesAt) ? global : operation;
+  return operation ?? global;
 }
 
 export function breakerReason(state: BreakerState): string {

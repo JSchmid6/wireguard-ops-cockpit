@@ -49,6 +49,25 @@ describe("circuit breaker evaluation", () => {
     expect(evaluateBreaker(legacy, "operation:fresh", limits, now)).toBeNull();
   });
 
+  it("reports the breaker that closes later when both are open", () => {
+    // Operation x failed early, then 9 other operations: global (limit 10 of 12) closes later.
+    const failures = [
+      ...[59, 58, 57].map((minutes, index) => ({ jobId: `x${index}`, at: at(minutes), key: "operation:x" })),
+      ...Array.from({ length: 9 }, (_, index) => ({ jobId: `o${index}`, at: at(50 - index), key: `operation:o${index}` })),
+    ];
+    const state = evaluateBreaker(failures, "operation:x", limits, now)!;
+    expect(state.scope).toBe("global");
+    expect(state.closesAt).toBe(new Date(Date.parse(at(57)) + 60 * 60_000).toISOString());
+    // Operation alone closes later than global: the operation is reported.
+    const late = [
+      ...Array.from({ length: 10 }, (_, index) => ({ jobId: `g${index}`, at: at(59 - index), key: index < 7 ? `operation:o${index}` : "operation:x" })),
+      { jobId: "x9", at: at(5), key: "operation:x" },
+    ];
+    const both = evaluateBreaker(late, "operation:x", limits, now)!;
+    expect(both.scope).toBe("operation");
+    expect(both.closesAt).toBe(new Date(Date.parse(at(51)) + 60 * 60_000).toISOString());
+  });
+
   it("keys on the operation, else on the intent", () => {
     expect(breakerKeyFor("t_dc5c96c6", "anything")).toBe("operation:t_dc5c96c6");
     expect(breakerKeyFor(null, "Update packages")).toBe(breakerKeyFor(undefined, "  Update packages \n"));

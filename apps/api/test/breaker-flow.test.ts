@@ -67,11 +67,13 @@ async function setup(overrides: Partial<AppConfig> = {}) {
   seed.initialize();
   seed.seedAdmin("admin", "test-password");
   const admin = seed.authenticateUser("admin", "test-password")!;
+  const automation = seed.createUser("hermes-automation", "unusable-random-password", "automation");
+  const bearer = seed.rotateApiToken(automation.id, "hermes", ["POST /api/hermes/runbook", "POST /api/hermes/jobs/:jobId/approval"]);
   const session = seed.upsertSession({ name: "hermes-flow", ownerId: admin.id, tmuxSessionName: "cockpit-hermes-flow", tmuxBackend: "tmux", terminalUrl: null });
   seed.close();
 
   // The host run's outcome, switched per test step.
-  const host: { status: "success" | "failed" } = { status: "failed" };
+  const host: { status: "success" | "failed"; doorkeeper: string } = { status: "failed", doorkeeper: "VERDICT: pass\nNOTES: routine apt maintenance" };
   const executorCalls = await listen(path.join(dir, "executor.sock"), (request) => {
     const expected = createHmac("sha256", BROKER_SECRET).update(JSON.stringify(request.payload)).digest("hex");
     if (request.signature !== expected) return { ok: false, error: "invalid request signature" };
@@ -88,7 +90,7 @@ async function setup(overrides: Partial<AppConfig> = {}) {
   });
   const app = await createApp({
     config: config(dir, { executorBrokerSocket: path.join(dir, "executor.sock"), executorBrokerSecret: BROKER_SECRET, agentBrokerSocket: path.join(dir, "agent.sock"), ...overrides }),
-    hostRunReviewRunner: async () => "VERDICT: pass\nNOTES: routine apt maintenance",
+    hostRunReviewRunner: async () => host.doorkeeper,
     hostRunPollMs: 10,
   });
   cleanup.push(() => app.close());
@@ -115,7 +117,7 @@ async function setup(overrides: Partial<AppConfig> = {}) {
     return inspect.listChangeFailuresSince(new Date(Date.now() - 3_600_000).toISOString(), fingerprint);
   };
   const explanationOf = (job: { output?: Record<string, unknown> | null }) => job.output?.explanation as { reason: string; evidence: string[]; phase: string };
-  return { app, cookie, host, executorCalls, agentCalls, submit, settled, inspect, failures, explanationOf };
+  return { app, cookie, bearer, host, executorCalls, agentCalls, submit, settled, inspect, failures, explanationOf };
 }
 
 const brokenIntent = (body: string) => `Contain the web shell\n\n\`\`\`host-run\n${body}\n\`\`\``;
@@ -236,6 +238,50 @@ describe("change circuit breaker through the API", () => {
     expect(rejected.statusCode).toBe(200);
     expect(flow.inspect.getJob(second.id)?.status).toBe("rejected");
     expect(flow.inspect.hasAudit("hermes.change.breaker_override_rejected", second.id)).toBe(true);
+  });
+
+  it("does not count a refusal of the API before it reaches the host (no executor broker)", async () => {
+    const flow = await setup({ executorBrokerSocket: null });
+    const jobs = [];
+    for (let index = 0; index < 4; index += 1) jobs.push(await flow.submit({ operation: "t_nobroker" }));
+    for (const job of jobs) {
+      expect(job.status).toBe("failed_execution");
+      expect(flow.explanationOf(job).reason).toContain("executor broker is not configured");
+      expect(job.output?.executionStartedAt).toBeUndefined();
+      expect(flow.inspect.hasAudit("hermes.change.failed", job.id)).toBe(false);
+    }
+  });
+
+  it("counts a failure after a normal operator approval (doorkeeper finding)", async () => {
+    const flow = await setup();
+    flow.host.doorkeeper = [
+      "VERDICT: flag", "FINDING: upgrade without pinning", "CLASS: X5", "WHERE: S1:L1",
+      "CODE: apt-get update && apt-get -y upgrade", "PATH: an upgrade can break a service", "SEVERITY: high",
+    ].join("\n");
+    const waiting = await flow.submit({ operation: "t_review" });
+    expect(waiting.status).toBe("blocked_user_approval");
+    expect(waiting.output?.breaker).toBeUndefined();
+    const approved = await flow.app.inject({ method: "POST", url: `/api/hermes/jobs/${waiting.id}/approval`, headers: { cookie: flow.cookie }, payload: { decision: "approved", reason: "plan ok" } });
+    expect(approved.statusCode).toBe(202);
+    const finished = await flow.settled(waiting.id);
+    expect(finished.status).toBe("failed_verification");
+    expect(typeof finished.output?.executionStartedAt).toBe("string");
+    expect(flow.failures().map((failure) => failure.jobId)).toEqual([waiting.id]);
+  });
+
+  it("refuses the pass to an automation token and after its window", async () => {
+    const flow = await setup({ approvalTtlMinutes: 0.001 });
+    for (let index = 0; index < 3; index += 1) await flow.submit({ operation: "t_y" });
+    const blocked = await flow.submit({ operation: "t_y" });
+    expect(blocked.status).toBe("blocked_user_approval");
+    const byToken = await flow.app.inject({ method: "POST", url: `/api/hermes/jobs/${blocked.id}/approval`, headers: { authorization: `Bearer ${flow.bearer}` }, payload: { decision: "approved", reason: "selbst" } });
+    expect(byToken.statusCode).toBe(403);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const late = await flow.app.inject({ method: "POST", url: `/api/hermes/jobs/${blocked.id}/approval`, headers: { cookie: flow.cookie }, payload: { decision: "approved", reason: "zu spaet" } });
+    expect(late.statusCode).toBe(409);
+    expect(late.json().message).toContain("override window expired");
+    expect(flow.inspect.getJob(blocked.id)?.status).toBe("blocked_user_approval");
+    expect(flow.inspect.hasAudit("hermes.change.breaker_override", blocked.id)).toBe(false);
   });
 
   it("refuses a malformed operation with the field and the expected form", async () => {

@@ -2022,10 +2022,22 @@ export async function createApp(options: AppOptions = {}) {
     ].join("\n");
   }
 
+  // Circuit Breaker: Ab hier geht der Auftrag an den Host (Executor-Broker oder
+  // Runner). Erst ein Fehlschlag nach dieser Marke ist ein echter Fehllauf; was
+  // die API vorher selbst abweist (Form, fehlender Broker, Riegel), zählt nicht.
+  // updateHermesJob trägt die Marke durch alle späteren Updates des Jobs.
+  function markExecutionStarted(jobId: string): void {
+    const job = database.getJob(jobId);
+    if (job && typeof job.output?.executionStartedAt !== "string") {
+      database.updateJob(jobId, { status: job.status, output: { ...job.output, executionStartedAt: new Date().toISOString() } });
+    }
+  }
+
   async function executeTypedCapabilities(planText: string, envelope: ExecutionEnvelope, manifest?: CapabilityManifest | null, reviewedUpdates: UpdateBinding[] = [], hostRun?: HostRunManifest | null): Promise<TypedExecution | null> {
     if (hostRun) return hostRunExecution(await runHostRun(envelope, hostRun));
     if (manifest) {
       if (!config.executorBrokerSocket || !config.executorBrokerSecret) throw new Error("sandbox executor broker is not configured");
+      markExecutionStarted(envelope.jobId);
       const output = await runDynamicCapability(config.executorBrokerSocket, config.executorBrokerSecret, {
         action: "capability.execute", manifest, envelope, expiresAt: envelope.expiresAt, envelopeDigest: envelope.digest,
       });
@@ -2077,6 +2089,7 @@ export async function createApp(options: AppOptions = {}) {
       actions.push(...borg.actions);
     }
     if (actions.length === 0) throw new Error("typed capability plan contains no typed action");
+    markExecutionStarted(envelope.jobId);
     const outputs: TypedActionOutput[] = [];
     for (const action of actions) {
       let diffSha256: string | null = null;
@@ -2197,6 +2210,7 @@ export async function createApp(options: AppOptions = {}) {
     if (backup.length > 0 && !envelope.operatorApproved) throw new Error(`the host run touches the backups and runs only with the operator's approval (${backup[0].where} ${backup[0].reason})`);
     // Marked before the start: an API that dies between the helper's answer
     // and the record below still follows the run after its restart.
+    markExecutionStarted(envelope.jobId);
     const requested = database.getJob(envelope.jobId);
     if (requested) database.updateJob(envelope.jobId, { status: requested.status, output: { ...requested.output, hostRunRequestedAt: new Date().toISOString() } });
     const started = await runDynamicCapability(config.executorBrokerSocket, config.executorBrokerSecret, {
@@ -2587,13 +2601,15 @@ export async function createApp(options: AppOptions = {}) {
         phase: "executing", intent, reason: policy.reason,
         completed: reviewedSteps,
         evidence: [review.summary, ...policy.evidence], rollbackAvailable: policy.rollbackAvailable,
-      }), { plan: planText, safety: review, policy, capabilities, manifest, hostRun, envelope, provenance, proposalPath, ...reviewRecord, executionStartedAt: new Date().toISOString() });
+      }), { plan: planText, safety: review, policy, capabilities, manifest, hostRun, envelope, provenance, proposalPath, ...reviewRecord });
       // James hat den Job zurückgezogen, während er plante oder geprüft wurde:
       // dann läuft nichts. Zwischen dieser Prüfung und dem Start liegt kein await.
       if (executing.status === "withdrawn") return;
       executedSteps = [...reviewedSteps, "Runner execution"];
       const typed = await executeTypedCapabilities(planText, envelope, manifest, updateReview?.outcome.bindings ?? [], hostRun);
       const typedResult = typed?.result ?? null;
+      // The isolated runner acts on the host itself: its failure is a real one.
+      if (!typedResult) markExecutionStarted(job.id);
       const runnerRaw = typedResult || await runIsolatedRunner(actor, session, planner, proposalPath, planText);
       const result = typedResult || filterSensitiveContent(extractRunnerHandoff(runnerRaw));
       if (!result) throw new Error("runner produced no structured execution result");
@@ -2819,7 +2835,6 @@ export async function createApp(options: AppOptions = {}) {
       ...job.output,
       envelope: approveExecutionEnvelope(job.output?.envelope as ExecutionEnvelope, config.executionEnvelopeSecret, config.approvalTtlMinutes),
       approval: { decision: "approved", reason: body.reason?.trim() || null, actorId: actor.id },
-      executionStartedAt: new Date().toISOString(),
     });
 
     void (async () => {
@@ -2831,6 +2846,7 @@ export async function createApp(options: AppOptions = {}) {
         const hostRun = running.output?.hostRun as HostRunManifest | null | undefined;
         const typed = await executeTypedCapabilities(reviewedPlan, envelope, manifest, reviewedUpdates, hostRun);
         const typedResult = typed?.result ?? null;
+        if (!typedResult) markExecutionStarted(job.id);
         const raw = typedResult || await runIsolatedRunner(actor, session, planner, proposalPath, reviewedPlan);
         const result = typedResult || filterSensitiveContent(extractRunnerHandoff(raw));
         const runnerSuccess = /STATUS:\s*success/i.test(result);

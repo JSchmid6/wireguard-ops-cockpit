@@ -3,6 +3,12 @@ import { describe, expect, it } from "vitest";
 import { loadConfig } from "../src/config.js";
 
 describe("loadConfig", () => {
+  it("reads the breaker limits as positive whole numbers, else the defaults", () => {
+    expect(loadConfig({})).toMatchObject({ maxFailedChangesPerHour: 3, maxFailedChangesPerHourGlobal: 10 });
+    expect(loadConfig({ COCKPIT_MAX_FAILED_CHANGES_PER_HOUR: "5", COCKPIT_MAX_FAILED_CHANGES_PER_HOUR_GLOBAL: "20" })).toMatchObject({ maxFailedChangesPerHour: 5, maxFailedChangesPerHourGlobal: 20 });
+    expect(loadConfig({ COCKPIT_MAX_FAILED_CHANGES_PER_HOUR: "drei", COCKPIT_MAX_FAILED_CHANGES_PER_HOUR_GLOBAL: "0" })).toMatchObject({ maxFailedChangesPerHour: 3, maxFailedChangesPerHourGlobal: 10 });
+  });
+
   it("reads the instance role only as vps or lab0", () => {
     expect(loadConfig({}).instanceRole).toBeNull();
     expect(loadConfig({ COCKPIT_INSTANCE_ROLE: "lab0" }).instanceRole).toBe("lab0");

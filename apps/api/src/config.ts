@@ -39,6 +39,13 @@ export interface AppConfig {
   instanceRole?: "vps" | "lab0" | null;
 }
 
+// A breaker limit from the environment: a positive whole number, else the
+// default (an unreadable value must neither disable nor break the breaker).
+function positiveCount(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return value && Number.isFinite(parsed) && parsed >= 1 ? Math.floor(parsed) : fallback;
+}
+
 function currentDirectory(): string {
   return path.dirname(fileURLToPath(import.meta.url));
 }
@@ -76,8 +83,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     safetyOpencodeModel: env.COCKPIT_SAFETY_OPENCODE_MODEL?.trim() || env.COCKPIT_OPENCODE_MODEL?.trim() || null,
     requireModelDiversity: env.COCKPIT_REQUIRE_MODEL_DIVERSITY === "true",
     approvalTtlMinutes: Math.max(1, Number(env.COCKPIT_APPROVAL_TTL_MINUTES || "30")),
-    maxFailedChangesPerHour: Math.max(1, Number(env.COCKPIT_MAX_FAILED_CHANGES_PER_HOUR || "3")),
-    maxFailedChangesPerHourGlobal: Math.max(1, Number(env.COCKPIT_MAX_FAILED_CHANGES_PER_HOUR_GLOBAL || "10")),
+    maxFailedChangesPerHour: positiveCount(env.COCKPIT_MAX_FAILED_CHANGES_PER_HOUR, 3),
+    maxFailedChangesPerHourGlobal: positiveCount(env.COCKPIT_MAX_FAILED_CHANGES_PER_HOUR_GLOBAL, 10),
     agentBrokerSocket: env.COCKPIT_AGENT_BROKER_SOCKET?.trim() || null,
     executorBrokerSocket: env.COCKPIT_EXECUTOR_BROKER_SOCKET?.trim() || null,
     executorBrokerSecret: env.COCKPIT_EXECUTOR_BROKER_SECRET?.trim() || null,
