@@ -66,6 +66,13 @@ describe("verifier prompt bound", () => {
     for (const line of clipped.split("\n")) expect(line === "" || /^(?:## |[A-Z_]+: |== |\d+ Setting up php8\.3-common \(8\.3\.36-1\+ubuntu24\.04\.1\+deb\.sury\.org\+1\) \.\.\.$|\[\.\.\. |Hit:1 |ii  |PHP |active$)/.test(line)).toBe(true);
   });
 
+  it("finds the OUTPUT field at a line start, not inside WHAT_RAN", () => {
+    const text = handoff(runLog(3000)).replace("WHAT_RAN: host run \"php\"", "WHAT_RAN: host run \"OUTPUT: trap " + "w".repeat(3000) + "\"");
+    const clipped = clipHandoff(text, 20000);
+    expect(clipped).toContain("WHAT_RAN: host run \"OUTPUT: trap " + "w".repeat(3000) + "\"");
+    expect(clipped.length).toBeLessThanOrEqual(20000);
+  });
+
   it("keeps the error and exit-code lines of a cut body, not only its head and end", () => {
     const apt = Array.from({ length: 3000 }, (_, index) => {
       if (index === 1200) return "E: Sub-process /usr/bin/dpkg returned an error code (1)";

@@ -168,7 +168,8 @@ function clipOutput(output: string, limit: number): string {
 // NOTES whole, the OUTPUT field clipped.
 export function clipHandoff(handoff: string, limit: number): string {
   if (handoff.length <= limit) return handoff;
-  const start = handoff.indexOf("OUTPUT: ");
+  // The field at a line start: WHAT_RAN carries plan names, which may contain "OUTPUT: ".
+  const start = handoff.search(/^OUTPUT: /m);
   if (start < 0) return clipMiddle(handoff, limit);
   const outputStart = start + "OUTPUT: ".length;
   const notes = handoff.lastIndexOf("\nNOTES:");

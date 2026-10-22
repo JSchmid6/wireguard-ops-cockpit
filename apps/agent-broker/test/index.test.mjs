@@ -7,7 +7,8 @@ process.env.NODE_ENV = "test";
 // A stand-in for opencode: reports its arguments, then echoes stdin.
 const fakeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-agent-fake-"));
 const fakeOpencode = path.join(fakeRoot, "opencode");
-fs.writeFileSync(fakeOpencode, "#!/bin/sh\nprintf 'argc=%s last=%s\\n' \"$#\" \"$(eval echo \\\"\\$$#\\\")\"\ncat\n", { mode: 0o755 });
+// A session whose requestId starts with dead0000 exits without reading stdin.
+fs.writeFileSync(fakeOpencode, "#!/bin/sh\ncase \"$PWD\" in */agent-dead0000*) exit 3;; esac\nprintf 'argc=%s last=%s\\n' \"$#\" \"$(eval echo \\\"\\$$#\\\")\"\ncat\n", { mode: 0o755 });
 process.env.COCKPIT_OPENCODE_EXECUTABLE = fakeOpencode;
 process.env.COCKPIT_AGENT_WORKSPACE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-agent-run-"));
 const { cleanupStaleWorkspaces, createSessionWorkspace, removeSessionWorkspace, runAgent, validateRequest } = await import("../src/index.mjs");
@@ -93,4 +94,13 @@ test("the prompt reaches opencode on stdin, whole, beyond the old argv bound", a
   const [head, ...rest] = result.output.split("\n");
   assert.match(head, /^argc=\d+ last=--print-logs$/);
   assert.equal(rest.join("\n"), prompt);
+});
+
+// A child that exits without reading its input: the write fails with EPIPE,
+// and the broker reports the exit instead of crashing.
+test("a child that ignores stdin does not crash the broker", async () => {
+  const result = await runAgent({ requestId: "dead0000-1", role: "verifier", prompt: "\u20ac".repeat(100000) });
+  assert.equal(result.ok, false);
+  assert.equal(result.exitCode, 3);
+  assert.deepEqual(fs.readdirSync(process.env.COCKPIT_AGENT_WORKSPACE_ROOT), []);
 });
