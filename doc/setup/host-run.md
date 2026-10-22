@@ -279,6 +279,21 @@ Freigabe).
   `api.env`, `executor.env` und `contabo.env`,
 - ein Lauf zur Zeit (Prüfen, Anlegen und Unit-Start unter einer atomaren Sperre).
 
+  Ein zweiter Start wird vor dem ersten Schritt abgewiesen (Exit 75, „another host run is
+  active: <job>“ bzw. „… is starting“). Die API nimmt das nicht als Fehllauf (Karte t_9c04b4de):
+  Sie nimmt die Startmarken (`executionStartedAt`, `hostRunRequestedAt`) zurück, stellt den Job
+  auf die Phase `waiting_for_host` (`output.hostRunQueue`: seit wann, wie oft abgewiesen, letzte
+  Absage; Audit `hermes.host_run.queued`) und fragt alle 15 s erneut. Der Job startet, sobald der
+  Platz frei ist. Er wartet höchstens 25 Minuten und endet spätestens eine Minute vor dem Ablauf
+  seines Envelopes. Findet er bis dahin keinen Platz, endet er als `blocked_runner_busy`: Auf dem
+  Host lief nichts, der Job ist wiederholbar und zählt nicht zum Circuit Breaker. Beim Warten darf
+  James ihn zurückziehen. Ein API-Neustart plant ihn neu, wie einen Job in der Prüfung.
+  Stirbt die API genau während eines Startversuchs (nur `hostRunRequestedAt` gesetzt), fragt sie
+  nach dem Neustart `status <job>`. Kennt der Helfer den Lauf auch fünf Minuten nach der Anfrage
+  nicht („no host run <job>“, die Startsperre ist dann verfallen), lief nichts: Die Marken fallen
+  weg (Audit `hermes.host_run.not_started`), der Job wird wie ein wartender neu geplant oder ohne
+  Breaker-Zählung beendet. Jede andere Antwort heißt weiter: dem Lauf folgen.
+
 `status <job>` liefert Zustand und Protokollende. Endet eine Unit ohne Ergebnis (Zeitlimit,
 Absturz), meldet `status` den Lauf als gescheitert.
 

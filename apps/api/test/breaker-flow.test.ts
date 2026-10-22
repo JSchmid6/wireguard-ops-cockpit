@@ -60,7 +60,7 @@ const hostRun = {
 };
 const plan = ["```host-run", JSON.stringify(hostRun), "```", "## Intent", "Keep the host's packages current."].join("\n");
 
-async function setup(overrides: Partial<AppConfig> = {}) {
+async function setup(overrides: Partial<AppConfig> = {}, slot: { pollMs?: number; waitMs?: number } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "breaker-flow-"));
   cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
   const seed = new CockpitDatabase(path.join(dir, "cockpit.sqlite"));
@@ -68,15 +68,25 @@ async function setup(overrides: Partial<AppConfig> = {}) {
   seed.seedAdmin("admin", "test-password");
   const admin = seed.authenticateUser("admin", "test-password")!;
   const automation = seed.createUser("hermes-automation", "unusable-random-password", "automation");
-  const bearer = seed.rotateApiToken(automation.id, "hermes", ["POST /api/hermes/runbook", "POST /api/hermes/jobs/:jobId/approval"]);
+  const bearer = seed.rotateApiToken(automation.id, "hermes", ["POST /api/hermes/runbook", "POST /api/hermes/jobs/:jobId/approval", "POST /api/hermes/jobs/:jobId/withdraw"]);
   const session = seed.upsertSession({ name: "hermes-flow", ownerId: admin.id, tmuxSessionName: "cockpit-hermes-flow", tmuxBackend: "tmux", terminalUrl: null });
+  // James' own session: a job he orders there is his to withdraw.
+  const automationSession = seed.upsertSession({ name: "hermes-james", ownerId: automation.id, tmuxSessionName: "cockpit-hermes-james", tmuxBackend: "tmux", terminalUrl: null });
   seed.close();
 
   // The host run's outcome, switched per test step.
-  const host: { status: "success" | "failed"; doorkeeper: string } = { status: "failed", doorkeeper: "VERDICT: pass\nNOTES: routine apt maintenance" };
+  // busy: so many starts the helper still refuses because another run holds the host.
+  const host: { status: "success" | "failed"; doorkeeper: string; busy: number; busyMessage: string } = {
+    status: "failed", doorkeeper: "VERDICT: pass\nNOTES: routine apt maintenance", busy: 0, busyMessage: "another host run is active: 3e06625f-0000",
+  };
   const executorCalls = await listen(path.join(dir, "executor.sock"), (request) => {
     const expected = createHmac("sha256", BROKER_SECRET).update(JSON.stringify(request.payload)).digest("hex");
     if (request.signature !== expected) return { ok: false, error: "invalid request signature" };
+    if (request.payload.action === "host.run" && host.busy > 0) {
+      host.busy -= 1;
+      // Wie der Executor-Broker: rc 75 des Helfers, stderr als Fehlertext.
+      return { ok: false, error: host.busyMessage };
+    }
     if (request.payload.action === "host.run") return { ok: true, output: JSON.stringify({ status: "started", jobId: request.payload.envelope.jobId }) };
     const ok = host.status === "success";
     return { ok: true, output: JSON.stringify({ ok: true, logTail: "upgraded", state: {
@@ -92,6 +102,8 @@ async function setup(overrides: Partial<AppConfig> = {}) {
     config: config(dir, { executorBrokerSocket: path.join(dir, "executor.sock"), executorBrokerSecret: BROKER_SECRET, agentBrokerSocket: path.join(dir, "agent.sock"), ...overrides }),
     hostRunReviewRunner: async () => host.doorkeeper,
     hostRunPollMs: 10,
+    hostRunSlotPollMs: slot.pollMs ?? 10,
+    hostRunSlotWaitMs: slot.waitMs,
   });
   cleanup.push(() => app.close());
   const login = await app.inject({ method: "POST", url: "/api/auth/login", payload: { username: "admin", password: "test-password" } });
@@ -117,7 +129,7 @@ async function setup(overrides: Partial<AppConfig> = {}) {
     return inspect.listChangeFailuresSince(new Date(Date.now() - 3_600_000).toISOString(), fingerprint);
   };
   const explanationOf = (job: { output?: Record<string, unknown> | null }) => job.output?.explanation as { reason: string; evidence: string[]; phase: string };
-  return { app, cookie, bearer, host, executorCalls, agentCalls, submit, settled, inspect, failures, explanationOf };
+  return { app, cookie, bearer, automationSessionId: automationSession.id, host, executorCalls, agentCalls, submit, settled, inspect, failures, explanationOf };
 }
 
 const brokenIntent = (body: string) => `Contain the web shell\n\n\`\`\`host-run\n${body}\n\`\`\``;
@@ -290,4 +302,90 @@ describe("change circuit breaker through the API", () => {
     expect(response.statusCode).toBe(400);
     expect(response.json()).toMatchObject({ field: "operation", message: expect.stringContaining("expected 1-80 characters") });
   });
+
+  // Karte t_9c04b4de (22.10.2026, Jobs 55d92118/bcc6dc38/58a95c8e): der Helfer
+  // weist einen zweiten Start ab, solange ein Lauf aktiv ist oder startet. Das
+  // ist kein Fehllauf; der Job wartet auf den Platz.
+  it("queues a job while another host run holds the host and starts it once the host is free", async () => {
+    const flow = await setup();
+    flow.host.status = "success";
+    flow.host.busy = 2;
+    const job = await flow.submit({ operation: "t_queue" });
+    expect(job.status).toBe("completed");
+    const starts = flow.executorCalls.filter((call) => call.payload.action === "host.run");
+    expect(starts).toHaveLength(3);
+    expect(job.output?.hostRunQueue).toMatchObject({ refusals: 2, lastRefusal: "another host run is active: 3e06625f-0000" });
+    expect(flow.explanationOf(job).phase).toBe("finished");
+    expect(flow.inspect.hasAudit("hermes.host_run.queued", job.id)).toBe(true);
+    expect(flow.inspect.hasAudit("hermes.host_run.started", job.id)).toBe(true);
+  });
+
+  it("counts a real failure after the wait once, not the refusals before it", async () => {
+    const flow = await setup();
+    flow.host.busy = 3;
+    flow.host.busyMessage = "another host run is starting";
+    const job = await flow.submit({ operation: "t_queue_fail" });
+    expect(job.status).toBe("failed_verification");
+    expect(typeof job.output?.executionStartedAt).toBe("string");
+    expect(flow.failures().map((failure) => failure.jobId)).toEqual([job.id]);
+  });
+
+  it("ends a job that finds no free slot as blocked_runner_busy, outside the breaker", async () => {
+    const flow = await setup({}, { pollMs: 10, waitMs: 60 });
+    flow.host.busy = Number.POSITIVE_INFINITY;
+    const jobs = [];
+    // Mehr als die Grenze des Vorgangs (3): keiner davon öffnet den Breaker.
+    for (let index = 0; index < 4; index += 1) jobs.push(await flow.submit({ operation: "t_busy" }));
+    for (const job of jobs) {
+      expect(job.status).toBe("blocked_runner_busy");
+      expect(job.output?.executionStartedAt).toBeUndefined();
+      expect(job.output?.hostRunRequestedAt).toBeUndefined();
+      expect(job.output?.breaker).toBeUndefined();
+      expect(flow.explanationOf(job).reason).toContain("another host run is active: 3e06625f-0000");
+      expect(flow.explanationOf(job).reason).toContain("nothing was executed");
+      expect(flow.inspect.hasAudit("hermes.change.failed", job.id)).toBe(false);
+    }
+    expect(flow.failures()).toEqual([]);
+    expect(flow.executorCalls.some((call) => call.payload.action === "host.status")).toBe(false);
+  });
+
+  it("lets James withdraw a job while it waits for the host; nothing starts afterwards", async () => {
+    const flow = await setup({}, { pollMs: 200, waitMs: 60_000 });
+    flow.host.busy = Number.POSITIVE_INFINITY;
+    const created = await flow.app.inject({
+      method: "POST", url: "/api/hermes/runbook", headers: { authorization: `Bearer ${flow.bearer}` },
+      payload: { intent: "Keep the host's packages current", sessionId: flow.automationSessionId, timeoutMs: 0, operation: "t_wait" },
+    });
+    const jobId = created.json().jobId as string;
+    const deadline = Date.now() + 10_000;
+    while ((flow.inspect.getJob(jobId)?.output?.explanation as { phase?: string } | undefined)?.phase !== "waiting_for_host" && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(flow.inspect.getJob(jobId)?.output?.hostRunRequestedAt).toBeUndefined();
+    // Trifft das Zurückziehen genau einen neuen Startversuch, lehnt die API es ab
+    // (der Start ist angefragt); im nächsten Wartetakt geht es durch.
+    let withdrawn = await flow.app.inject({ method: "POST", url: `/api/hermes/jobs/${jobId}/withdraw`, headers: { authorization: `Bearer ${flow.bearer}` }, payload: { reason: "Karte erledigt" } });
+    while (withdrawn.statusCode === 403 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      withdrawn = await flow.app.inject({ method: "POST", url: `/api/hermes/jobs/${jobId}/withdraw`, headers: { authorization: `Bearer ${flow.bearer}` }, payload: { reason: "Karte erledigt" } });
+    }
+    expect(withdrawn.statusCode).toBe(200);
+    const startsAtWithdrawal = flow.executorCalls.filter((call) => call.payload.action === "host.run").length;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(flow.inspect.getJob(jobId)?.status).toBe("withdrawn");
+    expect(flow.executorCalls.filter((call) => call.payload.action === "host.run").length).toBe(startsAtWithdrawal);
+    expect(flow.inspect.hasAudit("hermes.change.failed", jobId)).toBe(false);
+  });
+
+  it("waits no longer than the envelope allows: the helper checks it at the start", async () => {
+    // Freigabefenster 66 s, davon 60 s Abstand: höchstens ~6 s Warten, trotz 10 min waitMs.
+    const flow = await setup({ approvalTtlMinutes: 1.1 }, { pollMs: 50, waitMs: 600_000 });
+    flow.host.busy = Number.POSITIVE_INFINITY;
+    const started = Date.now();
+    const job = await flow.submit({ operation: "t_envelope" });
+    expect(job.status).toBe("blocked_runner_busy");
+    expect(Date.now() - started).toBeLessThan(9_500);
+    const envelope = job.output?.envelope as { expiresAt: string };
+    expect(Date.parse(String(job.completedAt))).toBeLessThan(Date.parse(envelope.expiresAt) - 55_000);
+  }, 15_000);
 });

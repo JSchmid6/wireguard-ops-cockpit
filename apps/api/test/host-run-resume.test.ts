@@ -124,4 +124,57 @@ describe("host run across an API restart", () => {
     expect(inspect.getJob(other.id)?.status).toBe("failed_execution");
     expect(agentCalls.filter((call) => call.role === "planner")).toHaveLength(0);
   });
+
+  // Karte t_9c04b4de: Die API starb, während sie den Start anfragte; der Helfer
+  // hatte ihn abgewiesen (ein anderer Lauf belegte den Host). Nach der Frist
+  // kennt der Helfer den Lauf nicht: nichts lief, der Job wird nicht verfolgt
+  // und zählt nicht zum Circuit Breaker.
+  it("does not follow a requested start the helper never took, and does not count it", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "host-run-resume-"));
+    cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
+    const hostRun = parseHostRunManifest("```host-run\n" + JSON.stringify({
+      version: "cockpit-host-run/v1", name: "apt maintenance", purpose: "update packages",
+      steps: [{ name: "upgrade", run: "apt-get -y upgrade" }],
+      checks: [{ name: "nothing pending", run: "true" }], rollback: ["downgrade the packages"],
+    }) + "\n```")!;
+    const seed = new CockpitDatabase(path.join(dir, "cockpit.sqlite"));
+    seed.initialize();
+    seed.seedAdmin("admin", "test-password");
+    const admin = seed.authenticateUser("admin", "test-password")!;
+    const session = seed.upsertSession({ name: "hermes-rb-y", ownerId: admin.id, tmuxSessionName: "cockpit-hermes-rb-y", tmuxBackend: "tmux", terminalUrl: null });
+    const at = new Date().toISOString();
+    const job = seed.createJob({
+      sessionId: session.id, kind: "runbook", subjectId: "hermes-change", status: "running", requiresApproval: false,
+      output: {
+        explanation: { phase: "executing", intent: "Update packages", reason: "running" },
+        plan: "## Intent\napt", hostRun, policy: { rollbackAvailable: true }, executionStartedAt: at, hostRunRequestedAt: at,
+      },
+    });
+    seed.close();
+
+    const executorCalls = await listen(path.join(dir, "executor.sock"), (request) => ({ ok: false, error: `no host run ${request.payload.target}` }));
+    const app = await createApp({
+      config: config(dir, { executorBrokerSocket: path.join(dir, "executor.sock"), executorBrokerSecret: BROKER_SECRET }),
+      hostRunPollMs: 10, hostRunStartGraceMs: 50,
+    });
+    cleanup.push(() => app.close());
+
+    const inspect = new CockpitDatabase(path.join(dir, "cockpit.sqlite"));
+    cleanup.push(() => inspect.close());
+    const deadline = Date.now() + 10_000;
+    while (inspect.getJob(job.id)?.status === "running" && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const ended = inspect.getJob(job.id)!;
+    // Ohne aufgezeichnete Bestellung wird nicht neu geplant, sondern mit Grund beendet.
+    expect(ended.status).toBe("failed_execution");
+    expect(ended.output?.executionStartedAt).toBeUndefined();
+    expect(ended.output?.hostRunRequestedAt).toBeUndefined();
+    expect(ended.output?.resumedAfterRestart).toBeUndefined();
+    expect(String((ended.output?.explanation as { reason?: string }).reason)).toContain("it has no recorded request to plan from");
+    expect((ended.output?.restarts as Array<{ phase: string; action: string }>)[0]).toMatchObject({ phase: "waiting_for_host", action: "abandoned" });
+    expect(inspect.hasAudit("hermes.host_run.not_started", job.id)).toBe(true);
+    expect(inspect.hasAudit("hermes.change.failed", job.id)).toBe(false);
+    expect(executorCalls.every((call) => call.payload.action === "host.status")).toBe(true);
+    expect(executorCalls.length).toBeGreaterThan(0);
+  });
 });

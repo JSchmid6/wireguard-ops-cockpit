@@ -12,6 +12,9 @@ export type JobStatus =
   | "blocked_user_approval"
   | "blocked_policy"
   | "blocked_prerequisite"
+  // Der Host war mit einem anderen Lauf belegt, bis das Freigabefenster ablief;
+  // auf dem Host lief nichts. Wiederholbar, zählt nicht zum Circuit Breaker.
+  | "blocked_runner_busy"
   | "failed_execution"
   | "failed_verification"
   | "rollback_completed"
