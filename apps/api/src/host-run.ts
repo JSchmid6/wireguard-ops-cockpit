@@ -5,6 +5,7 @@ import type { ExecutionReview } from "@wireguard-ops-cockpit/domain";
 import { backupGuardFocus, backupGuardHits, type BackupGuardHit } from "../../../deploy/helpers/cockpit-backup-guard.mjs";
 import { stateStepKinds, stepUninterruptible, type StepUninterruptible } from "../../../deploy/helpers/cockpit-state-steps.mjs";
 
+import { agentPromptLimit } from "./agent-broker.js";
 import { READABLE_PROTECTED_PATH } from "./capability-manifest.js";
 import { hashCanonical, typedPlanScript } from "./hermes-security.js";
 import { redactSecrets } from "./update-review.js";
@@ -87,9 +88,10 @@ const STEP_TIMEOUT_DEFAULT = 1800;
 const STEP_TIMEOUT_MAX = 10_800;
 const CHECK_TIMEOUT_DEFAULT = 300;
 const CHECK_TIMEOUT_MAX = 1800;
-// Bytes of the whole reviewer prompt; below the agent broker's safety-role
-// bound (100,000 characters in one argv element), like the update review.
-export const HOST_RUN_REVIEW_PROMPT_LIMIT = 90_000;
+// Bytes of the whole reviewer prompt: the agent broker's safety-role bound
+// (characters, apps/agent-broker/src/prompt-limits.mjs), counted in bytes, so
+// it holds for any text (a character is at least one byte), like the update review.
+export const HOST_RUN_REVIEW_PROMPT_LIMIT = agentPromptLimit("safety");
 
 function text(value: unknown, limit: number): string {
   return typeof value === "string" ? value.trim().slice(0, limit) : "";
@@ -675,7 +677,9 @@ export function hostRunResultText(manifest: HostRunManifest, result: HostRunStat
     `STATUS: ${result.success ? "success" : "failed"}`,
     `EXIT_CODE: ${result.success ? 0 : 1}`,
     `WHAT_RAN: host run "${manifest.name}": ${steps.map((step) => `${step.index} ${step.name} ${step.status}`).join(", ")}; checks: ${checks.map((check) => `${check.index} ${check.name} ${check.status}`).join(", ")}`,
-    `OUTPUT: ${result.logTail.slice(-30000)}`,
+    // The helper's own digest (cockpit-host-run, host.status); the verifier's
+    // prompt chooses from it within its bound (verifier-prompt.ts).
+    `OUTPUT: ${result.logTail}`,
     `NOTES: run ${result.status}${result.error ? ` — ${result.error}` : ""}${result.snapshotId ? `; ${result.snapshotKind} snapshot ${result.snapshotId} (revert only with operator approval)` : ""}; executed by the general host door as root in a transient unit${result.log ? `; full log on the host: ${result.log.path} (${result.log.chars} characters, root-only)` : ""}`,
   ].join("\n");
 }

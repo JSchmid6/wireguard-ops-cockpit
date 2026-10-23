@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
+import { agentPromptLimit } from "../src/agent-broker.js";
 import { createApp, verifierInstruction } from "../src/app.js";
 import type { AppConfig } from "../src/config.js";
 import { CockpitDatabase } from "../src/db.js";
@@ -74,7 +75,7 @@ const planWith = (...manifests: Array<{ version: string }>) => [
 ].join("\n");
 
 // The real broker's request check: a prompt beyond its bound is refused here
-// exactly as on the host ("prompt length is invalid").
+// exactly as on the host ("prompt length <n> exceeds verifier limit <bound>").
 const { validateRequest } = await import("../../agent-broker/src/index.mjs") as { validateRequest: (request: unknown) => unknown };
 
 async function setup(options: { plan: string; doorkeeper: string; intent?: string; ownedByAutomation?: boolean; hostState?: () => Record<string, unknown> | null; instanceRole?: "vps" | "lab0" | null; doorkeeperWait?: Promise<void>; logTail?: string; runStatus?: string; verifier?: () => Record<string, unknown> }) {
@@ -231,8 +232,7 @@ describe("host door through the API", () => {
     expect(job.output?.explanation).toMatchObject({ completed: expect.arrayContaining(["Runner execution", "Independent verification"]) });
     const verifier = String(flow.agentCalls.find((call) => call.role === "verifier")!.prompt);
     expect(verifier.length).toBeGreaterThan(30000);
-    expect(verifier.length).toBeLessThanOrEqual(100000);
-    expect(Buffer.byteLength(verifier, "utf8")).toBeLessThanOrEqual(120000);
+    expect(verifier.length).toBeLessThanOrEqual(agentPromptLimit("verifier"));
     expect(verifier).toContain(intent.trim());
     expect(verifier).toContain("CHECK-PROOF php8.3-fpm 8.3.36");
     expect(verifier).toContain("MIDDLE-200\\n");
@@ -266,14 +266,21 @@ describe("host door through the API", () => {
 
     expect(job.status).toBe("completed");
     const verifier = String(flow.agentCalls.find((call) => call.role === "verifier")!.prompt);
-    // The clipping really happened, within the broker's bound.
-    expect(verifier).toContain("left out for the verifier's prompt bound");
-    expect(verifier.length).toBeLessThanOrEqual(100000);
-    expect(Buffer.byteLength(verifier, "utf8")).toBeLessThanOrEqual(120000);
+    // The clipping really happened, within the broker's bound: the budget note
+    // names the shortened handoff, and the cuts are marked in place. Where the
+    // cut falls is the prompt's choice (verifier-prompt.ts), not this test's.
+    expect(verifier.length).toBeLessThanOrEqual(agentPromptLimit("verifier"));
+    expect(verifier).toContain("\"source\":\"cockpit-prompt-budget\"");
+    expect(verifier).toMatch(/runner-handoff: shortened from \d+ to \d+ characters; \d+ cuts?/);
+    const cut = [...verifier.matchAll(/\[\.\.\. (\d+) lines? \(\d+ characters\) left out for the verifier's prompt bound/g)];
+    expect(cut.length).toBeGreaterThan(0);
+    const shown = new Set([...verifier.matchAll(/MIDDLE-(\d+)\\n/g)].map((match) => Number(match[1])));
+    expect(shown.size).toBeLessThan(600);
+    expect(verifier).toContain("STATUS: success");
+    for (const line of log.split("\n").filter((entry) => entry.startsWith("== "))) expect(verifier).toContain(line);
     expect(verifier).toContain(intent.trim());
     expect(verifier).toContain("CHECK-PROOF php8.3-fpm 8.3.36");
     expect(verifier).toContain("EARLY-REV 66061bd");
-    expect(verifier).not.toContain("MIDDLE-300\\n");
     // The job record keeps the whole handoff, every line of the log.
     const result = String(job.output?.result);
     expect(result).not.toContain("left out for the verifier's prompt bound");

@@ -2,6 +2,7 @@ import net from "node:net";
 import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { PROMPT_LIMITS, promptLimitProblem } from "./prompt-limits.mjs";
 
 const socketPath = process.env.COCKPIT_AGENT_BROKER_SOCKET || "/run/wireguard-ops-cockpit/agent.sock";
 const executable = process.env.COCKPIT_OPENCODE_EXECUTABLE || "opencode";
@@ -11,25 +12,15 @@ const workspaceRoot = process.env.COCKPIT_AGENT_WORKSPACE_ROOT || "/var/lib/wire
 const opencodeConfig = process.env.COCKPIT_OPENCODE_CONFIG || "/var/lib/wireguard-ops-agent/.config/opencode/opencode.jsonc";
 const contextRoot = new URL("../context/", import.meta.url);
 const staleWorkspaceAgeMs = 24 * 60 * 60 * 1000;
-const allowedRoles = new Set(["planner", "research", "runner", "safety", "verifier"]);
-// The safety role also reviews the diff of a Cockpit self-update (a bounded
-// excerpt, see apps/api/src/update-review.ts), so it gets a larger budget. So
-// does the verifier: it reads the trusted intent, the reviewed plan and the
-// runner handoff, which the API clips to this bound (apps/api/src/
-// verifier-prompt.ts; 30,000 refused finished host runs on 21.10.2026). The
-// prompt is one argv element of opencode: Linux caps a single argument at
-// 128 KiB (MAX_ARG_STRLEN), hence the byte bound.
-const promptLimits = { safety: 100000, verifier: 100000 };
-const defaultPromptLimit = 30000;
-const promptByteLimit = 120000;
+const allowedRoles = new Set(Object.keys(PROMPT_LIMITS));
 const requestLineLimit = 1048576;
 
 export function validateRequest(value) {
   if (!value || typeof value !== "object") throw new Error("request must be an object");
   if (!allowedRoles.has(value.role)) throw new Error("invalid agent role");
-  const promptLimit = promptLimits[value.role] || defaultPromptLimit;
-  if (typeof value.prompt !== "string" || value.prompt.length < 1 || value.prompt.length > promptLimit) throw new Error("prompt length is invalid");
-  if (Buffer.byteLength(value.prompt, "utf8") > promptByteLimit) throw new Error("prompt length is invalid");
+  // Bounds and wording in prompt-limits.mjs: the API reads the same file.
+  const problem = promptLimitProblem(value.role, value.prompt);
+  if (problem) throw new Error(problem);
   if (typeof value.requestId !== "string" || !/^[a-f0-9-]{8,64}$/i.test(value.requestId)) throw new Error("requestId is invalid");
   return { requestId: value.requestId, role: value.role, prompt: value.prompt };
 }
@@ -69,7 +60,11 @@ export function runAgent(request) {
   return new Promise((resolve) => {
     const model = request.role === "planner" || request.role === "research" || request.role === "runner" ? plannerModel : safetyModel;
     const opencodeAgent = request.role === "runner" ? "build" : "plan";
-    const args = ["run", "--auto", "--pure", "--agent", opencodeAgent, ...(model ? ["--model", model] : []), "--print-logs", request.prompt];
+    // The prompt goes on stdin: `opencode run` without a message reads the
+    // piped text as the message (opencode 1.18 run.ts, resolveRunInput). An
+    // argv element is capped at 128 KiB by Linux, and run joins argv with
+    // quotes and backslash-escaped double quotes, which altered the prompt.
+    const args = ["run", "--auto", "--pure", "--agent", opencodeAgent, ...(model ? ["--model", model] : []), "--print-logs"];
     let workspace;
     try {
       workspace = createSessionWorkspace(request);
@@ -86,8 +81,11 @@ export function runAgent(request) {
         OPENCODE_CONFIG: opencodeConfig,
         NODE_ENV: "production",
       },
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
     });
+    // A child that dies before reading its input must not crash the broker (EPIPE).
+    child.stdin.on("error", () => {});
+    child.stdin.end(request.prompt, "utf8");
     let stdout = "";
     let stderr = "";
     let settled = false;
