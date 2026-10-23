@@ -98,6 +98,7 @@ import {
   hostRunManifestHash,
   hostRunPlannerContract,
   hostRunPolicy,
+  hostRunRisksNeedingApproval,
   hostRunResultText,
   hostRunSafetyRecord,
   intentHostRunManifest,
@@ -2287,6 +2288,9 @@ export async function createApp(options: AppOptions = {}) {
     // operator; this is the second check before the helper, which asks a third time.
     const backup = backupGuardHits(manifest);
     if (backup.length > 0 && !envelope.operatorApproved) throw new Error(`the host run touches the backups and runs only with the operator's approval (${backup[0].where} ${backup[0].reason})`);
+    // Risk bolt (host-run.ts): a declared risk beyond "contained" waits for the operator too.
+    const risks = hostRunRisksNeedingApproval(manifest);
+    if (risks.length > 0 && !envelope.operatorApproved) throw new Error(`the host run declares risk ${risks.join(", ")} and runs only with the operator's approval`);
     const started = await startHostRunWhenFree(envelope, manifest);
     const startedAt = Date.now();
     // Recorded on the job, so an API restart (a reboot step restarts it too)
