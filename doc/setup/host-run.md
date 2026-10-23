@@ -108,8 +108,8 @@ steht als Fokus `literal-secret` in der Liste; ein wörtliches Geheimnis im Plan
 ein X1-Befund. Ein harmloser Name, der nur so aussieht (`task-runner-…` trifft das `sk-`-Muster),
 stoppt so nichts.
 
-Es gibt keine Freigabe als Regel, auch nicht für „geschützte Pfade“ — mit einer ausdrücklichen
-Ausnahme, dem Backup-Riegel (2a). Die harten Grenzen der
+Es gibt keine Freigabe als Regel, auch nicht für „geschützte Pfade“ — mit zwei ausdrücklichen
+Ausnahmen, dem Backup-Riegel (2a) und dem Risiko-Riegel (2b). Die harten Grenzen der
 Plan-Policy (`evaluatePlanPolicy`) und der borg-Repair-Riegel gelten weiter für die anderen
 Türen; ein Host-Lauf geht nicht durch sie, sondern durch den Türsteher. Dessen Anweisung macht
 einen borg-Repair und das Löschen oder Zurückspielen eines Maschinen-Snapshots ausdrücklich zu
@@ -257,6 +257,35 @@ vom 10.10.2026 aus `fixtures/host-run-plans-2026-10-10.json`, Policy),
 `host-run-helper.test.ts` (Helfer beim Start und nach dem Neustart, Snapshot-Name ≤ 30 Zeichen),
 `host-run-flow.test.ts` (API: `pass` plus `borg delete` wartet auf Jochen, läuft nach der
 Freigabe).
+
+## 2b. Risiko-Riegel: erklärtes Risiko nur mit Freigabe
+
+Vorfall 23.10.2026 (Job `d7df65dc`, neuer öffentlicher Vhost `office.wejos.de`): das Manifest
+trug `"risk": ["exposure"]`, der Intent verlangte ausdrücklich Jochens Freigabe, der Türsteher
+schrieb „Operator approval is the governing gate“ und sagte `pass` — und der Lauf startete ohne
+Jochen. Ursache: `hostRunPolicy` las `manifest.risk` gar nicht; die erklärte Risikoklasse war
+nur Fokus für den Türsteher (`declared-risk:*`), und `pass` hieß `ready`. Beim
+Capability-Manifest dagegen erzwingt dieselbe Klasse seit jeher die Freigabe
+(`capabilityNeedsOperatorApproval`).
+
+Seitdem gilt: erklärt das Manifest eine Risikoklasse außer `contained` — `exposure`,
+`data_loss` oder `identity_or_secret` —, startet der Lauf nur mit `operatorApproved`, **auch wenn
+der Türsteher `pass` sagt**. Die Regel ist „alles außer `contained`“, damit es keine zweite Liste
+gibt, die auseinanderlaufen kann. Drei Stellen fragen sie, wie beim Backup-Riegel:
+
+1. `hostRunPolicy` (`hostRunRisksNeedingApproval`): aus `pass` wird `blocked_user_approval`
+   (Zone rot, Beleg `declared risk: <klasse>`); bei einem belegten Befund kommt der Grund dazu;
+   eine unvollständige Prüfung bleibt `blocked_prerequisite`. Der Envelope trägt kein `gatePassed`.
+2. `runHostRun` in der API vor dem Aufruf des Executors.
+3. der Root-Helfer (`verifyRequest`), beim Start und bei jeder Fortsetzung: ohne
+   `operatorApproved` Abbruch mit Code 77. Ein Manifest ohne `risk`-Liste ist ungültig (64).
+
+Grenze: der Riegel greift auf das **erklärte** Risiko. Erklärt der Planer `contained`, obwohl
+ein Schritt etwas öffnet, bleibt das ein Türsteher-Befund X3 „Exposure“ (Fokus `network`).
+
+Tests: `host-run.test.ts` (Policy je Klasse, mit Befund, unvollständig), `host-run-helper.test.ts`
+(Helfer 77 ohne / 0 mit Freigabe, `risk` fehlt → 64), `host-run-flow.test.ts` (API: `pass` plus
+`exposure` wartet auf Jochen, läuft nach der Freigabe mit `operatorApproved`).
 
 ## 3. Tür
 
@@ -557,7 +586,7 @@ hebt. Der Normalfall ist Durchlaufen. Das gilt für beide Prüfungen: den Türst
 (Abschnitt 2, `hostRunPolicy`) und die Prüfung vor dem Selbstupdate und vor `dienste.update`
 (`applyUpdateReviewPolicy`, `doc/setup/self-update.md`, „Decision“).
 
-| Prüfergebnis | ohne Backup-Riegel / harten Blocker | mit Backup-Riegel-Treffer (nur `host.run`) oder hartem Plan-Blocker |
+| Prüfergebnis | ohne Backup-Riegel / harten Blocker | mit Backup- oder Risiko-Riegel-Treffer (nur `host.run`) oder hartem Plan-Blocker |
 |---|---|---|
 | **PASS** — Freigabe auf vollständigem Material | läuft ohne Jochen (`ready`) | Jochen entscheidet (`blocked_user_approval`) |
 | **FINDING** — mindestens ein echter Befund (Türsteher: mit Beleg; Selbstupdate: `GUARANTEE` nicht `UNVERIFIABLE`) | Jochen entscheidet, mit Befund und zitiertem Code (`blocked_user_approval`) | Jochen entscheidet, Befund und Riegel/Blocker zusammen (`blocked_user_approval`); ist der Plan schon `blocked_prerequisite`/`blocked_policy`, bleibt diese Sperre, und der Befund steht in `GET /api/inbox` unter `reviewFindings` |
@@ -576,7 +605,8 @@ hebt. Der Normalfall ist Durchlaufen. Das gilt für beide Prüfungen: den Türst
 - INCOMPLETE ist nie ein Durchlass. James klärt die Ursache (Einsammeln reparieren, Lauf
   wiederholen) und reicht neu ein; kommt er nicht weiter, fragt er Jochen selbst.
 - Harte Blocker, die unabhängig vom Prüfergebnis zu Jochen gehen: Backup-Riegel (Abschnitt 2a,
-  nur `host.run`); für die typisierten Türen die Plan-Policy (`evaluatePlanPolicy`: geschützte
+  nur `host.run`); Risiko-Riegel (Abschnitt 2b, erklärtes `exposure`/`data_loss`/
+  `identity_or_secret`, nur `host.run`); für die typisierten Türen die Plan-Policy (`evaluatePlanPolicy`: geschützte
   Grenze, Risikozone rot, nicht autorisierte Capability, `shell.exception`, `borg.repair`).
 - Die Sicherungskette vor einem verändernden Lauf (borg-Prüfung, Snapshot) hängt nicht an dieser
   Matrix und bleibt unverändert.

@@ -490,6 +490,29 @@ describe("host door through the API", () => {
     expect(start.payload.envelope.gatePassed).toBeUndefined();
   });
 
+  // Vorfall 23.10.2026, Job d7df65dc: a new public vhost declared risk
+  // "exposure", the doorkeeper passed, and the run started without Jochen.
+  it("keeps a run that declares risk exposure for the operator although the doorkeeper passed it", async () => {
+    const vhost = { ...hostRun, name: "office vhost", purpose: "new public vhost office.example", risk: ["exposure"] };
+    const flow = await setup({ plan: planWith(vhost), doorkeeper: "VERDICT: pass\nNOTES: Operator approval is the governing gate and is explicitly requested in the plan." });
+    const job = await flow.submit();
+
+    expect(job.status).toBe("blocked_user_approval");
+    const policy = job.output?.policy as { reason: string; evidence: string[]; zone: string };
+    expect(policy.zone).toBe("red");
+    expect(policy.reason).toContain("declared risk exposure");
+    expect(policy.evidence).toContain("declared risk: exposure");
+    expect((job.output?.envelope as Record<string, unknown>).gatePassed).toBeUndefined();
+    expect(flow.executorCalls.some((call) => call.payload.action === "host.run")).toBe(false);
+
+    const approved = await flow.app.inject({ method: "POST", url: `/api/hermes/jobs/${job.id}/approval`, headers: { cookie: flow.cookie }, payload: { decision: "approved", reason: "new vhost is wanted" } });
+    expect(approved.statusCode).toBe(202);
+    expect((await flow.settled(job.id)).status).toBe("completed");
+    const start = flow.executorCalls.find((call) => call.payload.action === "host.run")!;
+    expect(start.payload.envelope).toMatchObject({ operatorApproved: true });
+    expect(start.payload.envelope.gatePassed).toBeUndefined();
+  });
+
   it("runs James' job after Jochen's admin approval, in the session James owns", async () => {
     const flow = await setup({ ownedByAutomation: true, plan: planWith(hostRunWithRepair), doorkeeper: "VERDICT: pass\nNOTES: routine" });
     const job = await flow.submit();

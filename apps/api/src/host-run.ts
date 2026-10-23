@@ -37,6 +37,12 @@ import { redactSecrets } from "./update-review.js";
 //               deterministically; the helper asks it again. What the bolt
 //               cannot read or what only names the backups is focus for the
 //               doorkeeper (backup-focus), never an automatic stop.
+//   risk bolt   the second exception (Vorfall 23.10.2026, Job d7df65dc): a
+//               manifest that declares a risk class beyond "contained"
+//               (exposure, data_loss, identity_or_secret) needs the
+//               operator's approval, even when the doorkeeper passes — like
+//               the capability manifest (capabilityNeedsOperatorApproval).
+//               Asked by the policy, runHostRun and the root helper.
 //   no kill     a step that touches state (packages, GitLab, migrations,
 //               docker compose, switching over) is never ended at its time
 //               limit: the helper only reports the overrun and waits
@@ -557,6 +563,13 @@ function describeFinding(finding: HostRunFinding): string {
   ].join("\n"), 4000);
 }
 
+// The declared risk classes that wait for the operator: every class except
+// "contained" (the only other value the parser keeps). The root helper
+// (deploy/helpers/cockpit-host-run) applies the same rule to the signed manifest.
+export function hostRunRisksNeedingApproval(manifest: Pick<HostRunManifest, "risk">): HostRunRisk[] {
+  return manifest.risk.filter((risk) => risk !== "contained");
+}
+
 function describeBackupHit(hit: BackupGuardHit): string {
   return clip(`BACKUP [${hit.kind}] ${hit.where}: ${hit.reason}\nCODE: ${hit.code}`, 1000);
 }
@@ -564,9 +577,15 @@ function describeBackupHit(hit: BackupGuardHit): string {
 export function hostRunPolicy(manifest: HostRunManifest, outcome: HostRunReviewOutcome): HostRunPolicy {
   const zone = manifest.mutates ? "yellow" : "green";
   const backup = backupGuardHits(manifest);
+  const risks = hostRunRisksNeedingApproval(manifest);
   const base = { rollbackAvailable: true, evidence: [`host-run manifest ${outcome.manifestHash.slice(0, 16)}: ${manifest.steps.length} step(s), ${manifest.checks.length} check(s), mutates ${manifest.mutates}`, `focus hits: ${outcome.focus.length}`, ...(backup.length ? [`backup bolt: ${backup.length} hit(s), operator approval required`] : [])] };
   const backupEvidence = backup.slice(0, 12).map(describeBackupHit);
-  const backupReason = backup.length ? `The run touches the backups (${backup.slice(0, 3).map((hit) => `${hit.where} ${hit.reason}`).join("; ").slice(0, 300)}); deleting backups or shortening their retention always needs the operator's approval.` : "";
+  const riskEvidence = risks.map((risk) => `declared risk: ${risk}`);
+  // Both bolts (backup and declared risk) in one sentence for the operator.
+  const backupReason = [
+    backup.length ? `The run touches the backups (${backup.slice(0, 3).map((hit) => `${hit.where} ${hit.reason}`).join("; ").slice(0, 300)}); deleting backups or shortening their retention always needs the operator's approval.` : "",
+    risks.length ? `The plan declares ${risks.map((risk) => `declared risk ${risk}`).join(", ")}; exposure, data loss and identity or secret changes always need the operator's approval.` : "",
+  ].filter(Boolean).join(" ");
   const incomplete = (why: string, evidence: string[] = []): HostRunPolicy => ({
     ...base, zone: "red", allowed: false, status: "blocked_prerequisite",
     reason: `The doorkeeper review is incomplete, so nothing runs: ${why}.`,
@@ -578,12 +597,12 @@ export function hostRunPolicy(manifest: HostRunManifest, outcome: HostRunReviewO
   const answer = outcome.answer;
   if (!answer || answer.verdict === "invalid") return incomplete(`the reviewer's answer could not be read (${answer?.problem || "no answer"})`);
   if (answer.verdict === "pass") {
-    if (backup.length) {
+    if (backupReason) {
       return {
         ...base, zone: "red", allowed: false, status: "blocked_user_approval",
         reason: `The doorkeeper passed the concrete steps. ${backupReason}`,
-        evidence: [...base.evidence, "doorkeeper verdict: pass", ...backupEvidence],
-        neededToContinue: ["Read the backup hits with their lines, then approve or reject exactly this signed plan."],
+        evidence: [...base.evidence, "doorkeeper verdict: pass", ...riskEvidence, ...backupEvidence],
+        neededToContinue: [backup.length ? "Read the backup hits with their lines, then approve or reject exactly this signed plan." : "Read the declared risk and the steps, then approve or reject exactly this signed plan."],
       };
     }
     return { ...base, zone, allowed: true, status: "ready", reason: "The doorkeeper passed the concrete steps; the run starts.", evidence: [...base.evidence, "doorkeeper verdict: pass"], neededToContinue: [] };
@@ -593,8 +612,8 @@ export function hostRunPolicy(manifest: HostRunManifest, outcome: HostRunReviewO
   if (evidenced.length === 0) return incomplete(`the reviewer flagged, but no finding carries evidence (${answer.problem || discarded.length + " discarded"})`, discarded);
   return {
     ...base, zone: "red", allowed: false, status: "blocked_user_approval",
-    reason: `The doorkeeper found ${evidenced.length} evidenced finding(s): ${evidenced.map((finding) => `${finding.where} ${finding.title}`).join("; ").slice(0, 400)}.${backup.length ? ` ${backupReason}` : ""}`,
-    evidence: [...base.evidence, "doorkeeper verdict: flag", ...evidenced.map(describeFinding), ...discarded, ...backupEvidence],
+    reason: `The doorkeeper found ${evidenced.length} evidenced finding(s): ${evidenced.map((finding) => `${finding.where} ${finding.title}`).join("; ").slice(0, 400)}.${backupReason ? ` ${backupReason}` : ""}`,
+    evidence: [...base.evidence, "doorkeeper verdict: flag", ...evidenced.map(describeFinding), ...discarded, ...riskEvidence, ...backupEvidence],
     neededToContinue: ["Read each finding with its quoted line and path, then approve or reject exactly this signed plan."],
   };
 }
@@ -696,6 +715,7 @@ export function hostRunPlannerContract(): string {
     "A reboot is an ordinary step ({\"name\":\"reboot\",\"reboot\":true}); the run continues with the next step after the host is back and reports its result then. Put the checks that prove the new state after the reboot.",
     "checks are mandatory and must be able to fail (exit non-zero when the target state is missing). rollback is mandatory: the concrete way back for this plan (for example: downgrade or reinstall the previous version, restore the saved config copy); the machine snapshot is the last resort and needs the operator.",
     "Split big work into stages with a check each (for GitLab: the official upgrade stops, gitlab-backup before each stage, gitlab-ctl reconfigure and a health check after). Use apt-get with -y and noninteractive defaults; hold packages explicitly when a stage must not touch them (apt-mark hold).",
+    "risk: [\"contained\"] unless the run opens or widens what is reachable (exposure: a new public hostname, port, vhost or firewall opening), can lose existing data (data_loss) or changes identities, keys or secrets (identity_or_secret). Any declared class other than contained always waits for the operator's approval, whatever the doorkeeper says; declare it honestly, the doorkeeper reads the steps as well.",
     "Deleting backups, changing their retention or switching them off always waits for the operator's approval, whatever the doorkeeper says: borg/borgmatic delete, prune, compact, recreate, break-lock, key changes, retention edits (/etc/borgmatic, keep_*, GitLab backup_keep_time), deleting, moving or overwriting in the repository path, /var/backups or /var/opt/gitlab/backups (also over ssh on Lab0, 10.0.0.5), stopping, disabling or masking borgmatic.timer or Lab0's retention service (cockpit-borg-retention set below its minimum or with --freigabe, freigeben, stopping/disabling its timer, editing its files), deleting a machine snapshot. Package updates, reading (borg list/info/check/create, docker ps/inspect/logs, systemctl status), plain borgmatic, cockpit-borg-action status|check, systemctl start borgmatic.service, new backup copies and on Lab0 /usr/local/sbin/cockpit-borg-retention status|run or set <keep_daily> <keep_weekly> <keep_monthly> <HH:MM> inside the fixed bounds (doc/setup/borg-retention.md) do not. Code the plan does not show (eval, decoding, piping into a shell, running a script the run did not write in a heredoc, commands or targets from values the plan does not show, ssh to another machine) makes the doorkeeper look hard: write the literal commands instead.",
     "Never read, print or send secrets (Cockpit configuration in /etc/wireguard-ops-cockpit, agent credentials, private keys, /etc/shadow, borg keys, database passwords), never send host data off the host, and never change users, sudoers, SSH keys, firewall rules or the Cockpit's own code: the doorkeeper stops those for the operator.",
   ].join("\n");

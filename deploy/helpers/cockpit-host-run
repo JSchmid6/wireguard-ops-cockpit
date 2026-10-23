@@ -178,6 +178,13 @@ function verifyRequest(request, { checkExpiry }) {
   if (backup.length > 0 && envelope.operatorApproved !== true) {
     fail(`the run touches the backups and needs the operator's approval: ${backup.slice(0, 3).map((hit) => `${hit.where} ${hit.reason}`).join("; ")}`, 77);
   }
+  // Erklärtes Risiko (Vorfall 23.10.2026, Job d7df65dc): jede Klasse außer
+  // "contained" (exposure, data_loss, identity_or_secret) öffnet nur mit
+  // operatorApproved — dieselbe Regel wie hostRunRisksNeedingApproval in der API.
+  const risks = manifest.risk.filter((risk) => risk !== "contained");
+  if (risks.length > 0 && envelope.operatorApproved !== true) {
+    fail(`the run declares risk ${risks.join(", ")} and needs the operator's approval`, 77);
+  }
   return { manifest, envelope };
 }
 
@@ -205,6 +212,7 @@ function validateManifest(manifest) {
     if (!Number.isInteger(check.timeoutSeconds) || check.timeoutSeconds < 1 || check.timeoutSeconds > CHECK_TIMEOUT_MAX) bad(`timeout of ${check.name}`);
   }
   if (!Array.isArray(manifest.rollback) || manifest.rollback.length < 1) bad("rollback");
+  if (!Array.isArray(manifest.risk) || manifest.risk.length < 1 || !manifest.risk.every((risk) => typeof risk === "string")) bad("risk");
 }
 
 // ── Schwärzen ──────────────────────────────────────────────────────────────

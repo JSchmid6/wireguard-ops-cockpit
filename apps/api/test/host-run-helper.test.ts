@@ -272,6 +272,21 @@ describe("cockpit-host-run: lock", () => {
     expect(status().state.status).toBe("success");
   });
 
+  // Vorfall 23.10.2026, Job d7df65dc: a declared risk beyond "contained" opens
+  // only for the operator's approval, even with a passed doorkeeper.
+  it.each(["exposure", "data_loss", "identity_or_secret"])("keeps a run that declares risk %s shut without the operator's approval", (risk) => {
+    const out = run(["start"], request(manifest({ risk: ["contained", risk] })));
+    expect(out.code).toBe(77);
+    expect(out.stderr).toContain(`declares risk ${risk}`);
+    expect(existsSync(path.join(dir, "runs", "job-1"))).toBe(false);
+    expect(existsSync(path.join(dir, "units.log"))).toBe(false);
+  });
+
+  it("opens a run with a declared risk for the operator's approval", () => {
+    expect(run(["start"], request(manifest({ risk: ["exposure"] }), { gatePassed: undefined, operatorApproved: true })).code).toBe(0);
+    expect(status().state.status).toBe("success");
+  });
+
   it("asks the backup bolt again when a run continues after the boot", () => {
     // A request.json that lost its approval (or was forged) does not continue.
     const prune = manifest({ steps: [{ name: "reboot", reboot: true }, { name: "delete", run: `echo 'borg delete ::a' > ${dir}/borg-delete.txt`, timeoutSeconds: 30 }] });
@@ -299,6 +314,8 @@ describe("cockpit-host-run: lock", () => {
     for (const bad of [
       manifest({ checks: [] }),
       manifest({ rollback: [] }),
+      manifest({ risk: [] }),
+      manifest({ risk: undefined as unknown as string[] }),
       manifest({ mutates: false, steps: [{ name: "boot", reboot: true }] }),
       manifest({ steps: [{ name: "no limit", run: "true" }] }),
     ]) {
