@@ -55,7 +55,7 @@
 // Verben (gepinnte Grammatik; sudoers erlaubt nur `start` und `status *`):
 //   start             stdin: {"manifest", "envelope"} — prüfen, Laufverzeichnis
 //                     anlegen, Lauf-Unit starten (ohne Warten), sofort zurück
-//   status <jobId>    Zustand und Protokollende eines Laufs (JSON)
+//   status <jobId>    Zustand und Protokollauszug eines Laufs (JSON; logDigest)
 //   resume            nur aus wireguard-ops-cockpit-host-run-resume.service beim
 //                     Hochfahren: Läufe, die für einen Neustart angehalten haben,
 //                     in einer neuen Unit fortsetzen
@@ -389,9 +389,59 @@ function status(jobId) {
   if (ACTIVE_PHASES.has(state.phase) && state.phase !== "rebooting" && !resumingNow && !unitActive(state.unit)) {
     state = { ...state, phase: "finished", status: "failed", error: state.error || "the run unit ended without a result (time limit or crash)" };
   }
-  let logTail = "";
-  try { logTail = readFileSync(`${runDir(jobId)}/output.log`, "utf8").slice(-30000); } catch { /* noch keine Ausgabe */ }
-  process.stdout.write(`${JSON.stringify({ ok: true, state, logTail })}\n`);
+  const path = `${runDir(jobId)}/output.log`;
+  let full = null;
+  try { full = readFileSync(path, "utf8"); } catch { /* noch keine Ausgabe */ }
+  // logTail heisst aus Kompatibilität so; seit dem Auszug ist es mehr als das Ende.
+  const log = full === null ? null : { path, chars: full.length };
+  process.stdout.write(`${JSON.stringify({ ok: true, state, logTail: full === null ? "" : logDigest(full), log })}\n`);
+}
+
+// Was `status` vom Protokoll zurückgibt, höchstens LOG_DIGEST Zeichen. Bis
+// 22.10.2026 nur das Ende (slice(-30000)): ein langer apt-Schritt schob die
+// Ausgabe der frühen Schritte (git rev-parse, dpkg -l) aus dem gespeicherten
+// Ergebnis (Job a45f57b1). Jetzt bleibt jede "== "-Zeile (Schritt, Prüfung,
+// Netz, Ergebnis), und jeder Abschnitt behält Kopf und Ende: die kleinen ganz,
+// die grossen teilen sich den Rest. Jeder Schnitt ist markiert; das ganze
+// Protokoll bleibt auf dem Host (status nennt log.path).
+const LOG_DIGEST = 30000;
+function cutMark(left) { return `[... ${left} characters of this section left out; the full log stays on the host ...]`; }
+function headAndEnd(text, limit) {
+  if (text.length <= limit) return text;
+  const room = limit - cutMark(text.length).length - 2;
+  // Zu wenig Platz für Kopf und Ende: der Schnitt bleibt trotzdem sichtbar.
+  if (room < 40) return limit >= cutMark(text.length).length ? cutMark(text.length) : "";
+  const head = Math.ceil(room / 2);
+  const tail = room - head;
+  return `${text.slice(0, head)}\n${cutMark(text.length - head - tail)}\n${text.slice(text.length - tail)}`;
+}
+function logDigest(text, limit = LOG_DIGEST) {
+  if (text.length <= limit) return text;
+  const parts = [];
+  let current = { header: null, lines: [] };
+  for (const line of text.split("\n")) {
+    if (line.startsWith("== ")) { parts.push(current); current = { header: line, lines: [] }; } else current.lines.push(line);
+  }
+  parts.push(current);
+  const sections = parts.map((part) => ({ header: part.header, body: part.lines.join("\n") })).filter((part) => part.header !== null || part.body);
+  const fixed = sections.reduce((sum, part) => sum + (part.header === null ? 0 : part.header.length + 1) + 1, 0);
+  // Fast nur Kopfzeilen (sehr viele Schritte, Wiederholungen): dann Kopf und Ende des Ganzen.
+  if (fixed > limit / 2) return headAndEnd(text, limit) || text.slice(-limit);
+  // Die kleinen Abschnitte ganz, die übrigen teilen sich den Rest zu gleichen Teilen.
+  const limits = new Map();
+  const open = sections.filter((part) => part.body).sort((a, b) => a.body.length - b.body.length);
+  let left = limit - fixed;
+  while (open.length > 0) {
+    const next = open.shift();
+    const share = Math.max(0, Math.min(next.body.length, Math.floor(left / (open.length + 1))));
+    limits.set(next, share);
+    left -= share;
+  }
+  const digest = sections.map((part) => {
+    const body = part.body ? headAndEnd(part.body, limits.get(part) ?? 0) : "";
+    return [part.header, body].filter((item) => item !== null && item !== "").join("\n");
+  }).join("\n");
+  return digest.length <= limit ? digest : headAndEnd(text, limit) || text.slice(-limit);
 }
 
 // ── resume (beim Hochfahren) ───────────────────────────────────────────────

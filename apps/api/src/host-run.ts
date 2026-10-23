@@ -637,12 +637,15 @@ export interface HostRunStatus {
   snapshotKind: "machine" | "host";
   state: Record<string, unknown>;
   logTail: string;
+  // The whole log on the host (root-only); logTail is the helper's digest of it.
+  // Null from a helper before 22.10.2026, which reported only the log's end.
+  log: { path: string; chars: number } | null;
 }
 
 export function parseHostRunStatus(raw: string): HostRunStatus {
   let value: unknown;
   try { value = JSON.parse(raw); } catch { throw new Error("host.status returned no JSON"); }
-  const data = value as { ok?: boolean; state?: Record<string, unknown>; logTail?: unknown };
+  const data = value as { ok?: boolean; state?: Record<string, unknown>; logTail?: unknown; log?: { path?: unknown; chars?: unknown } | null };
   if (!data || data.ok !== true || !data.state || typeof data.state !== "object") throw new Error("host.status returned an unexpected answer");
   const state = data.state;
   const phase = typeof state.phase === "string" ? state.phase : "unknown";
@@ -654,9 +657,18 @@ export function parseHostRunStatus(raw: string): HostRunStatus {
     snapshotId: typeof snapshot?.snapshotId === "string" ? snapshot.snapshotId : null,
     snapshotKind: snapshot?.kind === "host" ? "host" : "machine",
     state, logTail: typeof data.logTail === "string" ? redactSecrets(data.logTail) : "",
+    log: typeof data.log?.path === "string" && HOST_RUN_LOG_PATH.test(data.log.path) && Number.isSafeInteger(data.log.chars)
+      ? { path: data.log.path, chars: data.log.chars as number } : null,
   };
 }
 
+// Only the helper's own run directory is named as evidence, never a path the answer makes up.
+const HOST_RUN_LOG_PATH = /^\/var\/lib\/wireguard-ops-cockpit\/host-runs\/[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}\/output\.log$/;
+
+// OUTPUT is the helper's digest (every "== " line, head and end of each
+// section, cuts marked); NOTES names the whole log on the host when the
+// helper reports it (job a45f57b1, 22.10.2026: the old end-only tail lost the
+// early steps).
 export function hostRunResultText(manifest: HostRunManifest, result: HostRunStatus): string {
   const steps = Array.isArray(result.state.steps) ? result.state.steps as Array<Record<string, unknown>> : [];
   const checks = Array.isArray(result.state.checks) ? result.state.checks as Array<Record<string, unknown>> : [];
@@ -665,10 +677,10 @@ export function hostRunResultText(manifest: HostRunManifest, result: HostRunStat
     `STATUS: ${result.success ? "success" : "failed"}`,
     `EXIT_CODE: ${result.success ? 0 : 1}`,
     `WHAT_RAN: host run "${manifest.name}": ${steps.map((step) => `${step.index} ${step.name} ${step.status}`).join(", ")}; checks: ${checks.map((check) => `${check.index} ${check.name} ${check.status}`).join(", ")}`,
-    // The helper's own tail (cockpit-host-run, host.status); the verifier's
+    // The helper's own digest (cockpit-host-run, host.status); the verifier's
     // prompt chooses from it within its bound (verifier-prompt.ts).
     `OUTPUT: ${result.logTail}`,
-    `NOTES: run ${result.status}${result.error ? ` — ${result.error}` : ""}${result.snapshotId ? `; ${result.snapshotKind} snapshot ${result.snapshotId} (revert only with operator approval)` : ""}; executed by the general host door as root in a transient unit`,
+    `NOTES: run ${result.status}${result.error ? ` — ${result.error}` : ""}${result.snapshotId ? `; ${result.snapshotKind} snapshot ${result.snapshotId} (revert only with operator approval)` : ""}; executed by the general host door as root in a transient unit${result.log ? `; full log on the host: ${result.log.path} (${result.log.chars} characters, root-only)` : ""}`,
   ].join("\n");
 }
 

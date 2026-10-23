@@ -241,6 +241,52 @@ describe("host door through the API", () => {
     expect(job.output?.result).not.toContain("left out for the verifier's prompt bound");
   });
 
+  // Review of PR #57 (t_b17eb461): at realistic sizes the app never clips, so
+  // the test above cannot show that the job keeps the unclipped handoff. Here
+  // intent, plan and log together exceed the verifier's bound: the planner may
+  // write a plan of up to 24 steps of 16,000 characters.
+  it("keeps the unclipped handoff in the job when the verifier's prompt is clipped", async () => {
+    const apt = Array.from({ length: 600 }, (_, index) => `Setting up php8.${index % 5}-common (8.${index % 5}.36-1) \u2026 MIDDLE-${index}`).join("\n");
+    const log = [
+      "== 2026-10-21T18:20:00.000Z step 1/2: sources (limit 600 s)", "EARLY-REV 66061bdac5fc65ad3d1148b3af5acbc0864bb04a",
+      "== 2026-10-21T18:21:00.000Z step 2/2: upgrade (limit 1800 s, uninterruptible: package-management)", apt,
+      "== 2026-10-21T18:39:30.000Z check 1/1: nothing pending", "CHECK-PROOF php8.3-fpm 8.3.36",
+      "== 2026-10-21T18:39:41.000Z run finished: success",
+    ].join("\n");
+    const script = (label: string) => `cat > /etc/php/8.3/fpm/conf.d/90-${label}.ini <<'EOF'\n${Array.from({ length: 300 }, (_, index) => `; ${label} setting ${index} ......................`).join("\n")}\nEOF`;
+    const bigRun = { ...hostRun, steps: [...hostRun.steps, ...["a", "b", "c", "d", "e"].map((label) => ({ name: `config ${label}`, run: script(label) }))] };
+    const plan = planWith(bigRun);
+    const intent = `Critical PHP security update on the VPS. ${"Zielzustand und W\u00e4chter ausf\u00fchrlich erkl\u00e4rt \u2013 ".repeat(250)}`;
+    // Within the door's own bounds: the helper's 30,000-character digest and
+    // the doorkeeper's 90,000 bytes of steps and checks.
+    expect(log.length).toBeLessThanOrEqual(30000);
+    expect(intent.length + plan.length + log.length).toBeGreaterThan(100000);
+    const flow = await setup({ plan, doorkeeper: "VERDICT: pass", intent, logTail: log });
+    const job = await flow.submit();
+
+    expect(job.status).toBe("completed");
+    const verifier = String(flow.agentCalls.find((call) => call.role === "verifier")!.prompt);
+    // The clipping really happened, within the broker's bound: the budget note
+    // names the shortened handoff, and the cuts are marked in place. Where the
+    // cut falls is the prompt's choice (verifier-prompt.ts), not this test's.
+    expect(verifier.length).toBeLessThanOrEqual(agentPromptLimit("verifier"));
+    expect(verifier).toContain("\"source\":\"cockpit-prompt-budget\"");
+    expect(verifier).toMatch(/runner-handoff: shortened from \d+ to \d+ characters; \d+ cuts?/);
+    const cut = [...verifier.matchAll(/\[\.\.\. (\d+) lines? \(\d+ characters\) left out for the verifier's prompt bound/g)];
+    expect(cut.length).toBeGreaterThan(0);
+    const shown = new Set([...verifier.matchAll(/MIDDLE-(\d+)\\n/g)].map((match) => Number(match[1])));
+    expect(shown.size).toBeLessThan(600);
+    expect(verifier).toContain("STATUS: success");
+    for (const line of log.split("\n").filter((entry) => entry.startsWith("== "))) expect(verifier).toContain(line);
+    expect(verifier).toContain(intent.trim());
+    expect(verifier).toContain("CHECK-PROOF php8.3-fpm 8.3.36");
+    expect(verifier).toContain("EARLY-REV 66061bd");
+    // The job record keeps the whole handoff, every line of the log.
+    const result = String(job.output?.result);
+    expect(result).not.toContain("left out for the verifier's prompt bound");
+    expect(result).toContain(`OUTPUT: ${log}\nNOTES:`);
+  });
+
   it("verifies a run that printed nothing", async () => {
     const flow = await setup({ plan: planWith(hostRun), doorkeeper: "VERDICT: pass", logTail: "" });
     const job = await flow.submit();
