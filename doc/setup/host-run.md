@@ -280,6 +280,10 @@ gibt, die auseinanderlaufen kann. Drei Stellen fragen sie, wie beim Backup-Riege
 3. der Root-Helfer (`verifyRequest`), beim Start und bei jeder Fortsetzung: ohne
    `operatorApproved` Abbruch mit Code 77. Ein Manifest ohne `risk`-Liste ist ungültig (64).
 
+Unbekannte Klassen schließen zu: ein `risk`-Eintrag außerhalb der vier Klassen (`"network"`,
+`"Exposure"`) oder ein `risk`, das keine Liste ist, macht das Manifest ungültig, statt still
+zu `contained` zu werden. Fehlt `risk` ganz, setzt die API `["contained"]` (Planer-Vertrag).
+
 Grenze: der Riegel greift auf das **erklärte** Risiko. Erklärt der Planer `contained`, obwohl
 ein Schritt etwas öffnet, bleibt das ein Türsteher-Befund X3 „Exposure“ (Fokus `network`).
 

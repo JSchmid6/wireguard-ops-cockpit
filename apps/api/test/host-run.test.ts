@@ -120,6 +120,9 @@ describe("parseHostRunManifest", () => {
     ["an oversized step", { ...aptManifest, steps: [{ name: "x", run: "a".repeat(16_001) }] }, "longer than"],
     ["no purpose", { ...aptManifest, purpose: "" }, "name and purpose"],
     ["another version", { ...aptManifest, version: "cockpit-host-run/v2" }, "version"],
+    ["an unknown risk class", { ...aptManifest, risk: ["network"] }, "unknown risk class"],
+    ["a misspelled risk class", { ...aptManifest, risk: ["contained", "Exposure"] }, "unknown risk class"],
+    ["a risk that is no list", { ...aptManifest, risk: "exposure" }, "unknown risk class"],
   ])("refuses %s", (_label, manifest, message) => {
     expect(() => parseHostRunManifest(plan(manifest, "host-run"))).toThrow(message);
   });

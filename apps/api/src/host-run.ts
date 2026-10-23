@@ -190,7 +190,12 @@ export function parseHostRunManifest(plan: string): HostRunManifest | null {
   const rollback = Array.isArray(value.rollback) ? value.rollback.slice(0, 32).flatMap((item) => typeof item === "string" && item.trim() ? [item.trim().slice(0, 1000)] : []) : [];
   if (rollback.length === 0) fail("host-run manifest requires a rollback (the way back): field rollback must be an array with at least one non-empty string");
   const validRisks = new Set<HostRunRisk>(["contained", "exposure", "data_loss", "identity_or_secret"]);
-  const risk = Array.isArray(value.risk) ? value.risk.filter((item): item is HostRunRisk => typeof item === "string" && validRisks.has(item as HostRunRisk)) : [];
+  // Fail closed: a class the contract does not know ("network", "Exposure")
+  // would otherwise drop out and leave "contained", which skips the risk bolt.
+  if (value.risk !== undefined && (!Array.isArray(value.risk) || value.risk.some((item) => typeof item !== "string" || !validRisks.has(item as HostRunRisk)))) {
+    fail(`host-run manifest has an unknown risk class: field risk must list only ${[...validRisks].join(", ")}, got ${JSON.stringify(value.risk).slice(0, 200)}`);
+  }
+  const risk = Array.isArray(value.risk) ? (value.risk as HostRunRisk[]) : [];
   return {
     version: HOST_RUN_VERSION, name, purpose, mutates, steps, checks, rollback,
     risk: risk.length ? [...new Set(risk)].sort() : ["contained"],
