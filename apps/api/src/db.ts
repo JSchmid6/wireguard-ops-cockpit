@@ -1002,7 +1002,8 @@ export class CockpitDatabase {
         input.approvalId ?? current.approvalId,
         stringifyJsonValue(input.output ?? current.output),
         now(),
-        input.completedAt ?? current.completedAt,
+        // null clears it (a job running again after the operator's approval); undefined keeps it.
+        input.completedAt === undefined ? current.completedAt : input.completedAt,
         jobId
       );
 

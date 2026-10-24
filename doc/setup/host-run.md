@@ -317,10 +317,16 @@ Tests: `host-run.test.ts` (Policy je Klasse, mit Befund, unvollständig), `host-
   Sie nimmt die Startmarken (`executionStartedAt`, `hostRunRequestedAt`) zurück, stellt den Job
   auf die Phase `waiting_for_host` (`output.hostRunQueue`: seit wann, wie oft abgewiesen, letzte
   Absage; Audit `hermes.host_run.queued`) und fragt alle 15 s erneut. Der Job startet, sobald der
-  Platz frei ist. Er wartet höchstens 25 Minuten und endet spätestens eine Minute vor dem Ablauf
-  seines Envelopes. Findet er bis dahin keinen Platz, endet er als `blocked_runner_busy`: Auf dem
+  Platz frei ist. Die Freigabefrist gilt nur bis zum Klick (Vorfall 24.10.2026, Job a6ffb1fb):
+  Wartet der Job in der Reihe, erneuert die API vor dem nächsten Startversuch die Frist seines
+  Envelopes (`extendQueuedExecutionEnvelope`: gleicher Inhalt, also Plan-, Manifest- und
+  Policy-Hash, `gatePassed`/`operatorApproved` unverändert, nur `issuedAt`/`expiresAt` neu, neu
+  signiert; Audit `hermes.host_run.envelope_extended`, Zähler `hostRunQueue.extensions`). Er
+  wartet höchstens 24 Stunden ab der ersten Abweisung (`hostRunQueue.notAfter`); keine neue Frist
+  reicht darüber hinaus. Findet er bis dahin keinen Platz, endet er als `blocked_runner_busy`: Auf dem
   Host lief nichts, der Job ist wiederholbar und zählt nicht zum Circuit Breaker. Beim Warten darf
-  James ihn zurückziehen. Ein API-Neustart plant ihn neu, wie einen Job in der Prüfung.
+  James ihn zurückziehen, solange er nicht freigegeben ist. Ein freigegebener Job wartet bis zum
+  Start oder bis zur Obergrenze; zurückziehen kann ihn James nicht. Ein API-Neustart plant ihn neu, wie einen Job in der Prüfung.
   Stirbt die API genau während eines Startversuchs (nur `hostRunRequestedAt` gesetzt), fragt sie
   nach dem Neustart `status <job>`. Kennt der Helfer den Lauf auch fünf Minuten nach der Anfrage
   nicht („no host run <job>“, die Startsperre ist dann verfallen), lief nichts: Die Marken fallen

@@ -56,6 +56,7 @@ import {
 import {
   approveExecutionEnvelope,
   renewExecutionEnvelope,
+  extendQueuedExecutionEnvelope,
   buildAgentTask,
   classifyCapabilities,
   parseTypedDiskActions,
@@ -194,13 +195,17 @@ const HOST_RUN_REBOOT_ALLOWANCE_MS = 60 * 60 * 1000;
 // Platz am Host (Karte t_9c04b4de): Der Host-Run-Helfer lässt nur einen Lauf
 // zugleich zu und weist einen zweiten Start vor dem ersten Schritt ab (Exit 75,
 // „another host run is active: <id>“ bzw. „… is starting“). Das ist kein
-// Fehllauf: Der Job reiht sich ein und fragt im Takt erneut, längstens bis kurz
-// vor dem Ablauf seines Envelopes. Findet er keinen Platz, endet er als
+// Fehllauf: Der Job reiht sich ein und fragt im Takt erneut. Die Freigabefrist
+// gilt nur bis zum Klick (Vorfall 24.10.2026, Job a6ffb1fb): Wartet ein Job in
+// der Reihe, bekommt sein Envelope vor dem nächsten Startversuch eine neue Frist
+// (extendQueuedExecutionEnvelope, gleicher Inhalt), längstens HOST_RUN_SLOT_WAIT_MS
+// ab der ersten Abweisung. Findet er bis dahin keinen Platz, endet er als
 // blocked_runner_busy (wiederholbar, zählt nicht zum Circuit Breaker).
 const HOST_RUN_BUSY = /another host run is (?:active|starting)/;
 const HOST_RUN_SLOT_POLL_MS = 15_000;
-const HOST_RUN_SLOT_WAIT_MS = 25 * 60 * 1000;
-// Abstand zum Ablauf des Envelopes: Der Helfer prüft ihn beim Start.
+const HOST_RUN_SLOT_WAIT_MS = 24 * 60 * 60 * 1000;
+// Abstand zum Ablauf des Envelopes: Der Helfer prüft ihn beim Start; liegt die
+// Frist näher, wird sie vor dem Startversuch erneuert.
 const HOST_RUN_SLOT_MARGIN_MS = 60_000;
 // So lange nach einem angefragten Start, der nie bestätigt wurde, gilt ein
 // „no host run <job>“ des Helfers als endgültig: Die Startsperre des Helfers
@@ -2234,15 +2239,31 @@ export async function createApp(options: AppOptions = {}) {
   // zurück (der Job hat auf dem Host nichts getan und zählt nicht zum Breaker),
   // stellt den Job auf waiting_for_host und fragt im Takt erneut. Zieht James den
   // Job beim Warten zurück, startet nichts mehr.
-  async function startHostRunWhenFree(envelope: ExecutionEnvelope, manifest: HostRunManifest): Promise<string> {
+  async function startHostRunWhenFree(approvedEnvelope: ExecutionEnvelope, manifest: HostRunManifest): Promise<string> {
+    let envelope = approvedEnvelope;
     const jobId = envelope.jobId;
-    const waitUntil = Math.min(Date.now() + hostRunSlotWaitMs, Date.parse(envelope.expiresAt) - HOST_RUN_SLOT_MARGIN_MS);
+    let waitUntil = Number.POSITIVE_INFINITY;
     let waitingSince = "";
     let refusals = 0;
+    let extensions = 0;
     let waitingFrom: Record<string, unknown> | null = null;
     for (;;) {
       const before = database.getJob(jobId);
       if (before?.status === "withdrawn") throw new Error("the job was withdrawn while it waited for the host; nothing was executed");
+      // In der Reihe (nach einer Abweisung): Frist erneuern, bevor sie den Start
+      // verhindert. Ein Job ohne Abweisung behält seine Frist unverändert.
+      if (refusals > 0 && Date.parse(envelope.expiresAt) - Date.now() < HOST_RUN_SLOT_MARGIN_MS + hostRunSlotPollMs) {
+        if (!(Date.now() < waitUntil)) throw new HostRunBusyError(`the host stayed busy with another run until the job's queue limit (${new Date(waitUntil).toISOString()}); nothing was executed`);
+        const previousExpiresAt = envelope.expiresAt;
+        envelope = extendQueuedExecutionEnvelope(envelope, config.executionEnvelopeSecret, config.approvalTtlMinutes, new Date(waitUntil));
+        extensions += 1;
+        const queued = database.getJob(jobId);
+        if (queued) database.updateJob(jobId, { status: queued.status, output: { ...queued.output, envelope } });
+        database.createAudit({ actorId: null, action: "hermes.host_run.envelope_extended", targetType: "job", targetId: jobId, details: {
+          previousExpiresAt, expiresAt: envelope.expiresAt, notAfter: new Date(waitUntil).toISOString(),
+          operatorApproved: envelope.operatorApproved === true, planHash: envelope.planHash, manifestHash: envelope.manifestHash ?? null,
+        } });
+      }
       // Marked before the start: an API that dies between the helper's answer
       // and the record below still follows the run after its restart.
       markExecutionStarted(jobId);
@@ -2260,9 +2281,12 @@ export async function createApp(options: AppOptions = {}) {
         const message = error instanceof Error ? error.message : String(error);
         if (!HOST_RUN_BUSY.test(message)) throw error;
         const refusal = (message.match(/another host run is (?:active: [A-Za-z0-9_-]{1,80}|starting)/) ?? [message])[0];
-        waitingSince ||= new Date().toISOString();
+        if (!waitingSince) {
+          waitingSince = new Date().toISOString();
+          waitUntil = Date.parse(waitingSince) + hostRunSlotWaitMs;
+        }
         refusals += 1;
-        const queue = { waitingSince, refusals, lastRefusal: refusal };
+        const queue = { waitingSince, refusals, lastRefusal: refusal, notAfter: new Date(waitUntil).toISOString(), extensions };
         const current = database.getJob(jobId);
         if (current) {
           const { executionStartedAt: _started, hostRunRequestedAt: _requested, ...output } = current.output || {};
@@ -2270,12 +2294,12 @@ export async function createApp(options: AppOptions = {}) {
           waitingFrom ??= detail;
           database.updateJob(jobId, { status: current.status, output: { ...output, hostRunQueue: queue, explanation: {
             ...detail, phase: "waiting_for_host",
-            reason: `Waiting for the host: ${refusal}. Nothing was executed; the job starts as soon as the host is free.`,
+            reason: `Waiting for the host: ${refusal}. Nothing was executed; the job starts as soon as the host is free (it waits in the queue until ${new Date(waitUntil).toISOString()}, its approval does not expire meanwhile).`,
           } } });
         }
         if (refusals === 1) database.createAudit({ actorId: null, action: "hermes.host_run.queued", targetType: "job", targetId: jobId, details: { refusal } });
         if (Date.now() + hostRunSlotPollMs >= waitUntil) {
-          throw new HostRunBusyError(`the host was busy with another run (${refusal}) for ${Math.round((Date.now() - Date.parse(waitingSince)) / 1000)} s, until the job's approval window closes; nothing was executed`);
+          throw new HostRunBusyError(`the host was busy with another run (${refusal}) for ${Math.round((Date.now() - Date.parse(waitingSince)) / 1000)} s, until the job's queue limit; nothing was executed`);
         }
         await new Promise((resolve) => setTimeout(resolve, hostRunSlotPollMs));
       }

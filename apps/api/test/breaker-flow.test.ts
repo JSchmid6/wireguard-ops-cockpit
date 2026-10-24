@@ -76,12 +76,14 @@ async function setup(overrides: Partial<AppConfig> = {}, slot: { pollMs?: number
 
   // The host run's outcome, switched per test step.
   // busy: so many starts the helper still refuses because another run holds the host.
-  const host: { status: "success" | "failed"; doorkeeper: string; busy: number; busyMessage: string } = {
-    status: "failed", doorkeeper: "VERDICT: pass\nNOTES: routine apt maintenance", busy: 0, busyMessage: "another host run is active: 3e06625f-0000",
+  const host: { status: "success" | "failed"; doorkeeper: string; busy: number; busyMessage: string; plan: string } = {
+    status: "failed", doorkeeper: "VERDICT: pass\nNOTES: routine apt maintenance", busy: 0, busyMessage: "another host run is active: 3e06625f-0000", plan,
   };
   const executorCalls = await listen(path.join(dir, "executor.sock"), (request) => {
     const expected = createHmac("sha256", BROKER_SECRET).update(JSON.stringify(request.payload)).digest("hex");
     if (request.signature !== expected) return { ok: false, error: "invalid request signature" };
+    // Wie Broker und Helfer: ein abgelaufener Auftrag startet nichts.
+    if (request.payload.action === "host.run" && !(Date.now() <= Date.parse(request.payload.envelope.expiresAt))) return { ok: false, error: "execution envelope expired" };
     if (request.payload.action === "host.run" && host.busy > 0) {
       host.busy -= 1;
       // Wie der Executor-Broker: rc 75 des Helfers, stderr als Fehlertext.
@@ -95,7 +97,7 @@ async function setup(overrides: Partial<AppConfig> = {}, slot: { pollMs?: number
     } }) };
   });
   const agentCalls = await listen(path.join(dir, "agent.sock"), (request) => {
-    if (request.role === "planner") return { ok: true, output: plan };
+    if (request.role === "planner") return { ok: true, output: host.plan };
     return { ok: true, output: "VERIFICATION_STATUS: passed\nEVIDENCE: no upgradable packages\nREASON: done" };
   });
   const app = await createApp({
@@ -377,15 +379,73 @@ describe("change circuit breaker through the API", () => {
     expect(flow.inspect.hasAudit("hermes.change.failed", jobId)).toBe(false);
   });
 
-  it("waits no longer than the envelope allows: the helper checks it at the start", async () => {
-    // Freigabefenster 66 s, davon 60 s Abstand: höchstens ~6 s Warten, trotz 10 min waitMs.
-    const flow = await setup({ approvalTtlMinutes: 1.1 }, { pollMs: 50, waitMs: 600_000 });
+  it("keeps a queued job's approval alive: the envelope gets a fresh expiry, same content", async () => {
+    // Freigabefenster 1,2 s, Host 2 s belegt: Ohne neue Frist käme der Start zu spät.
+    const flow = await setup({ approvalTtlMinutes: 0.02 }, { pollMs: 100, waitMs: 60_000 });
+    flow.host.status = "success";
+    flow.host.busy = 20;
+    const job = await flow.submit({ operation: "t_queue_extend" });
+    expect(job.status).toBe("completed");
+    const starts = flow.executorCalls.filter((call) => call.payload.action === "host.run");
+    const first = starts[0].payload.envelope;
+    const last = starts.at(-1)!.payload.envelope;
+    expect(Date.parse(last.expiresAt)).toBeGreaterThan(Date.parse(first.expiresAt));
+    for (const key of ["jobId", "actorId", "sessionId", "intentHash", "planHash", "safetyHash", "policyHash", "manifestHash", "gatePassed", "capabilities"]) {
+      expect(last[key]).toEqual(first[key]);
+    }
+    expect(last.operatorApproved).toBeUndefined();
+    expect(starts.at(-1)!.payload.expiresAt).toBe(last.expiresAt);
+    expect(starts.at(-1)!.payload.envelopeDigest).toBe(last.digest);
+    expect(flow.inspect.hasAudit("hermes.host_run.envelope_extended", job.id)).toBe(true);
+    expect((job.output?.hostRunQueue as { extensions: number }).extensions).toBeGreaterThan(0);
+  }, 15_000);
+
+  it("keeps the operator's approval while the approved job waits for the host", async () => {
+    // Vorfall 24.10.2026 (Job a6ffb1fb): freigegeben, dann hinter einem anderen Lauf verfallen.
+    const flow = await setup({ approvalTtlMinutes: 0.02 }, { pollMs: 100, waitMs: 60_000 });
+    flow.host.plan = plan.replace('"risk":["contained"]', '"risk":["exposure"]');
+    const blocked = await flow.submit({ operation: "t_queue_approved" });
+    expect(blocked.status).toBe("blocked_user_approval");
+    flow.host.status = "success";
+    flow.host.busy = 20;
+    const approved = await flow.app.inject({
+      method: "POST", url: `/api/hermes/jobs/${blocked.id}/approval`, headers: { cookie: flow.cookie },
+      payload: { decision: "approved", reason: "Rotation sofort" },
+    });
+    expect(approved.statusCode).toBe(202);
+    // Beim Warten läuft der Job: kein Endstatus und kein completedAt aus der Zeit vor dem Klick.
+    const deadline = Date.now() + 10_000;
+    while ((flow.inspect.getJob(blocked.id)?.output?.explanation as { phase?: string } | undefined)?.phase !== "waiting_for_host" && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const waiting = flow.inspect.getJob(blocked.id)!;
+    expect(waiting.status).toBe("running");
+    expect(waiting.completedAt).toBeNull();
+    const job = await flow.settled(blocked.id);
+    expect(job.status).toBe("completed");
+    const starts = flow.executorCalls.filter((call) => call.payload.action === "host.run" && call.payload.envelope.jobId === blocked.id);
+    const first = starts[0].payload.envelope;
+    const last = starts.at(-1)!.payload.envelope;
+    expect(first.operatorApproved).toBe(true);
+    expect(last.operatorApproved).toBe(true);
+    expect(last.planHash).toBe((blocked.output?.envelope as { planHash: string }).planHash);
+    expect(last.manifestHash).toBe((blocked.output?.envelope as { manifestHash: string }).manifestHash);
+    expect(Date.parse(last.expiresAt)).toBeGreaterThan(Date.parse(first.expiresAt));
+    expect(flow.inspect.hasAudit("hermes.host_run.envelope_extended", blocked.id)).toBe(true);
+  }, 15_000);
+
+  it("waits in the queue no longer than its limit, even with fresh expiries", async () => {
+    const flow = await setup({ approvalTtlMinutes: 0.02 }, { pollMs: 50, waitMs: 1_500 });
     flow.host.busy = Number.POSITIVE_INFINITY;
     const started = Date.now();
-    const job = await flow.submit({ operation: "t_envelope" });
+    const job = await flow.submit({ operation: "t_queue_limit" });
     expect(job.status).toBe("blocked_runner_busy");
-    expect(Date.now() - started).toBeLessThan(9_500);
+    expect(Date.now() - started).toBeLessThan(6_000);
+    const queue = job.output?.hostRunQueue as { waitingSince: string; notAfter: string };
+    expect(Date.parse(queue.notAfter) - Date.parse(queue.waitingSince)).toBe(1_500);
     const envelope = job.output?.envelope as { expiresAt: string };
-    expect(Date.parse(String(job.completedAt))).toBeLessThan(Date.parse(envelope.expiresAt) - 55_000);
+    expect(Date.parse(envelope.expiresAt)).toBeLessThanOrEqual(Date.parse(queue.notAfter));
+    expect(flow.explanationOf(job).reason).toContain("queue limit");
+    expect(flow.inspect.hasAudit("hermes.change.failed", job.id)).toBe(false);
   }, 15_000);
 });

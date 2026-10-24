@@ -265,6 +265,23 @@ export function renewExecutionEnvelope(envelope: ExecutionEnvelope, signingSecre
   return { ...unsigned, digest: signEnvelope(unsigned, signingSecret) };
 }
 
+// Warteschlange am Host (startHostRunWhenFree): Die Freigabefrist gilt bis zum
+// Klick bzw. bis zum ersten Startversuch. Weist der Helfer den Start ab, weil
+// ein anderer Lauf den Host hält, wartet der Job in der Reihe; damit er dabei
+// nicht verfällt, bekommt er eine neue Frist — derselbe Inhalt (Plan-, Manifest-,
+// Policy-Hash, gatePassed, operatorApproved), nur issuedAt/expiresAt neu und
+// nie über notAfter (Obergrenze der Warteschlange) hinaus. Nur die API ruft das,
+// und nur für einen Job, den der Helfer nachweislich wegen "busy" abgewiesen hat.
+export function extendQueuedExecutionEnvelope(envelope: ExecutionEnvelope, signingSecret: string, ttlMinutes: number, notAfter: Date, now = new Date()): ExecutionEnvelope {
+  if (!verifyExecutionEnvelopeSignature(envelope, signingSecret)) throw new Error("cannot extend an invalid execution envelope");
+  if (!envelope.capabilities.includes("host.run")) throw new Error("only a queued host run's envelope is extended");
+  if (!(now.getTime() < notAfter.getTime())) throw new Error("the host-run queue limit has passed");
+  const { digest: _digest, ...current } = envelope;
+  const expiresAt = Math.min(now.getTime() + ttlMinutes * 60_000, notAfter.getTime());
+  const unsigned = { ...current, issuedAt: now.toISOString(), expiresAt: new Date(expiresAt).toISOString() };
+  return { ...unsigned, digest: signEnvelope(unsigned, signingSecret) };
+}
+
 export function verifyExecutionEnvelopeSignature(envelope: ExecutionEnvelope, signingSecret: string): boolean {
   const { digest, ...unsigned } = envelope;
   const expected = signEnvelope(unsigned, signingSecret);
