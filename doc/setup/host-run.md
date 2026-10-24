@@ -325,7 +325,8 @@ Tests: `host-run.test.ts` (Policy je Klasse, mit Befund, unvollständig), `host-
   wartet höchstens 24 Stunden ab der ersten Abweisung (`hostRunQueue.notAfter`); keine neue Frist
   reicht darüber hinaus. Findet er bis dahin keinen Platz, endet er als `blocked_runner_busy`: Auf dem
   Host lief nichts, der Job ist wiederholbar und zählt nicht zum Circuit Breaker. Beim Warten darf
-  James ihn zurückziehen. Ein API-Neustart plant ihn neu, wie einen Job in der Prüfung.
+  James ihn zurückziehen, solange er nicht freigegeben ist. Ein freigegebener Job wartet bis zum
+  Start oder bis zur Obergrenze; zurückziehen kann ihn James nicht. Ein API-Neustart plant ihn neu, wie einen Job in der Prüfung.
   Stirbt die API genau während eines Startversuchs (nur `hostRunRequestedAt` gesetzt), fragt sie
   nach dem Neustart `status <job>`. Kennt der Helfer den Lauf auch fünf Minuten nach der Anfrage
   nicht („no host run <job>“, die Startsperre ist dann verfallen), lief nichts: Die Marken fallen

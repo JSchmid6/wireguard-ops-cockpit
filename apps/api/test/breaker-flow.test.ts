@@ -82,6 +82,8 @@ async function setup(overrides: Partial<AppConfig> = {}, slot: { pollMs?: number
   const executorCalls = await listen(path.join(dir, "executor.sock"), (request) => {
     const expected = createHmac("sha256", BROKER_SECRET).update(JSON.stringify(request.payload)).digest("hex");
     if (request.signature !== expected) return { ok: false, error: "invalid request signature" };
+    // Wie Broker und Helfer: ein abgelaufener Auftrag startet nichts.
+    if (request.payload.action === "host.run" && !(Date.now() <= Date.parse(request.payload.envelope.expiresAt))) return { ok: false, error: "execution envelope expired" };
     if (request.payload.action === "host.run" && host.busy > 0) {
       host.busy -= 1;
       // Wie der Executor-Broker: rc 75 des Helfers, stderr als Fehlertext.
