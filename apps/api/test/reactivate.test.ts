@@ -8,7 +8,7 @@ import { createApp, REACTIVATION_MAX_AGE_HOURS, REACTIVATION_MAX_COUNT } from ".
 import type { AppConfig } from "../src/config.js";
 import { CockpitDatabase } from "../src/db.js";
 import {
-  approveExecutionEnvelope, createExecutionEnvelope, hashCanonical, renewExecutionEnvelope, verifyExecutionEnvelopeSignature,
+  approveExecutionEnvelope, createExecutionEnvelope, extendQueuedExecutionEnvelope, hashCanonical, renewExecutionEnvelope, verifyExecutionEnvelopeSignature,
   type ExecutionEnvelope,
 } from "../src/hermes-security.js";
 
@@ -140,6 +140,38 @@ describe("renewExecutionEnvelope", () => {
     const approved = approveExecutionEnvelope(base(), SECRET, TTL);
     expect(() => renewExecutionEnvelope(approved, SECRET, TTL, new Date(Date.now() + 3_600_000))).toThrow(/approved/);
     expect(() => renewExecutionEnvelope({ ...base(), planHash: hashCanonical("other") }, SECRET, TTL, new Date(Date.now() + 3_600_000))).toThrow(/invalid/);
+  });
+});
+
+describe("extendQueuedExecutionEnvelope", () => {
+  const base = (capabilities: Array<"host.run" | "read.host"> = ["host.run"]) => createExecutionEnvelope({
+    jobId: "j", actorId: "a", sessionId: "s", intent, evidence: [], plan, safety, policy, capabilities,
+    ttlMinutes: TTL, signingSecret: SECRET, now: new Date("2026-10-11T08:00:00.000Z"),
+  });
+
+  it("keeps the operator's approval and every reviewed hash, only the deadline moves", () => {
+    const approved = approveExecutionEnvelope(base(), SECRET, TTL, new Date("2026-10-11T08:00:00.000Z"));
+    const now = new Date("2026-10-11T12:00:00.000Z");
+    const extended = extendQueuedExecutionEnvelope(approved, SECRET, TTL, new Date("2026-10-12T08:00:00.000Z"), now);
+    expect(verifyExecutionEnvelopeSignature(extended, SECRET)).toBe(true);
+    expect(extended.expiresAt).toBe("2026-10-11T12:30:00.000Z");
+    expect(extended.operatorApproved).toBe(true);
+    const { digest: _a, issuedAt: _b, expiresAt: _c, ...kept } = extended;
+    const { digest: _d, issuedAt: _e, expiresAt: _f, ...original } = approved;
+    expect(kept).toEqual(original);
+  });
+
+  it("never passes the queue limit and refuses after it", () => {
+    const now = new Date("2026-10-11T12:00:00.000Z");
+    expect(extendQueuedExecutionEnvelope(base(), SECRET, TTL, new Date("2026-10-11T12:05:00.000Z"), now).expiresAt).toBe("2026-10-11T12:05:00.000Z");
+    expect(() => extendQueuedExecutionEnvelope(base(), SECRET, TTL, now, now)).toThrow(/queue limit/);
+  });
+
+  it("refuses a forged envelope and one without host.run", () => {
+    const later = new Date(Date.now() + 3_600_000);
+    expect(() => extendQueuedExecutionEnvelope({ ...base(), planHash: hashCanonical("other") }, SECRET, TTL, later)).toThrow(/invalid/);
+    expect(() => extendQueuedExecutionEnvelope({ ...base(), operatorApproved: true }, SECRET, TTL, later)).toThrow(/invalid/);
+    expect(() => extendQueuedExecutionEnvelope(base(["read.host"]), SECRET, TTL, later)).toThrow(/host run/);
   });
 });
 
