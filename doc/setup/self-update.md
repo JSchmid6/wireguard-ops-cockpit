@@ -504,6 +504,19 @@ changed. VPS-specific service settings live in drop-ins
 (`*.service.d/`) and are not touched. `homeserver-cockpit-deploy.sh` is Lab0's
 and is not installed here.
 
+**Pinned Node runtime:** the version comes from the deployed commit's
+`.node-version` (the file `bin/with-runtime` and the units read), and the deploy
+installs `/opt/node-v<version>-linux-x64` from
+`https://nodejs.org/dist/v<version>/` when the host does not have it — before the
+build, because `bin/with-runtime` fails closed with 69 without it and a host
+without the runtime could never roll itself out. The tarball is checked against
+nodejs.org's own `SHASUMS256.txt` (no hash is kept in the repository) with
+`sha256sum -c`; a download or checksum failure exits 70 and the rollback runs.
+The install is idempotent (an existing runtime is used as it is) and never
+removes another runtime: the previous version stays on disk, and that is what the
+rollback's build runs on. Only one clean `x.y.z` is accepted from `.node-version`
+— the value becomes a path and a URL under a root script.
+
 **Web:** the image is always built (the Docker cache makes an unchanged build
 cheap; a list of build inputs would miss some). The running container is never
 switched by the deploy: `wireguard-ops-cockpit-web.service` (oneshot,
@@ -524,8 +537,12 @@ files that did not exist, puts the web image tag back on the previous image,
 checks the old commit out and rebuilds it; each step
 is logged and a partial rollback says so. `test/vps-cockpit-deploy.test.sh`
 exercises install, byte-exact rollback, web image rollback, build failure,
-unmerged commit, the deferred restart, the web unit start rule and the data
-directory's mode offline (fixture repo, stub systemctl/visudo/docker).
+unmerged commit, the deferred restart, the web unit start rule, the data
+directory's mode and the pinned-runtime install (missing runtime, second run
+without a download, wrong checksum, failed download, `.node-version` that is not
+one `x.y.z` — each of the last three ends in 70 and its rollback) offline
+(fixture repo, stub systemctl/visudo/docker, a local release directory as
+`VPS_DEPLOY_NODE_DIST`).
 
 First install, once, as root (take a Contabo snapshot before):
 
