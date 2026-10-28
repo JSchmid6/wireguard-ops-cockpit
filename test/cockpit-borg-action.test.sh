@@ -1000,6 +1000,7 @@ printf '#!/bin/bash\nexit 0\n' > "$STUBS/php"
 cat > "$STUBS/mysql" <<EOF
 #!/bin/bash
 # Attrappe: Anmeldung aus der Optionsdatei, Abfragen aus -e oder stdin.
+hash() { python3 -c 'import hashlib, sys; print("*" + hashlib.sha1(hashlib.sha1(sys.stdin.buffer.read()).digest()).hexdigest().upper())'; }
 f=""; q=""
 while [ "\$#" -gt 0 ]; do case "\$1" in --defaults-extra-file=*) f="\${1#*=}";; -e) shift; q="\$1";; esac; shift; done
 c="\$(cat "\$f")"  # einmal lesen: /dev/fd aus <(…) ist eine Pipe
@@ -1007,36 +1008,38 @@ u="\$(sed -n 's/^user=//p' <<<"\$c" | head -n 1)"; p="\$(sed -n 's/^password="\{
 echo "login \$u" >> "$DB/mysql.log"
 case "\$u" in
   nextDB) [ "\$p" = "$NCPASS" ] || { echo "ERROR 1045 (28000): Access denied for user 'nextDB'@'localhost' (using password: YES)" >&2; exit 1; } ;;
-  cockpit_backup) [ -f "$DB/created-pw" ] && [ "\$p" = "\$(cat "$DB/created-pw")" ] || { echo "ERROR 1045 (28000): Access denied for user 'cockpit_backup'@'localhost' (using password: YES)" >&2; exit 1; } ;;
+  cockpit_backup) [ -f "$DB/created-hash" ] && [ "\$(printf '%s' "\$p" | hash)" = "\$(cat "$DB/created-hash")" ] || { echo "ERROR 1045 (28000): Access denied for user 'cockpit_backup'@'localhost' (using password: YES)" >&2; exit 1; } ;;
   *) echo "ERROR 1045 (28000): Access denied for user '\$u'@'localhost' (using password: YES)" >&2; exit 1 ;;
 esac
 if [ -z "\$q" ]; then
   sql="\$(cat)"; printf '%s\n' "\$sql" >> "$DB/sql.log"
   [ -e "$DB/admin-denied" ] && { echo "ERROR 1227 (42000) at line 1: Access denied; you need (at least one of) the CREATE USER privilege(s) for this operation" >&2; exit 1; }
-  pw="\$(printf '%s\n' "\$sql" | sed -n "s/^ALTER USER .* IDENTIFIED BY '\([^']*\)';\$/\1/p")"
-  [ -n "\$pw" ] && printf '%s' "\$pw" > "$DB/created-pw"
-  case "\$sql" in DROP*) rm -f "$DB/created-pw";; esac
+  case "\$sql" in *"IDENTIFIED BY '"*) echo "Klartext-Passwort im SQL" >> "$DB/plaintext-sql";; esac
+  h="\$(printf '%s\n' "\$sql" | sed -n "s/^ALTER USER .* IDENTIFIED BY PASSWORD '\([^']*\)';\$/\1/p")"
+  [ -n "\$h" ] && printf '%s' "\$h" > "$DB/created-hash"
+  case "\$sql" in DROP*) rm -f "$DB/created-hash";; esac
   exit 0
 fi
 case "\$q" in
   "SELECT CURRENT_USER()") echo "\$u@localhost" ;;
-  "SELECT COUNT(*) FROM mysql.user"*) [ -f "$DB/created-pw" ] && echo 1 || echo 0 ;;
+  "SELECT COUNT(*) FROM mysql.user"*) [ -f "$DB/created-hash" ] && echo 1 || echo 0 ;;
   "SHOW DATABASES") printf '%s\n' information_schema mysql nextDB wordpress ;;
   *) echo "ERROR 1064: unerwartete Abfrage \$q" >&2; exit 1 ;;
 esac
 EOF
 cat > "$STUBS/mysqldump" <<EOF
 #!/bin/bash
+hash() { python3 -c 'import hashlib, sys; print("*" + hashlib.sha1(hashlib.sha1(sys.stdin.buffer.read()).digest()).hexdigest().upper())'; }
 f=""; for a in "\$@"; do case "\$a" in --defaults-extra-file=*) f="\${a#*=}";; esac; done
 c="\$(cat "\$f")"  # einmal lesen: /dev/fd aus <(…) ist eine Pipe
 u="\$(sed -n 's/^user=//p' <<<"\$c" | head -n 1)"; p="\$(sed -n 's/^password="\{0,1\}\([^"]*\)"\{0,1\}\$/\1/p' <<<"\$c" | head -n 1)"
-[ "\$u" = cockpit_backup ] && [ "\$p" = "\$(cat "$DB/created-pw" 2>/dev/null)" ] || { echo "mysqldump: Got error: 1045: Access denied" >&2; exit 2; }
+[ "\$u" = cockpit_backup ] && [ "\$(printf '%s' "\$p" | hash)" = "\$(cat "$DB/created-hash" 2>/dev/null)" ] || { echo "mysqldump: Got error: 1045: Access denied" >&2; exit 2; }
 [ -e "$DB/dump-denied" ] && { echo "mysqldump: Couldn't execute 'SHOW CREATE TRIGGER': 1142 TRIGGER command denied" >&2; exit 2; }
 echo "-- Dump completed"
 EOF
 chmod 755 "$STUBS/runuser" "$STUBS/php" "$STUBS/mysql" "$STUBS/mysqldump"
 reset_db() {
-  rm -f "$DB"/created-pw "$DB"/sql.log "$DB"/mysql.log "$DB"/admin-denied "$DB"/dump-denied "$DB"/mysqldump.cnf*
+  rm -f "$DB"/created-hash "$DB"/plaintext-sql "$DB"/sql.log "$DB"/mysql.log "$DB"/admin-denied "$DB"/dump-denied "$DB"/mysqldump.cnf*
   printf '[client]\nuser=nextDB\npassword=%s\n[mysqldump]\nmax_allowed_packet=64M\n' "$ALTPW" > "$DB/mysqldump.cnf"
   chmod 600 "$DB/mysqldump.cnf"; cp -a "$DB/mysqldump.cnf" "$DB/cnf-original"
 }
@@ -1045,7 +1048,7 @@ db() { # db <cgroup-datei> <verb>
     COCKPIT_BORG_ACTION_CGROUP_FILE="$DB/$1" -- db-access "$2"
 }
 no_secret_out() { # weder Ausgabe noch Fehlerausgabe nennen ein Passwort
-  local pw; pw="$(cat "$DB/created-pw" 2>/dev/null || true)"
+  local pw; pw="$(sed -n 's/^password="\(.*\)"$/\1/p' "$DB/mysqldump.cnf" 2>/dev/null | head -n 1)"
   if grep -qF -- "$NCPASS" <<<"$OUT$ERR" || grep -qF -- "$ALTPW" <<<"$OUT$ERR" || { [ -n "$pw" ] && grep -qF -- "$pw" <<<"$OUT$ERR"; }; then
     bad "$1 — ein Passwort steht in der Ausgabe"
   else ok "$1"; fi
@@ -1084,7 +1087,7 @@ db cgroup-run ensure
 assert_rc "ensure mit unvollständigen Rechten scheitert" 1
 assert_err "Grund aus mysqldump" "TRIGGER command denied"
 cnf_unchanged "unvollständige Rechte: Datei unverändert"
-assert_no_file "das in diesem Aufruf angelegte Konto ist wieder entfernt" "$DB/created-pw"
+assert_no_file "das in diesem Aufruf angelegte Konto ist wieder entfernt" "$DB/created-hash"
 if ls "$DB"/mysqldump.cnf.neu.* >/dev/null 2>&1; then bad "Arbeitsdatei bleibt liegen"; else ok "Arbeitsdatei weggeräumt"; fi
 
 echo "== db-access ensure: Backup läuft gerade =="
@@ -1106,30 +1109,60 @@ reset_db
 db cgroup-run ensure
 assert_rc "ensure" 0
 no_secret_out "ensure ohne Passwort in der Ausgabe"
-assert_out "Konto genannt" "konto: cockpit_backup@localhost (Rechte: SELECT, SHOW VIEW, TRIGGER, LOCK TABLES, EVENT, SHOW DATABASES auf *.*)"
+assert_out "Konto genannt" "konto: cockpit_backup@localhost (Rechte: SELECT, SHOW VIEW, TRIGGER, LOCK TABLES, SHOW DATABASES auf *.*)"
 assert_out "neue Anmeldung geht" "anmeldung: ok cockpit_backup@localhost"
 if grep -q '^user=cockpit_backup$' "$DB/mysqldump.cnf" && ! grep -qF "$ALTPW" "$DB/mysqldump.cnf" && ! grep -q '^user=nextDB' "$DB/mysqldump.cnf"; then ok "Datei trägt nur das neue Konto"; else bad "Datei trägt nicht nur das neue Konto"; fi
 if grep -q '^max_allowed_packet=64M$' "$DB/mysqldump.cnf"; then ok "übrige Optionen der alten Datei bleiben"; else bad "übrige Optionen verloren"; fi
 [ "$(stat -c '%U:%G %a' "$DB/mysqldump.cnf")" = "root:root 600" ] && ok "Datei root:root 0600" || bad "Datei nicht root:root 0600 ($(stat -c '%U:%G %a' "$DB/mysqldump.cnf"))"
 VOR="$(ls -1 "$DB"/mysqldump.cnf.vor-* 2>/dev/null | head -n 1)"
 if [ -n "$VOR" ] && cmp -s "$VOR" "$DB/cnf-original" && [ "$(stat -c %a "$VOR")" = 600 ]; then ok "alte Datei als .vor-<Zeit> gesichert (0600)"; else bad "keine passende Sicherung der alten Datei"; fi
-[ "$(wc -c < "$DB/created-pw")" -eq 40 ] && ok "Passwort 40 Zeichen" || bad "Passwortlänge falsch"
-if grep -qF "GRANT SELECT, SHOW VIEW, TRIGGER, LOCK TABLES, EVENT, SHOW DATABASES ON *.* TO 'cockpit_backup'@'localhost';" "$DB/sql.log" \
+NEWPW="$(sed -n 's/^password="\(.*\)"$/\1/p' "$DB/mysqldump.cnf" | head -n 1)"
+[[ "$NEWPW" =~ ^[A-Za-z0-9]{40}$ ]] && ok "Passwort 40 Zeichen [A-Za-z0-9]" || bad "Passwort nicht 40 Zeichen [A-Za-z0-9]"
+if grep -qF -- "$NEWPW" "$DB/sql.log"; then bad "Klartext-Passwort an die Datenbank gegeben"; else ok "die Datenbank bekommt nur den Hash"; fi
+assert_no_file "kein IDENTIFIED BY '<klartext>' im SQL" "$DB/plaintext-sql"
+if grep -qF "GRANT SELECT, SHOW VIEW, TRIGGER, LOCK TABLES, SHOW DATABASES ON *.* TO 'cockpit_backup'@'localhost';" "$DB/sql.log" \
   && grep -qF "REVOKE ALL PRIVILEGES, GRANT OPTION FROM 'cockpit_backup'@'localhost';" "$DB/sql.log"; then ok "nur lesende Rechte, vorher alle anderen entzogen"; else bad "Rechte-SQL anders als erwartet"; fi
-if grep -qE '(^|[^A-Z])(ALL PRIVILEGES ON|WITH GRANT OPTION|SUPER|RELOAD|FILE)' "$DB/sql.log"; then bad "zu weite Rechte vergeben"; else ok "keine weiten Rechte"; fi
+if grep -qE '(^|[^A-Z])(ALL PRIVILEGES ON|WITH GRANT OPTION|SUPER|RELOAD|FILE|EVENT)' "$DB/sql.log"; then bad "zu weite Rechte vergeben"; else ok "keine weiten Rechte (auch kein EVENT)"; fi
 db cgroup-run check
 assert_rc "check nach ensure" 0
 assert_out "check meldet alle Datenbanken lesbar" "ok: cockpit_backup meldet sich an und liest alle Datenbanken"
-OLDPW="$(cat "$DB/created-pw")"
+
+echo "== db-access ensure: Rotation scheitert, alte Datei bleibt gültig (Befund 2) =="
+cp -a "$DB/mysqldump.cnf" "$DB/cnf-rotation"; : > "$DB/dump-denied"
+db cgroup-run ensure
+assert_rc "Rotation mit unvollständigen Rechten scheitert" 1
+rm -f "$DB/dump-denied"
+if cmp -s "$DB/mysqldump.cnf" "$DB/cnf-rotation"; then ok "Datei nach gescheiterter Rotation unverändert"; else bad "Datei nach gescheiterter Rotation verändert"; fi
+db cgroup-run check
+assert_rc "die alte Datei meldet sich nach der gescheiterten Rotation weiter an" 0
+
+echo "== db-access ensure: Rotation =="
 db cgroup-run ensure
 assert_rc "ensure ein zweites Mal (neues Passwort)" 0
-[ "$(cat "$DB/created-pw")" != "$OLDPW" ] && ok "zweites ensure dreht das Passwort" || bad "zweites ensure behält das Passwort"
+no_secret_out "Rotation ohne Passwort in der Ausgabe"
+[ "$(sed -n 's/^password="\(.*\)"$/\1/p' "$DB/mysqldump.cnf")" != "$NEWPW" ] && ok "zweites ensure dreht das Passwort" || bad "zweites ensure behält das Passwort"
 
 echo "== db-access restore: Rückweg =="
 sleep 1
 db cgroup-run restore
 assert_rc "restore" 0
-if grep -q '^user=cockpit_backup$' "$DB/mysqldump.cnf"; then ok "restore nimmt die jüngste Sicherung (Stand vor dem zweiten ensure)"; else bad "restore nahm nicht die jüngste Sicherung"; fi
+if [ "$(sed -n 's/^password="\(.*\)"$/\1/p' "$DB/mysqldump.cnf")" = "$NEWPW" ]; then ok "restore nimmt die jüngste Sicherung (Stand vor der Rotation)"; else bad "restore nahm nicht die jüngste Sicherung"; fi
+db cgroup-run check
+assert_rc "nach restore meldet sich die zurückgespielte Datei an (Konto auf ihren Hash gesetzt)" 0
+no_secret_out "restore ohne Passwort in der Ausgabe"
+
+echo "== db-access: Prüf-Haken biegen das Konto nicht um, xtrace verrät nichts (Befunde 1, 5) =="
+run_helper_env COCKPIT_BORG_ACTION_DB_CNF="$DB/mysqldump.cnf" COCKPIT_BORG_ACTION_NC_CONFIG="$DB/config.php" \
+  COCKPIT_BORG_ACTION_CGROUP_FILE="$DB/cgroup-run" COCKPIT_BORG_ACTION_DB_USER=root -- db-access ensure
+assert_rc "ensure mit COCKPIT_BORG_ACTION_DB_USER=root" 0
+if grep -q "'root'@" "$DB/sql.log"; then bad "Konto root angefasst"; else ok "das Konto bleibt cockpit_backup"; fi
+OUT="$(PATH="$STUBS:$PATH" COCKPIT_BORG_ACTION_DB_CNF="$DB/mysqldump.cnf" COCKPIT_BORG_ACTION_NC_CONFIG="$DB/config.php" \
+  COCKPIT_BORG_ACTION_CGROUP_FILE="$DB/cgroup-run" "$BASH_BIN" -x "$HELPER" db-access ensure 2>"$WORK/stderr")"; RC=$?
+ERR="$(cat "$WORK/stderr")"
+assert_rc "ensure unter bash -x" 0
+no_secret_out "bash -x schreibt kein Passwort mit"
+if grep -c '^+' <<<"$ERR" | grep -qx '[0-3]'; then ok "xtrace endet in der ersten Zeile"; else bad "xtrace läuft weiter ($(grep -c '^+' <<<"$ERR") Zeilen)"; fi
+
 reset_db
 db cgroup-run restore
 assert_rc "restore ohne Sicherung" 1
