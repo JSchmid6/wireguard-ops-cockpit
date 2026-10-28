@@ -221,7 +221,7 @@ const doorkeeperDecides: Array<[string, string]> = [
   ["function argument", "f(){ rm -rf \"$1\"; }; f /srv/old"],
   ["ANSI-C quoting", "x=$'\\x62org'; $x delete"],
   ["PATH", "export PATH=/tmp/evil:$PATH; ls"],
-  ["retention helper through node", "/opt/node-v20.19.1-linux-x64/bin/node /usr/local/lib/wireguard-ops-cockpit/cockpit-borg-retention.mjs set 7 4 6 06:00"],
+  ["retention helper through node", "/opt/node-v22.23.4-linux-x64/bin/node /usr/local/lib/wireguard-ops-cockpit/cockpit-borg-retention.mjs set 7 4 6 06:00"],
   ["docker run with a backup mount", "docker run --rm -v /var/backups:/b alpine ls /b"],
   ["rm with a variable target", "rm -rf \"$X\""],
   ["ssh to Lab0 that reads", "ssh borg@10.0.0.5 df -h /media/RAID"],

@@ -19,7 +19,7 @@ LoadCredential=passphrase:/etc/cockpit-borg-retention/passphrase
 Environment=COCKPIT_BORG_RETENTION_IN_UNIT=1
 StateDirectory=cockpit-borg-retention
 StateDirectoryMode=0750
-ExecStart=/opt/node-v20.19.1-linux-x64/bin/node /usr/local/lib/wireguard-ops-cockpit/cockpit-borg-retention.mjs --im-dienst
+ExecStart=/opt/node-v22.23.4-linux-x64/bin/node /usr/local/lib/wireguard-ops-cockpit/cockpit-borg-retention.mjs --im-dienst
 # 3 = angehalten (Anomalie): die Unit steht dann auf failed, sichtbar für
 # systemctl --failed und das Cockpit.
 TimeoutStartSec=8h

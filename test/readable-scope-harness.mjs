@@ -10,7 +10,7 @@ import { spawn, spawnSync } from "node:child_process";
 
 const EXECUTOR = process.argv[2];
 if (!EXECUTOR) { console.error("usage: readable-scope-harness <executor>"); process.exit(64); }
-const PINNED = "/opt/node-v20.19.1-linux-x64/bin/node";
+const PINNED = "/opt/node-v22.23.4-linux-x64/bin/node";
 const NODE = existsSync(PINNED) ? PINNED : "/usr/bin/node";
 const secret = readFileSync("/etc/wireguard-ops-cockpit/api.env", "utf8")
   .split(/\r?\n/).find((l) => l.startsWith("COCKPIT_EXECUTION_ENVELOPE_SECRET="))

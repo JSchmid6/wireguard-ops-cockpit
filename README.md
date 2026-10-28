@@ -125,7 +125,7 @@ npm run check
 
 `npm run test` covers the shared tmux adapter plus the API and web workspaces. `npm run check` is the same build-and-test gate used by CI.
 `npm run coverage` enforces workspace-specific coverage thresholds for the tmux adapter, API, and web UI and is also run in CI.
-Production and local verification must use the same Node.js 20.19.1 runtime because `better-sqlite3` is a native module.
+Production and local verification must use the same Node.js 22.23.4 runtime because `better-sqlite3` is a native module.
 
 ## Docker Compose development
 
@@ -157,8 +157,8 @@ Minimal flow:
 ```bash
 cp .env.vps.example .env
 sudo apt-get install -y tmux ttyd
-curl -fsSLO https://nodejs.org/dist/v20.19.1/node-v20.19.1-linux-x64.tar.xz
-sudo tar -C /opt -xf node-v20.19.1-linux-x64.tar.xz
+curl -fsSLO https://nodejs.org/dist/v22.23.4/node-v22.23.4-linux-x64.tar.xz
+sudo tar -C /opt -xf node-v22.23.4-linux-x64.tar.xz
 sudo systemctl enable --now wireguard-ops-cockpit-api wireguard-ops-cockpit-ttyd
 docker compose --env-file .env -f docker-compose.vps.yml up -d --build web
 ```

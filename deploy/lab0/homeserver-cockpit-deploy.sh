@@ -4,7 +4,7 @@
 # -----------------------------------------------------------------------------
 # Ziel:   Agent-Cockpit auf dem Home-Server (10.0.0.5) für Fernadministration
 # Autor:  James (Hermes VPS) — Kanban t_6a58ebc7
-# Stand:  2026-09-25   (Pin: Repo-Commit 59dc679 — Merge #7; Node v20.19.1)
+# Stand:  2026-09-25   (Pin: Repo-Commit 59dc679 — Merge #7; Node v22.23.4)
 #         v2: installiert zusätzlich cockpit-disk-action (IMSM-Helfer für /dev/md127,
 #         Capability disk.manage) samt Rückbau-Zeile; Zweit-Review eingearbeitet;
 #         REPO_COMMIT und OPENCODE_VERSION per Env überschreibbar.
@@ -111,8 +111,8 @@ set -euo pipefail
 REPO_URL="https://github.com/JSchmid6/wireguard-ops-cockpit.git"
 REPO_COMMIT="${REPO_COMMIT:-49ed9f376d253071afc0fdea1730612b9ebe5f70}"
 OPENCODE_VERSION="${OPENCODE_VERSION:-1.18.31}"   # VPS-validierte Serie (VPS: 1.18.30)
-NODE_DIR="/opt/node-v20.19.1-linux-x64"
-NODE_SHA256="b6c4cedfc81fc544b9993bc8a3628b5c0aa7a169fbaa293460abc0418d0fabb6"
+NODE_DIR="/opt/node-v22.23.4-linux-x64"
+NODE_SHA256="1805bcd35e6815559bd2eb97db438d3fdb0eb3a5e6a977b7c1badca76337e9ce"
 COCKPIT_DIR="/opt/wireguard-ops-cockpit"
 ENV_DIR="/etc/wireguard-ops-cockpit"
 STATE_DIR="/var/lib/wireguard-ops-cockpit"
@@ -121,7 +121,7 @@ EXEC_DIR="/var/lib/wireguard-ops-executor"
 WEBROOT="/var/www/wireguard-ops-cockpit"
 SECRETS_DIR="/root/cockpit-deploy"
 WG_BIND_IP="${WG_BIND_IP:-10.0.0.5}"
-NODE_PKG_URL="https://nodejs.org/dist/v20.19.1/node-v20.19.1-linux-x64.tar.xz"
+NODE_PKG_URL="https://nodejs.org/dist/v22.23.4/node-v22.23.4-linux-x64.tar.xz"
 # Hinweis WEB_PORT: nicht hier vorbelegen — der effektive Wert wird in Abschnitt 0b
 # aus dem Site-Ist-Zustand abgeleitet (Default = vorhandener Site-Port).
 
@@ -361,11 +361,11 @@ curl -fsS --max-time 15 -o /dev/null "https://registry.npmjs.org/" \
   || die "registry.npmjs.org nicht erreichbar. Stoppen und melden."
 
 # ---------------------------------------------------------------------------
-# 2) Node-Runtime v20.19.1 (gepinnt, Prüfsumme verifiziert)
+# 2) Node-Runtime v22.23.4 (gepinnt, Prüfsumme verifiziert)
 # ---------------------------------------------------------------------------
 log "2) Node $NODE_DIR sicherstellen"
 if [ ! -x "$NODE_DIR/bin/node" ]; then
-  tarball="$SECRETS_DIR/node-v20.19.1-linux-x64.tar.xz"
+  tarball="$SECRETS_DIR/node-v22.23.4-linux-x64.tar.xz"
   if [ ! -f "$tarball" ]; then
     curl -fL --max-time 300 -o "$tarball" "$NODE_PKG_URL" || die "Node-Tarball-Download fehlgeschlagen."
   fi
@@ -375,9 +375,9 @@ else
   echo "Node bereits vorhanden."
 fi
 [ -x "$NODE_DIR/bin/node" ] || die "Node-Installation unvollständig."
-"$NODE_DIR/bin/node" --version | grep -q "v20.19.1" || die "Falsche Node-Version aktiv."
+"$NODE_DIR/bin/node" --version | grep -q "v22.23.4" || die "Falsche Node-Version aktiv."
 
-# /usr/bin/node für Helper-Shebang (#!/usr/bin/node) — 20.19.1, falls nichts vorhanden
+# /usr/bin/node für Helper-Shebang (#!/usr/bin/node) — 22.23.4, falls nichts vorhanden
 if [ ! -e /usr/bin/node ]; then ln -s "$NODE_DIR/bin/node" /usr/bin/node; fi
 
 # ---------------------------------------------------------------------------
@@ -879,6 +879,6 @@ Rückbau (nur bei Bedarf, als root):
   # Benutzer (nur auf Wunsch): userdel -r wgops; userdel -r cockpit-agent; userdel -r cockpit-executor
   # Node/OpenCode (nur auf Wunsch, falls sonst ungenutzt):
   #   npm uninstall -g opencode-ai; rm -f /usr/local/bin/opencode
-  #   rm -rf /opt/node-v20.19.1-linux-x64 /root/cockpit-deploy
+  #   rm -rf /opt/node-v22.23.4-linux-x64 /root/cockpit-deploy
   #   # /usr/bin/node-Symlink nur entfernen, wenn er von diesem Deploy stammt
 EOF

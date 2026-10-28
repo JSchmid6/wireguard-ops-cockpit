@@ -297,7 +297,7 @@ Tests: `host-run.test.ts` (Policy je Klasse, mit Befund, unvollständig), `host-
 ## 3. Tür
 
 `deploy/helpers/cockpit-host-run` (installiert als
-`/usr/local/lib/wireguard-ops-cockpit/cockpit-host-run.mjs`, gepinnte Node 20):
+`/usr/local/lib/wireguard-ops-cockpit/cockpit-host-run.mjs`, gepinnte Node 22):
 
 - eigene transiente Unit `cockpit-host-run-<job>` (`systemd-run --collect`, ohne Warten):
   außerhalb der Executor-Sandbox, übersteht einen Neustart des Executors,

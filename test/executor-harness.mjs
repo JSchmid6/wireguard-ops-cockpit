@@ -9,7 +9,7 @@ const EXECUTOR = process.argv[2];
 if (!EXECUTOR) { console.error("usage: harness <executor.mjs>"); process.exit(64); }
 // Derselbe Node wie in der sudoers-Regel des Brokers, nicht der der Shell:
 // /usr/bin/node ist eine andere Hauptversion (22) als die der Dienste (20).
-const PINNED = "/opt/node-v20.19.1-linux-x64/bin/node";
+const PINNED = "/opt/node-v22.23.4-linux-x64/bin/node";
 const NODE = existsSync(PINNED) ? PINNED : "/usr/bin/node";
 
 const secret = readFileSync("/etc/wireguard-ops-cockpit/api.env", "utf8")
