@@ -166,7 +166,7 @@ beforeEach(() => {
   write(path.join(dir, "borg-status"), [
     "#!/bin/bash",
     "echo borg >> \"$STUB_DIR/borg.log\"",
-    "end=$(date -u -d \"-${STUB_BORG_AGE_HOURS:-2} hours\" +%Y-%m-%dT%H:%M:%SZ)",
+    "end=${STUB_BORG_END:-$(date -u -d \"-${STUB_BORG_AGE_HOURS:-2} hours\" +%Y-%m-%dT%H:%M:%SZ)}",
     "echo '== DATEN (cockpit-borg-status/v1) =='",
     "echo \"last_run_end=$end\"",
     "echo \"last_run_result=${STUB_BORG_RESULT:-success}\"",
@@ -394,6 +394,34 @@ describe("cockpit-host-run: safety net", () => {
     expect(existsSync(path.join(dir, "step-one"))).toBe(true);
   });
 
+  // Zweitprüfung B6: das Alter zählt über die Zeitzone hinweg (Host-Zeit mit
+  // Offset), und ein unbekanntes Ende ist kein Rückweg.
+  const endWithOffset = (hoursAgo: number) =>
+    `${new Date(Date.now() - hoursAgo * 3600000 + 3600000).toISOString().slice(0, 19)}+01:00`;
+  it("counts the age across a +01:00 offset: 29 h old still is a return path", () => {
+    run(["start"], request(manifest()), { STUB_BORG_RESULT: "exit-code", STUB_BORG_END: endWithOffset(29) });
+    const { state } = status();
+    expect(state.status).toBe("success");
+    expect(state.borg.ageHours).toBeGreaterThan(28.8);
+    expect(state.borg.ageHours).toBeLessThan(29.2);
+  });
+
+  it("counts the age across a +01:00 offset: 31 h old is no return path", () => {
+    run(["start"], request(manifest()), { STUB_BORG_RESULT: "exit-code", STUB_BORG_END: endWithOffset(31) });
+    const { state } = status();
+    expect(state.status).toBe("preflight_failed");
+    expect(state.error).toContain("limit 30 h");
+    expect(existsSync(path.join(dir, "step-one"))).toBe(false);
+  });
+
+  it("an unknown end of the last successful run is no return path", () => {
+    run(["start"], request(manifest()), { STUB_BORG_RESULT: "unknown", STUB_BORG_END: "unknown" });
+    const { state } = status();
+    expect(state.status).toBe("preflight_failed");
+    expect(state.error).toContain("no successfully finished borg backup is known (no return path)");
+    expect(existsSync(path.join(dir, "step-one"))).toBe(false);
+  });
+
   it("stops a normal run when the last run failed and the last success is old (the situation of 28.10.2026)", () => {
     run(["start"], request(manifest()), { STUB_BORG_RESULT: "exit-code", STUB_BORG_AGE_HOURS: "50" });
     const { state } = status();
@@ -490,6 +518,11 @@ describe("cockpit-host-run: net exceptions without a return path", () => {
     ["stopping sshd", () => emergency({ steps: [{ name: "s", run: "systemctl stop sshd", timeoutSeconds: 60 }], rollback: ["systemctl start sshd"] })],
     ["stopping apache2 (all sites)", () => emergency({ steps: [{ name: "s", run: "systemctl stop apache2.service", timeoutSeconds: 60 }], rollback: ["systemctl start apache2"] })],
     ["stopping a target", () => emergency({ steps: [{ name: "s", run: "systemctl stop multi-user.target", timeoutSeconds: 60 }], rollback: ["systemctl start multi-user.target"] })],
+    ["stopping the firewall (not on the list)", () => emergency({ steps: [{ name: "s", run: "systemctl stop ufw", timeoutSeconds: 60 }], rollback: ["systemctl start ufw"] })],
+    ["stopping nftables (not on the list)", () => emergency({ steps: [{ name: "s", run: "systemctl stop nftables.service", timeoutSeconds: 60 }], rollback: ["systemctl start nftables.service"] })],
+    ["stopping fail2ban (not on the list)", () => emergency({ steps: [{ name: "s", run: "systemctl stop fail2ban", timeoutSeconds: 60 }], rollback: ["systemctl start fail2ban"] })],
+    ["stopping the syslog alias (not on the list)", () => emergency({ steps: [{ name: "s", run: "systemctl stop syslog", timeoutSeconds: 60 }], rollback: ["systemctl start syslog"] })],
+    ["stopping a unit that only starts with an allowed name", () => emergency({ steps: [{ name: "s", run: "systemctl stop php8.4-fpm-extra", timeoutSeconds: 60 }], rollback: ["systemctl start php8.4-fpm-extra"] })],
     ["only reading, nothing switched off", () => emergency({ steps: [{ name: "r", run: "apache2ctl -S", timeoutSeconds: 60 }] })],
     ["a reboot", () => emergency({ steps: [{ name: "off", run: "a2dissite 010-wordpress-wejos", timeoutSeconds: 60 }, { name: "reboot", reboot: true }] })],
     ["repair without ensure", () => repair({ steps: [{ name: "db access", run: `${BA} db-access status`, timeoutSeconds: 300 }] })],

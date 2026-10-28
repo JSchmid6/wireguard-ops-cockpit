@@ -475,10 +475,14 @@ gelten unverändert; das Protokoll nennt `net exception <art>`, der Laufzustand 
 | `emergency-shutdown` (Notfall-Abschalten) | `a2dissite [-q] <site>`, `systemctl stop <unit>`, `systemctl reload apache2`, `apache2ctl configtest\|-t\|-S` | `[! ] systemctl is-active --quiet <unit>`, `test [! ]-e /etc/apache2/sites-enabled/<site>.conf`, `apache2ctl …` | `a2ensite [-q] <site>`, `systemctl start <unit>`, `systemctl reload apache2` — zu **jedem** abgeschalteten Site/Dienst der passende |
 | `backup-repair` (Reparatur des Backups) | `/usr/local/sbin/cockpit-borg-action db-access ensure` (Pflicht), `… db-access status\|check`, `… status`, `systemctl start borgmatic.service` | `… db-access status\|check`, `… status`, `! systemctl is-failed --quiet borgmatic.service`, `systemctl is-active --quiet borgmatic.timer` | `… db-access restore` |
 
-Ein Notfall stoppt nie Zugang und Grundlagen: `ssh(d)`, `wg-quick@*`, `wireguard*`, `cockpit-*`,
-`borgmatic*`, `systemd-*`, `dbus`, `cron`, `rsyslog`, Netz, `getty@*`, und nicht, was alle Seiten
-zugleich trägt (`apache2`, `mariadb`/`mysql`, `docker`, `containerd`, `gitlab-*`); nur Units vom
-Typ service (kein `.target`, `.timer`, `.socket` …). Einen vHost auf eine **Wartungsseite**
+Gestoppt werden darf nur, was auf der **Positivliste** steht (Zweitprüfung B3, 28.10.2026):
+Dienste, die eine einzelne Anwendung tragen — `php<Version>-fpm` (WordPress, Nextcloud), `coolwsd`
+(Collabora), `notify_push` und `nextcloud-*`; nur Units vom Typ service (kein `.target`, `.timer`,
+`.socket` …). Alles andere — Zugang (`ssh(d)`, WireGuard), Netz und Firewall (`ufw`, `nftables`),
+Schutz- und Protokolldienste (`fail2ban`, `apparmor`, `clamav*`, `rsyslog`/`syslog`), das Cockpit, die
+Sicherung und was alle Seiten zugleich trägt (`apache2`, `mariadb`, `docker`, `gitlab-*`) — ist ein
+gewöhnlicher Lauf mit Rückweg. Eine Sperrliste war zu offen: jeder nicht bedachte Name (oder ein
+Alias wie `syslog`) wäre durchgerutscht. Einen vHost auf eine **Wartungsseite**
 umstellen (Konfiguration schreiben) ist kein Notfall-Abschalten in diesem Sinn, sondern ein
 gewöhnlicher Lauf mit Rückweg — das typisierte Abschalten ist `a2dissite`. Vorher `apache2ctl -S`
 lesen: liegt ein abgeschalteter Name danach auf einem anderen vHost (etwa `000-default` mit

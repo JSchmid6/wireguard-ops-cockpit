@@ -755,14 +755,17 @@ function borgFresh() {
 // Türsteher, Riegel und der Maschinen-Snapshot bleiben bei beiden unverändert.
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9@._-]{0,79}$/;
 const OTHER_UNIT_TYPE = /\.(?:socket|device|mount|automount|swap|target|path|timer|slice|scope)$/;
-// Was ein Notfall nie stoppt: Zugang (sshd, WireGuard), das Cockpit, die
-// Sicherung, Grunddienste und was alle Seiten zugleich trägt (Apache, Datenbank,
-// Docker, GitLab) — dafür bleibt der gewöhnliche Lauf mit Rückweg.
-const UNIT_NEVER = /^(?:ssh|sshd|apache2|mariadb|mysql|mysqld|docker|containerd|dbus|cron|rsyslog|networking|NetworkManager|systemd-.*|getty@.*|wg-quick@.*|wireguard.*|cockpit-.*|borgmatic.*|gitlab-.*)$/;
+// Was ein Notfall stoppen darf, ist eine Positivliste (Zweitprüfung B3,
+// 28.10.2026): nur Dienste, die eine einzelne Anwendung tragen — PHP-FPM-Pools
+// (WordPress, Nextcloud), Collabora (coolwsd), notify_push und die
+// nextcloud-*-Hilfsdienste. Zugang, Netz, Firewall, Schutz- und Protokolldienste,
+// das Cockpit, die Sicherung und was alle Seiten trägt (Apache, Datenbank,
+// Docker, GitLab), stehen nie darin; für sie bleibt der gewöhnliche Lauf mit Rückweg.
+const UNIT_EMERGENCY = /^(?:php[0-9]+(?:\.[0-9]+)?-fpm|coolwsd|notify_push|nextcloud-[A-Za-z0-9._-]{1,60})$/;
 function unitArg(name) {
   if (!NAME_RE.test(name) || OTHER_UNIT_TYPE.test(name)) return null;
   const unit = name.replace(/\.service$/, "");
-  return UNIT_NEVER.test(unit) ? null : unit;
+  return UNIT_EMERGENCY.test(unit) ? unit : null;
 }
 function siteArg(name) {
   return /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(name) && !name.endsWith(".") ? name.replace(/\.conf$/, "") : null;
