@@ -395,7 +395,7 @@ describe("hostRunPlannerContract", () => {
     expect(contract).toContain("cockpit-host-run/v1");
     expect(contract).toContain("package updates, Docker, kernel updates with a reboot, GitLab upgrades in stages");
     expect(contract).toContain("\"reboot\":true");
-    expect(contract).toContain("younger than 24 h");
+    expect(contract).toContain("the last successful borg backup must be at most 30 h old");
     expect(contract).toContain("checks are mandatory");
   });
 });

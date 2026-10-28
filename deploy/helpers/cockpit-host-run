@@ -25,9 +25,15 @@
 //   Netz       Vor einem Lauf, der den Systemzustand ändert (mutates, Standard),
 //              je Instanzrolle (vom Deploy root-eigen in instance-role.env gelegt,
 //              nie aus Plan, Manifest oder Umgebung des Aufrufers):
-//                vps   das letzte borg-Backup muss jünger als 24 h sein, dann ein
+//                vps   ein Rückweg muss da sein: das jüngste erfolgreich
+//                      abgeschlossene borg-Backup ist höchstens 30 h alt (ein
+//                      späterer gescheiterter Lauf nimmt es nicht weg), dann ein
 //                      Maschinen-Snapshot beim Hoster (cockpit-vps-snapshot,
-//                      rotiert den ältesten cockpit-eigenen);
+//                      rotiert den ältesten cockpit-eigenen). Fehlt der Rückweg,
+//                      laufen nur die zwei festen Ausnahmen (netException):
+//                      Notfall-Abschalten und die Reparatur des Backups selbst —
+//                      jeder Schritt, jede Prüfung und jeder Rückweg in einer
+//                      festen Grammatik; der Snapshot bleibt Pflicht;
 //                lab0  das borg-Ziel, kein borg-Client, ohne Hoster: ein lokaler
 //                      Host-Snapshot (cockpit-host-snapshot: /etc, Paketstand,
 //                      Unit-Zustände). Die Daten deckt er nicht ab — darum
@@ -125,7 +131,12 @@ const MAX_REBOOTS = 3;
 const MAX_SCRIPT = 16000;
 const STEP_TIMEOUT_MAX = 10800;
 const CHECK_TIMEOUT_MAX = 1800;
-const BORG_MAX_AGE_HOURS = 24;
+// Rückweg statt letzter Lauf (Jochen 28.10.2026, Karte t_30c9ea52): verlangt wird
+// das Archiv der letzten Nacht. 24 h Takt des Timers plus 6 h für dessen Streuung
+// und die Laufzeit (Start 00:07–02:26, Dauer bis ~1 h): der Ausfall einer Nacht
+// sperrt also spätestens am Morgen danach, nicht erst Tage später.
+const BORG_MAX_AGE_HOURS = 30;
+const BORG_ACTION_BIN = "/usr/local/sbin/cockpit-borg-action";
 const SNAPSHOT_NAME_MAX = 30; // Grenze des Hosters (Contabo) für Snapshot-Namen
 const ACTIVE_PHASES = new Set(["preflight", "resuming", "running", "rebooting", "checking"]);
 const REBOOT_GRACE_MS = 30 * 60 * 1000;
@@ -374,7 +385,7 @@ function startLocked(manifest, envelope) {
     mutates: manifest.mutates, phase: "preflight", status: "running", nextStep: 0, boots: [bootId()],
     steps: manifest.steps.map((step, index) => ({ index: index + 1, name: step.name, reboot: step.reboot === true, status: "pending" })),
     checks: manifest.checks.map((check, index) => ({ index: index + 1, name: check.name, status: "pending" })),
-    role: null, borg: null, snapshot: null, error: null, startedAt: now(), updatedAt: now(), finishedAt: null,
+    role: null, borg: null, netException: null, snapshot: null, error: null, startedAt: now(), updatedAt: now(), finishedAt: null,
   };
   saveStateStrict(state);
   const problem = startUnit(envelope.jobId, runtimeBudget(manifest));
@@ -709,9 +720,11 @@ function dataLockHeld() {
   return { ok: true };
 }
 
-// last_run_end is the newest "Finished borgmatic…" line: systemd writes it
-// only when the oneshot backup unit completed successfully. last_run_result
-// (systemd's Result) must also be success, so a later failed run blocks too.
+// Der Rückweg ist das jüngste erfolgreich abgeschlossene Backup: last_run_end ist
+// die jüngste "Finished borgmatic…"-Zeile, die systemd nur schreibt, wenn die
+// oneshot-Unit erfolgreich endete (borgmatic exit 0: Dumps, Archiv und Prüfung
+// durch). Ein späterer gescheiterter Lauf (last_run_result) nimmt diesen Rückweg
+// nicht weg — er steht im Protokoll, sperrt aber nicht (Jochen 28.10.2026).
 function borgFresh() {
   const out = spawnSync(BORG_STATUS[0], BORG_STATUS.slice(1), { encoding: "utf8", timeout: 300000, maxBuffer: 4 * 1024 * 1024 });
   if (out.status !== 0) return { ok: false, why: `borg status failed (exit ${out.status})` };
@@ -719,12 +732,100 @@ function borgFresh() {
   const end = value("last_run_end");
   const result = value("last_run_result");
   const ended = Date.parse(end);
-  if (!Number.isFinite(ended)) return { ok: false, why: "no finished borg backup is known" };
+  if (!Number.isFinite(ended)) return { ok: false, why: "no successfully finished borg backup is known (no return path)" };
   const ageHours = (Date.now() - ended) / 3600000;
   const record = { lastRunEnd: end, lastRunResult: result, ageHours: Math.round(ageHours * 10) / 10 };
-  if (result !== "success") return { ok: false, why: `the last borg backup did not succeed (${result || "unknown"})`, record };
-  if (ageHours > BORG_MAX_AGE_HOURS) return { ok: false, why: `the last borg backup is ${record.ageHours} h old (limit ${BORG_MAX_AGE_HOURS} h)`, record };
+  if (ageHours > BORG_MAX_AGE_HOURS) {
+    const last = result && result !== "success" ? `; the last borg run did not succeed (${result})` : "";
+    return { ok: false, why: `the last successful borg backup is ${record.ageHours} h old (limit ${BORG_MAX_AGE_HOURS} h)${last} — no return path`, record };
+  }
   return { ok: true, record };
+}
+
+// ── Ausnahmen vom Rückweg (Jochen 28.10.2026, Karte t_30c9ea52) ─────────────
+// Ohne jungen Rückweg dürfen genau zwei Arten Lauf trotzdem starten, damit die
+// Sperre sich nicht selbst festhält: (a) Notfall-Abschalten — ein vHost aus
+// (a2dissite) oder ein Dienst gestoppt, jeweils mit dem passenden Rückweg;
+// (b) die Reparatur des Backups selbst (DB-Zugang des Backups über
+// cockpit-borg-action db-access, danach ein Backup-Lauf). Erkannt wird nur, was
+// VOLLSTÄNDIG in der festen Grammatik steht: jede Zeile jedes Schritts, jeder
+// Prüfung und jedes Rückwegs ist genau eine der Formen unten — ganze Zeile,
+// keine Shell-Zeichen, keine Variablen. Ein einziger fremder Befehl, und der
+// Lauf ist ein gewöhnlicher Lauf (preflight_failed ohne Rückweg). Schloss,
+// Türsteher, Riegel und der Maschinen-Snapshot bleiben bei beiden unverändert.
+const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9@._-]{0,79}$/;
+const OTHER_UNIT_TYPE = /\.(?:socket|device|mount|automount|swap|target|path|timer|slice|scope)$/;
+// Was ein Notfall nie stoppt: Zugang (sshd, WireGuard), das Cockpit, die
+// Sicherung, Grunddienste und was alle Seiten zugleich trägt (Apache, Datenbank,
+// Docker, GitLab) — dafür bleibt der gewöhnliche Lauf mit Rückweg.
+const UNIT_NEVER = /^(?:ssh|sshd|apache2|mariadb|mysql|mysqld|docker|containerd|dbus|cron|rsyslog|networking|NetworkManager|systemd-.*|getty@.*|wg-quick@.*|wireguard.*|cockpit-.*|borgmatic.*|gitlab-.*)$/;
+function unitArg(name) {
+  if (!NAME_RE.test(name) || OTHER_UNIT_TYPE.test(name)) return null;
+  const unit = name.replace(/\.service$/, "");
+  return UNIT_NEVER.test(unit) ? null : unit;
+}
+function siteArg(name) {
+  return /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(name) && !name.endsWith(".") ? name.replace(/\.conf$/, "") : null;
+}
+const APACHE_READ = /^(?:apache2ctl|apachectl) (?:configtest|-t|-S)$/;
+const RELOAD_APACHE = /^systemctl reload apache2(?:\.service)?$/;
+
+function emergencyLine(line, where) {
+  let m;
+  if (APACHE_READ.test(line)) return { ok: true };
+  if (where === "step") {
+    if (RELOAD_APACHE.test(line)) return { ok: true };
+    if ((m = line.match(/^a2dissite (?:-q )?(\S+)$/)) && siteArg(m[1])) return { ok: true, off: `site ${siteArg(m[1])}` };
+    if ((m = line.match(/^systemctl stop (\S+)$/)) && unitArg(m[1])) return { ok: true, off: `unit ${unitArg(m[1])}` };
+  } else if (where === "check") {
+    if ((m = line.match(/^(?:! )?systemctl is-active --quiet (\S+)$/)) && NAME_RE.test(m[1])) return { ok: true };
+    if ((m = line.match(/^test (?:! )?-e \/etc\/apache2\/sites-enabled\/(\S+)\.conf$/)) && siteArg(m[1])) return { ok: true };
+  } else {
+    if (RELOAD_APACHE.test(line)) return { ok: true };
+    if ((m = line.match(/^a2ensite (?:-q )?(\S+)$/)) && siteArg(m[1])) return { ok: true, back: `site ${siteArg(m[1])}` };
+    if ((m = line.match(/^systemctl start (\S+)$/)) && unitArg(m[1])) return { ok: true, back: `unit ${unitArg(m[1])}` };
+  }
+  return { ok: false };
+}
+
+function repairLine(line, where) {
+  const dbAccess = (verbs) => verbs.some((verb) => line === `${BORG_ACTION_BIN} db-access ${verb}`);
+  if (where === "step") {
+    if (dbAccess(["ensure"])) return { ok: true, ensure: true };
+    if (dbAccess(["status", "check"]) || line === "systemctl start borgmatic.service" || line === `${BORG_ACTION_BIN} status`) return { ok: true };
+  } else if (where === "check") {
+    if (dbAccess(["status", "check"]) || line === `${BORG_ACTION_BIN} status`) return { ok: true };
+    if (line === "! systemctl is-failed --quiet borgmatic.service" || line === "systemctl is-active --quiet borgmatic.timer") return { ok: true };
+  } else if (dbAccess(["restore"])) return { ok: true };
+  return { ok: false };
+}
+
+// { kind, why } für einen ändernden Lauf, der ganz in einer Ausnahme-Grammatik
+// steht, sonst null. Ein Rückweg-Eintrag darf mehrere Formen mit " && " reihen
+// ("a2ensite x && systemctl reload apache2"); Schritte und Prüfungen je Zeile.
+function netException(manifest) {
+  if (!manifest?.mutates || manifest.steps.some((step) => step.reboot === true)) return null;
+  if (manifest.rollback.some((entry) => typeof entry !== "string")) return null;
+  const split = (text) => text.split("\n").map((line) => line.trim()).filter(Boolean);
+  const all = [
+    ...manifest.steps.flatMap((step) => split(step.run).map((line) => ["step", line])),
+    ...manifest.checks.flatMap((check) => split(check.run).map((line) => ["check", line])),
+    ...manifest.rollback.flatMap((entry) => split(entry).flatMap((line) => line.split(/\s+&&\s+/)).map((line) => ["rollback", line])),
+  ];
+  if (!all.some(([where]) => where === "rollback")) return null;
+  const emergency = all.map(([where, line]) => emergencyLine(line, where));
+  if (emergency.every((hit) => hit.ok)) {
+    const off = new Set(emergency.filter((hit) => hit.off).map((hit) => hit.off));
+    const back = new Set(emergency.filter((hit) => hit.back).map((hit) => hit.back));
+    if (off.size > 0 && [...off].every((what) => back.has(what))) {
+      return { kind: "emergency-shutdown", why: `emergency shutdown (${[...off].join(", ")}) with its way back` };
+    }
+  }
+  const repair = all.map(([where, line]) => repairLine(line, where));
+  if (repair.every((hit) => hit.ok) && repair.some((hit) => hit.ensure)) {
+    return { kind: "backup-repair", why: "repair of the backup's database access (cockpit-borg-action db-access), then a backup run" };
+  }
+  return null;
 }
 
 function takeSnapshot(jobId, net) {
@@ -764,8 +865,17 @@ async function payload(jobId) {
         const borg = borgFresh();
         state.borg = borg.record || null;
         saveState(state);
-        if (!borg.ok) return finish(state, "preflight_failed", `${borg.why}; nothing was executed`);
-        log(`== instance role ${role.role}; borg: last backup ${borg.record.lastRunEnd} (${borg.record.ageHours} h ago)`);
+        if (borg.ok) {
+          const last = borg.record.lastRunResult && borg.record.lastRunResult !== "success" ? `; the last borg run did not succeed (${borg.record.lastRunResult})` : "";
+          log(`== instance role ${role.role}; borg: last successful backup ${borg.record.lastRunEnd} (${borg.record.ageHours} h ago)${last}`);
+        } else {
+          const exception = netException(manifest);
+          if (!exception) return finish(state, "preflight_failed", `${borg.why}; nothing was executed`);
+          state.netException = exception.kind;
+          saveState(state);
+          log(`== instance role ${role.role}; borg: ${borg.why}`);
+          log(`== net exception ${exception.kind}: ${exception.why} — runs without a young backup; the machine snapshot is still taken`);
+        }
       } else {
         log(`== instance role ${role.role}: the borg target, not a borg client — no backup age check; a local host snapshot instead`);
       }

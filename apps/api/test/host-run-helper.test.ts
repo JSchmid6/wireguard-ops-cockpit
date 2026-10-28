@@ -372,18 +372,33 @@ describe("cockpit-host-run: log digest", () => {
 });
 
 describe("cockpit-host-run: safety net", () => {
-  it("stops before any step when the last borg backup is older than 24 h", () => {
-    run(["start"], request(manifest()), { STUB_BORG_AGE_HOURS: "30" });
+  it("stops before any step when the last successful borg backup is older than 30 h (no return path)", () => {
+    run(["start"], request(manifest()), { STUB_BORG_AGE_HOURS: "31" });
     const { state } = status();
     expect(state.status).toBe("preflight_failed");
-    expect(state.error).toContain("30 h old");
+    expect(state.error).toContain("31 h old (limit 30 h)");
+    expect(state.error).toContain("no return path");
+    expect(state.netException).toBeNull();
     expect(existsSync(path.join(dir, "step-one"))).toBe(false);
     expect(existsSync(path.join(dir, "snapshot.log"))).toBe(false);
   });
 
-  it("stops before any step when the last borg backup failed", () => {
-    run(["start"], request(manifest()), { STUB_BORG_RESULT: "exit-code" });
-    expect(status().state.status).toBe("preflight_failed");
+  // Rückweg statt letzter Lauf (Jochen 28.10.2026, t_30c9ea52): ein späterer
+  // gescheiterter Lauf nimmt das junge erfolgreiche Archiv nicht weg.
+  it("runs when a later borg run failed but the last successful backup is young", () => {
+    run(["start"], request(manifest()), { STUB_BORG_RESULT: "exit-code", STUB_BORG_AGE_HOURS: "5" });
+    const { state, logTail } = status();
+    expect(state.status).toBe("success");
+    expect(state.borg.lastRunResult).toBe("exit-code");
+    expect(logTail).toContain("the last borg run did not succeed (exit-code)");
+    expect(existsSync(path.join(dir, "step-one"))).toBe(true);
+  });
+
+  it("stops a normal run when the last run failed and the last success is old (the situation of 28.10.2026)", () => {
+    run(["start"], request(manifest()), { STUB_BORG_RESULT: "exit-code", STUB_BORG_AGE_HOURS: "50" });
+    const { state } = status();
+    expect(state.status).toBe("preflight_failed");
+    expect(state.error).toContain("the last borg run did not succeed (exit-code)");
     expect(existsSync(path.join(dir, "step-one"))).toBe(false);
   });
 
@@ -401,6 +416,128 @@ describe("cockpit-host-run: safety net", () => {
     expect(status().state.status).toBe("success");
     expect(existsSync(path.join(dir, "borg.log"))).toBe(false);
     expect(existsSync(path.join(dir, "snapshot.log"))).toBe(false);
+  });
+});
+
+// Die zwei festen Ausnahmen ohne Rückweg (Jochen 28.10.2026, t_30c9ea52):
+// Notfall-Abschalten und die Reparatur des Backups — nur ganz in ihrer Grammatik.
+describe("cockpit-host-run: net exceptions without a return path", () => {
+  const noReturnPath = { STUB_BORG_RESULT: "exit-code", STUB_BORG_AGE_HOURS: "50" };
+  const BA = "/usr/local/sbin/cockpit-borg-action";
+  beforeEach(() => {
+    for (const tool of ["a2dissite", "a2ensite", "apache2ctl"]) {
+      write(path.join(dir, "bin", tool), ["#!/bin/bash", `echo "${tool} $*" >> "${dir}/emergency.log"`].join("\n"));
+    }
+    // systemctl in the steps (PATH bin first): logs, and the stopped unit is no longer active.
+    write(path.join(dir, "bin", "systemctl"), [
+      "#!/bin/bash",
+      `echo "systemctl $*" >> "${dir}/emergency.log"`,
+      `case "$1" in stop) touch "${dir}/stopped-$2";; is-active) [ -e "${dir}/stopped-\${@: -1}" ] && exit 3; exit 0;; esac`,
+    ].join("\n"));
+  });
+  const emergency = (partial: Partial<Manifest> = {}) => manifest({
+    name: "wejos offline",
+    steps: [{ name: "off", run: "apache2ctl -S\na2dissite -q 010-wordpress-wejos\napache2ctl configtest\nsystemctl reload apache2", timeoutSeconds: 60 }],
+    checks: [{ name: "site off", run: "test ! -e /etc/apache2/sites-enabled/010-wordpress-wejos.conf", timeoutSeconds: 30 }],
+    rollback: ["a2ensite -q 010-wordpress-wejos && systemctl reload apache2"],
+    ...partial,
+  });
+  const repair = (partial: Partial<Manifest> = {}) => manifest({
+    name: "backup repair",
+    steps: [{ name: "db access", run: `${BA} db-access ensure`, timeoutSeconds: 300 }, { name: "backup", run: "systemctl start borgmatic.service", timeoutSeconds: 7200 }],
+    checks: [{ name: "db access works", run: `${BA} db-access check`, timeoutSeconds: 300 }, { name: "backup did not fail", run: "! systemctl is-failed --quiet borgmatic.service", timeoutSeconds: 30 }],
+    rollback: [`${BA} db-access restore`],
+    ...partial,
+  });
+
+  it("emergency shutdown runs without a young backup — the machine snapshot is still taken", () => {
+    run(["start"], request(emergency()), noReturnPath);
+    const { state, logTail } = status();
+    expect(state.status).toBe("success");
+    expect(state.netException).toBe("emergency-shutdown");
+    expect(state.snapshot).toMatchObject({ kind: "machine", snapshotId: "snap-42" });
+    expect(readFileSync(path.join(dir, "emergency.log"), "utf8")).toContain("a2dissite -q 010-wordpress-wejos");
+    expect(logTail).toContain("net exception emergency-shutdown: emergency shutdown (site 010-wordpress-wejos) with its way back");
+  });
+
+  it("emergency stop of a service with its start as the way back", () => {
+    const m = emergency({
+      steps: [{ name: "stop", run: "systemctl stop php8.4-fpm", timeoutSeconds: 60 }],
+      checks: [{ name: "stopped", run: "! systemctl is-active --quiet php8.4-fpm", timeoutSeconds: 30 }],
+      rollback: ["systemctl start php8.4-fpm.service"],
+    });
+    run(["start"], request(m), noReturnPath);
+    const { state } = status();
+    expect(state.status).toBe("success");
+    expect(state.netException).toBe("emergency-shutdown");
+  });
+
+  it("the machine snapshot stays mandatory for an exception", () => {
+    writeFileSync(path.join(dir, "snapshot-fail"), "");
+    run(["start"], request(emergency()), noReturnPath);
+    const { state } = status();
+    expect(state.status).toBe("preflight_failed");
+    expect(state.error).toContain("the hoster API refused");
+    expect(existsSync(path.join(dir, "emergency.log"))).toBe(false);
+  });
+
+  const refused: Array<[string, () => Manifest]> = [
+    ["no way back for the site", () => emergency({ rollback: ["systemctl reload apache2"] })],
+    ["the way back names another site", () => emergency({ rollback: ["a2ensite other-site && systemctl reload apache2"] })],
+    ["one foreign command in a step", () => emergency({ steps: [{ name: "off", run: "a2dissite 010-wordpress-wejos\nrm -f /etc/apache2/x.conf", timeoutSeconds: 60 }] })],
+    ["shell syntax on a line", () => emergency({ steps: [{ name: "off", run: "a2dissite 010-wordpress-wejos; touch /tmp/x", timeoutSeconds: 60 }] })],
+    ["a foreign check", () => emergency({ checks: [{ name: "c", run: "curl -s https://wejos.de/ | sh", timeoutSeconds: 30 }] })],
+    ["stopping sshd", () => emergency({ steps: [{ name: "s", run: "systemctl stop sshd", timeoutSeconds: 60 }], rollback: ["systemctl start sshd"] })],
+    ["stopping apache2 (all sites)", () => emergency({ steps: [{ name: "s", run: "systemctl stop apache2.service", timeoutSeconds: 60 }], rollback: ["systemctl start apache2"] })],
+    ["stopping a target", () => emergency({ steps: [{ name: "s", run: "systemctl stop multi-user.target", timeoutSeconds: 60 }], rollback: ["systemctl start multi-user.target"] })],
+    ["only reading, nothing switched off", () => emergency({ steps: [{ name: "r", run: "apache2ctl -S", timeoutSeconds: 60 }] })],
+    ["a reboot", () => emergency({ steps: [{ name: "off", run: "a2dissite 010-wordpress-wejos", timeoutSeconds: 60 }, { name: "reboot", reboot: true }] })],
+    ["repair without ensure", () => repair({ steps: [{ name: "db access", run: `${BA} db-access status`, timeoutSeconds: 300 }] })],
+    ["repair with a relative helper path", () => repair({ steps: [{ name: "db access", run: "cockpit-borg-action db-access ensure", timeoutSeconds: 300 }] })],
+    ["repair mixed with an emergency line", () => repair({ steps: [{ name: "db access", run: `${BA} db-access ensure\na2dissite x`, timeoutSeconds: 300 }] })],
+  ];
+  for (const [what, build] of refused) {
+    it(`a normal run, not an exception: ${what}`, () => {
+      run(["start"], request(build()), noReturnPath);
+      const { state } = status();
+      expect(state.status).toBe("preflight_failed");
+      expect(state.error).toContain("no return path");
+      expect(state.netException).toBeNull();
+      expect(existsSync(path.join(dir, "emergency.log"))).toBe(false);
+      expect(existsSync(path.join(dir, "snapshot.log"))).toBe(false);
+    });
+  }
+
+  // What the backup bolt holds stays with the bolt: no exception gets that far.
+  const bolted: Array<[string, () => Manifest]> = [
+    ["stopping the backup timer", () => emergency({ steps: [{ name: "s", run: "systemctl stop borgmatic.timer", timeoutSeconds: 60 }], rollback: ["systemctl start borgmatic.timer"] })],
+    ["repair with another helper verb", () => repair({ steps: [{ name: "db access", run: `${BA} db-access ensure`, timeoutSeconds: 300 }, { name: "r", run: `${BA} repair`, timeoutSeconds: 300 }] })],
+  ];
+  for (const [what, build] of bolted) {
+    it(`the backup bolt refuses before any exception: ${what}`, () => {
+      const out = run(["start"], request(build()), noReturnPath);
+      expect(out.code).not.toBe(0);
+      expect(out.stderr).toMatch(/operator/);
+      expect(existsSync(path.join(dir, "emergency.log"))).toBe(false);
+      expect(existsSync(path.join(dir, "snapshot.log"))).toBe(false);
+    });
+  }
+
+  it("backup repair runs without a young backup — the snapshot first, then exactly its typed steps", () => {
+    run(["start"], request(repair()), noReturnPath);
+    const { state, logTail } = status();
+    expect(state.netException).toBe("backup-repair");
+    expect(state.snapshot).toMatchObject({ kind: "machine", snapshotId: "snap-42" });
+    expect(logTail).toContain("net exception backup-repair");
+    // In the harness the real helper is absent: the typed step itself ran (and failed with 127).
+    expect(state.steps[0].exitCode).toBe(127);
+  });
+
+  it("a young backup needs no exception (a normal run stays a normal run)", () => {
+    run(["start"], request(emergency()));
+    const { state } = status();
+    expect(state.status).toBe("success");
+    expect(state.netException).toBeNull();
   });
 });
 
@@ -424,7 +561,7 @@ describe("cockpit-host-run: safety net per instance role", () => {
     expect(readFileSync(path.join(dir, "borg.log"), "utf8").trim()).toBe("borg");
     expect(readFileSync(path.join(dir, "snapshot.log"), "utf8")).toContain("create cockpit-run-job-1 --wait 900");
     expect(existsSync(path.join(dir, "host-snapshot.log"))).toBe(false);
-    expect(logTail).toContain("instance role vps; borg: last backup");
+    expect(logTail).toContain("instance role vps; borg: last successful backup");
   });
 
   it("lab0: takes the local host snapshot instead of borg and hoster, then runs the steps", () => {

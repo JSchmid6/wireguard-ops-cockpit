@@ -737,7 +737,7 @@ function readOnlyForm(command, segmentText) {
       return verb !== null && BORG_READ.has(verb) || args.includes("--version");
     }
     case "borgmatic": return borgmaticReadOnly(args);
-    case "cockpit-borg-action": return args.length === 1 && (args[0] === "status" || args[0] === "check");
+    case "cockpit-borg-action": return (args.length === 1 && (args[0] === "status" || args[0] === "check")) || (args.length === 2 && args[0] === "db-access" && (args[1] === "status" || args[1] === "check"));
     case "cockpit-borg-retention": return retentionRoutine(args);
     case "systemctl": {
       const { verb, rest } = firstVerb(args, new Set(["-H", "--host", "-M", "--machine", "-t", "--type", "-p", "--property", "-o", "--output", "-n", "--lines", "--state"]));
@@ -1069,7 +1069,11 @@ function segmentBolt(text, command, name, readOnly, cwds, context, line, piped) 
     const index = args.findIndex((arg) => baseName(arg) === "cockpit-borg-retention.mjs");
     if (index >= 0 && !retentionRoutine(args.slice(index + 1))) return "the retention service outside its routine";
   }
-  if (name === "cockpit-borg-action" && !(args.length === 1 && (args[0] === "status" || args[0] === "check"))) return "the backup helper outside status and check (repair can delete archives)";
+  // db-access (Karte t_30c9ea52) richtet nur den DB-Zugang des Backups ein bzw.
+  // spielt dessen alte Optionsdatei zurück: es löscht kein Archiv, ändert keine
+  // Aufbewahrung und schaltet nichts ab — frei wie status und check.
+  const dbAccess = args.length === 2 && args[0] === "db-access" && ["status", "check", "ensure", "restore"].includes(args[1]);
+  if (name === "cockpit-borg-action" && !dbAccess && !(args.length === 1 && (args[0] === "status" || args[0] === "check"))) return "the backup helper outside status, check and db-access (repair can delete archives)";
 
   // Die Units der Sicherung und des Aufräum-Dienstes anhalten, abschalten, maskieren.
   if (/^(?:systemctl|service|invoke-rc\.d|deb-systemd-invoke|update-rc\.d)$/.test(name)) {

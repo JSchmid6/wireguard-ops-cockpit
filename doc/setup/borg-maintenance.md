@@ -191,7 +191,8 @@ das Backup über das Drop-in die paar Sekunden ab.
 
 | Pfad (Host) | Quelle | Zweck |
 | --- | --- | --- |
-| `/usr/local/sbin/cockpit-borg-action` | `deploy/helpers/cockpit-borg-action` | der einzige sudo-exponierte Einstieg; gepinnte Grammatik `status\|check\|repair` |
+| `/usr/local/sbin/cockpit-borg-action` | `deploy/helpers/cockpit-borg-action` | der einzige sudo-exponierte Einstieg; gepinnte Grammatik `status\|check\|repair` (dazu `db-access …`, nur aus einem Lauf der allgemeinen Tür) |
+| `/etc/borgmatic/mysqldump.cnf` (+ `.vor-<Zeit>`) | `db-access ensure` | Anmeldung des mysqldump-Hooks: `cockpit_backup@localhost`, 0600 root; die `.vor-`Dateien sind der Rückweg |
 | `/etc/sudoers.d/cockpit-executor` | `deploy/sudoers/cockpit-executor` | Zeile `cockpit-executor ALL=(root) NOPASSWD: /usr/local/sbin/cockpit-borg-action *` |
 | `/var/lib/wireguard-ops-cockpit/borg/last.unit`, `last.kind` | Laufzeit | zuletzt gestartete Wartungs-Unit und ihre Art, 0750 root — nur für die Anzeige; **der Laufzustand kommt aus systemd** (`systemctl is-active <unit>`) |
 | `/run/lock/cockpit-borg.lock` | Laufzeit | Sperre gegen zwei gleichzeitige Läufe auf demselben Repo: `check`/`repair` halten sie für die Dauer des Laufs, die Repo-Abfragen von `status` kurz (ist sie nach 60 s nicht frei, meldet `status` „belegt“ mit rc=0); das nächtliche Backup wartet auf sie |
@@ -224,6 +225,47 @@ oder zu wenig Frist bis zum Timer · `64` Aufruffehler · `67` falscher Host
 * Kein tmux-Runbook für borg: Runbook-Sitzungen laufen als `wgops`, der
   Repo-Schlüssel gehört root. Der lesende Weg ist die typisierte Aktion, nicht
   eine Shell-Sitzung.
+
+## DB-Zugang des Backups (`db-access`, 28.10.2026)
+
+Der mysqldump-Hook der borgmatic-Konfiguration
+(`mysqldump --defaults-extra-file=/etc/borgmatic/mysqldump.cnf --single-transaction --quick --all-databases`)
+meldete sich bis zum 26.10.2026 mit dem **Nextcloud-Konto** an. Nach dessen Passwort-Rotation
+(Karte t_bc2b0db1) scheiterte jedes Backup mit 1045, zwei Nächte lang. **Entscheidung (Jochen,
+28.10.2026, Karte t_30c9ea52):** das Backup bekommt ein eigenes Konto, entkoppelt von Nextcloud-
+und WordPress-Passwörtern.
+
+| Form | Wirkung |
+| --- | --- |
+| `cockpit-borg-action db-access status` | lesend: Besitz/Modus der Datei, Konto (`user=`-Zeile), ob die Anmeldung geht (Fehlerzeile der Datenbank), Zahl der Sicherungen. Kein Wert. |
+| `cockpit-borg-action db-access check` | rc=0, wenn das Konto der Datei sich anmeldet und `mysqldump --all-databases --no-data` durchläuft (wie der Hook, nur das Schema) |
+| `cockpit-borg-action db-access ensure` | legt `cockpit_backup@localhost` an (oder setzt ihm ein neues Passwort), entzieht alles und gibt genau `SELECT, SHOW VIEW, TRIGGER, LOCK TABLES, EVENT, SHOW DATABASES` auf `*.*` (der Hook dumpt alle Datenbanken), prüft das neue Konto mit einer Arbeitsdatei, sichert die alte Datei als `mysqldump.cnf.vor-<UTC-Zeit>` (0600) und tauscht dann (0600 root). Übrige Zeilen der alten Datei außer `user`/`password` bleiben. |
+| `cockpit-borg-action db-access restore` | spielt die jüngste `.vor-`Datei zurück (das Konto bleibt, ohne Wirkung) |
+
+Grenzen:
+
+* **Nur aus einem Lauf der allgemeinen Tür:** der Aufruf muss in der cgroup einer Lauf-Unit
+  `cockpit-host-run-<job>.service` stehen. Der Executor kommt per sudo an den Helfer, aber nicht in
+  diese cgroup — `db-access` ist für ihn mit rc=64 zu. Damit bleibt `borg.manage` bei
+  `status|check|repair`.
+* **Kein Wert verlässt die Shell:** das Zufallspasswort (40 Zeichen `[A-Za-z0-9]` aus
+  `/dev/urandom`) und die Verwaltungs-Anmeldung gehen nur über `printf` (bash-builtin) in eine
+  Pipe bzw. ein `/dev/fd` — nie in argv, Umgebung, Protokoll oder Ausgabe. Das Protokoll der Tür
+  schwärzt zusätzlich jede `password=`-Zuweisung.
+* **Die einmalige Verwaltungs-Anmeldung** ist das Nextcloud-DB-Konto aus `config.php`: auf
+  diesem Host sind root (Socket und `debian.cnf`) und `mysql@localhost` passwortgeschützt
+  (Inventar-Jobs 697b46d0, be3a0f57), ein anderes Konto mit `CREATE USER` gibt es nicht. Gelesen
+  wird die Datei als `www-data` (`runuser`), weil sie www-data-beschreibbar war — root führt ihren
+  Code nie aus. Das ist Lesen eines Geheimnisses (X1): der Lauf nennt es im Intent, und der Befund
+  geht an Jochen. Danach braucht das Backup das Nextcloud-Passwort nie wieder; eine spätere
+  Rotation des Backup-Passworts ist ein weiteres `ensure` (wieder mit dieser Anmeldung).
+* Fail closed: Backup läuft gerade (rc=3), Nextcloud-Konto fehlt/ist nicht lokal (rc=67), Konto
+  anlegen scheitert oder das neue Konto liest nicht alle Datenbanken (rc=1) — die Datei bleibt dann
+  unverändert, ein in diesem Aufruf neu angelegtes Konto wird wieder entfernt.
+* Ohne Rückweg darf genau dieser Lauf trotzdem starten (Ausnahme `backup-repair`,
+  `doc/setup/host-run.md`): `db-access ensure`, danach `systemctl start borgmatic.service`,
+  Prüfungen `db-access check` und `! systemctl is-failed --quiet borgmatic.service`, Rückweg
+  `db-access restore`.
 
 ## Zustand der Kiste (Baustein „Sichtbarkeit“)
 

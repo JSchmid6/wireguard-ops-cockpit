@@ -33,7 +33,8 @@ Planer ──► Plan mit einem ```host-run-Manifest (cockpit-host-run/v1)
         ──► Executor-Broker host.run ──► sudo cockpit-host-run.mjs start
               prüft das Schloss, legt /var/lib/wireguard-ops-cockpit/host-runs/<job>/ an,
               startet die Unit cockpit-host-run-<job> und kehrt sofort zurück
-        ──► Unit: Netz je Instanzrolle (VPS: borg jünger als 24 h? Snapshot beim Hoster.
+        ──► Unit: Netz je Instanzrolle (VPS: Rückweg = letztes erfolgreiches borg-Backup ≤ 30 h,
+              sonst nur die zwei typisierten Ausnahmen; Snapshot beim Hoster.
               Lab0: lokaler Host-Snapshot). Schritte. Prüfschritte.
         ──► API folgt mit host.status, danach unabhängige Verifikation wie bisher
 ```
@@ -162,7 +163,7 @@ jedes `cd`-Ziel aufgelöst. Kommentare zählen nicht.
 - `borg`/`borgmatic` `delete`, `prune`, `compact`, `recreate`, `break-lock`, eine
   Schlüsseländerung (`key change-passphrase|import|migrate-to-repokey …`), `check --repair`,
   `borgmatic borg …`, ein `borgmatic`-Lauf mit anderer Konfiguration (`-c`) oder `--override`,
-  `cockpit-borg-action` außer `status|check` — auch als Text in `sh -c '…'`, in einem Skript,
+  `cockpit-borg-action` außer `status|check|db-access …` — auch als Text in `sh -c '…'`, in einem Skript,
   das der Lauf schreibt, in einer Cron-Zeile oder in `echo/printf`;
 - jede Änderung der Aufbewahrung: `keep_*`/`--keep-*`, `keepDaily|Weekly|Monthly`,
   `backup_keep_time` (GitLab), außerhalb eines reinen Lesebefehls;
@@ -216,7 +217,9 @@ jedes `cd`-Ziel aufgelöst. Kommentare zählen nicht.
 **Frei** (weder Riegel noch Hinweis) bleiben die Routine und das Lesen: `systemctl start
 borgmatic.service`, ein nacktes `borgmatic` (konfigurierte Aufbewahrung),
 `borg list|info|check|create|diff`, `borgmatic list|info|check|create`,
-`cockpit-borg-action status|check`, `systemctl status|is-active|show|list-timers …`,
+`cockpit-borg-action status|check|db-access status|check|ensure|restore` (der DB-Zugang des
+Backups löscht kein Archiv und ändert keine Aufbewahrung, Karte t_30c9ea52),
+`systemctl status|is-active|show|list-timers …`,
 `journalctl -u borgmatic`, lesende docker-Befehle (`ps`, `images`, `inspect`, `logs`, `stats`,
 `version`, `info`, `compose ps|config|logs`), Paket-Updates — auch wenn `borgbackup` oder
 `borgmatic` darunter sind —, `gitlab-backup create`, Lesebefehle (`ls`, `cat`, `grep`, `test`;
@@ -438,14 +441,50 @@ Produktionshost. Der Rest des Vertrags (X1–X6, Antwortformat) ist auf beiden H
 Auf Lab0 hielt der Türsteher einen Lab0-Plan für einen Widerspruch zum Produktionshost (X5) und
 stoppte jeden verändernden Lauf. Die Rolle ändert nur den Text, nie Schloss, Netz oder Riegel.
 
-**vps** (unverändert):
+**vps**:
 
-1. `cockpit-borg-action status`: das letzte borg-Backup muss erfolgreich und jünger als 24 h
-   sein. `last_run_end` ist die jüngste „Finished borgmatic…“-Zeile, die systemd nur beim
-   erfolgreichen Ende der oneshot-Unit schreibt; `last_run_result` muss zusätzlich `success`
-   sein, damit auch ein späterer gescheiterter Lauf stoppt.
+1. `cockpit-borg-action status`: **ein Rückweg muss da sein** — das jüngste erfolgreich
+   abgeschlossene borg-Backup ist höchstens **30 h** alt. `last_run_end` ist die jüngste
+   „Finished borgmatic…“-Zeile, die systemd nur beim erfolgreichen Ende der oneshot-Unit
+   schreibt (borgmatic exit 0: Dumps, Archiv, Prüfung). Ein späterer gescheiterter Lauf
+   (`last_run_result`) nimmt diesen Rückweg nicht weg; er steht im Protokoll, sperrt aber nicht.
+   Fehlt der Rückweg, läuft nur eine der zwei Ausnahmen unten, sonst `preflight_failed`.
 2. `cockpit-vps-snapshot create cockpit-run-<job> --wait 900`: Maschinen-Snapshot beim Hoster;
-   ist das Kontingent voll, rotiert das Werkzeug den ältesten cockpit-eigenen Snapshot.
+   ist das Kontingent voll, rotiert das Werkzeug den ältesten cockpit-eigenen Snapshot. Er ist
+   auch für die Ausnahmen Pflicht.
+
+**Entscheidung 28.10.2026 (Jochen, Karte t_30c9ea52): Rückweg statt letzter Lauf.** Bis dahin
+stoppte jeder gescheiterte Backup-Lauf jeden ändernden Lauf, auch die Reparatur des Backups
+selbst. Am 27./28.10. scheiterte borgmatic zwei Nächte (mysqldump 1045 nach der
+Nextcloud-DB-Rotation), und damit war auch das Abschalten der möglicherweise kompromittierten
+Seite wejos.de gesperrt — eine Sackgasse. Gefragt wird jetzt, ob es einen Rückweg gibt.
+**Schwelle 30 h:** verlangt ist das Archiv der letzten Nacht — 24 h Takt des Timers plus 6 h für
+dessen Streuung und die Laufzeit (Start 00:07–02:26, Dauer bis ~1 h). Fällt eine Nacht aus,
+sperrt die Tür also spätestens am Morgen danach, nicht erst Tage später; ein einmaliger
+Fehlschlag kurz nach einem guten Lauf (ein Zusatzlauf) sperrt nicht.
+
+**Zwei feste Ausnahmen ohne Rückweg** (`netException` in `cockpit-host-run`). Erkannt wird nur,
+was **vollständig** in der Grammatik steht: jede Zeile jedes Schritts, jeder Prüfung und jedes
+Rückwegs (ein Rückweg-Eintrag darf Formen mit ` && ` reihen) ist genau eine der Formen — ganze
+Zeile, keine Shell-Zeichen, keine Variablen, kein Neustart. Ein einziger fremder Befehl, und der
+Lauf ist ein gewöhnlicher Lauf. Schloss, Türsteher, Backup-Riegel, Risiko-Riegel und Snapshot
+gelten unverändert; das Protokoll nennt `net exception <art>`, der Laufzustand `netException`.
+
+| Ausnahme | Schritte | Prüfungen | Rückweg |
+|---|---|---|---|
+| `emergency-shutdown` (Notfall-Abschalten) | `a2dissite [-q] <site>`, `systemctl stop <unit>`, `systemctl reload apache2`, `apache2ctl configtest\|-t\|-S` | `[! ] systemctl is-active --quiet <unit>`, `test [! ]-e /etc/apache2/sites-enabled/<site>.conf`, `apache2ctl …` | `a2ensite [-q] <site>`, `systemctl start <unit>`, `systemctl reload apache2` — zu **jedem** abgeschalteten Site/Dienst der passende |
+| `backup-repair` (Reparatur des Backups) | `/usr/local/sbin/cockpit-borg-action db-access ensure` (Pflicht), `… db-access status\|check`, `… status`, `systemctl start borgmatic.service` | `… db-access status\|check`, `… status`, `! systemctl is-failed --quiet borgmatic.service`, `systemctl is-active --quiet borgmatic.timer` | `… db-access restore` |
+
+Ein Notfall stoppt nie Zugang und Grundlagen: `ssh(d)`, `wg-quick@*`, `wireguard*`, `cockpit-*`,
+`borgmatic*`, `systemd-*`, `dbus`, `cron`, `rsyslog`, Netz, `getty@*`, und nicht, was alle Seiten
+zugleich trägt (`apache2`, `mariadb`/`mysql`, `docker`, `containerd`, `gitlab-*`); nur Units vom
+Typ service (kein `.target`, `.timer`, `.socket` …). Einen vHost auf eine **Wartungsseite**
+umstellen (Konfiguration schreiben) ist kein Notfall-Abschalten in diesem Sinn, sondern ein
+gewöhnlicher Lauf mit Rückweg — das typisierte Abschalten ist `a2dissite`. Vorher `apache2ctl -S`
+lesen: liegt ein abgeschalteter Name danach auf einem anderen vHost (etwa `000-default` mit
+demselben DocumentRoot), ist das Abschalten unwirksam — das beurteilt der Türsteher.
+`db-access` (Grammatik und Grenzen: `doc/setup/borg-maintenance.md`, „DB-Zugang des Backups“)
+läuft nur in einem Lauf dieser Tür, nie über den Executor.
 
 **lab0**: Lab0 ist das borg-**Ziel**, kein borg-Client, und hat keinen Hoster — borg-Frische und
 Maschinen-Snapshot passen dort nicht (Lauf 98a12e31 vom 16.10.2026 scheiterte genau daran:
