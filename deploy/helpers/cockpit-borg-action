@@ -843,11 +843,22 @@ db_set_hash() { # db_set_hash <hash>: das Konto bekommt genau diesen Hash
   printf "ALTER USER '%s'@'localhost' IDENTIFIED BY PASSWORD '%s';\n" "$DB_USER" "$1" | amysql 2>&1
 }
 
+# Die Repo-Sperre für die Dauer von ensure/restore (Re-Review 28.10.2026): der
+# Drop-in borgmatic-cockpit-borg-lock.conf lässt den Nachtlauf auf sie warten, so
+# fällt er nie zwischen ALTER USER und den Tausch der Datei. Der Deskriptor bleibt
+# bis zum Ende dieses Prozesses offen.
+db_lock() {
+  have flock || die "flock fehlt — ohne die Sperre könnte der Nachtlauf mitten in den Tausch fallen; nichts verändert." 67
+  exec 9>>"$BORG_ACTION_LOCK" || die "Sperrdatei $BORG_ACTION_LOCK ist nicht öffenbar — nichts verändert." 67
+  flock -n 9 || die "$BORG_ACTION_LOCK ist belegt — eine Prüfung oder ein Backup hält das Repo; nach dem Lauf erneut, nichts verändert." 3
+}
+
 db_ensure() {
   borgmatic_here || die "borgmatic (und $BORG_ACTION_CONFIG) fehlen auf diesem Host — der DB-Zugang des Backups gehört zum VPS." 67
   [ -f "$DB_CNF" ] || die "$DB_CNF fehlt — ensure ersetzt nur die Datei, die der Hook schon liest; nichts verändert." 67
   local tool state
   for tool in mysql mysqldump php runuser mktemp python3; do have "$tool" || die "$tool fehlt — nichts verändert." 67; done
+  db_lock
   if state="$(borgmatic_busy)"; then die "das Backup läuft gerade ($state) — nach dem Lauf erneut; nichts verändert." 3; fi
   db_admin
 
@@ -914,6 +925,7 @@ db_restore() {
   local last out
   last="$(db_backups | head -n 1)"
   [ -n "$last" ] || die "keine Sicherung $DB_CNF.vor-* — nichts verändert." 1
+  db_lock
   # Gehört die Sicherung schon dem Backup-Konto (Stand vor einer Rotation), gilt sie
   # erst wieder, wenn das Konto ihren Hash bekommt.
   if [ "$(db_cnf_user "$last")" = "$DB_USER" ]; then

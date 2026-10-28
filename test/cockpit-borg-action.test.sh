@@ -1097,6 +1097,17 @@ assert_rc "ensure während des Backups abgewiesen" 3
 rm -f "$WORK/borgmatic-busy"
 cnf_unchanged "während des Backups: Datei unverändert"
 
+echo "== db-access ensure: Repo-Sperre belegt (Re-Review: kein Nachtlauf mitten im Tausch) =="
+reset_db
+rm -f "$WORK/unlock"
+( exec 9>>"$COCKPIT_BORG_ACTION_LOCK"; flock 9; n=0; while [ ! -e "$WORK/unlock" ] && [ "$n" -lt 300 ]; do sleep 0.1; n=$((n+1)); done ) & LOCKER=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do flock -n "$COCKPIT_BORG_ACTION_LOCK" true 2>/dev/null || break; sleep 0.2; done
+db cgroup-run ensure
+assert_rc "ensure bei belegter Sperre abgewiesen" 3
+: > "$WORK/unlock"; wait "$LOCKER" 2>/dev/null; rm -f "$WORK/unlock"
+cnf_unchanged "bei belegter Sperre: Datei unverändert"
+assert_no_file "bei belegter Sperre: kein Konto angelegt" "$DB/created-hash"
+
 echo "== db-access ensure: fremder Datenbank-Host =="
 reset_db; printf 'nextDB\n%s\ndb.example.org\n' "$NCPASS" > "$DB/nc-creds"
 db cgroup-run ensure

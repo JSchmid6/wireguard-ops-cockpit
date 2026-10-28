@@ -239,8 +239,8 @@ und WordPress-Passwörtern.
 | --- | --- |
 | `cockpit-borg-action db-access status` | lesend: Besitz/Modus der Datei, Konto (`user=`-Zeile), ob die Anmeldung geht (Fehlerzeile der Datenbank), Zahl der Sicherungen. Kein Wert. |
 | `cockpit-borg-action db-access check` | rc=0, wenn das Konto der Datei sich anmeldet und `mysqldump --all-databases --no-data` durchläuft (wie der Hook, nur das Schema) |
-| `cockpit-borg-action db-access ensure` | legt `cockpit_backup@localhost` an (oder setzt ihm ein neues Passwort), entzieht alles und gibt genau `SELECT, SHOW VIEW, TRIGGER, LOCK TABLES, EVENT, SHOW DATABASES` auf `*.*` (der Hook dumpt alle Datenbanken), prüft das neue Konto mit einer Arbeitsdatei, sichert die alte Datei als `mysqldump.cnf.vor-<UTC-Zeit>` (0600) und tauscht dann (0600 root). Übrige Zeilen der alten Datei außer `user`/`password` bleiben. |
-| `cockpit-borg-action db-access restore` | spielt die jüngste `.vor-`Datei zurück (das Konto bleibt, ohne Wirkung) |
+| `cockpit-borg-action db-access ensure` | legt `cockpit_backup@localhost` an (oder setzt ihm ein neues Passwort), entzieht alles und gibt genau `SELECT, SHOW VIEW, TRIGGER, LOCK TABLES, SHOW DATABASES` auf `*.*` (der Hook dumpt alle Datenbanken, ohne `--events`, darum kein EVENT), prüft das neue Konto mit einer Arbeitsdatei, sichert die alte Datei als `mysqldump.cnf.vor-<UTC-Zeit>` (0600) und tauscht dann (0600 root). Übrige Zeilen der alten Datei außer `user`/`password` bleiben. |
+| `cockpit-borg-action db-access restore` | spielt die jüngste `.vor-`Datei zurück. Gehört sie schon dem Backup-Konto (Stand vor einer Rotation), setzt `restore` das Konto zuerst auf ihren Hash — dafür braucht es wieder die Verwaltungs-Anmeldung (unten, X1). Gehört sie dem alten Nextcloud-Konto (Stand vor dem ersten `ensure`), bleibt `cockpit_backup` bestehen, ohne Wirkung. |
 
 Grenzen:
 
@@ -252,14 +252,32 @@ Grenzen:
   `/dev/urandom`) und die Verwaltungs-Anmeldung gehen nur über `printf` (bash-builtin) in eine
   Pipe bzw. ein `/dev/fd` — nie in argv, Umgebung, Protokoll oder Ausgabe. Das Protokoll der Tür
   schwärzt zusätzlich jede `password=`-Zuweisung.
-* **Die einmalige Verwaltungs-Anmeldung** ist das Nextcloud-DB-Konto aus `config.php`: auf
+* **Die Verwaltungs-Anmeldung** ist das Nextcloud-DB-Konto aus `config.php`: auf
   diesem Host sind root (Socket und `debian.cnf`) und `mysql@localhost` passwortgeschützt
   (Inventar-Jobs 697b46d0, be3a0f57), ein anderes Konto mit `CREATE USER` gibt es nicht. Gelesen
   wird die Datei als `www-data` (`runuser`), weil sie www-data-beschreibbar war — root führt ihren
   Code nie aus. Das ist Lesen eines Geheimnisses (X1): der Lauf nennt es im Intent, und der Befund
   geht an Jochen. Danach braucht das Backup das Nextcloud-Passwort nie wieder; eine spätere
-  Rotation des Backup-Passworts ist ein weiteres `ensure` (wieder mit dieser Anmeldung).
-* Fail closed: Backup läuft gerade (rc=3), Nextcloud-Konto fehlt/ist nicht lokal (rc=67), Konto
+  Rotation des Backup-Passworts ist ein weiteres `ensure`, ein `restore` nach einer Rotation setzt
+  den Hash zurück — beide wieder mit dieser Anmeldung und damit wieder X1 im Intent.
+* **Die Datenbank bekommt nur den Hash:** `ensure` rechnet den `mysql_native_password`-Hash im
+  Helfer und setzt ihn per `IDENTIFIED BY PASSWORD '<hash>'`; der Klartext steht nur in der Datei.
+  Scheitert eine Rotation nach dem `ALTER USER`, bekommt das Konto den alten Hash zurück — die
+  alte Datei bleibt gültig (fail closed).
+* **Repo-Sperre:** `ensure` und `restore` halten `/run/lock/cockpit-borg.lock` bis zum Ende; der
+  Drop-in `cockpit-borg-lock.conf` lässt den Nachtlauf darauf warten, er fällt also nie zwischen
+  `ALTER USER` und den Tausch der Datei. Belegt (Prüfung läuft) → rc=3, nichts verändert.
+* **Prüf-Haken nur in einer Kopie:** Unter `/usr/local/sbin/cockpit-borg-action` gelten immer die
+  festen Pfade (Datei, `config.php`, `/proc/self/cgroup`) und das feste Konto; die
+  `COCKPIT_BORG_ACTION_DB_*`-Variablen wirken nur in einer Testkopie des Helfers. `xtrace` ist
+  im Helfer abgeschaltet.
+* **TRIGGER ist kein reines Leserecht (bewusste Abweichung):** MariaDB kennt kein lesendes
+  Trigger-Recht; `SHOW TRIGGERS` — und damit ein vollständiger Dump mit Triggern — braucht
+  `TRIGGER`, das auch `CREATE/DROP TRIGGER` erlaubt. Jochens Auftrag (28.10.2026) nennt TRIGGER
+  ausdrücklich in der Rechte-Liste. Das Restrisiko: wer die 0600-root-Datei liest, könnte Trigger
+  anlegen; root erreicht über `config.php` ohnehin ein vollberechtigtes Konto. Die Alternative
+  (`--skip-triggers` im Hook, Dump ohne Trigger) wäre eine eigene Entscheidung.
+* Fail closed: Backup läuft gerade oder Sperre belegt (rc=3), Nextcloud-Konto fehlt/ist nicht lokal (rc=67), Konto
   anlegen scheitert oder das neue Konto liest nicht alle Datenbanken (rc=1) — die Datei bleibt dann
   unverändert, ein in diesem Aufruf neu angelegtes Konto wird wieder entfernt.
 * Ohne Rückweg darf genau dieser Lauf trotzdem starten (Ausnahme `backup-repair`,
