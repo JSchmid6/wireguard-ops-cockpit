@@ -792,7 +792,7 @@ db_login() { # Optionsdatei → "ok <konto>" oder der Fehlercode der Datenbank (
 db_error() { # die ERROR-Zeile (sonst die erste, die nicht nur Rahmen ist), ab " near " gekappt (dort zitiert MariaDB SQL)
   # mysql -N -B setzt vor manche Fehler eine Rahmenzeile "-----" (Job a0545b06, 28.10.2026).
   local line
-  line="$(printf '%s\n' "$1" | grep -m 1 -E '^(ERROR|mysqldump: )' || true)"
+  line="$(printf '%s\n' "$1" | grep -m 1 -E '^ERROR|^mysqldump: (Got error|Couldn|Error)' || true)"
   [ -n "$line" ] || line="$(printf '%s\n' "$1" | grep -m 1 -vE '^[[:space:]+|-]*$' || true)"
   printf '%s\n' "$line" | sed 's/ near .*//'
 }
@@ -849,7 +849,7 @@ db_set_hash() { # db_set_hash <hash>: das Konto bekommt genau diesen Hash
   printf "ALTER USER '%s'@'localhost' IDENTIFIED BY PASSWORD '%s';\n" "$DB_USER" "$1" | amysql 2>&1
 }
 
-# Die Repo-Sperre für die Dauer von ensure/restore (Re-Review 28.10.2026): der
+# Die Repo-Sperre für die Dauer von ensure/adopt/restore (Re-Review 28.10.2026): der
 # Drop-in borgmatic-cockpit-borg-lock.conf lässt den Nachtlauf auf sie warten, so
 # fällt er nie zwischen ALTER USER und den Tausch der Datei. Der Deskriptor bleibt
 # bis zum Ende dieses Prozesses offen.
@@ -914,7 +914,7 @@ db_ensure() {
   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
   [ -e "$DB_CNF.vor-$stamp" ] && stamp="$stamp-$$"
   if ! { cp -a "$DB_CNF" "$DB_CNF.vor-$stamp" && chmod 600 "$DB_CNF.vor-$stamp"; }; then
-    rm -f "$tmp"; undo; unset nc_pass; die "Sicherung der alten Datei gescheitert — $DB_CNF unverändert." 1
+    rm -f "$tmp" "$DB_CNF.vor-$stamp"; undo; unset nc_pass; die "Sicherung der alten Datei gescheitert — $DB_CNF unverändert." 1
   fi
   if ! mv -f "$tmp" "$DB_CNF"; then rm -f "$tmp"; undo; unset nc_pass; die "Tausch gescheitert — $DB_CNF unverändert." 1; fi
   unset nc_pass
@@ -961,7 +961,7 @@ db_adopt() {
   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
   [ -e "$DB_CNF.vor-$stamp" ] && stamp="$stamp-$$"
   if ! { cp -a "$DB_CNF" "$DB_CNF.vor-$stamp" && chmod 600 "$DB_CNF.vor-$stamp"; }; then
-    rm -f "$tmp"; die "Sicherung der alten Datei gescheitert — $DB_CNF unverändert." 1
+    rm -f "$tmp" "$DB_CNF.vor-$stamp"; die "Sicherung der alten Datei gescheitert — $DB_CNF unverändert." 1
   fi
   mv -f "$tmp" "$DB_CNF" || { rm -f "$tmp"; die "Tausch gescheitert — $DB_CNF unverändert." 1; }
 

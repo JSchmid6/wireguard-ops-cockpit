@@ -258,14 +258,14 @@ Grenzen:
   (Inventar-Jobs 697b46d0, be3a0f57), ein anderes Konto mit `CREATE USER` gibt es nicht. Gelesen
   wird die Datei als `www-data` (`runuser`), weil sie www-data-beschreibbar war — root führt ihren
   Code nie aus. Das ist Lesen eines Geheimnisses (X1): der Lauf nennt es im Intent, und der Befund
-  geht an Jochen. Danach braucht das Backup das Nextcloud-Passwort nie wieder; eine spätere
+  geht an Jochen. Nach einem `ensure` braucht das Backup das Nextcloud-Passwort nie wieder (nach `adopt` schon — siehe Befund unten); eine spätere
   Rotation des Backup-Passworts ist ein weiteres `ensure`, ein `restore` nach einer Rotation setzt
   den Hash zurück — beide wieder mit dieser Anmeldung und damit wieder X1 im Intent.
 * **Die Datenbank bekommt nur den Hash:** `ensure` rechnet den `mysql_native_password`-Hash im
   Helfer und setzt ihn per `IDENTIFIED BY PASSWORD '<hash>'`; der Klartext steht nur in der Datei.
   Scheitert eine Rotation nach dem `ALTER USER`, bekommt das Konto den alten Hash zurück — die
   alte Datei bleibt gültig (fail closed).
-* **Repo-Sperre:** `ensure` und `restore` halten `/run/lock/cockpit-borg.lock` bis zum Ende; der
+* **Repo-Sperre:** `ensure`, `adopt` und `restore` halten `/run/lock/cockpit-borg.lock` bis zum Ende; der
   Drop-in `cockpit-borg-lock.conf` lässt den Nachtlauf darauf warten, er fällt also nie zwischen
   `ALTER USER` und den Tausch der Datei. Belegt (Prüfung läuft) → rc=3, nichts verändert.
 * **Prüf-Haken nur in einer Kopie:** Unter `/usr/local/sbin/cockpit-borg-action` gelten immer die

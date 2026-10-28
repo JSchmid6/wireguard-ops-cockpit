@@ -1191,6 +1191,7 @@ if grep -c '^+' <<<"$ERR" | grep -qx '[0-3]'; then ok "xtrace endet in der erste
 reset_db
 db cgroup-run restore
 assert_rc "restore ohne Sicherung" 1
+cnf_unchanged "restore ohne Sicherung: Datei unverändert"
 
 echo "== db-access adopt: Zwischenweg B — Nextcloud-Konto in die Datei, Datenbank unberührt =="
 reset_db
@@ -1215,6 +1216,7 @@ echo "== db-access adopt: Anmeldung geht nicht → Datei unverändert =="
 reset_db; printf 'nextDB\nFALSCH-%s\nlocalhost\n' "$NCPASS" > "$DB/nc-creds"
 db cgroup-run adopt
 assert_rc "adopt mit ungültiger Anmeldung scheitert" 1
+no_secret_out "adopt-Fehlschlag ohne Passwort in der Ausgabe"
 assert_err "Grund aus der Datenbank" "Access denied"
 cnf_unchanged "adopt gescheitert: Datei unverändert, keine Sicherung"
 if ls "$DB"/mysqldump.cnf.neu.* >/dev/null 2>&1; then bad "adopt: Arbeitsdatei bleibt liegen"; else ok "adopt: Arbeitsdatei weggeräumt"; fi
@@ -1235,7 +1237,6 @@ db cgroup-run ensure
 assert_rc "ensure ohne CREATE USER scheitert (mit Rahmenzeile)" 1
 assert_err "die ERROR-Zeile wird genannt, nicht der Rahmen" "ERROR 1227"
 rm -f "$DB/frame-line"
-cnf_unchanged "restore ohne Sicherung: Datei unverändert"
 
 echo
 printf 'bestanden: %s, fehlgeschlagen: %s\n' "$PASS" "$FAIL"
