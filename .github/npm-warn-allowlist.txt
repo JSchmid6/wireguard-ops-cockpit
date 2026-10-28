@@ -9,4 +9,4 @@
 #
 #   <substring of the warning line> # <reason: why it is acceptable, when it goes away>
 
-prebuild-install@7.1.3 # better-sqlite3 (< 13) installs prebuild-install on Node 20; only better-sqlite3 >= 13 dropped it, and that version needs Node >= 22, while the services (deploy/systemd) are pinned to Node 20.19.1 via .node-version. Install-time helper only, not part of any shipped code path. Remove this entry once the pinned Node runtime is >= 22 and better-sqlite3 >= 13 is in use.
+prebuild-install@7.1.3 # better-sqlite3 (< 13) still resolves prebuild-install; only better-sqlite3 >= 13 dropped it as a dependency. The GitHub deprecation warning is printed for the package itself, independent of the Node major the install runs on (the services are pinned to Node 22.23.4 via .node-version). Install-time helper only, not part of any shipped code path. Remove this entry once better-sqlite3 >= 13 is in use.

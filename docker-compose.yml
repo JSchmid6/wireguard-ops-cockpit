@@ -1,6 +1,6 @@
 services:
   api:
-    image: node:20-bookworm
+    image: node:22-bookworm
     working_dir: /workspace
     volumes:
       - .:/workspace
@@ -13,7 +13,7 @@ services:
       - "3001:3001"
 
   web:
-    image: node:20-bookworm
+    image: node:22-bookworm
     network_mode: host
     working_dir: /workspace
     volumes:

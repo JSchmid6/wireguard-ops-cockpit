@@ -9,14 +9,14 @@ User=cockpit-agent
 Group=cockpit-agent-client
 WorkingDirectory=/opt/wireguard-ops-cockpit
 Environment=NODE_ENV=production
-Environment=PATH=/opt/node-v20.19.1-linux-x64/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=/opt/node-v22.23.4-linux-x64/bin:/usr/local/bin:/usr/bin:/bin
 Environment=COCKPIT_AGENT_BROKER_SOCKET=/run/cockpit-agent/agent.sock
 Environment=COCKPIT_AGENT_WORKSPACE_ROOT=/var/lib/wireguard-ops-agent/sessions
 Environment=COCKPIT_OPENCODE_CONFIG=/var/lib/wireguard-ops-agent/.config/opencode/opencode.jsonc
 EnvironmentFile=/etc/wireguard-ops-cockpit/agent.env
 RuntimeDirectory=cockpit-agent
 RuntimeDirectoryMode=0770
-ExecStart=/opt/node-v20.19.1-linux-x64/bin/node /opt/wireguard-ops-cockpit/apps/agent-broker/src/index.mjs
+ExecStart=/opt/node-v22.23.4-linux-x64/bin/node /opt/wireguard-ops-cockpit/apps/agent-broker/src/index.mjs
 Restart=always
 RestartSec=5
 UMask=0007

@@ -10,7 +10,7 @@ const diskHelper = "/usr/local/sbin/cockpit-disk-action";
 const selfUpdateHelper = "/usr/local/sbin/cockpit-self-update-action";
 const diensteUpdateHelper = "/usr/local/sbin/cockpit-dienste-update-action";
 const capabilityHelper = "/usr/local/lib/wireguard-ops-cockpit/cockpit-capability-action.mjs";
-const capabilityNode = "/opt/node-v20.19.1-linux-x64/bin/node";
+const capabilityNode = "/opt/node-v22.23.4-linux-x64/bin/node";
 // The general host door (doc/setup/host-run.md): host.run hands the signed
 // manifest to the root helper, which starts the run in its own unit and returns
 // at once; host.status reads that run's state. The helper verifies the envelope

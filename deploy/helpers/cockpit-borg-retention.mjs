@@ -1,4 +1,4 @@
-#!/opt/node-v20.19.1-linux-x64/bin/node
+#!/opt/node-v22.23.4-linux-x64/bin/node
 // cockpit-borg-retention — der Aufräum-Dienst für das borg-Repo auf Lab0
 // (doc/setup/borg-retention.md).
 //

@@ -4,4 +4,4 @@
 # /usr/local/lib/wireguard-ops-cockpit/cockpit-borg-retention.mjs; hier wird nur
 # der gepinnte Node-Lauf gestartet, damit der Backup-Riegel (cockpit-backup-guard.mjs)
 # und sudoers einen festen Namen unter /usr/local/sbin sehen.
-exec /opt/node-v20.19.1-linux-x64/bin/node /usr/local/lib/wireguard-ops-cockpit/cockpit-borg-retention.mjs "$@"
+exec /opt/node-v22.23.4-linux-x64/bin/node /usr/local/lib/wireguard-ops-cockpit/cockpit-borg-retention.mjs "$@"

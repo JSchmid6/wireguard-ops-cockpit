@@ -26,7 +26,7 @@ The VPS flow uses these repository files:
 - Docker Engine with Compose support
 - `tmux`
 - `ttyd`
-- local Node.js 20 runtime under `/opt/node-v20.19.1-linux-x64/`
+- local Node.js 22 runtime under `/opt/node-v22.23.4-linux-x64/`
 - a checked out copy of this repository
 - a WireGuard address that should be the only bind target for the web port
 - an explicit admin password before the first start
@@ -77,7 +77,7 @@ For a later rollout on the same VPS:
 
 ```bash
 git pull --ff-only
-export PATH=/opt/node-v20.19.1-linux-x64/bin:$PATH
+export PATH=/opt/node-v22.23.4-linux-x64/bin:$PATH
 npm ci --no-audit --no-fund
 npm run build
 systemctl restart wireguard-ops-cockpit-api wireguard-ops-cockpit-ttyd
