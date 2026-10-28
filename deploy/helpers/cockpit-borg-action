@@ -6,7 +6,7 @@
 #   cockpit-borg-action status     lesend: Zustand des Backups, beider Seiten
 #   cockpit-borg-action check      startet einen Repo-Check (lesend, mit --force)
 #   cockpit-borg-action repair     startet check --repair --force
-#   cockpit-borg-action db-access status|check|ensure|restore
+#   cockpit-borg-action db-access status|check|ensure|adopt|restore
 #                                  DB-Zugang des Backups (mysqldump-Hook): nur aus
 #                                  einem Lauf der allgemeinen Tür (cockpit-host-run,
 #                                  geprüft an der cgroup), nie über sudo/Executor —
@@ -152,14 +152,16 @@ cockpit-borg-action — Borg-Betrieb auf diesem Host.
            Freigabe des Operators in der Plan-Policy der Cockpit-API. Gleiche
            Frist- und Sperrprüfung wie check.
 
-  db-access status|check|ensure|restore
+  db-access status|check|ensure|adopt|restore
            DB-Zugang des Backups (die Optionsdatei des mysqldump-Hooks). Nur
            aus einem Lauf der allgemeinen Tür (cockpit-host-run), nie über den
            Executor. status: Konto und Anmeldung (ohne Werte); check: rc=0, wenn
            das Konto anmelden und alle Datenbanken lesen kann; ensure: eigenes,
            nur lesendes Konto anlegen bzw. neu verschlüsseln und die Datei
-           tauschen (alte Datei bleibt als .vor-<Zeit>); restore: die jüngste
-           .vor-Datei zurück.
+           tauschen (alte Datei bleibt als .vor-<Zeit>); adopt (Zwischenweg,
+           wenn das Nextcloud-Konto keine Konten anlegen darf): die Datei
+           bekommt das aktuelle Nextcloud-DB-Konto, ebenso mit Sicherung;
+           restore: die jüngste .vor-Datei zurück.
 
 Alles andere wird abgelehnt. Der Repo-Schlüssel bleibt auf diesem Host.
 EOF
@@ -787,8 +789,12 @@ db_login() { # Optionsdatei → "ok <konto>" oder der Fehlercode der Datenbank (
   fi
 }
 
-db_error() { # erste Zeile, ab " near " gekappt (dort zitiert MariaDB SQL)
-  printf '%s\n' "$1" | head -n 1 | sed 's/ near .*//'
+db_error() { # die ERROR-Zeile (sonst die erste, die nicht nur Rahmen ist), ab " near " gekappt (dort zitiert MariaDB SQL)
+  # mysql -N -B setzt vor manche Fehler eine Rahmenzeile "-----" (Job a0545b06, 28.10.2026).
+  local line
+  line="$(printf '%s\n' "$1" | grep -m 1 -E '^(ERROR|mysqldump: )' || true)"
+  [ -n "$line" ] || line="$(printf '%s\n' "$1" | grep -m 1 -vE '^[[:space:]+|-]*$' || true)"
+  printf '%s\n' "$line" | sed 's/ near .*//'
 }
 
 db_dump_ok() { # alle Datenbanken lesbar (nur Schema, schnell), wie der Hook sie liest
@@ -921,6 +927,53 @@ db_ensure() {
   printf 'datenbanken lesbar: %s\n' "$(mysql --defaults-extra-file="$DB_CNF" -N -B -e 'SHOW DATABASES' 2>/dev/null | wc -l)"
 }
 
+# Zwischenweg B (Jochen 28.10.2026, Karte t_30c9ea52): das Nextcloud-Konto hat auf
+# diesem Host nur Rechte auf seine eigene Datenbank (kein CREATE USER, Diagnose
+# 1c231c24) — ensure kann dann kein eigenes Konto anlegen. adopt schreibt das
+# aktuelle Nextcloud-Konto aus config.php (gelesen als www-data, wie ensure) in die
+# Datei; an der Datenbank ändert sich nichts. Das Backup bleibt damit an das
+# Nextcloud-Passwort gekoppelt und dumpt nur, was dieses Konto sieht — bis ensure
+# über einen anderen Verwaltungsweg möglich ist. Der Wert geht nur per printf in
+# die Datei, nie in argv, Umgebung oder Ausgabe.
+db_adopt() {
+  borgmatic_here || die "borgmatic (und $BORG_ACTION_CONFIG) fehlen auf diesem Host — der DB-Zugang des Backups gehört zum VPS." 67
+  [ -f "$DB_CNF" ] || die "$DB_CNF fehlt — adopt ersetzt nur die Datei, die der Hook schon liest; nichts verändert." 67
+  local tool state
+  for tool in mysql mysqldump php runuser mktemp; do have "$tool" || die "$tool fehlt — nichts verändert." 67; done
+  db_lock
+  if state="$(borgmatic_busy)"; then die "das Backup läuft gerade ($state) — nach dem Lauf erneut; nichts verändert." 3; fi
+  db_admin
+
+  local tmp err stamp
+  tmp="$(mktemp "$DB_CNF.neu.XXXXXX")" || { unset nc_pass; die "keine Arbeitsdatei neben $DB_CNF — $DB_CNF unverändert." 1; }
+  chown root:root "$tmp" && chmod 600 "$tmp" || { rm -f "$tmp"; unset nc_pass; die "Arbeitsdatei nicht auf root 0600 — $DB_CNF unverändert." 1; }
+  { admin_opts; grep -vE '^[[:space:]]*(user|password)[[:space:]]*=' "$DB_CNF" || true; } > "$tmp"
+  unset nc_pass
+  err="$(mktemp)"
+  if ! db_login "$tmp" >/dev/null || ! db_dump_ok "$tmp" "$err"; then
+    printf '%s\n' "das Nextcloud-Konto meldet sich nicht an oder liest nicht, was der Hook dumpt:" >&2
+    { db_login "$tmp" || true; db_error "$(cat "$err")"; } >&2
+    rm -f "$tmp" "$err"
+    die "$DB_CNF unverändert." 1
+  fi
+  rm -f "$err"
+
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  [ -e "$DB_CNF.vor-$stamp" ] && stamp="$stamp-$$"
+  if ! { cp -a "$DB_CNF" "$DB_CNF.vor-$stamp" && chmod 600 "$DB_CNF.vor-$stamp"; }; then
+    rm -f "$tmp"; die "Sicherung der alten Datei gescheitert — $DB_CNF unverändert." 1
+  fi
+  mv -f "$tmp" "$DB_CNF" || { rm -f "$tmp"; die "Tausch gescheitert — $DB_CNF unverändert." 1; }
+
+  section "Backup-DB-Zugang übernommen (Zwischenweg)"
+  printf 'konto: %s (das Nextcloud-Konto; an der Datenbank nichts geändert)\n' "$(db_cnf_user "$DB_CNF")"
+  printf 'passwort: aus %s, im Klartext nur in %s (%s), nie ausgegeben\n' "$NC_CONFIG" "$DB_CNF" "$(stat -c '%U:%G %a' "$DB_CNF")"
+  printf 'alte datei: %s (Rückweg: db-access restore)\n' "$DB_CNF.vor-$stamp"
+  printf 'anmeldung: %s\n' "$(db_login "$DB_CNF" || true)"
+  printf 'datenbanken lesbar: %s\n' "$(mysql --defaults-extra-file="$DB_CNF" -N -B -e 'SHOW DATABASES' 2>/dev/null | wc -l)"
+  printf '%s\n' "hinweis: gekoppelt an das Nextcloud-Passwort; eine weitere Rotation braucht wieder adopt (oder ensure)"
+}
+
 db_restore() {
   local last out
   last="$(db_backups | head -n 1)"
@@ -968,6 +1021,7 @@ case "$1" in
       status) db_status ;;
       check) db_check ;;
       ensure) db_ensure ;;
+      adopt) db_adopt ;;
       restore) db_restore ;;
       *) usage >&2; die "unbekanntes db-access-Verb: $2" 64 ;;
     esac

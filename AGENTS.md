@@ -105,7 +105,7 @@ Bare-metal Ubuntu VPS (161.97.86.86) running:
 - Typed path (`borg.manage`): `cockpit-borg-action status|check|repair`, see
   `doc/setup/borg-maintenance.md`. The backup's database access (mysqldump hook,
   `/etc/borgmatic/mysqldump.cnf`) is the dedicated read-only account `cockpit_backup@localhost`,
-  decoupled from Nextcloud/WordPress passwords; `cockpit-borg-action db-access status|check|ensure|restore`
+  decoupled from Nextcloud/WordPress passwords; `cockpit-borg-action db-access status|check|ensure|adopt|restore`
   runs only inside a host-run unit (cgroup check), never through the executor. `repair` always needs the operator's approval:
   the plan policy stops any plan that names it — a capability manifest or another
   code fence changes nothing — and the executor refuses a repair without the

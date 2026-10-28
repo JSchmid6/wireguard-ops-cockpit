@@ -527,6 +527,7 @@ describe("cockpit-host-run: net exceptions without a return path", () => {
     ["a reboot", () => emergency({ steps: [{ name: "off", run: "a2dissite 010-wordpress-wejos", timeoutSeconds: 60 }, { name: "reboot", reboot: true }] })],
     ["repair without ensure", () => repair({ steps: [{ name: "db access", run: `${BA} db-access status`, timeoutSeconds: 300 }] })],
     ["repair with a relative helper path", () => repair({ steps: [{ name: "db access", run: "cockpit-borg-action db-access ensure", timeoutSeconds: 300 }] })],
+    ["adopt as a check, ensure missing", () => repair({ steps: [{ name: "b", run: "systemctl start borgmatic.service", timeoutSeconds: 7200 }], checks: [{ name: "c", run: `${BA} db-access adopt`, timeoutSeconds: 300 }] })],
     ["repair mixed with an emergency line", () => repair({ steps: [{ name: "db access", run: `${BA} db-access ensure\na2dissite x`, timeoutSeconds: 300 }] })],
   ];
   for (const [what, build] of refused) {
@@ -544,6 +545,7 @@ describe("cockpit-host-run: net exceptions without a return path", () => {
   // What the backup bolt holds stays with the bolt: no exception gets that far.
   const bolted: Array<[string, () => Manifest]> = [
     ["stopping the backup timer", () => emergency({ steps: [{ name: "s", run: "systemctl stop borgmatic.timer", timeoutSeconds: 60 }], rollback: ["systemctl start borgmatic.timer"] })],
+    ["repair with adopt plus an extra argument", () => repair({ steps: [{ name: "db access", run: `${BA} db-access adopt nextDB`, timeoutSeconds: 300 }] })],
     ["repair with another helper verb", () => repair({ steps: [{ name: "db access", run: `${BA} db-access ensure`, timeoutSeconds: 300 }, { name: "r", run: `${BA} repair`, timeoutSeconds: 300 }] })],
   ];
   for (const [what, build] of bolted) {
@@ -563,6 +565,15 @@ describe("cockpit-host-run: net exceptions without a return path", () => {
     expect(state.snapshot).toMatchObject({ kind: "machine", snapshotId: "snap-42" });
     expect(logTail).toContain("net exception backup-repair");
     // In the harness the real helper is absent: the typed step itself ran (and failed with 127).
+    expect(state.steps[0].exitCode).toBe(127);
+  });
+
+  it("backup repair via the interim verb adopt (Zwischenweg B) is the same exception", () => {
+    run(["start"], request(repair({ steps: [{ name: "db access", run: `${BA} db-access adopt`, timeoutSeconds: 300 }, { name: "backup", run: "systemctl start borgmatic.service", timeoutSeconds: 7200 }] })), noReturnPath);
+    const { state, logTail } = status();
+    expect(state.netException).toBe("backup-repair");
+    expect(state.snapshot).toMatchObject({ kind: "machine", snapshotId: "snap-42" });
+    expect(logTail).toContain("net exception backup-repair");
     expect(state.steps[0].exitCode).toBe(127);
   });
 

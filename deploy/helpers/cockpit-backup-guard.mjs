@@ -1072,7 +1072,7 @@ function segmentBolt(text, command, name, readOnly, cwds, context, line, piped) 
   // db-access (Karte t_30c9ea52) richtet nur den DB-Zugang des Backups ein bzw.
   // spielt dessen alte Optionsdatei zurück: es löscht kein Archiv, ändert keine
   // Aufbewahrung und schaltet nichts ab — frei wie status und check.
-  const dbAccess = args.length === 2 && args[0] === "db-access" && ["status", "check", "ensure", "restore"].includes(args[1]);
+  const dbAccess = args.length === 2 && args[0] === "db-access" && ["status", "check", "ensure", "adopt", "restore"].includes(args[1]);
   if (name === "cockpit-borg-action" && !dbAccess && !(args.length === 1 && (args[0] === "status" || args[0] === "check"))) return "the backup helper outside status, check and db-access (repair can delete archives)";
 
   // Die Units der Sicherung und des Aufräum-Dienstes anhalten, abschalten, maskieren.
