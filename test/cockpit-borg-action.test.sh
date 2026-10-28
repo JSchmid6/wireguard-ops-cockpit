@@ -1022,7 +1022,7 @@ if [ -z "\$q" ]; then
 fi
 case "\$q" in
   "SELECT CURRENT_USER()") echo "\$u@localhost" ;;
-  "SELECT COUNT(*) FROM mysql.user"*) [ -f "$DB/created-hash" ] && echo 1 || echo 0 ;;
+  "SELECT COUNT(*) FROM mysql.user"*) if [ -e "$DB/frame-line" ]; then echo "--------------" >&2; echo "ERROR 1227 (42000): Access denied; you need the CREATE USER privilege" >&2; exit 1; fi; [ -f "$DB/created-hash" ] && echo 1 || echo 0 ;;
   "SHOW DATABASES") printf '%s\n' information_schema mysql nextDB wordpress ;;
   *) echo "ERROR 1064: unerwartete Abfrage \$q" >&2; exit 1 ;;
 esac
@@ -1033,13 +1033,13 @@ hash() { python3 -c 'import hashlib, sys; print("*" + hashlib.sha1(hashlib.sha1(
 f=""; for a in "\$@"; do case "\$a" in --defaults-extra-file=*) f="\${a#*=}";; esac; done
 c="\$(cat "\$f")"  # einmal lesen: /dev/fd aus <(…) ist eine Pipe
 u="\$(sed -n 's/^user=//p' <<<"\$c" | head -n 1)"; p="\$(sed -n 's/^password="\{0,1\}\([^"]*\)"\{0,1\}\$/\1/p' <<<"\$c" | head -n 1)"
-[ "\$u" = cockpit_backup ] && [ "\$(printf '%s' "\$p" | hash)" = "\$(cat "$DB/created-hash" 2>/dev/null)" ] || { echo "mysqldump: Got error: 1045: Access denied" >&2; exit 2; }
+{ [ "\$u" = cockpit_backup ] && [ "\$(printf '%s' "\$p" | hash)" = "\$(cat "$DB/created-hash" 2>/dev/null)" ]; } || { [ "\$u" = nextDB ] && [ "\$p" = "$NCPASS" ]; } || { echo "mysqldump: Got error: 1045: Access denied" >&2; exit 2; }
 [ -e "$DB/dump-denied" ] && { echo "mysqldump: Couldn't execute 'SHOW CREATE TRIGGER': 1142 TRIGGER command denied" >&2; exit 2; }
 echo "-- Dump completed"
 EOF
 chmod 755 "$STUBS/runuser" "$STUBS/php" "$STUBS/mysql" "$STUBS/mysqldump"
 reset_db() {
-  rm -f "$DB"/created-hash "$DB"/plaintext-sql "$DB"/sql.log "$DB"/mysql.log "$DB"/admin-denied "$DB"/dump-denied "$DB"/mysqldump.cnf*
+  rm -f "$DB"/frame-line "$DB"/created-hash "$DB"/plaintext-sql "$DB"/sql.log "$DB"/mysql.log "$DB"/admin-denied "$DB"/dump-denied "$DB"/mysqldump.cnf*
   printf '[client]\nuser=nextDB\npassword=%s\n[mysqldump]\nmax_allowed_packet=64M\n' "$ALTPW" > "$DB/mysqldump.cnf"
   chmod 600 "$DB/mysqldump.cnf"; cp -a "$DB/mysqldump.cnf" "$DB/cnf-original"
 }
@@ -1192,6 +1192,51 @@ reset_db
 db cgroup-run restore
 assert_rc "restore ohne Sicherung" 1
 cnf_unchanged "restore ohne Sicherung: Datei unverändert"
+
+echo "== db-access adopt: Zwischenweg B — Nextcloud-Konto in die Datei, Datenbank unberührt =="
+reset_db
+db cgroup-run adopt
+assert_rc "adopt" 0
+no_secret_out "adopt ohne Passwort in der Ausgabe"
+assert_out "adopt nennt das Konto" "konto: nextDB (das Nextcloud-Konto"
+assert_out "adopt: Anmeldung geht" "anmeldung: ok nextDB@localhost"
+if grep -q '^user=nextDB$' "$DB/mysqldump.cnf" && grep -qF "password=\"$NCPASS\"" "$DB/mysqldump.cnf" && ! grep -qF "$ALTPW" "$DB/mysqldump.cnf"; then ok "Datei trägt das aktuelle Nextcloud-Passwort, nicht das alte"; else bad "Datei trägt nicht das aktuelle Nextcloud-Passwort"; fi
+if grep -q '^max_allowed_packet=64M$' "$DB/mysqldump.cnf"; then ok "adopt: übrige Optionen bleiben"; else bad "adopt: übrige Optionen verloren"; fi
+[ "$(stat -c '%U:%G %a' "$DB/mysqldump.cnf")" = "root:root 600" ] && ok "adopt: Datei root:root 0600" || bad "adopt: Datei nicht root:root 0600"
+VOR="$(ls -1 "$DB"/mysqldump.cnf.vor-* 2>/dev/null | head -n 1)"
+if [ -n "$VOR" ] && cmp -s "$VOR" "$DB/cnf-original"; then ok "adopt: alte Datei als .vor-<Zeit> gesichert"; else bad "adopt: keine Sicherung der alten Datei"; fi
+assert_no_file "adopt ändert an der Datenbank nichts (kein SQL)" "$DB/sql.log"
+db cgroup-run check
+assert_rc "check nach adopt" 0
+db cgroup-run restore
+assert_rc "restore nach adopt" 0
+if cmp -s "$DB/mysqldump.cnf" "$DB/cnf-original"; then ok "restore nach adopt: alte Datei zurück"; else bad "restore nach adopt: nicht die alte Datei"; fi
+
+echo "== db-access adopt: Anmeldung geht nicht → Datei unverändert =="
+reset_db; printf 'nextDB\nFALSCH-%s\nlocalhost\n' "$NCPASS" > "$DB/nc-creds"
+db cgroup-run adopt
+assert_rc "adopt mit ungültiger Anmeldung scheitert" 1
+no_secret_out "adopt-Fehlschlag ohne Passwort in der Ausgabe"
+assert_err "Grund aus der Datenbank" "Access denied"
+cnf_unchanged "adopt gescheitert: Datei unverändert, keine Sicherung"
+if ls "$DB"/mysqldump.cnf.neu.* >/dev/null 2>&1; then bad "adopt: Arbeitsdatei bleibt liegen"; else ok "adopt: Arbeitsdatei weggeräumt"; fi
+printf 'nextDB\n%s\nlocalhost\n' "$NCPASS" > "$DB/nc-creds"
+
+echo "== db-access adopt: Backup läuft / Executor =="
+reset_db; : > "$WORK/borgmatic-busy"
+db cgroup-run adopt
+assert_rc "adopt während des Backups abgewiesen" 3
+rm -f "$WORK/borgmatic-busy"
+cnf_unchanged "adopt während des Backups: Datei unverändert"
+db cgroup-executor adopt
+assert_rc "adopt über den Executor abgewiesen" 64
+
+echo "== db-access: Fehlerzeile hinter einer Rahmenzeile (Job a0545b06) =="
+reset_db; : > "$DB/admin-denied"; : > "$DB/frame-line"
+db cgroup-run ensure
+assert_rc "ensure ohne CREATE USER scheitert (mit Rahmenzeile)" 1
+assert_err "die ERROR-Zeile wird genannt, nicht der Rahmen" "ERROR 1227"
+rm -f "$DB/frame-line"
 
 echo
 printf 'bestanden: %s, fehlgeschlagen: %s\n' "$PASS" "$FAIL"

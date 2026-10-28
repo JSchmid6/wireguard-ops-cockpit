@@ -794,7 +794,7 @@ function emergencyLine(line, where) {
 function repairLine(line, where) {
   const dbAccess = (verbs) => verbs.some((verb) => line === `${BORG_ACTION_BIN} db-access ${verb}`);
   if (where === "step") {
-    if (dbAccess(["ensure"])) return { ok: true, ensure: true };
+    if (dbAccess(["ensure", "adopt"])) return { ok: true, ensure: true };
     if (dbAccess(["status", "check"]) || line === "systemctl start borgmatic.service" || line === `${BORG_ACTION_BIN} status`) return { ok: true };
   } else if (where === "check") {
     if (dbAccess(["status", "check"]) || line === `${BORG_ACTION_BIN} status`) return { ok: true };
@@ -826,7 +826,7 @@ function netException(manifest) {
   }
   const repair = all.map(([where, line]) => repairLine(line, where));
   if (repair.every((hit) => hit.ok) && repair.some((hit) => hit.ensure)) {
-    return { kind: "backup-repair", why: "repair of the backup's database access (cockpit-borg-action db-access), then a backup run" };
+    return { kind: "backup-repair", why: "repair of the backup's database access (cockpit-borg-action db-access ensure|adopt), then a backup run" };
   }
   return null;
 }

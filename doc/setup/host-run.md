@@ -217,7 +217,7 @@ jedes `cd`-Ziel aufgelöst. Kommentare zählen nicht.
 **Frei** (weder Riegel noch Hinweis) bleiben die Routine und das Lesen: `systemctl start
 borgmatic.service`, ein nacktes `borgmatic` (konfigurierte Aufbewahrung),
 `borg list|info|check|create|diff`, `borgmatic list|info|check|create`,
-`cockpit-borg-action status|check|db-access status|check|ensure|restore` (der DB-Zugang des
+`cockpit-borg-action status|check|db-access status|check|ensure|adopt|restore` (der DB-Zugang des
 Backups löscht kein Archiv und ändert keine Aufbewahrung, Karte t_30c9ea52),
 `systemctl status|is-active|show|list-timers …`,
 `journalctl -u borgmatic`, lesende docker-Befehle (`ps`, `images`, `inspect`, `logs`, `stats`,
@@ -473,7 +473,7 @@ gelten unverändert; das Protokoll nennt `net exception <art>`, der Laufzustand 
 | Ausnahme | Schritte | Prüfungen | Rückweg |
 |---|---|---|---|
 | `emergency-shutdown` (Notfall-Abschalten) | `a2dissite [-q] <site>`, `systemctl stop <unit>`, `systemctl reload apache2`, `apache2ctl configtest\|-t\|-S` | `[! ] systemctl is-active --quiet <unit>`, `test [! ]-e /etc/apache2/sites-enabled/<site>.conf`, `apache2ctl …` | `a2ensite [-q] <site>`, `systemctl start <unit>`, `systemctl reload apache2` — zu **jedem** abgeschalteten Site/Dienst der passende |
-| `backup-repair` (Reparatur des Backups) | `/usr/local/sbin/cockpit-borg-action db-access ensure` (Pflicht), `… db-access status\|check`, `… status`, `systemctl start borgmatic.service` | `… db-access status\|check`, `… status`, `! systemctl is-failed --quiet borgmatic.service`, `systemctl is-active --quiet borgmatic.timer` | `… db-access restore` |
+| `backup-repair` (Reparatur des Backups) | `/usr/local/sbin/cockpit-borg-action db-access ensure` oder `… db-access adopt` (Pflicht, eins davon), `… db-access status\|check`, `… status`, `systemctl start borgmatic.service` | `… db-access status\|check`, `… status`, `! systemctl is-failed --quiet borgmatic.service`, `systemctl is-active --quiet borgmatic.timer` | `… db-access restore` |
 
 Gestoppt werden darf nur, was auf der **Positivliste** steht (Zweitprüfung B3, 28.10.2026):
 Dienste, die eine einzelne Anwendung tragen — `php<Version>-fpm` (WordPress, Nextcloud), `coolwsd`

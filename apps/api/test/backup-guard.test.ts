@@ -23,6 +23,7 @@ const free: Array<[string, string]> = [
   ["typed helper", "/usr/local/sbin/cockpit-borg-action status\n/usr/local/sbin/cockpit-borg-action check"],
   // DB-Zugang des Backups (t_30c9ea52): legt kein Archiv weg, ändert keine Aufbewahrung.
   ["backup db access", "/usr/local/sbin/cockpit-borg-action db-access status\n/usr/local/sbin/cockpit-borg-action db-access ensure\n/usr/local/sbin/cockpit-borg-action db-access check\n/usr/local/sbin/cockpit-borg-action db-access restore"],
+  ["backup db access, Zwischenweg adopt", "/usr/local/sbin/cockpit-borg-action db-access adopt"],
   ["Lab0 status file", "curl -fsS http://10.0.0.5:8088/status.txt"],
   ["GitLab stage", "gitlab-backup create STRATEGY=copy\ngitlab-ctl reconfigure\ngitlab-ctl status"],
   ["config edit with backup copy", "cp /etc/apache2/sites-available/x.conf /etc/apache2/sites-available/x.conf.bak.$(date +%s)\nsed -i 's/a/b/' /etc/apache2/sites-available/x.conf\nsystemctl reload apache2"],

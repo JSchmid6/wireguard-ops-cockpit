@@ -240,6 +240,7 @@ und WordPress-Passwörtern.
 | `cockpit-borg-action db-access status` | lesend: Besitz/Modus der Datei, Konto (`user=`-Zeile), ob die Anmeldung geht (Fehlerzeile der Datenbank), Zahl der Sicherungen. Kein Wert. |
 | `cockpit-borg-action db-access check` | rc=0, wenn das Konto der Datei sich anmeldet und `mysqldump --all-databases --no-data` durchläuft (wie der Hook, nur das Schema) |
 | `cockpit-borg-action db-access ensure` | legt `cockpit_backup@localhost` an (oder setzt ihm ein neues Passwort), entzieht alles und gibt genau `SELECT, SHOW VIEW, TRIGGER, LOCK TABLES, SHOW DATABASES` auf `*.*` (der Hook dumpt alle Datenbanken, ohne `--events`, darum kein EVENT), prüft das neue Konto mit einer Arbeitsdatei, sichert die alte Datei als `mysqldump.cnf.vor-<UTC-Zeit>` (0600) und tauscht dann (0600 root). Übrige Zeilen der alten Datei außer `user`/`password` bleiben. |
+| `cockpit-borg-action db-access adopt` | **Zwischenweg B** (Jochen 28.10.2026): schreibt das aktuelle Nextcloud-DB-Konto aus `config.php` (gelesen als `www-data`, wie bei `ensure`) in die Datei; an der Datenbank ändert sich nichts. Prüft die neue Anmeldung und den Schema-Dump mit einer Arbeitsdatei, sichert die alte Datei als `.vor-<UTC-Zeit>` und tauscht (0600 root). Für den Fall, dass `ensure` kein Konto anlegen kann (siehe unten). |
 | `cockpit-borg-action db-access restore` | spielt die jüngste `.vor-`Datei zurück. Gehört sie schon dem Backup-Konto (Stand vor einer Rotation), setzt `restore` das Konto zuerst auf ihren Hash — dafür braucht es wieder die Verwaltungs-Anmeldung (unten, X1). Gehört sie dem alten Nextcloud-Konto (Stand vor dem ersten `ensure`), bleibt `cockpit_backup` bestehen, ohne Wirkung. |
 
 Grenzen:
@@ -257,14 +258,14 @@ Grenzen:
   (Inventar-Jobs 697b46d0, be3a0f57), ein anderes Konto mit `CREATE USER` gibt es nicht. Gelesen
   wird die Datei als `www-data` (`runuser`), weil sie www-data-beschreibbar war — root führt ihren
   Code nie aus. Das ist Lesen eines Geheimnisses (X1): der Lauf nennt es im Intent, und der Befund
-  geht an Jochen. Danach braucht das Backup das Nextcloud-Passwort nie wieder; eine spätere
+  geht an Jochen. Nach einem `ensure` braucht das Backup das Nextcloud-Passwort nie wieder (nach `adopt` schon — siehe Befund unten); eine spätere
   Rotation des Backup-Passworts ist ein weiteres `ensure`, ein `restore` nach einer Rotation setzt
   den Hash zurück — beide wieder mit dieser Anmeldung und damit wieder X1 im Intent.
 * **Die Datenbank bekommt nur den Hash:** `ensure` rechnet den `mysql_native_password`-Hash im
   Helfer und setzt ihn per `IDENTIFIED BY PASSWORD '<hash>'`; der Klartext steht nur in der Datei.
   Scheitert eine Rotation nach dem `ALTER USER`, bekommt das Konto den alten Hash zurück — die
   alte Datei bleibt gültig (fail closed).
-* **Repo-Sperre:** `ensure` und `restore` halten `/run/lock/cockpit-borg.lock` bis zum Ende; der
+* **Repo-Sperre:** `ensure`, `adopt` und `restore` halten `/run/lock/cockpit-borg.lock` bis zum Ende; der
   Drop-in `cockpit-borg-lock.conf` lässt den Nachtlauf darauf warten, er fällt also nie zwischen
   `ALTER USER` und den Tausch der Datei. Belegt (Prüfung läuft) → rc=3, nichts verändert.
 * **Prüf-Haken nur in einer Kopie:** Unter `/usr/local/sbin/cockpit-borg-action` gelten immer die
@@ -278,10 +279,18 @@ Grenzen:
   anlegen; root erreicht über `config.php` ohnehin ein vollberechtigtes Konto. Die Alternative
   (`--skip-triggers` im Hook, Dump ohne Trigger) wäre eine eigene Entscheidung.
 * Fail closed: Backup läuft gerade oder Sperre belegt (rc=3), Nextcloud-Konto fehlt/ist nicht lokal (rc=67), Konto
-  anlegen scheitert oder das neue Konto liest nicht alle Datenbanken (rc=1) — die Datei bleibt dann
+  anlegen scheitert, die übernommene Anmeldung (`adopt`) geht nicht oder das neue Konto liest nicht alle Datenbanken (rc=1) — die Datei bleibt dann
   unverändert, ein in diesem Aufruf neu angelegtes Konto wird wieder entfernt.
+* **Befund 28.10.2026 (Diagnose-Job 1c231c24):** das Nextcloud-Konto `nextDB` hat nur
+  `ALL PRIVILEGES ON nextcloud.*` — kein `CREATE USER`, `mysql.user` nicht lesbar. `ensure` scheitert
+  darum hier (Job a0545b06, nichts verändert). **Entscheidung (Jochen, 28.10.2026):** bis ein anderer
+  einmaliger Verwaltungsweg da ist (Weg A: MariaDB-Start mit `--init-file`, eigene Karte), nimmt das
+  Backup per `adopt` wieder das aktuelle Nextcloud-Konto. Folgen, bewusst hingenommen: das Backup
+  bleibt an das Nextcloud-Passwort gekoppelt (jede Rotation braucht wieder `adopt`), und der Hook
+  dumpt mit diesem Konto nur die Datenbank `nextcloud` — **nicht** `wordpress` (das war schon vor dem
+  26.10. so). `adopt` ist Lesen desselben Geheimnisses wie bei `ensure` (X1 im Intent).
 * Ohne Rückweg darf genau dieser Lauf trotzdem starten (Ausnahme `backup-repair`,
-  `doc/setup/host-run.md`): `db-access ensure`, danach `systemctl start borgmatic.service`,
+  `doc/setup/host-run.md`): `db-access ensure` (oder `adopt`), danach `systemctl start borgmatic.service`,
   Prüfungen `db-access check` und `! systemctl is-failed --quiet borgmatic.service`, Rückweg
   `db-access restore`.
 
