@@ -1153,6 +1153,20 @@ assert_rc "ensure ein zweites Mal (neues Passwort)" 0
 no_secret_out "Rotation ohne Passwort in der Ausgabe"
 [ "$(sed -n 's/^password="\(.*\)"$/\1/p' "$DB/mysqldump.cnf")" != "$NEWPW" ] && ok "zweites ensure dreht das Passwort" || bad "zweites ensure behält das Passwort"
 
+echo "== db-access restore: Backup läuft gerade / Sperre belegt =="
+cp -a "$DB/mysqldump.cnf" "$WORK/cnf-vor-restore"
+: > "$WORK/borgmatic-busy"
+db cgroup-run restore
+assert_rc "restore während des Backups abgewiesen" 3
+rm -f "$WORK/borgmatic-busy"
+rm -f "$WORK/unlock"
+( exec 9>>"$COCKPIT_BORG_ACTION_LOCK"; flock 9; n=0; while [ ! -e "$WORK/unlock" ] && [ "$n" -lt 300 ]; do sleep 0.1; n=$((n+1)); done ) & LOCKER=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do flock -n "$COCKPIT_BORG_ACTION_LOCK" true 2>/dev/null || break; sleep 0.2; done
+db cgroup-run restore
+assert_rc "restore bei belegter Sperre abgewiesen" 3
+: > "$WORK/unlock"; wait "$LOCKER" 2>/dev/null; rm -f "$WORK/unlock"
+if cmp -s "$DB/mysqldump.cnf" "$WORK/cnf-vor-restore"; then ok "abgewiesenes restore: Datei unverändert"; else bad "abgewiesenes restore hat die Datei verändert"; fi
+
 echo "== db-access restore: Rückweg =="
 sleep 1
 db cgroup-run restore

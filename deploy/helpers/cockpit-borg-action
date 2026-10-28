@@ -926,6 +926,8 @@ db_restore() {
   last="$(db_backups | head -n 1)"
   [ -n "$last" ] || die "keine Sicherung $DB_CNF.vor-* — nichts verändert." 1
   db_lock
+  local state
+  if state="$(borgmatic_busy)"; then die "das Backup läuft gerade ($state) — nach dem Lauf erneut; nichts verändert." 3; fi
   # Gehört die Sicherung schon dem Backup-Konto (Stand vor einer Rotation), gilt sie
   # erst wieder, wenn das Konto ihren Hash bekommt.
   if [ "$(db_cnf_user "$last")" = "$DB_USER" ]; then
