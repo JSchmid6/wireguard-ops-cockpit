@@ -11,8 +11,11 @@
 #   * REPO_COMMIT is a full lowercase sha merged into origin/main of the
 #     allowlisted repository (the runner verified it and the reviewed diff hash;
 #     this script checks the merge again).
-#   * It checks the commit out on main, builds on the pinned Node runtime, builds
-#     the web image (always; the Docker cache makes an unchanged build cheap, and a
+#   * It checks the commit out on main, makes sure the pinned Node runtime that
+#     commit names in .node-version is installed (when the host lacks it, it
+#     installs it from nodejs.org, verified against nodejs.org's SHASUMS256.txt,
+#     and never removes another runtime), builds on that runtime, builds the web
+#     image (always; the Docker cache makes an unchanged build cheap, and a
 #     trigger list would silently miss build inputs), and installs EVERY file of
 #     the table below — the complete set of root helpers the executor and the
 #     capability sandbox dispatch to, the sudoers file (visudo-checked), the four
@@ -30,9 +33,10 @@
 #     and the script exits non-zero with the original error code.
 #
 # Harness hooks (VPS_DEPLOY_ROOT, _REPO, _ORIGIN, _SYSTEMCTL, _VISUDO, _DOCKER,
-# _BUILD) redirect host paths and tools for test/vps-cockpit-deploy.test.sh. The
-# self-update runner starts this script with a fixed, clean environment (PATH,
-# HOME, REPO_COMMIT, COCKPIT_RESTART_MODE), so they never apply on that path.
+# _BUILD, _NODE_DIST) redirect host paths and tools for
+# test/vps-cockpit-deploy.test.sh. The self-update runner starts this script with
+# a fixed, clean environment (PATH, HOME, REPO_COMMIT, COCKPIT_RESTART_MODE), so
+# they never apply on that path.
 set -Eeuo pipefail
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -50,6 +54,11 @@ readonly SUDOERS="$ROOT/etc/sudoers.d/cockpit-executor"
 readonly STATE_DIR="$ROOT/var/lib/wireguard-ops-cockpit/self-update"
 readonly CONFIG="$ROOT/etc/wireguard-ops-cockpit/self-update.env"
 readonly WEB_URL=http://10.0.0.1:8080
+# The pinned Node runtime: its version is the deployed commit's .node-version, the
+# same file bin/with-runtime and the systemd units read. The script installs it
+# below $NODE_BASE when the host lacks it (see install_runtime).
+readonly NODE_BASE="$ROOT/opt"
+readonly NODE_DIST="${VPS_DEPLOY_NODE_DIST:-https://nodejs.org/dist}"
 readonly SERVICES=(wireguard-ops-cockpit-api wireguard-ops-cockpit-agent wireguard-ops-cockpit-executor wireguard-ops-cockpit-ttyd wireguard-ops-cockpit-web)
 readonly COMPOSE=("$DOCKER" compose --env-file .env -f docker-compose.vps.yml)
 WEB_IMAGE=""      # the compose image name of the web service
@@ -130,6 +139,82 @@ build() {
   if [ -n "${VPS_DEPLOY_BUILD:-}" ]; then bash -c "$VPS_DEPLOY_BUILD"; return $?; fi
   bin/with-runtime npm ci --no-audit --no-fund
   bin/with-runtime npm run build
+}
+
+# The pinned Node runtime, installed before build() — not after it: bin/with-runtime
+# fails closed with 69 when /opt/node-v<version>-linux-x64 is missing, so a host
+# without the runtime could never roll itself out (22.23.4 first had to be placed
+# by hand, card t_7c8b0c56). Idempotent, bound to nodejs.org's own SHASUMS256.txt
+# (no hash is kept in this repository, the tarball is checked where it is packed),
+# and it never removes another runtime: the previous version stays installed, which
+# is what the rollback's build runs on.
+# Returns 70 when it cannot deliver the runtime; the ERR trap then rolls back.
+install_runtime() {
+  local version dir pkg work
+  # Only a clean x.y.z survives: the value becomes a directory name and a URL, and
+  # this runs as root — anything else (a range, a suffix, a path) is refused here.
+  version="$(sed -nE 's/^[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+)[[:space:]]*$/\1/p' .node-version 2>/dev/null || true)"
+  if [ -z "$version" ]; then
+    log "FAILED: $REPO/.node-version does not name one Node version (x.y.z)"
+    return 70
+  fi
+  dir="$NODE_BASE/node-v$version-linux-x64"
+  if [ -x "$dir/bin/node" ]; then
+    log "pinned Node v$version is already installed at $dir"
+    return 0
+  fi
+  pkg="$BACKUP/node-v$version-linux-x64.tar.xz"
+  log "installing pinned Node v$version from $NODE_DIST/v$version into $NODE_BASE"
+  if ! curl -fsSL --connect-timeout 20 --max-time 300 -o "$pkg" \
+      "$NODE_DIST/v$version/node-v$version-linux-x64.tar.xz"; then
+    log "FAILED: could not download node-v$version-linux-x64.tar.xz from $NODE_DIST"
+    return 70
+  fi
+  if ! curl -fsSL --connect-timeout 20 --max-time 120 -o "$BACKUP/SHASUMS256.txt" \
+      "$NODE_DIST/v$version/SHASUMS256.txt"; then
+    log "FAILED: could not download SHASUMS256.txt of v$version"
+    return 70
+  fi
+  # The published list names every artefact of the release; only our tarball counts.
+  awk -v f="node-v$version-linux-x64.tar.xz" '$2 == f' "$BACKUP/SHASUMS256.txt" > "$BACKUP/node.sums" || true
+  if [ ! -s "$BACKUP/node.sums" ]; then
+    log "FAILED: SHASUMS256.txt of v$version has no entry for node-v$version-linux-x64.tar.xz"
+    return 70
+  fi
+  if ! ( cd "$BACKUP" && sha256sum -c node.sums ); then
+    log "FAILED: the downloaded tarball does not match nodejs.org's SHASUMS256.txt"
+    return 70
+  fi
+  # Unpack beside the target and move it into place in one step: a half-unpacked
+  # directory must never look like an installed runtime to the next run.
+  work="$NODE_BASE/.node-v$version.incoming"
+  [ -d "$NODE_BASE" ] || install -d -m 0755 "$NODE_BASE"
+  rm -rf -- "$work"
+  install -d -m 0755 "$work"
+  if ! tar -xJf "$pkg" -C "$work"; then
+    log "FAILED: could not unpack node-v$version-linux-x64.tar.xz"
+    rm -rf -- "$work"
+    return 70
+  fi
+  # A directory without a runnable node is not a runtime. It is moved aside, never
+  # deleted: nothing below $NODE_BASE is removed by a deploy.
+  if [ -e "$dir" ] && ! mv -- "$dir" "$dir.incomplete.$(date -u +%Y%m%dT%H%M%SZ)"; then
+    log "FAILED: $dir exists without a runnable node and could not be moved aside"
+    rm -rf -- "$work"
+    return 70
+  fi
+  if ! chown -R root:root -- "$work/node-v$version-linux-x64" \
+     || ! mv -- "$work/node-v$version-linux-x64" "$dir"; then
+    log "FAILED: could not take ownership of or move the unpacked runtime to $dir"
+    rm -rf -- "$work"
+    return 70
+  fi
+  rmdir -- "$work" 2>/dev/null || true
+  if ! "$dir/bin/node" --version 2>/dev/null | grep -qx "v$version"; then
+    log "FAILED: $dir/bin/node does not report v$version"
+    return 70
+  fi
+  log "pinned Node v$version installed at $dir"
 }
 
 self_update_env() { # the runner's configuration on this host
@@ -230,6 +315,14 @@ rollback() {
     fi
   fi
   if git checkout -q -B main "$OLD"; then log "rollback: checkout back at $OLD"; else log "rollback: checkout of $OLD FAILED"; step_failed=1; fi
+  # The old build needs the old commit's pinned runtime; instant when it is there.
+  # Skipped when this run just failed on that very step (nothing to learn from a
+  # second identical download), and the old runtime is normally still installed.
+  if [ "$code" = 70 ]; then
+    log "rollback: pinned runtime step skipped (it is what failed)"
+  elif install_runtime; then log "rollback: pinned runtime ok"
+  else log "rollback: pinned runtime of $OLD could NOT be installed"; step_failed=1
+  fi
   if build >/dev/null 2>&1; then log "rollback: old build ok"; else log "rollback: old build FAILED"; step_failed=1; fi
   [ "$step_failed" = 0 ] && log "rollback complete; running services were not restarted" || log "rollback INCOMPLETE — see the lines above"
   exit "$code"
@@ -238,6 +331,7 @@ trap rollback ERR
 
 log "deploying $REPO_COMMIT over $OLD (restart mode: ${COCKPIT_RESTART_MODE:-now}, backup $BACKUP)"
 git checkout -q -B main "$REPO_COMMIT"
+install_runtime
 build
 save_targets
 INSTALLED=1

@@ -20,6 +20,7 @@ WANT=$(tr -d ' \n\r\t' < "$HERE/.node-version")
 DIR="/opt/node-v${WANT}-linux-x64/bin"
 if [ ! -x "$DIR/node" ]; then
   echo "with-runtime: the pinned Node $WANT is not installed at $DIR; the services in deploy/systemd run on it" >&2
+  echo "with-runtime: on the VPS the deploy (deploy/vps/vps-cockpit-deploy.sh) installs it from .node-version before it builds" >&2
   exit 69
 fi
 PATH="$DIR:$PATH"
