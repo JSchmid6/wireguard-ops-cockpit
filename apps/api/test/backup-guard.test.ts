@@ -21,6 +21,8 @@ const free: Array<[string, string]> = [
   ["an extra backup", "borgmatic -v 1 create --stats"],
   ["timer status", "systemctl status borgmatic.timer --no-pager\nsystemctl list-timers borgmatic.timer --output=json\njournalctl -u borgmatic --since today | tail -20"],
   ["typed helper", "/usr/local/sbin/cockpit-borg-action status\n/usr/local/sbin/cockpit-borg-action check"],
+  // DB-Zugang des Backups (t_30c9ea52): legt kein Archiv weg, ändert keine Aufbewahrung.
+  ["backup db access", "/usr/local/sbin/cockpit-borg-action db-access status\n/usr/local/sbin/cockpit-borg-action db-access ensure\n/usr/local/sbin/cockpit-borg-action db-access check\n/usr/local/sbin/cockpit-borg-action db-access restore"],
   ["Lab0 status file", "curl -fsS http://10.0.0.5:8088/status.txt"],
   ["GitLab stage", "gitlab-backup create STRATEGY=copy\ngitlab-ctl reconfigure\ngitlab-ctl status"],
   ["config edit with backup copy", "cp /etc/apache2/sites-available/x.conf /etc/apache2/sites-available/x.conf.bak.$(date +%s)\nsed -i 's/a/b/' /etc/apache2/sites-available/x.conf\nsystemctl reload apache2"],
@@ -70,6 +72,8 @@ const needsApproval: Array<[string, string]> = [
   ["compact", "borgmatic compact"],
   ["recreate with excludes", "borg recreate --exclude /var ::a"],
   ["repair", "/usr/local/sbin/cockpit-borg-action repair"],
+  ["db-access with an unknown verb", "/usr/local/sbin/cockpit-borg-action db-access drop"],
+  ["db-access with extra arguments", "/usr/local/sbin/cockpit-borg-action db-access ensure --user root"],
   ["retention edit", "sed -i 's/keep_daily: 7/keep_daily: 1/' /etc/borgmatic/config.yaml"],
   ["retention written by heredoc", "cat > /etc/borgmatic/config.yaml <<'EOF'\nkeep_daily: 1\nEOF"],
   ["config moved away", "mv /etc/borgmatic /tmp/"],

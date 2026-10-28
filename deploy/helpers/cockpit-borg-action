@@ -6,6 +6,11 @@
 #   cockpit-borg-action status     lesend: Zustand des Backups, beider Seiten
 #   cockpit-borg-action check      startet einen Repo-Check (lesend, mit --force)
 #   cockpit-borg-action repair     startet check --repair --force
+#   cockpit-borg-action db-access status|check|ensure|restore
+#                                  DB-Zugang des Backups (mysqldump-Hook): nur aus
+#                                  einem Lauf der allgemeinen Tür (cockpit-host-run,
+#                                  geprüft an der cgroup), nie über sudo/Executor —
+#                                  siehe "DB-Zugang des Backups" unten.
 #
 # Jedes Verb läuft in einer EIGENEN transienten systemd-Unit, nie im Executor
 # selbst: der Executor-Dienst ist sandboxed (RestrictAddressFamilies=AF_UNIX,
@@ -91,6 +96,10 @@
 # Umgebung zurück und der Broker gibt nur PATH mit, auf dem typisierten Weg
 # sieht der Helfer also immer die echten Pfade und Grenzen.
 # =============================================================================
+# Nie mitschreiben, was die Shell ausführt: db-access hält Passwörter in Variablen
+# (bash -x, SHELLOPTS=xtrace oder BASH_XTRACEFD aus dem Aufruf).
+set +x
+unset BASH_XTRACEFD 2>/dev/null || true
 set -uo pipefail
 umask 027
 
@@ -107,6 +116,20 @@ readonly BORG_ACTION_MIN_HEADROOM="${COCKPIT_BORG_ACTION_MIN_HEADROOM_SEC:-28800
 readonly BORG_ACTION_STATUS_TIMEOUT="${COCKPIT_BORG_ACTION_STATUS_TIMEOUT_SEC:-200}"    # s
 readonly BORG_ACTION_RUN_TIMEOUT="${COCKPIT_BORG_ACTION_RUN_TIMEOUT_SEC:-86400}"        # 24 h
 readonly BORG_ACTION_LOCK_WAIT="${COCKPIT_BORG_ACTION_LOCK_WAIT_SEC:-60}"              # s
+# DB-Zugang des Backups (db-access): die Optionsdatei, die der mysqldump-Hook der
+# borgmatic-Konfiguration liest (--defaults-extra-file), das eigene Konto dafür,
+# und woher die Verwaltungs-Anmeldung kommt. Fest — Prüf-Haken nur ausserhalb
+# einer Lauf-Unit der Tür (db_access_context).
+readonly DB_CNF_FIXED="/etc/borgmatic/mysqldump.cnf"
+readonly DB_USER_FIXED="cockpit_backup"
+readonly NC_CONFIG_FIXED="/var/www/nextcloud/config/config.php"
+# Lesen, was der Hook dumpt: SELECT (Daten), SHOW VIEW (Views), TRIGGER (SHOW
+# TRIGGERS — erlaubt auch CREATE/DROP TRIGGER, MariaDB kennt kein lesendes
+# Trigger-Recht), LOCK TABLES (Lesesperre für Nicht-InnoDB-Tabellen),
+# SHOW DATABASES (--all-databases). Kein EVENT (der Hook dumpt ohne --events).
+readonly BORG_ACTION_DB_GRANTS="SELECT, SHOW VIEW, TRIGGER, LOCK TABLES, SHOW DATABASES"
+readonly HOST_RUN_CGROUP_RE='/cockpit-host-run-[A-Za-z0-9][A-Za-z0-9_.-]*\.service$'
+DB_CNF=""; DB_USER=""; NC_CONFIG=""
 
 # Die Unit startet diesen Helfer erneut (`--payload <verb>`). Der Pfad muss dafür
 # absolut sein — systemd startet die Unit mit Arbeitsverzeichnis /.
@@ -128,6 +151,15 @@ cockpit-borg-action — Borg-Betrieb auf diesem Host.
            entfernen) — sinnvoll ERST nach einem Check mit Befund; verlangt die
            Freigabe des Operators in der Plan-Policy der Cockpit-API. Gleiche
            Frist- und Sperrprüfung wie check.
+
+  db-access status|check|ensure|restore
+           DB-Zugang des Backups (die Optionsdatei des mysqldump-Hooks). Nur
+           aus einem Lauf der allgemeinen Tür (cockpit-host-run), nie über den
+           Executor. status: Konto und Anmeldung (ohne Werte); check: rc=0, wenn
+           das Konto anmelden und alle Datenbanken lesen kann; ensure: eigenes,
+           nur lesendes Konto anlegen bzw. neu verschlüsseln und die Datei
+           tauschen (alte Datei bleibt als .vor-<Zeit>); restore: die jüngste
+           .vor-Datei zurück.
 
 Alles andere wird abgelehnt. Der Repo-Schlüssel bleibt auf diesem Host.
 EOF
@@ -698,6 +730,218 @@ start_maintenance() { # verb (check|repair)
 }
 
 # ---------------------------------------------------------------------------
+# DB-Zugang des Backups (db-access) — Karte t_30c9ea52, Jochen 28.10.2026
+# ---------------------------------------------------------------------------
+# Der mysqldump-Hook der borgmatic-Konfiguration liest seine Anmeldung aus
+# DB_CNF. Bis 26.10.2026 stand dort das Nextcloud-Konto; nach dessen
+# Passwort-Rotation scheiterte jedes Backup (1045). `ensure` entkoppelt das: ein
+# eigenes Konto nur fürs Backup, lesende Rechte auf alle Datenbanken (der Hook
+# dumpt --all-databases), eigenes Zufallspasswort, erzeugt hier und im Klartext
+# nur in dieser Datei (0600 root). Die Datenbank bekommt nur den Hash
+# (IDENTIFIED BY PASSWORD '*…', mysql_native_password) — so steht der Wert auch
+# in keinem Server-Log und in keiner Fehlermeldung. Kein Wert erscheint in argv,
+# Umgebung oder Ausgabe: Passwort und Anmeldung gehen nur über printf (bash
+# builtin) in eine Pipe bzw. /dev/fd.
+#
+# Ein Konto anlegen kann auf diesem Host nur ein Konto mit CREATE USER; root und
+# debian.cnf sind passwortgeschützt (Inventar 697b46d0/be3a0f57). Die Verwaltungs-
+# Anmeldung ist deshalb das Nextcloud-DB-Konto aus config.php, gelesen als
+# www-data (die Datei war www-data-beschreibbar; root führt ihren Code nie aus).
+# Das ist Lesen eines Geheimnisses: der Türsteher sieht es im Intent, und ein
+# Befund geht an Jochen. Das Backup selbst braucht das Nextcloud-Passwort danach
+# nie wieder.
+#
+# Nur aus einem Lauf der allgemeinen Tür: der Aufruf muss in der cgroup einer
+# Lauf-Unit cockpit-host-run-<job>.service stehen. Über sudo (Executor) kommt man
+# dort nicht hin. Der installierte Helfer nimmt dabei immer die festen Pfade oben
+# und die echte /proc/self/cgroup, nie die Prüf-Haken (COCKPIT_BORG_ACTION_DB_*,
+# _NC_CONFIG, _CGROUP_FILE): kein Plan kann sie auf config.yaml, einen Schlüssel
+# oder das Konto root umbiegen, auch nicht über eine eigene Unit (Befund
+# Zweitprüfung). Die Haken gelten nur für eine Kopie ausserhalb von
+# /usr/local/sbin — die Offline-Prüfung (test/cockpit-borg-action.test.sh).
+readonly BORG_ACTION_INSTALLED="/usr/local/sbin/cockpit-borg-action"
+db_access_context() {
+  DB_CNF="$DB_CNF_FIXED"; DB_USER="$DB_USER_FIXED"; NC_CONFIG="$NC_CONFIG_FIXED"
+  if [ "$BORG_ACTION_SELF" = "$BORG_ACTION_INSTALLED" ]; then
+    grep -qE "$HOST_RUN_CGROUP_RE" /proc/self/cgroup 2>/dev/null
+    return
+  fi
+  grep -qE "$HOST_RUN_CGROUP_RE" "${COCKPIT_BORG_ACTION_CGROUP_FILE:-/proc/self/cgroup}" 2>/dev/null || return 1
+  DB_CNF="${COCKPIT_BORG_ACTION_DB_CNF:-$DB_CNF_FIXED}"
+  NC_CONFIG="${COCKPIT_BORG_ACTION_NC_CONFIG:-$NC_CONFIG_FIXED}"
+}
+
+db_cnf_user() { # nur die user-Zeile, nie die Datei
+  sed -n 's/^[[:space:]]*user[[:space:]]*=[[:space:]]*"\{0,1\}\([^"[:space:]]*\)"\{0,1\}[[:space:]]*$/\1/p' "$1" 2>/dev/null | head -n 1
+}
+
+db_backups() { ls -1 "$DB_CNF".vor-* 2>/dev/null | sort -r || true; } # jüngste zuerst (Zeit im Namen)
+
+db_login() { # Optionsdatei → "ok <konto>" oder der Fehlercode der Datenbank (nie ein Wert)
+  local out
+  if out="$(mysql --defaults-extra-file="$1" -N -B -e 'SELECT CURRENT_USER()' 2>&1)"; then
+    printf 'ok %s\n' "$out"
+  else
+    db_error "$out"
+    return 1
+  fi
+}
+
+db_error() { # erste Zeile, ab " near " gekappt (dort zitiert MariaDB SQL)
+  printf '%s\n' "$1" | head -n 1 | sed 's/ near .*//'
+}
+
+db_dump_ok() { # alle Datenbanken lesbar (nur Schema, schnell), wie der Hook sie liest
+  mysqldump --defaults-extra-file="$1" --single-transaction --quick --all-databases --no-data >/dev/null 2>"$2"
+}
+
+db_hash() { # mysql_native_password-Hash eines Werts von stdin: '*' + SHA1(SHA1(wert)), gross
+  python3 -c 'import hashlib, sys; print("*" + hashlib.sha1(hashlib.sha1(sys.stdin.buffer.read()).digest()).hexdigest().upper())'
+}
+
+db_status() {
+  section "Backup-DB-Zugang ($DB_CNF)"
+  if [ ! -f "$DB_CNF" ]; then printf '%s\n' "datei: fehlt"; return 0; fi
+  printf 'datei: %s\n' "$(stat -c '%U:%G %a' "$DB_CNF" 2>/dev/null)"
+  printf 'konto: %s\n' "$(db_cnf_user "$DB_CNF")"
+  printf 'anmeldung: %s\n' "$(db_login "$DB_CNF" || true)"
+  printf 'sicherungen der datei: %s\n' "$(db_backups | wc -l)"
+  return 0
+}
+
+db_check() {
+  [ -f "$DB_CNF" ] || die "$DB_CNF fehlt." 1
+  local err
+  db_login "$DB_CNF" >/dev/null || die "Anmeldung mit $DB_CNF scheitert: $(db_login "$DB_CNF" || true)" 1
+  err="$(mktemp)"
+  if ! db_dump_ok "$DB_CNF" "$err"; then
+    printf '%s\n' "mysqldump --all-databases --no-data scheitert:" >&2; db_error "$(cat "$err")" >&2; rm -f "$err"; exit 1
+  fi
+  rm -f "$err"
+  printf 'ok: %s meldet sich an und liest alle Datenbanken (mysqldump --all-databases --no-data)\n' "$(db_cnf_user "$DB_CNF")"
+}
+
+# Verwaltungs-Anmeldung laden (nc_user/nc_pass in dieser Shell) und amysql bereitstellen.
+db_admin() {
+  nc_user=""; nc_pass=""
+  local nc_host=""
+  { IFS= read -r nc_user; IFS= read -r nc_pass; IFS= read -r nc_host; } < <(runuser -u www-data -- php -r \
+    '$f = $argv[1]; include $f; foreach (["dbuser", "dbpassword", "dbhost"] as $k) { echo str_replace(["\r", "\n"], "", (string)($CONFIG[$k] ?? "")), "\n"; }' \
+    "$NC_CONFIG" 2>/dev/null) || true
+  [[ "$nc_user" =~ ^[A-Za-z0-9_.-]{1,80}$ ]] || die "kein Datenbank-Konto in $NC_CONFIG lesbar — nichts verändert." 67
+  [ -n "$nc_pass" ] && [[ "$nc_pass" != *'"'* ]] && [[ "$nc_pass" != *'\'* ]] || die "das Passwort des Nextcloud-Kontos ist leer oder nicht als Optionswert schreibbar — nichts verändert." 67
+  case "$nc_host" in ''|localhost|127.0.0.1|localhost:3306|127.0.0.1:3306) : ;; *) die "Nextcloud nutzt keine lokale Datenbank (dbhost) — nichts verändert." 67 ;; esac
+}
+admin_opts() { printf '[client]\nuser=%s\npassword="%s"\n' "$nc_user" "$nc_pass"; }
+amysql() { mysql --defaults-extra-file=<(admin_opts) -N -B "$@"; }
+
+db_cnf_hash() { # Hash des Passworts einer Optionsdatei (leer, wenn keins); der Wert bleibt in der Pipe
+  sed -n 's/^[[:space:]]*password[[:space:]]*=[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\1/p' "$1" 2>/dev/null | head -n 1 | tr -d '\n' | db_hash
+}
+
+db_set_hash() { # db_set_hash <hash>: das Konto bekommt genau diesen Hash
+  printf "ALTER USER '%s'@'localhost' IDENTIFIED BY PASSWORD '%s';\n" "$DB_USER" "$1" | amysql 2>&1
+}
+
+# Die Repo-Sperre für die Dauer von ensure/restore (Re-Review 28.10.2026): der
+# Drop-in borgmatic-cockpit-borg-lock.conf lässt den Nachtlauf auf sie warten, so
+# fällt er nie zwischen ALTER USER und den Tausch der Datei. Der Deskriptor bleibt
+# bis zum Ende dieses Prozesses offen.
+db_lock() {
+  have flock || die "flock fehlt — ohne die Sperre könnte der Nachtlauf mitten in den Tausch fallen; nichts verändert." 67
+  exec 9>>"$BORG_ACTION_LOCK" || die "Sperrdatei $BORG_ACTION_LOCK ist nicht öffenbar — nichts verändert." 67
+  flock -n 9 || die "$BORG_ACTION_LOCK ist belegt — eine Prüfung oder ein Backup hält das Repo; nach dem Lauf erneut, nichts verändert." 3
+}
+
+db_ensure() {
+  borgmatic_here || die "borgmatic (und $BORG_ACTION_CONFIG) fehlen auf diesem Host — der DB-Zugang des Backups gehört zum VPS." 67
+  [ -f "$DB_CNF" ] || die "$DB_CNF fehlt — ensure ersetzt nur die Datei, die der Hook schon liest; nichts verändert." 67
+  local tool state
+  for tool in mysql mysqldump php runuser mktemp python3; do have "$tool" || die "$tool fehlt — nichts verändert." 67; done
+  db_lock
+  if state="$(borgmatic_busy)"; then die "das Backup läuft gerade ($state) — nach dem Lauf erneut; nichts verändert." 3; fi
+  db_admin
+
+  local u="$DB_USER" existed out
+  existed="$(amysql -e "SELECT COUNT(*) FROM mysql.user WHERE User='$u' AND Host='localhost'" 2>&1)" \
+    || die "das Nextcloud-Konto kommt nicht an die Kontenliste: $(db_error "$existed") — nichts verändert." 1
+  [[ "$existed" =~ ^[0-9]+$ ]] || die "unerwartete Antwort der Datenbank — nichts verändert." 1
+  # Rotation (Konto besteht): der Hash, mit dem die jetzige Datei gilt — damit ein
+  # Fehler nach dem ALTER USER die Datei nicht ungültig zurücklässt.
+  local keep=""
+  [ "$existed" != 0 ] && [ "$(db_cnf_user "$DB_CNF")" = "$u" ] && grep -qE '^[[:space:]]*password[[:space:]]*=' "$DB_CNF" && keep="$(db_cnf_hash "$DB_CNF")"
+  undo() { # Datenbank auf den Stand vor diesem Aufruf
+    if [ "$existed" = 0 ]; then printf "DROP USER IF EXISTS '%s'@'localhost';\n" "$u" | amysql >/dev/null 2>&1
+    elif [ -n "$keep" ]; then db_set_hash "$keep" >/dev/null; fi
+  }
+
+  # Zufallspasswort: 40 Zeichen [A-Za-z0-9], nur in dieser Shell und gleich in der Datei.
+  local pw hash
+  pw="$(head -c 600 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9' | head -c 40)"
+  [ "${#pw}" -eq 40 ] || die "kein Zufallswert erzeugt — nichts verändert." 1
+  hash="$(printf '%s' "$pw" | db_hash)"
+  [[ "$hash" =~ ^\*[0-9A-F]{40}$ ]] || die "kein Hash erzeugt — nichts verändert." 1
+
+  if ! out="$(printf "CREATE USER IF NOT EXISTS '%s'@'localhost' IDENTIFIED BY PASSWORD '%s';\nALTER USER '%s'@'localhost' IDENTIFIED BY PASSWORD '%s';\nREVOKE ALL PRIVILEGES, GRANT OPTION FROM '%s'@'localhost';\nGRANT %s ON *.* TO '%s'@'localhost';\n" \
+      "$u" "$hash" "$u" "$hash" "$u" "$BORG_ACTION_DB_GRANTS" "$u" | amysql 2>&1)"; then
+    undo; unset pw nc_pass
+    die "Konto $u nicht eingerichtet: $(db_error "$out") — $DB_CNF unverändert." 1
+  fi
+
+  # Neue Optionsdatei neben der alten: [client] mit dem neuen Konto, dazu alle
+  # übrigen Zeilen der alten Datei ausser deren user/password (andere Abschnitte
+  # oder Optionen des Hooks bleiben, wie sie waren).
+  local tmp err stamp
+  if ! tmp="$(mktemp "$DB_CNF.neu.XXXXXX")"; then undo; unset pw nc_pass; die "keine Arbeitsdatei neben $DB_CNF — $DB_CNF unverändert." 1; fi
+  { printf '[client]\nuser=%s\npassword="%s"\n' "$u" "$pw"; grep -vE '^[[:space:]]*(user|password)[[:space:]]*=' "$DB_CNF" || true; } > "$tmp"
+  unset pw
+  chown root:root "$tmp" && chmod 600 "$tmp"
+  err="$(mktemp)"
+  if ! db_login "$tmp" >/dev/null || ! db_dump_ok "$tmp" "$err"; then
+    printf '%s\n' "das neue Konto meldet sich nicht an oder liest nicht alle Datenbanken:" >&2
+    { db_login "$tmp" || true; db_error "$(cat "$err")"; } >&2
+    rm -f "$tmp" "$err"; undo; unset nc_pass
+    die "$DB_CNF unverändert." 1
+  fi
+  rm -f "$err"
+
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  [ -e "$DB_CNF.vor-$stamp" ] && stamp="$stamp-$$"
+  if ! { cp -a "$DB_CNF" "$DB_CNF.vor-$stamp" && chmod 600 "$DB_CNF.vor-$stamp"; }; then
+    rm -f "$tmp"; undo; unset nc_pass; die "Sicherung der alten Datei gescheitert — $DB_CNF unverändert." 1
+  fi
+  if ! mv -f "$tmp" "$DB_CNF"; then rm -f "$tmp"; undo; unset nc_pass; die "Tausch gescheitert — $DB_CNF unverändert." 1; fi
+  unset nc_pass
+
+  section "Backup-DB-Zugang eingerichtet"
+  printf 'konto: %s@localhost (Rechte: %s auf *.*)\n' "$u" "$BORG_ACTION_DB_GRANTS"
+  printf 'passwort: 40 Zeichen, auf diesem Host erzeugt, im Klartext nur in %s (%s), nie ausgegeben\n' "$DB_CNF" "$(stat -c '%U:%G %a' "$DB_CNF")"
+  printf 'alte datei: %s (Rückweg: db-access restore)\n' "$DB_CNF.vor-$stamp"
+  printf 'anmeldung: %s\n' "$(db_login "$DB_CNF" || true)"
+  printf 'datenbanken lesbar: %s\n' "$(mysql --defaults-extra-file="$DB_CNF" -N -B -e 'SHOW DATABASES' 2>/dev/null | wc -l)"
+}
+
+db_restore() {
+  local last out
+  last="$(db_backups | head -n 1)"
+  [ -n "$last" ] || die "keine Sicherung $DB_CNF.vor-* — nichts verändert." 1
+  db_lock
+  local state
+  if state="$(borgmatic_busy)"; then die "das Backup läuft gerade ($state) — nach dem Lauf erneut; nichts verändert." 3; fi
+  # Gehört die Sicherung schon dem Backup-Konto (Stand vor einer Rotation), gilt sie
+  # erst wieder, wenn das Konto ihren Hash bekommt.
+  if [ "$(db_cnf_user "$last")" = "$DB_USER" ]; then
+    have python3 || die "python3 fehlt — nichts verändert." 67
+    db_admin
+    out="$(db_set_hash "$(db_cnf_hash "$last")")" || { unset nc_pass; die "Konto $DB_USER nicht auf den Stand der Sicherung gesetzt: $(db_error "$out") — nichts verändert." 1; }
+    unset nc_pass
+  fi
+  cp -a "$last" "$DB_CNF" && chmod 600 "$DB_CNF" || die "Zurückspielen gescheitert." 1
+  printf 'zurück: %s → %s\n' "$last" "$DB_CNF"
+  printf 'anmeldung: %s\n' "$(db_login "$DB_CNF" || true)"
+}
+
+# ---------------------------------------------------------------------------
 # Grammatik
 # ---------------------------------------------------------------------------
 if [ "$#" -lt 1 ]; then
@@ -715,6 +959,18 @@ case "$1" in
     [ "$#" -eq 1 ] || { usage >&2; exit 64; }
     require_root
     start_maintenance "$1"
+    ;;
+  db-access)
+    [ "$#" -eq 2 ] || { usage >&2; exit 64; }
+    require_root
+    db_access_context || die "db-access läuft nur in einem Lauf der allgemeinen Tür (cockpit-host-run), nicht über den Executor." 64
+    case "$2" in
+      status) db_status ;;
+      check) db_check ;;
+      ensure) db_ensure ;;
+      restore) db_restore ;;
+      *) usage >&2; die "unbekanntes db-access-Verb: $2" 64 ;;
+    esac
     ;;
   --payload)
     shift
