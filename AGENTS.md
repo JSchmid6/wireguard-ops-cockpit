@@ -104,8 +104,13 @@ Bare-metal Ubuntu VPS (161.97.86.86) running:
   never cat it in a plan; only borgmatic itself may use it.
 - Typed path (`borg.manage`): `cockpit-borg-action status|check|repair`, see
   `doc/setup/borg-maintenance.md`. The backup's database access (mysqldump hook,
-  `/etc/borgmatic/mysqldump.cnf`) is the dedicated read-only account `cockpit_backup@localhost`,
-  decoupled from Nextcloud/WordPress passwords; `cockpit-borg-action db-access status|check|ensure|adopt|restore`
+  `/etc/borgmatic/mysqldump.cnf`) currently runs on interim path B (`db-access adopt`, decision
+  28.10.2026): the file carries the Nextcloud DB account `nextDB`, so the backup is coupled to the
+  Nextcloud password — every NC password rotation breaks the backup until `db-access adopt` runs again.
+  With that account the hook (`--all-databases`) dumps only the database `nextcloud`; **WordPress
+  (`wordpress`) is NOT in the borg archive** — run `wp db export` before any WordPress DB change.
+  The dedicated read-only account `cockpit_backup@localhost` via `db-access ensure` is the target and
+  arrives only with path A (MariaDB `--init-file`, card t_58a51884); `cockpit-borg-action db-access status|check|ensure|adopt|restore`
   runs only inside a host-run unit (cgroup check), never through the executor. `repair` always needs the operator's approval:
   the plan policy stops any plan that names it — a capability manifest or another
   code fence changes nothing — and the executor refuses a repair without the

@@ -192,7 +192,7 @@ das Backup über das Drop-in die paar Sekunden ab.
 | Pfad (Host) | Quelle | Zweck |
 | --- | --- | --- |
 | `/usr/local/sbin/cockpit-borg-action` | `deploy/helpers/cockpit-borg-action` | der einzige sudo-exponierte Einstieg; gepinnte Grammatik `status\|check\|repair` (dazu `db-access …`, nur aus einem Lauf der allgemeinen Tür) |
-| `/etc/borgmatic/mysqldump.cnf` (+ `.vor-<Zeit>`) | `db-access ensure` | Anmeldung des mysqldump-Hooks: `cockpit_backup@localhost`, 0600 root; die `.vor-`Dateien sind der Rückweg |
+| `/etc/borgmatic/mysqldump.cnf` (+ `.vor-<Zeit>`) | heute `db-access adopt` (Zwischenweg B), Ziel `db-access ensure` (Weg A, Karte t_58a51884) | Anmeldung des mysqldump-Hooks, 0600 root: heute das Nextcloud-Konto `nextDB` — an das NC-Passwort gekoppelt, gedumpt wird nur `nextcloud`, **nicht** `wordpress`; Ziel `cockpit_backup@localhost`. Die `.vor-`Dateien sind der Rückweg |
 | `/etc/sudoers.d/cockpit-executor` | `deploy/sudoers/cockpit-executor` | Zeile `cockpit-executor ALL=(root) NOPASSWD: /usr/local/sbin/cockpit-borg-action *` |
 | `/var/lib/wireguard-ops-cockpit/borg/last.unit`, `last.kind` | Laufzeit | zuletzt gestartete Wartungs-Unit und ihre Art, 0750 root — nur für die Anzeige; **der Laufzustand kommt aus systemd** (`systemctl is-active <unit>`) |
 | `/run/lock/cockpit-borg.lock` | Laufzeit | Sperre gegen zwei gleichzeitige Läufe auf demselben Repo: `check`/`repair` halten sie für die Dauer des Laufs, die Repo-Abfragen von `status` kurz (ist sie nach 60 s nicht frei, meldet `status` „belegt“ mit rc=0); das nächtliche Backup wartet auf sie |
@@ -232,8 +232,10 @@ Der mysqldump-Hook der borgmatic-Konfiguration
 (`mysqldump --defaults-extra-file=/etc/borgmatic/mysqldump.cnf --single-transaction --quick --all-databases`)
 meldete sich bis zum 26.10.2026 mit dem **Nextcloud-Konto** an. Nach dessen Passwort-Rotation
 (Karte t_bc2b0db1) scheiterte jedes Backup mit 1045, zwei Nächte lang. **Entscheidung (Jochen,
-28.10.2026, Karte t_30c9ea52):** das Backup bekommt ein eigenes Konto, entkoppelt von Nextcloud-
-und WordPress-Passwörtern.
+28.10.2026, Karte t_30c9ea52):** Ziel ist ein eigenes Konto, entkoppelt von Nextcloud-
+und WordPress-Passwörtern. **Ist-Stand:** das ist noch nicht umgesetzt — live läuft Zwischenweg B
+(`adopt`, Nextcloud-Konto, nur DB `nextcloud`, WordPress nicht im Dump; siehe Befund unten), bis
+Weg A (Karte t_58a51884) da ist.
 
 | Form | Wirkung |
 | --- | --- |
