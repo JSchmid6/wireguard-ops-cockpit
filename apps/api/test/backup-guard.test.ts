@@ -104,6 +104,7 @@ const needsApproval: Array<[string, string]> = [
   ["the helper through bash --norc", "bash --norc /usr/local/sbin/cockpit-borg-action sources disconnect"],
   ["the helper through bash, named by a glob", "bash /usr/local/sbin/cockpit-borg-actio? sources restore"],
   ["the helper named by a glob", "/usr/local/sbin/cockpit-borg-act* repair"],
+  ["the helper named by a glob after a separator inside sh -c", "sh -c 'true; /usr/local/sbin/cockpit-borg-actio? sources restore'"],
   ["the helper through source, named by a bracket glob", ". /usr/local/sbin/cockpit-borg-actio[n] sources disconnect"],
   ["the helper through bash under another path", "bash /usr/local/bin/cockpit-borg-action sources add /opt/stacks/x"],
   ["retention edit", "sed -i 's/keep_daily: 7/keep_daily: 1/' /etc/borgmatic/config.yaml"],

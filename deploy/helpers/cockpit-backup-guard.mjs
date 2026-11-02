@@ -1220,12 +1220,14 @@ function checkSegment(text, { piped, quoted }, line, context, cwds, hit) {
     return { touching: TOKEN.test(text), readOnly: true, name, deletesFromInput: false, runsInput: false, echoed: null, found: [] };
   }
 
+  // Ein Glob, der auf den Backup-Helfer passt, ist der Helfer in einer Form, die
+  // der Riegel nicht nach seinen Verben lesen kann — auch in Quotes (sh -c '…; …'),
+  // wo die innere Shell ihn expandiert (Zweitprüfung PR #69).
+  if (GLOB.test(word) && globRegex(word).test(BORG_ACTION_PATH)) hit(line.id, "backup", "the backup helper named by a glob", code);
   // Wer läuft? Ein dynamischer Name ist unsicher.
   if (word.includes(OPAQUE) || word.startsWith("$") || !quoted && GLOB.test(word)) {
     hit(line.id, "uncertain", "the command name is built at run time", code);
-    // Ein Glob, der auf den Backup-Helfer passt, ist der Helfer in einer Form,
-    // die der Riegel nicht nach seinen Verben lesen kann (Zweitprüfung PR #69).
-    const bolt = phraseBolt(text) || (!quoted && GLOB.test(word) && globRegex(word).test(BORG_ACTION_PATH) ? "the backup helper named by a glob" : null);
+    const bolt = phraseBolt(text);
     if (bolt) hit(line.id, "backup", bolt, code);
     return { touching: true, readOnly: false, name, deletesFromInput: false, runsInput: true, echoed: null, found: [] };
   }
