@@ -1100,8 +1100,10 @@ function segmentBolt(text, command, name, readOnly, cwds, context, line, piped) 
   // Das Befehlswort bleibt die Shell, damit ihre eigenen Hinweise (Heredoc als
   // Shell gelesen, Text aus einer Pipe) erhalten bleiben; Optionen wie -s oder -c
   // lesen den Code woanders her und machen die Form selbst nicht frei.
-  const viaShell = (SHELLS.has(name) || name === "source" || name === ".") ? args.findIndex((arg) => !/^-[eux]+$/.test(arg) && arg !== "--") : -1;
-  if (viaShell >= 0 && baseName(args[viaShell]) === "cockpit-borg-action") {
+  // Greift, sobald irgendein Argument der Helfer ist (auch hinter -v, -O …, -o …);
+  // frei bleibt nur die exakte Form.
+  const viaShell = (SHELLS.has(name) || name === "source" || name === ".") ? args.findIndex((arg) => baseName(arg) === "cockpit-borg-action") : -1;
+  if (viaShell >= 0) {
     const inner = args.slice(viaShell + 1);
     const innerDb = inner.length === 2 && inner[0] === "db-access" && ["status", "check", "ensure", "adopt", "restore"].includes(inner[1]);
     if (args[viaShell] !== BORG_ACTION_PATH || args.slice(0, viaShell).some((arg) => arg !== "--" && !/^-[eux]+$/.test(arg)) || !(sourcesFree(inner) || innerDb || (inner.length === 1 && (inner[0] === "status" || inner[0] === "check")))) {
