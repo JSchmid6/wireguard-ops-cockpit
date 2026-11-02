@@ -354,9 +354,14 @@ Grenzen:
 * **Kein Kürzen bei Schreibfehlern:** jeder Schreibschritt von `add` wird geprüft, und vor dem
   Tausch muss die neue Datei die alte vollständig enthalten und genau eine `R`-Zeile mehr haben
   (volles Dateisystem → rc=1, nichts verändert).
-* **Riegel über Umwege:** `bash|sh|source|. /usr/local/sbin/cockpit-borg-action …` prüft der Riegel
-  wie den Helfer selbst; eine Kopie oder ein Link des Helfers (`cp`, `ln`, `install`, `rsync`)
-  geht an Jochen, weil der Riegel ihn unter anderem Namen nicht mehr erkennt (Zweitprüfung PR #69).
+* **Riegel über Umwege (Zweitprüfung PR #69):** `bash|sh|source|. /usr/local/sbin/cockpit-borg-action …`
+  prüft der Riegel mit denselben Regeln wie den Helfer (das Befehlswort bleibt die Shell, ihre
+  eigenen Hinweise bleiben); `cp|ln|install|rsync` des Helfers geht an Jochen. Weil der Riegel den
+  Helfer nur am Namen erkennt, schützt sich der Helfer zusätzlich selbst: in der echten cgroup
+  eines Laufs der allgemeinen Tür laufen alle Verben außer `status`/`check` nur, wenn er genau als
+  `/usr/local/sbin/cockpit-borg-action` aufgerufen wird und dort liegt — eine Kopie (`cat > …`),
+  ein Link oder ein anderer Pfad endet mit rc=64. Offline nicht prüfbar (braucht die cgroup einer
+  Lauf-Unit), die Bedingung steht vor der Grammatik.
 * Mehr Quellen heißen mehr Platz auf der Kiste (RAID, `DF` in `status`): `add` nennt die Größe,
   die Entscheidung bleibt „ergänzen ist frei“.
 

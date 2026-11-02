@@ -127,6 +127,7 @@ const BORG_TOOLS = /^(?:borg|borgmatic|cockpit-borg-action|cockpit-borg-retentio
 // einem wörtlichen Pfad mindestens eine Ebene unter diesen Wurzeln — dieselbe
 // Liste prüft der Helfer (cockpit-borg-action, SOURCES_ROOTS_FIXED) noch einmal
 // samt Existenz und Symlinks.
+const BORG_ACTION_PATH = "/usr/local/sbin/cockpit-borg-action";
 const SOURCE_ROOTS = ["/opt/stacks", "/srv", "/var/lib/docker/volumes"];
 const SOURCE_PATH = /^(?:\/[A-Za-z0-9_@+][A-Za-z0-9._@+-]*)+$/;
 export function sourcesFree(args) {
@@ -592,15 +593,6 @@ function commandOf(words, strict) {
       prefixes.push(name); i += 1;
       while (i < words.length && words[i].startsWith("-")) { const flag = words[i]; i += 1; if (/c/.test(flag)) break; }
       continue;
-    }
-    // `bash /usr/local/sbin/cockpit-borg-action sources restore`, `. <helfer> …`:
-    // der Helfer läuft mit denselben Argumenten, also gilt er als Befehl
-    // (Zweitprüfung PR #69, Befund 1).
-    if (SHELLS.has(name) || name === "source" || name === ".") {
-      let j = i + 1;
-      while (j < words.length && words[j].startsWith("-") && words[j] !== "--") j += 1;
-      if (words[j] === "--") j += 1;
-      if (j < words.length && baseName(words[j]) === "cockpit-borg-action") { prefixes.push(name); i = j; continue; }
     }
     break;
   }
@@ -1103,6 +1095,19 @@ function segmentBolt(text, command, name, readOnly, cwds, context, line, piped) 
   // Eine Kopie oder ein Link des Helfers unter anderem Namen erkennt der Riegel
   // nicht mehr am Befehlswort (Zweitprüfung PR #69, Befund 1).
   if (/^(?:ln|cp|install|rsync|link)$/.test(name) && args.some((arg) => !arg.startsWith("-") && baseName(arg) === "cockpit-borg-action")) return "copies or links the backup helper under another name, where the bolt no longer recognizes it";
+  // `bash|sh|source|. /usr/local/sbin/cockpit-borg-action <verb>` läuft den Helfer
+  // mit denselben Argumenten: dieselben Regeln (Zweitprüfung PR #69, Befund 1).
+  // Das Befehlswort bleibt die Shell, damit ihre eigenen Hinweise (Heredoc als
+  // Shell gelesen, Text aus einer Pipe) erhalten bleiben; Optionen wie -s oder -c
+  // lesen den Code woanders her und machen die Form selbst nicht frei.
+  const viaShell = (SHELLS.has(name) || name === "source" || name === ".") ? args.findIndex((arg) => !/^-[eux]+$/.test(arg) && arg !== "--") : -1;
+  if (viaShell >= 0 && baseName(args[viaShell]) === "cockpit-borg-action") {
+    const inner = args.slice(viaShell + 1);
+    const innerDb = inner.length === 2 && inner[0] === "db-access" && ["status", "check", "ensure", "adopt", "restore"].includes(inner[1]);
+    if (args[viaShell] !== BORG_ACTION_PATH || args.slice(0, viaShell).some((arg) => arg !== "--" && !/^-[eux]+$/.test(arg)) || !(sourcesFree(inner) || innerDb || (inner.length === 1 && (inner[0] === "status" || inner[0] === "check")))) {
+      return "the backup helper through a shell outside status, check, db-access, sources status and sources add <path below the roots>";
+    }
+  }
   if (name === "cockpit-borg-action" && args[0] === "sources" && !sourcesFree(args)) return "the backup helper's sources outside status and add <path below /opt/stacks, /srv or /var/lib/docker/volumes> (connect, disconnect and restore change the configuration or drop sources)";
   if (name === "cockpit-borg-action" && args[0] !== "sources" && !dbAccess && !(args.length === 1 && (args[0] === "status" || args[0] === "check"))) return "the backup helper outside status, check, db-access and sources (repair can delete archives)";
 

@@ -97,6 +97,9 @@ const needsApproval: Array<[string, string]> = [
   ["repair through sh with options", "sh -e -- /usr/local/sbin/cockpit-borg-action repair"],
   ["the helper linked under another name", "ln -s /usr/local/sbin/cockpit-borg-action /usr/local/bin/cba\ncba sources restore"],
   ["the helper copied", "cp /usr/local/sbin/cockpit-borg-action /tmp/x"],
+  // Re-Review: -s liest den Code von stdin — der Heredoc bleibt Shell-Code.
+  ["bash -s with the helper as a parameter and a heredoc", "bash -s cockpit-borg-action status <<'EOF'\nsystemctl stop borgmatic.timer\n/usr/local/sbin/cockpit-borg-action sources restore\nEOF"],
+  ["the helper through bash under another path", "bash /usr/local/bin/cockpit-borg-action sources add /opt/stacks/x"],
   ["retention edit", "sed -i 's/keep_daily: 7/keep_daily: 1/' /etc/borgmatic/config.yaml"],
   ["retention written by heredoc", "cat > /etc/borgmatic/config.yaml <<'EOF'\nkeep_daily: 1\nEOF"],
   ["config moved away", "mv /etc/borgmatic /tmp/"],
