@@ -163,7 +163,9 @@ jedes `cd`-Ziel aufgelöst. Kommentare zählen nicht.
 - `borg`/`borgmatic` `delete`, `prune`, `compact`, `recreate`, `break-lock`, eine
   Schlüsseländerung (`key change-passphrase|import|migrate-to-repokey …`), `check --repair`,
   `borgmatic borg …`, ein `borgmatic`-Lauf mit anderer Konfiguration (`-c`) oder `--override`,
-  `cockpit-borg-action` außer `status|check|db-access …` — auch als Text in `sh -c '…'`, in einem Skript,
+  `cockpit-borg-action` außer `status|check|db-access …|sources status|sources add <pfad>` (also auch
+  `sources connect|disconnect|restore` und `sources add` mit einem Pfad außerhalb der Wurzeln oder
+  aus einer Variablen) — auch als Text in `sh -c '…'`, in einem Skript,
   das der Lauf schreibt, in einer Cron-Zeile oder in `echo/printf`;
 - jede Änderung der Aufbewahrung: `keep_*`/`--keep-*`, `keepDaily|Weekly|Monthly`,
   `backup_keep_time` (GitLab), außerhalb eines reinen Lesebefehls;
@@ -219,6 +221,9 @@ borgmatic.service`, ein nacktes `borgmatic` (konfigurierte Aufbewahrung),
 `borg list|info|check|create|diff`, `borgmatic list|info|check|create`,
 `cockpit-borg-action status|check|db-access status|check|ensure|adopt|restore` (der DB-Zugang des
 Backups löscht kein Archiv und ändert keine Aufbewahrung, Karte t_30c9ea52),
+`cockpit-borg-action sources status|add <pfad>` mit einem wörtlichen Verzeichnis unter `/opt/stacks`,
+`/srv` oder `/var/lib/docker/volumes` (eine Backup-Quelle ergänzen stärkt den Rückweg; Jochen
+31.10.2026: „Ergänzen ja, Schwächen nein“, Karte t_2b394537, `doc/setup/borg-maintenance.md`),
 `systemctl status|is-active|show|list-timers …`,
 `journalctl -u borgmatic`, lesende docker-Befehle (`ps`, `images`, `inspect`, `logs`, `stats`,
 `version`, `info`, `compose ps|config|logs`), Paket-Updates — auch wenn `borgbackup` oder

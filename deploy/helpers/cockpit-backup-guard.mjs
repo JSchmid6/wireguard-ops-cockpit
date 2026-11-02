@@ -122,6 +122,21 @@ const REPO = ["/media/RAID/backup_VServer"];
 const GUARDED_READ = [...SECRETS, ...REPO];
 const METADATA = new Set(["ls", "stat", "test", "[", "[[", "du", "df", "findmnt", "readlink", "realpath", "basename", "dirname", "lsblk", "file", "wc", "sha256sum", "sha1sum", "md5sum", "b2sum", "cksum", "cd", "pushd", "mountpoint", "namei", "getfacl", "lsattr"]);
 const BORG_TOOLS = /^(?:borg|borgmatic|cockpit-borg-action|cockpit-borg-retention)$/;
+// Backup-Quellen ergänzen (Karte t_2b394537, Jochen 31.10.2026: „Ergänzen ja,
+// Schwächen nein“): frei sind nur `sources status` und `sources add <pfad>` mit
+// einem wörtlichen Pfad mindestens eine Ebene unter diesen Wurzeln — dieselbe
+// Liste prüft der Helfer (cockpit-borg-action, SOURCES_ROOTS_FIXED) noch einmal
+// samt Existenz und Symlinks.
+const SOURCE_ROOTS = ["/opt/stacks", "/srv", "/var/lib/docker/volumes"];
+const SOURCE_PATH = /^(?:\/[A-Za-z0-9_@+][A-Za-z0-9._@+-]*)+$/;
+export function sourcesFree(args) {
+  if (args[0] !== "sources") return false;
+  if (args.length === 2) return args[1] === "status";
+  if (args.length !== 3 || args[1] !== "add") return false;
+  const path = args[2];
+  if (path.includes(OPAQUE) || !SOURCE_PATH.test(path) || `${path}/`.includes("/./") || `${path}/`.includes("/../")) return false;
+  return SOURCE_ROOTS.some((root) => path.startsWith(`${root}/`) && path.length > root.length + 1);
+}
 // Lesen, die einen ganzen Baum durchgehen (grep -r /etc) oder einhängen.
 const TREE_READERS = /^(?:rg|sshfs|mount|bindfs|rclone)$/;
 const BORG_READ_OUT = new Set(["mount", "extract", "export-tar"]);
@@ -737,7 +752,7 @@ function readOnlyForm(command, segmentText) {
       return verb !== null && BORG_READ.has(verb) || args.includes("--version");
     }
     case "borgmatic": return borgmaticReadOnly(args);
-    case "cockpit-borg-action": return (args.length === 1 && (args[0] === "status" || args[0] === "check")) || (args.length === 2 && args[0] === "db-access" && (args[1] === "status" || args[1] === "check"));
+    case "cockpit-borg-action": return (args.length === 1 && (args[0] === "status" || args[0] === "check")) || (args.length === 2 && args[0] === "db-access" && (args[1] === "status" || args[1] === "check")) || (args.length === 2 && args[0] === "sources" && args[1] === "status");
     case "cockpit-borg-retention": return retentionRoutine(args);
     case "systemctl": {
       const { verb, rest } = firstVerb(args, new Set(["-H", "--host", "-M", "--machine", "-t", "--type", "-p", "--property", "-o", "--output", "-n", "--lines", "--state"]));
@@ -1073,7 +1088,11 @@ function segmentBolt(text, command, name, readOnly, cwds, context, line, piped) 
   // spielt dessen alte Optionsdatei zurück: es löscht kein Archiv, ändert keine
   // Aufbewahrung und schaltet nichts ab — frei wie status und check.
   const dbAccess = args.length === 2 && args[0] === "db-access" && ["status", "check", "ensure", "adopt", "restore"].includes(args[1]);
-  if (name === "cockpit-borg-action" && !dbAccess && !(args.length === 1 && (args[0] === "status" || args[0] === "check"))) return "the backup helper outside status, check and db-access (repair can delete archives)";
+  // sources (Karte t_2b394537): eine Quelle hinzufügen stärkt den Rückweg und ist
+  // frei; den Verweis in config.yaml setzen oder lösen und Quellen zurücknehmen
+  // (connect, disconnect, restore) bleibt beim Riegel.
+  if (name === "cockpit-borg-action" && args[0] === "sources" && !sourcesFree(args)) return "the backup helper's sources outside status and add <path below /opt/stacks, /srv or /var/lib/docker/volumes> (connect, disconnect and restore change the configuration or drop sources)";
+  if (name === "cockpit-borg-action" && args[0] !== "sources" && !dbAccess && !(args.length === 1 && (args[0] === "status" || args[0] === "check"))) return "the backup helper outside status, check, db-access and sources (repair can delete archives)";
 
   // Die Units der Sicherung und des Aufräum-Dienstes anhalten, abschalten, maskieren.
   if (/^(?:systemctl|service|invoke-rc\.d|deb-systemd-invoke|update-rc\.d)$/.test(name)) {

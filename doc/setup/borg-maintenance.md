@@ -191,7 +191,8 @@ das Backup über das Drop-in die paar Sekunden ab.
 
 | Pfad (Host) | Quelle | Zweck |
 | --- | --- | --- |
-| `/usr/local/sbin/cockpit-borg-action` | `deploy/helpers/cockpit-borg-action` | der einzige sudo-exponierte Einstieg; gepinnte Grammatik `status\|check\|repair` (dazu `db-access …`, nur aus einem Lauf der allgemeinen Tür) |
+| `/usr/local/sbin/cockpit-borg-action` | `deploy/helpers/cockpit-borg-action` | der einzige sudo-exponierte Einstieg; gepinnte Grammatik `status\|check\|repair` (dazu `db-access …` und `sources …`, nur aus einem Lauf der allgemeinen Tür) |
+| `/etc/borgmatic/cockpit-sources.patterns` (+ `.vor-<Zeit>`) | `sources connect` legt sie an, `sources add` ergänzt | zusätzliche Backup-Quellen als `R <pfad>`-Zeilen, 0644 root, kein Geheimnis; `config.yaml` nennt sie per `patterns_from` |
 | `/etc/borgmatic/mysqldump.cnf` (+ `.vor-<Zeit>`) | heute `db-access adopt` (Zwischenweg B), Ziel `db-access ensure` (Weg A, Karte t_58a51884) | Anmeldung des mysqldump-Hooks, 0600 root: heute das Nextcloud-Konto `nextDB` — an das NC-Passwort gekoppelt, gedumpt wird nur `nextcloud`, **nicht** `wordpress`; Ziel `cockpit_backup@localhost`. Die `.vor-`Dateien sind der Rückweg |
 | `/etc/sudoers.d/cockpit-executor` | `deploy/sudoers/cockpit-executor` | Zeile `cockpit-executor ALL=(root) NOPASSWD: /usr/local/sbin/cockpit-borg-action *` |
 | `/var/lib/wireguard-ops-cockpit/borg/last.unit`, `last.kind` | Laufzeit | zuletzt gestartete Wartungs-Unit und ihre Art, 0750 root — nur für die Anzeige; **der Laufzustand kommt aus systemd** (`systemctl is-active <unit>`) |
@@ -216,7 +217,7 @@ oder zu wenig Frist bis zum Timer · `64` Aufruffehler · `67` falscher Host
   `/etc/borgmatic/config.yaml` **nie** — die Datei enthält Klartext-Zugangsdaten
   (mysqldump, borg). Es laufen nur borgmatic-Kommandos, die den Schlüssel selbst
   benutzen und nur ihre Zusammenfassung ausgeben.
-* Keine freien Argumente, keine Pfade, kein `borg`-Rohkommando, kein `--repair`
+* Keine freien Argumente, keine Pfade (einzige Ausnahme: `sources add <pfad>` mit fester Wurzel-Liste, unten), kein `borg`-Rohkommando, kein `--repair`
   ohne vorherige Freigabe. Die internen Payload-Verben (`--payload <verb>`) laufen
   nur aus der eigenen Unit: sie verlangen `COCKPIT_BORG_ACTION_IN_UNIT`, das die
   Unit selbst setzt — und `sudo` lässt ohne SETENV keine Umgebung durch.
@@ -295,6 +296,65 @@ Grenzen:
   `doc/setup/host-run.md`): `db-access ensure` (oder `adopt`), danach `systemctl start borgmatic.service`,
   Prüfungen `db-access check` und `! systemctl is-failed --quiet borgmatic.service`, Rückweg
   `db-access restore`.
+
+## Backup-Quellen ergänzen (`sources`, 02.11.2026)
+
+**Entscheidung (Jochen, 31.10.2026, Karte t_2b394537):** „Wie sollen wir ein System sicher
+betreiben, wenn das Backup nicht gepflegt werden darf?“ — James darf das Backup **ergänzen**,
+ohne Jochens Klick; **schwächen** (Quellen entfernen, Aufbewahrung, delete/prune, Passphrase,
+Repo) bleibt beim Backup-Riegel und damit bei Jochen.
+
+**Ist-Stand vor dieser Fähigkeit (02.11.2026, belegt ohne config.yaml):** die Quellen stehen in
+der Kommandozeile jedes Archivs (`borgmatic info --last 1`, Zeile `Command line:`), das ist
+lesend und frei. Archiv `vmd61162-2026-11-02T00:47:26` sichert `/etc /home/hermes/.hermes
+/opt/collabora /opt/frigate/config /opt/gitlab /opt/nextcloud /opt/nextcloud-appapi
+/opt/nextcloud-hpb /opt/wireguard-ops-cockpit /root/.borgmatic /tmp/backup_dumps
+/var/lib/docker/volumes/nc_app_email_archive_data/_data /var/www/html /var/www/nextcloud` —
+`/opt/stacks` (wejos-wp) und `/var/lib/docker/volumes/forgejo-data` fehlen. Für diese Frage also
+`server_einblick was=host pruefung=borg` statt einer Abfrage der Konfiguration.
+
+**Weg:** zusätzliche Quellen stehen nicht in `config.yaml` (die hält Zugangsdaten und wird nie
+gelesen), sondern in einer eigenen Musterdatei ohne Geheimnisse,
+`/etc/borgmatic/cockpit-sources.patterns` (0644 root), eine Zeile `R <pfad>` je Quelle.
+`config.yaml` nennt sie einmal per `patterns_from`; borgmatic 1.8 reicht das als
+`--patterns-from` an `borg create`, und borg nimmt die R-Zeilen („root path“) zu den
+`source_directories` hinzu. Kein `!include`, kein zweites borgmatic-Konfig unter
+`/etc/borgmatic.d` (das wäre ein zweiter Lauf mit eigenem Repo und eigener Passphrase).
+
+| Form | Wirkung | Riegel |
+| --- | --- | --- |
+| `cockpit-borg-action sources status` | lesend: angeschlossen ja/nein (nur ein Treffer-Test auf `config.yaml`, kein Inhalt), die R-Zeilen, Zahl der Sicherungen | frei |
+| `cockpit-borg-action sources add <pfad>` | hängt genau eine R-Zeile an. Pfad: absolut, nur `[A-Za-z0-9._@+-]` je Ebene, kein `.`/`..`, kein Symlink (`realpath` = Pfad), existierendes Verzeichnis, mindestens eine Ebene unter `/opt/stacks`, `/srv` oder `/var/lib/docker/volumes`. Schon drin oder unter einer vorhandenen Quelle → nichts verändert, rc=0. Alte Datei als `.vor-<UTC-Zeit>`, neue per `mv`, dann `borgmatic config validate`; ungültig → alte Datei zurück, rc=1. Nennt die Größe (`du -shx`), wirkt ab dem nächsten Backup-Lauf | **frei** |
+| `cockpit-borg-action sources connect` | einmalig: `config.yaml` bekommt am Ende den Block `patterns_from: [<musterdatei>]` (alte Datei als `config.yaml.vor-<Zeit>`, 0600), legt die leere Musterdatei an, `borgmatic config validate`; ungültig → alte `config.yaml` zurück. Nennt `config.yaml` schon ein eigenes `patterns_from`, verändert es nichts (rc=1, dann von Hand) | Jochen |
+| `cockpit-borg-action sources disconnect` | nimmt genau diesen Block wieder heraus — nur, wenn `config.yaml` seit dem Anschluss sonst unverändert ist (Vergleich mit der `.vor`-Datei plus Block), sonst rc=1 und nichts verändert | Jochen |
+| `cockpit-borg-action sources restore` | die jüngste `.vor`-Musterdatei zurück, also Quellen weg | Jochen |
+
+Ein Verb zum Entfernen einzelner Quellen gibt es nicht; das ist `restore` (Riegel) oder ein
+Lauf, der die Musterdatei schreibt (Schreiben in `/etc/borgmatic` → Riegel).
+
+Grenzen:
+
+* **Nur aus einem Lauf der allgemeinen Tür** (cgroup `cockpit-host-run-<job>.service`), wie
+  `db-access`; über den Executor rc=64. Der installierte Helfer nimmt immer die festen Pfade, die
+  Prüf-Haken (`COCKPIT_BORG_ACTION_SOURCES_FILE`, `_SOURCES_ROOTS`, `_CONFIG`, `_LOCK`,
+  `_CGROUP_FILE`) gelten nur in einer Testkopie.
+* **Kein Geheimnis in der Ausgabe:** `config.yaml` wird nur per `grep -q` (angeschlossen?) und
+  beim Anhängen/Vergleichen berührt, nie ausgegeben; die Ausgabe von `borgmatic config validate`
+  wird verworfen (sie zitiert bei Schemafehlern Werte), nach aussen geht nur „gültig“.
+* **Sperre:** jede Änderung nimmt `/run/lock/cockpit-borg.lock` und weist ab, solange das Backup
+  läuft (rc=3) — eine Musterdatei wechselt nie mitten in einem `borg create`.
+* **Wurzeln** stehen doppelt fest: im Helfer (`SOURCES_ROOTS_FIXED`) und im Riegel
+  (`SOURCE_ROOTS` in `deploy/helpers/cockpit-backup-guard.mjs`, prüft den wörtlichen Pfad; ein Pfad
+  aus einer Variablen ist für den Riegel unlesbar und geht an Jochen). `/etc`, `/opt/<dienst>`,
+  `/var/www` sind schon ganze Quellen und darum keine Wurzeln.
+* Mehr Quellen heißen mehr Platz auf der Kiste (RAID, `DF` in `status`): `add` nennt die Größe,
+  die Entscheidung bleibt „ergänzen ist frei“.
+
+Ablauf für eine neue Quelle (ohne Jochen, sobald angeschlossen): ein host-run mit dem Schritt
+`/usr/local/sbin/cockpit-borg-action sources add <pfad>`, Prüfung `… sources status`, Rückweg
+keiner nötig (ein Zusatz löscht nichts; Zurücknehmen wäre `restore` und damit Jochens Sache).
+Beleg nach dem nächsten Nachtlauf: `borgmatic list --archive latest --path <pfad ohne /> | head`
+(frei, lesend) bzw. die Kommandozeile `--patterns-from` in `borgmatic info --last 1`.
 
 ## Zustand der Kiste (Baustein „Sichtbarkeit“)
 
