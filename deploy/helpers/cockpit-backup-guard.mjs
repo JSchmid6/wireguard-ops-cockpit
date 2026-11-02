@@ -1102,7 +1102,7 @@ function segmentBolt(text, command, name, readOnly, cwds, context, line, piped) 
   // lesen den Code woanders her und machen die Form selbst nicht frei.
   // Greift, sobald irgendein Argument der Helfer ist (auch hinter -v, -O …, -o …);
   // frei bleibt nur die exakte Form.
-  const viaShell = (SHELLS.has(name) || name === "source" || name === ".") ? args.findIndex((arg) => baseName(arg) === "cockpit-borg-action") : -1;
+  const viaShell = (SHELLS.has(name) || name === "source" || name === ".") ? args.findIndex((arg) => baseName(arg) === "cockpit-borg-action" || (GLOB.test(arg) && globRegex(arg).test(BORG_ACTION_PATH))) : -1;
   if (viaShell >= 0) {
     const inner = args.slice(viaShell + 1);
     const innerDb = inner.length === 2 && inner[0] === "db-access" && ["status", "check", "ensure", "adopt", "restore"].includes(inner[1]);
@@ -1223,7 +1223,9 @@ function checkSegment(text, { piped, quoted }, line, context, cwds, hit) {
   // Wer läuft? Ein dynamischer Name ist unsicher.
   if (word.includes(OPAQUE) || word.startsWith("$") || !quoted && GLOB.test(word)) {
     hit(line.id, "uncertain", "the command name is built at run time", code);
-    const bolt = phraseBolt(text);
+    // Ein Glob, der auf den Backup-Helfer passt, ist der Helfer in einer Form,
+    // die der Riegel nicht nach seinen Verben lesen kann (Zweitprüfung PR #69).
+    const bolt = phraseBolt(text) || (!quoted && GLOB.test(word) && globRegex(word).test(BORG_ACTION_PATH) ? "the backup helper named by a glob" : null);
     if (bolt) hit(line.id, "backup", bolt, code);
     return { touching: true, readOnly: false, name, deletesFromInput: false, runsInput: true, echoed: null, found: [] };
   }

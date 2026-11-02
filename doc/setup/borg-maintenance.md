@@ -356,7 +356,8 @@ Grenzen:
   (volles Dateisystem → rc=1, nichts verändert).
 * **Riegel über Umwege (Zweitprüfung PR #69):** `bash|sh|source|. /usr/local/sbin/cockpit-borg-action …`
   prüft der Riegel mit denselben Regeln wie den Helfer (das Befehlswort bleibt die Shell, ihre
-  eigenen Hinweise bleiben); `cp|ln|install|rsync` des Helfers geht an Jochen. Weil der Riegel den
+  eigenen Hinweise bleiben; frei nur die exakte Form); ein Glob, der auf den Helfer passt (als
+  Befehlswort oder Shell-Argument), und `cp|ln|install|rsync` des Helfers gehen an Jochen. Weil der Riegel den
   Helfer nur am Namen erkennt, schützt sich der Helfer zusätzlich selbst: in der echten cgroup
   eines Laufs der allgemeinen Tür laufen alle Verben außer `status`/`check` nur, wenn er genau als
   `/usr/local/sbin/cockpit-borg-action` aufgerufen wird und dort liegt — eine Kopie (`cat > …`),
