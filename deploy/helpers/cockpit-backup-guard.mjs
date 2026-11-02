@@ -122,6 +122,22 @@ const REPO = ["/media/RAID/backup_VServer"];
 const GUARDED_READ = [...SECRETS, ...REPO];
 const METADATA = new Set(["ls", "stat", "test", "[", "[[", "du", "df", "findmnt", "readlink", "realpath", "basename", "dirname", "lsblk", "file", "wc", "sha256sum", "sha1sum", "md5sum", "b2sum", "cksum", "cd", "pushd", "mountpoint", "namei", "getfacl", "lsattr"]);
 const BORG_TOOLS = /^(?:borg|borgmatic|cockpit-borg-action|cockpit-borg-retention)$/;
+// Backup-Quellen ergänzen (Karte t_2b394537, Jochen 31.10.2026: „Ergänzen ja,
+// Schwächen nein“): frei sind nur `sources status` und `sources add <pfad>` mit
+// einem wörtlichen Pfad mindestens eine Ebene unter diesen Wurzeln — dieselbe
+// Liste prüft der Helfer (cockpit-borg-action, SOURCES_ROOTS_FIXED) noch einmal
+// samt Existenz und Symlinks.
+const BORG_ACTION_PATH = "/usr/local/sbin/cockpit-borg-action";
+const SOURCE_ROOTS = ["/opt/stacks", "/srv", "/var/lib/docker/volumes"];
+const SOURCE_PATH = /^(?:\/[A-Za-z0-9_@+][A-Za-z0-9._@+-]*)+$/;
+export function sourcesFree(args) {
+  if (args[0] !== "sources") return false;
+  if (args.length === 2) return args[1] === "status";
+  if (args.length !== 3 || args[1] !== "add") return false;
+  const path = args[2];
+  if (path.includes(OPAQUE) || !SOURCE_PATH.test(path) || `${path}/`.includes("/./") || `${path}/`.includes("/../")) return false;
+  return SOURCE_ROOTS.some((root) => path.startsWith(`${root}/`) && path.length > root.length + 1);
+}
 // Lesen, die einen ganzen Baum durchgehen (grep -r /etc) oder einhängen.
 const TREE_READERS = /^(?:rg|sshfs|mount|bindfs|rclone)$/;
 const BORG_READ_OUT = new Set(["mount", "extract", "export-tar"]);
@@ -737,7 +753,7 @@ function readOnlyForm(command, segmentText) {
       return verb !== null && BORG_READ.has(verb) || args.includes("--version");
     }
     case "borgmatic": return borgmaticReadOnly(args);
-    case "cockpit-borg-action": return (args.length === 1 && (args[0] === "status" || args[0] === "check")) || (args.length === 2 && args[0] === "db-access" && (args[1] === "status" || args[1] === "check"));
+    case "cockpit-borg-action": return (args.length === 1 && (args[0] === "status" || args[0] === "check")) || (args.length === 2 && args[0] === "db-access" && (args[1] === "status" || args[1] === "check")) || (args.length === 2 && args[0] === "sources" && args[1] === "status");
     case "cockpit-borg-retention": return retentionRoutine(args);
     case "systemctl": {
       const { verb, rest } = firstVerb(args, new Set(["-H", "--host", "-M", "--machine", "-t", "--type", "-p", "--property", "-o", "--output", "-n", "--lines", "--state"]));
@@ -1073,7 +1089,29 @@ function segmentBolt(text, command, name, readOnly, cwds, context, line, piped) 
   // spielt dessen alte Optionsdatei zurück: es löscht kein Archiv, ändert keine
   // Aufbewahrung und schaltet nichts ab — frei wie status und check.
   const dbAccess = args.length === 2 && args[0] === "db-access" && ["status", "check", "ensure", "adopt", "restore"].includes(args[1]);
-  if (name === "cockpit-borg-action" && !dbAccess && !(args.length === 1 && (args[0] === "status" || args[0] === "check"))) return "the backup helper outside status, check and db-access (repair can delete archives)";
+  // sources (Karte t_2b394537): eine Quelle hinzufügen stärkt den Rückweg und ist
+  // frei; den Verweis in config.yaml setzen oder lösen und Quellen zurücknehmen
+  // (connect, disconnect, restore) bleibt beim Riegel.
+  // Eine Kopie oder ein Link des Helfers unter anderem Namen erkennt der Riegel
+  // nicht mehr am Befehlswort (Zweitprüfung PR #69, Befund 1).
+  if (/^(?:ln|cp|install|rsync|link)$/.test(name) && args.some((arg) => !arg.startsWith("-") && baseName(arg) === "cockpit-borg-action")) return "copies or links the backup helper under another name, where the bolt no longer recognizes it";
+  // `bash|sh|source|. /usr/local/sbin/cockpit-borg-action <verb>` läuft den Helfer
+  // mit denselben Argumenten: dieselben Regeln (Zweitprüfung PR #69, Befund 1).
+  // Das Befehlswort bleibt die Shell, damit ihre eigenen Hinweise (Heredoc als
+  // Shell gelesen, Text aus einer Pipe) erhalten bleiben; Optionen wie -s oder -c
+  // lesen den Code woanders her und machen die Form selbst nicht frei.
+  // Greift, sobald irgendein Argument der Helfer ist (auch hinter -v, -O …, -o …);
+  // frei bleibt nur die exakte Form.
+  const viaShell = (SHELLS.has(name) || name === "source" || name === ".") ? args.findIndex((arg) => baseName(arg) === "cockpit-borg-action" || (GLOB.test(arg) && globRegex(arg).test(BORG_ACTION_PATH))) : -1;
+  if (viaShell >= 0) {
+    const inner = args.slice(viaShell + 1);
+    const innerDb = inner.length === 2 && inner[0] === "db-access" && ["status", "check", "ensure", "adopt", "restore"].includes(inner[1]);
+    if (args[viaShell] !== BORG_ACTION_PATH || args.slice(0, viaShell).some((arg) => arg !== "--" && !/^-[eux]+$/.test(arg)) || !(sourcesFree(inner) || innerDb || (inner.length === 1 && (inner[0] === "status" || inner[0] === "check")))) {
+      return "the backup helper through a shell outside status, check, db-access, sources status and sources add <path below the roots>";
+    }
+  }
+  if (name === "cockpit-borg-action" && args[0] === "sources" && !sourcesFree(args)) return "the backup helper's sources outside status and add <path below /opt/stacks, /srv or /var/lib/docker/volumes> (connect, disconnect and restore change the configuration or drop sources)";
+  if (name === "cockpit-borg-action" && args[0] !== "sources" && !dbAccess && !(args.length === 1 && (args[0] === "status" || args[0] === "check"))) return "the backup helper outside status, check, db-access and sources (repair can delete archives)";
 
   // Die Units der Sicherung und des Aufräum-Dienstes anhalten, abschalten, maskieren.
   if (/^(?:systemctl|service|invoke-rc\.d|deb-systemd-invoke|update-rc\.d)$/.test(name)) {
@@ -1182,6 +1220,10 @@ function checkSegment(text, { piped, quoted }, line, context, cwds, hit) {
     return { touching: TOKEN.test(text), readOnly: true, name, deletesFromInput: false, runsInput: false, echoed: null, found: [] };
   }
 
+  // Ein Glob, der auf den Backup-Helfer passt, ist der Helfer in einer Form, die
+  // der Riegel nicht nach seinen Verben lesen kann — auch in Quotes (sh -c '…; …'),
+  // wo die innere Shell ihn expandiert (Zweitprüfung PR #69).
+  if (GLOB.test(word) && globRegex(word).test(BORG_ACTION_PATH)) hit(line.id, "backup", "the backup helper named by a glob", code);
   // Wer läuft? Ein dynamischer Name ist unsicher.
   if (word.includes(OPAQUE) || word.startsWith("$") || !quoted && GLOB.test(word)) {
     hit(line.id, "uncertain", "the command name is built at run time", code);

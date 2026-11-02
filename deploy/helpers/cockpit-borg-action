@@ -11,6 +11,10 @@
 #                                  einem Lauf der allgemeinen Tür (cockpit-host-run,
 #                                  geprüft an der cgroup), nie über sudo/Executor —
 #                                  siehe "DB-Zugang des Backups" unten.
+#   cockpit-borg-action sources status|add <pfad>|connect|disconnect|restore
+#                                  zusätzliche Backup-Quellen, ebenso nur aus einem
+#                                  Lauf der allgemeinen Tür — siehe
+#                                  "Backup-Quellen ergänzen" unten.
 #
 # Jedes Verb läuft in einer EIGENEN transienten systemd-Unit, nie im Executor
 # selbst: der Executor-Dienst ist sandboxed (RestrictAddressFamilies=AF_UNIX,
@@ -162,6 +166,13 @@ cockpit-borg-action — Borg-Betrieb auf diesem Host.
            wenn das Nextcloud-Konto keine Konten anlegen darf): die Datei
            bekommt das aktuelle Nextcloud-DB-Konto, ebenso mit Sicherung;
            restore: die jüngste .vor-Datei zurück.
+
+  sources status|add <pfad>|connect|disconnect|restore
+           Zusätzliche Backup-Quellen (Musterdatei mit R-Zeilen, kein
+           Geheimnis). Nur aus einem Lauf der allgemeinen Tür. add hängt ein
+           existierendes Verzeichnis unter /opt/stacks, /srv oder
+           /var/lib/docker/volumes an (frei); connect/disconnect (Verweis in
+           config.yaml) und restore (Quellen weg) brauchen Jochens Freigabe.
 
 Alles andere wird abgelehnt. Der Repo-Schlüssel bleibt auf diesem Host.
 EOF
@@ -995,12 +1006,247 @@ db_restore() {
 }
 
 # ---------------------------------------------------------------------------
+# Backup-Quellen ergänzen (sources, Karte t_2b394537)
+# ---------------------------------------------------------------------------
+# Jochen, 31.10.2026: „Wie sollen wir ein System sicher betreiben, wenn das
+# Backup nicht gepflegt werden darf?“ — Ergänzen ja, Schwächen nein.
+#
+# Zusätzliche Quellen stehen NICHT in config.yaml (die hält Zugangsdaten und
+# wird nie gelesen), sondern in einer eigenen Musterdatei ohne Geheimnisse:
+# eine Zeile `R <pfad>` je Quelle (borg-Muster „root path“). config.yaml nennt
+# sie einmal per `patterns_from`; borgmatic 1.8 reicht das als `--patterns-from`
+# an `borg create`, und borg nimmt die R-Zeilen zu den source_directories hinzu.
+#
+#   sources status      lesend: angeschlossen ja/nein (nur ein Treffer-Test auf
+#                       config.yaml, kein Inhalt), die R-Zeilen der Musterdatei
+#   sources add <pfad>  hängt genau eine R-Zeile an — frei (Backup-Riegel), weil
+#                       es nichts löscht, nichts kürzt und nichts abschaltet
+#   sources connect     einmalig: config.yaml bekommt den patterns_from-Verweis
+#                       (Schreiben in die Konfiguration → Riegel, Jochen)
+#   sources disconnect  nimmt genau diesen Verweis wieder heraus (Riegel, Jochen)
+#   sources restore     die jüngste .vor-Musterdatei zurück, also Quellen weg
+#                       (Riegel, Jochen)
+#
+# Ein Pfad für add: absolut, ohne Symlink (realpath = Pfad), ein existierendes
+# Verzeichnis, mindestens eine Ebene unter einer der Wurzeln (/opt/stacks, /srv,
+# /var/lib/docker/volumes) — /etc, /opt/<dienst> und /var/www sind schon ganze
+# Quellen. Jede Änderung: alte Datei als .vor-<Zeit> daneben, neue Datei per mv,
+# dann `borgmatic config validate`; ungültig → alte Datei zurück, rc=1. Die
+# Ausgabe von validate geht nie nach aussen (sie könnte Werte aus config.yaml
+# zitieren). Nur aus einem Lauf der allgemeinen Tür, wie db-access; der
+# installierte Helfer nimmt immer die festen Pfade, nie die Prüf-Haken.
+readonly SOURCES_FILE_FIXED="/etc/borgmatic/cockpit-sources.patterns"
+readonly SOURCES_ROOTS_FIXED="/opt/stacks /srv /var/lib/docker/volumes"
+readonly SOURCES_CONFIG_FIXED="/etc/borgmatic/config.yaml"
+readonly SOURCES_LOCK_FIXED="/run/lock/cockpit-borg.lock"
+SOURCES_FILE=""; SOURCES_ROOTS=""; SOURCES_CONFIG=""; SOURCES_LOCK=""; SOURCES_SERVICE=""
+
+sources_context() {
+  SOURCES_FILE="$SOURCES_FILE_FIXED"; SOURCES_ROOTS="$SOURCES_ROOTS_FIXED"
+  SOURCES_CONFIG="$SOURCES_CONFIG_FIXED"; SOURCES_LOCK="$SOURCES_LOCK_FIXED"; SOURCES_SERVICE="borgmatic.service"
+  if [ "$BORG_ACTION_SELF" = "$BORG_ACTION_INSTALLED" ]; then
+    grep -qE "$HOST_RUN_CGROUP_RE" /proc/self/cgroup 2>/dev/null
+    return
+  fi
+  grep -qE "$HOST_RUN_CGROUP_RE" "${COCKPIT_BORG_ACTION_CGROUP_FILE:-/proc/self/cgroup}" 2>/dev/null || return 1
+  SOURCES_FILE="${COCKPIT_BORG_ACTION_SOURCES_FILE:-$SOURCES_FILE_FIXED}"
+  SOURCES_ROOTS="${COCKPIT_BORG_ACTION_SOURCES_ROOTS:-$SOURCES_ROOTS_FIXED}"
+  SOURCES_CONFIG="$BORG_ACTION_CONFIG"; SOURCES_LOCK="$BORG_ACTION_LOCK"; SOURCES_SERVICE="$BORG_ACTION_SERVICE"
+}
+
+sources_ref_block() { # genau der Block, den connect anhängt und disconnect sucht
+  printf '\n# Cockpit: zusätzliche Backup-Quellen (cockpit-borg-action sources, nur Hinzufügen)\npatterns_from:\n    - %s\n' "$SOURCES_FILE"
+}
+sources_connected() { grep -qF -- "- $SOURCES_FILE" "$SOURCES_CONFIG" 2>/dev/null; } # Treffer-Test, kein Inhalt
+sources_list() { sed -n 's/^R \(\/[^[:space:]]*\)$/\1/p' "$SOURCES_FILE" 2>/dev/null || true; }
+sources_backups() { ls -1 "$SOURCES_FILE".vor-* 2>/dev/null | sort -r || true; } # jüngste zuerst (Zeit im Namen)
+ends_without_newline() { [ -s "$1" ] && [ -n "$(tail -c 1 "$1")" ]; }
+sources_stamp() { # sources_stamp <datei>: UTC-Zeit, zu der es noch keine <datei>.vor-<Zeit> gibt
+  local stamp
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  while [ -e "$1.vor-$stamp" ]; do sleep 1; stamp="$(date -u +%Y%m%dT%H%M%SZ)"; done
+  printf '%s' "$stamp"
+}
+
+sources_lock() {
+  have flock || die "flock fehlt — nichts verändert." 67
+  exec 9>>"$SOURCES_LOCK" || die "Sperrdatei $SOURCES_LOCK ist nicht öffenbar — nichts verändert." 67
+  flock -n 9 || die "$SOURCES_LOCK ist belegt — eine Prüfung oder ein Backup hält das Repo; nach dem Lauf erneut, nichts verändert." 3
+  local state
+  if state="$(unit_busy "$SOURCES_SERVICE")"; then die "das Backup läuft gerade ($state) — nach dem Lauf erneut; nichts verändert." 3; fi
+}
+
+# Die Musterdatei muss eine eigene, gewöhnliche Datei sein: kein Symlink, kein
+# zweiter Name (Hardlink) — sonst läse add z. B. config.yaml und legte sie 0644
+# ab (Zweitprüfung PR #69, Befund 3).
+sources_file_plain() {
+  [ -e "$SOURCES_FILE" ] || [ -L "$SOURCES_FILE" ] || return 0
+  [ ! -L "$SOURCES_FILE" ] && [ -f "$SOURCES_FILE" ] && [ "$(stat -c %h "$SOURCES_FILE")" = 1 ] \
+    || die "$SOURCES_FILE ist keine eigene, gewöhnliche Datei (Symlink, Hardlink oder anderes) — nichts verändert." 1
+}
+
+sources_validate() { # rc von `borgmatic config validate`; seine Ausgabe bleibt drinnen
+  borgmatic config validate >/dev/null 2>&1 9>&-
+}
+
+sources_need_borgmatic() {
+  { have borgmatic && [ -f "$SOURCES_CONFIG" ]; } || die "borgmatic (und $SOURCES_CONFIG) fehlen auf diesem Host — die Backup-Quellen gehören zum VPS." 67
+}
+
+sources_status() {
+  sources_need_borgmatic
+  sources_file_plain
+  local path count=0
+  printf 'musterdatei: %s\n' "$SOURCES_FILE"
+  if sources_connected; then printf 'angeschlossen: ja\n'; else printf 'angeschlossen: nein (einmalig: sources connect, Freigabe Jochen)\n'; fi
+  while read -r path; do
+    [ -n "$path" ] || continue
+    count=$((count + 1)); printf 'quelle: %s\n' "$path"
+  done < <(sources_list)
+  printf 'quellen: %s\n' "$count"
+  # Alles andere als Kommentare und R-Zeilen (etwa ein Ausschluss „! /srv“)
+  # gehört nicht hierher und könnte eine gemeldete Quelle wieder ausschliessen.
+  printf 'fremde zeilen: %s\n' "$(grep -cvE '^(#.*|R /[^[:space:]]*|[[:space:]]*)$' "$SOURCES_FILE" 2>/dev/null || true)"
+  printf 'sicherungen: %s\n' "$(sources_backups | grep -c . || true)"
+  printf 'wurzeln für add: %s\n' "$SOURCES_ROOTS"
+}
+
+sources_path_ok() { # sources_path_ok <pfad>: Grund auf stdout und rc=1, wenn nicht erlaubt
+  local p="$1" root real ok=""
+  [[ "$p" =~ ^(/[A-Za-z0-9_@+][A-Za-z0-9._@+-]*)+$ ]] || { printf 'kein absoluter Pfad aus Buchstaben, Ziffern und ._@+- (je Ebene), ohne / am Ende'; return 1; }
+  case "$p/" in */./*|*/../*) printf 'enthält . oder ..'; return 1 ;; esac
+  for root in $SOURCES_ROOTS; do
+    case "$p" in "$root"/?*) ok=1 ;; esac
+  done
+  [ -n "$ok" ] || { printf 'liegt nicht unter einer Wurzel (%s)' "$SOURCES_ROOTS"; return 1; }
+  [ -d "$p" ] || { printf 'kein existierendes Verzeichnis'; return 1; }
+  real="$(realpath -e -- "$p" 2>/dev/null || true)"
+  [ "$real" = "$p" ] || { printf 'Symlink im Pfad'; return 1; }
+}
+
+sources_add() {
+  local p="$1" why existing tmp stamp size
+  sources_need_borgmatic
+  why="$(sources_path_ok "$p")" || die "abgewiesen: $p — $why; nichts verändert." 64
+  sources_connected || die "die Musterdatei ist noch nicht angeschlossen (einmalig: sources connect, Freigabe Jochen) — nichts verändert." 1
+  sources_lock
+  sources_file_plain
+  while read -r existing; do
+    [ -n "$existing" ] || continue
+    if [ "$existing" = "$p" ]; then printf 'schon drin: %s — nichts verändert.\n' "$p"; return 0; fi
+    case "$p" in "$existing"/*) printf 'schon abgedeckt durch %s — nichts verändert.\n' "$existing"; return 0 ;; esac
+  done < <(sources_list)
+  stamp="$(sources_stamp "$SOURCES_FILE")"
+  tmp="$(mktemp "$SOURCES_FILE.neu.XXXXXX")" || die "Arbeitsdatei nicht anlegbar — nichts verändert." 1
+  # Jeder Schreibschritt wird geprüft, und vor dem Tausch muss die neue Datei
+  # die alte vollständig enthalten — ein volles Dateisystem darf die Liste nie
+  # kürzen (Zweitprüfung PR #69, Befund 2).
+  if [ -f "$SOURCES_FILE" ]; then
+    cp -a "$SOURCES_FILE" "$SOURCES_FILE.vor-$stamp" || { rm -f "$tmp" "$SOURCES_FILE.vor-$stamp"; die "Sicherung der alten Datei gescheitert — nichts verändert." 1; }
+    { cat "$SOURCES_FILE" && if ends_without_newline "$SOURCES_FILE"; then printf '\n'; fi && printf 'R %s\n' "$p"; } > "$tmp" \
+      || { rm -f "$tmp" "$SOURCES_FILE.vor-$stamp"; die "Schreiben der Arbeitsdatei gescheitert — nichts verändert." 1; }
+    if ! cmp -s -n "$(stat -c %s "$SOURCES_FILE")" "$SOURCES_FILE" "$tmp" \
+      || [ "$(grep -c '^R ' "$tmp")" -ne $(( $(grep -c '^R ' "$SOURCES_FILE") + 1 )) ]; then
+      rm -f "$tmp" "$SOURCES_FILE.vor-$stamp"; die "Arbeitsdatei unvollständig — nichts verändert." 1
+    fi
+  else
+    printf '# Zusätzliche Backup-Quellen — nur über cockpit-borg-action sources add\nR %s\n' "$p" > "$tmp" \
+      || { rm -f "$tmp"; die "Schreiben der Arbeitsdatei gescheitert — nichts verändert." 1; }
+  fi
+  chmod 644 "$tmp" || { rm -f "$tmp" "$SOURCES_FILE.vor-$stamp"; die "Rechte der Arbeitsdatei nicht setzbar — nichts verändert." 1; }
+  mv -f "$tmp" "$SOURCES_FILE" || { rm -f "$tmp" "$SOURCES_FILE.vor-$stamp"; die "Tausch der Musterdatei gescheitert — nichts verändert." 1; }
+  if ! sources_validate; then
+    if [ -f "$SOURCES_FILE.vor-$stamp" ]; then cp -a "$SOURCES_FILE.vor-$stamp" "$SOURCES_FILE" && rm -f "$SOURCES_FILE.vor-$stamp"; else rm -f "$SOURCES_FILE"; fi
+    die "borgmatic config validate lehnt ab — alte Musterdatei zurück, nichts verändert." 1
+  fi
+  size="$(timeout 120 du -shx -- "$p" 2>/dev/null | awk '{ print $1 }')"
+  printf 'hinzugefügt: %s (Größe %s)\n' "$p" "${size:-unbekannt}"
+  printf 'konfiguration: gültig (borgmatic config validate)\n'
+  if [ -f "$SOURCES_FILE.vor-$stamp" ]; then printf 'alte datei: %s\n' "$SOURCES_FILE.vor-$stamp"; fi
+  printf 'wirkt ab: dem nächsten Backup-Lauf (borgmatic.timer oder systemctl start borgmatic.service)\n'
+}
+
+sources_connect() {
+  local stamp created=""
+  sources_need_borgmatic
+  if sources_connected; then printf 'schon angeschlossen — nichts verändert.\n'; return 0; fi
+  if grep -qE '^[[:space:]]*patterns_from[[:space:]]*:' "$SOURCES_CONFIG"; then
+    die "config.yaml nennt schon ein eigenes patterns_from — der Anschluss gehört dann von Hand dazu; nichts verändert." 1
+  fi
+  sources_lock
+  stamp="$(sources_stamp "$SOURCES_CONFIG")"
+  if [ ! -f "$SOURCES_FILE" ]; then
+    { printf '# Zusätzliche Backup-Quellen — nur über cockpit-borg-action sources add\n' > "$SOURCES_FILE" && chmod 644 "$SOURCES_FILE"; } || die "Musterdatei nicht anlegbar — nichts verändert." 1
+    created=1
+  fi
+  cp -a "$SOURCES_CONFIG" "$SOURCES_CONFIG.vor-$stamp" || die "Sicherung von config.yaml gescheitert — nichts verändert." 1
+  if ! { if ends_without_newline "$SOURCES_CONFIG"; then printf '\n'; fi; sources_ref_block; } >> "$SOURCES_CONFIG"; then
+    cp -a "$SOURCES_CONFIG.vor-$stamp" "$SOURCES_CONFIG"
+    die "Anhängen gescheitert — alte config.yaml zurück." 1
+  fi
+  if ! sources_validate; then
+    cp -a "$SOURCES_CONFIG.vor-$stamp" "$SOURCES_CONFIG" && rm -f "$SOURCES_CONFIG.vor-$stamp"
+    [ -n "$created" ] && rm -f "$SOURCES_FILE"
+    die "borgmatic config validate lehnt ab — alte config.yaml zurück, nichts verändert." 1
+  fi
+  printf 'angeschlossen: %s (patterns_from)\n' "$SOURCES_FILE"
+  printf 'konfiguration: gültig (borgmatic config validate)\n'
+  printf 'alte datei: %s (Rückweg: sources disconnect)\n' "$SOURCES_CONFIG.vor-$stamp"
+}
+
+sources_disconnect() { # nimmt nur den eigenen Block heraus, und nur, wenn config.yaml seither unverändert ist
+  local last tmp
+  sources_need_borgmatic
+  if ! sources_connected; then printf 'nicht angeschlossen — nichts verändert.\n'; return 0; fi
+  sources_lock
+  while read -r last; do
+    [ -n "$last" ] || continue
+    tmp="$(mktemp)" || die "Arbeitsdatei nicht anlegbar — nichts verändert." 1
+    { cat "$last"; if ends_without_newline "$last"; then printf '\n'; fi; sources_ref_block; } > "$tmp"
+    if cmp -s "$tmp" "$SOURCES_CONFIG"; then
+      rm -f "$tmp"
+      cp -a "$last" "$SOURCES_CONFIG" || die "Zurückspielen gescheitert." 1
+      printf 'getrennt: %s → %s\n' "$last" "$SOURCES_CONFIG"
+      return 0
+    fi
+    rm -f "$tmp"
+  done < <(ls -1 "$SOURCES_CONFIG".vor-* 2>/dev/null | sort -r)
+  die "config.yaml wurde nach dem Anschluss geändert — kein passender Stand; nichts verändert (von Hand trennen)." 1
+}
+
+sources_restore() {
+  local last
+  sources_need_borgmatic
+  last="$(sources_backups | head -n 1)"
+  [ -n "$last" ] || die "keine Sicherung $SOURCES_FILE.vor-* — nichts verändert." 1
+  sources_lock
+  cp -a "$last" "$SOURCES_FILE" && rm -f "$last" || die "Zurückspielen gescheitert." 1
+  printf 'zurück: %s → %s\n' "$last" "$SOURCES_FILE"
+}
+
+# ---------------------------------------------------------------------------
 # Grammatik
 # ---------------------------------------------------------------------------
 if [ "$#" -lt 1 ]; then
   usage >&2
   exit 64
 fi
+
+# Selbstschutz (Zweitprüfung PR #69): der Backup-Riegel erkennt den Helfer an
+# seinem Namen. Eine Kopie, ein Link oder ein Aufruf unter anderem Pfad aus einem
+# Lauf der allgemeinen Tür käme an ihm vorbei — darum laufen dort alle Verben
+# ausser status/check nur, wenn der Helfer genau als /usr/local/sbin/cockpit-borg-action
+# aufgerufen wird und auch dort liegt. Gilt nur in der echten cgroup eines Laufs;
+# Executor (sudo) und Testkopien sind davon unberührt.
+case "${1:-}" in
+  status|check|-h|--help|help|--payload) ;;
+  *)
+    if grep -qE "$HOST_RUN_CGROUP_RE" /proc/self/cgroup 2>/dev/null \
+      && { [ "${BASH_SOURCE[0]}" != "$BORG_ACTION_INSTALLED" ] || [ "$BORG_ACTION_SELF" != "$BORG_ACTION_INSTALLED" ]; }; then
+      die "aus einem Lauf der allgemeinen Tür nur als $BORG_ACTION_INSTALLED aufrufen (keine Kopie, kein Link, kein anderer Pfad) — nichts verändert." 64
+    fi
+    ;;
+esac
 
 case "$1" in
   status)
@@ -1024,6 +1270,21 @@ case "$1" in
       adopt) db_adopt ;;
       restore) db_restore ;;
       *) usage >&2; die "unbekanntes db-access-Verb: $2" 64 ;;
+    esac
+    ;;
+  sources)
+    require_root
+    sources_context || die "sources läuft nur in einem Lauf der allgemeinen Tür (cockpit-host-run), nicht über den Executor." 64
+    case "${2:-}" in
+      status|connect|disconnect|restore)
+        [ "$#" -eq 2 ] || { usage >&2; exit 64; }
+        "sources_$2"
+        ;;
+      add)
+        [ "$#" -eq 3 ] || { usage >&2; exit 64; }
+        sources_add "$3"
+        ;;
+      *) usage >&2; die "unbekanntes sources-Verb: ${2:-}" 64 ;;
     esac
     ;;
   --payload)

@@ -137,6 +137,12 @@ Bare-metal Ubuntu VPS (161.97.86.86) running:
   `/run/lock/cockpit-borg.lock` via `ExecStartPre` instead of failing.
 - `check`/`repair` units run with `Nice=10` and `IOSchedulingClass=idle` so a
   multi-hour run never crowds out Nextcloud or GitLab; `status` does not.
+- Backup sources (`doc/setup/borg-maintenance.md`, "Backup-Quellen ergänzen"; decision 31.10.2026:
+  adding yes, weakening no): extra sources live in `/etc/borgmatic/cockpit-sources.patterns` (`R <path>`
+  lines, no secrets), referenced once from `config.yaml` via `patterns_from`.
+  `cockpit-borg-action sources add <dir below /opt/stacks|/srv|/var/lib/docker/volumes>` from a host run
+  is free under the backup bolt; `sources connect|disconnect|restore` go to the operator. Which paths are
+  backed up is readable without the config: `Command line:` in `borgmatic info --last 1`.
 - Retention lives on Lab0, not here (`doc/setup/borg-retention.md`): the VPS key is
   append-only there and borgmatic here only creates and checks. Lab0's
   `cockpit-borg-retention.timer` prunes the `vmd61162-*` series by the retention set in the

@@ -220,6 +220,15 @@ case "\$*" in
     printf '%s: %s\n' "\$what" "\$probe" >> "$WORK/lock-probe.log"
     ;;
 esac
+# sources: validate zitiert zur Probe die Konfiguration (wie es borgmatic bei
+# einem Schemafehler mit Werten tut) — der Helfer darf davon nichts zeigen.
+case "\$*" in
+  *"config validate"*)
+    cat "\${COCKPIT_BORG_ACTION_CONFIG:-/dev/null}"; cat "\${COCKPIT_BORG_ACTION_CONFIG:-/dev/null}" >&2
+    [ -e "$WORK/validate-fail" ] && exit 1
+    exit 0
+    ;;
+esac
 case "\$*" in
   *" list --last 5"*) printf '%s\n' "home_server: Listing archives" "vmd61162-2026-09-27T02:40:56.874046  Sun, 2026-09-27 02:41:08" ;;
   *" info --last 1"*) printf '%s\n' "Archive name: vmd61162-2026-09-27T02:40:56.874046" "Duration: 8 minutes 26.47 seconds" "All archives:                3.52 TB              3.37 TB            581.67 GB" ;;
@@ -1237,6 +1246,157 @@ db cgroup-run ensure
 assert_rc "ensure ohne CREATE USER scheitert (mit Rahmenzeile)" 1
 assert_err "die ERROR-Zeile wird genannt, nicht der Rahmen" "ERROR 1227"
 rm -f "$DB/frame-line"
+
+# --- sources: Backup-Quellen ergänzen (Karte t_2b394537) ---------------------
+# Hinzufügen frei, Schwächen beim Riegel: geprüft werden die Grammatik und die
+# Herkunft (nur ein Lauf der allgemeinen Tür), die Pfadregeln, der einmalige
+# Anschluss samt Rückweg, dass validate jede Änderung zurückrollt und dass weder
+# config.yaml noch die Ausgabe von validate je nach aussen gehen (der
+# borgmatic-Stub zitiert bei validate die ganze Konfiguration).
+SRC="$WORK/sources"; mkdir -p "$SRC/stacks/wejos-wp/data" "$SRC/srv/daten" "$SRC/geheim"
+ln -s "$SRC/geheim" "$SRC/stacks/verweis"
+printf '%s\n' "# borgmatic — Klartext-Zugangsdaten" "encryption_passphrase: GEHEIM-QUELLEN" > "$SRC/config.yaml"
+chmod 600 "$SRC/config.yaml"; cp -a "$SRC/config.yaml" "$SRC/config-original"
+PAT="$SRC/cockpit-sources.patterns"
+src() { # src <cgroup-datei> <argumente…>
+  local cg="$1"; shift
+  run_helper_env COCKPIT_BORG_ACTION_CONFIG="$SRC/config.yaml" COCKPIT_BORG_ACTION_SOURCES_FILE="$PAT" \
+    COCKPIT_BORG_ACTION_SOURCES_ROOTS="$SRC/srv $SRC/stacks" COCKPIT_BORG_ACTION_CGROUP_FILE="$DB/$cg" -- sources "$@"
+}
+no_config_out() { if grep -qF -- "GEHEIM-QUELLEN" <<<"$OUT$ERR"; then bad "$1 — config.yaml steht in der Ausgabe"; else ok "$1"; fi; }
+r_lines() { grep -c '^R ' "$PAT" 2>/dev/null || true; }
+
+echo "== sources: Grammatik und Herkunft =="
+src cgroup-executor status
+assert_rc "sources ausserhalb eines Laufs der allgemeinen Tür (Executor/sudo) abgewiesen" 64
+src cgroup-run remove "$SRC/stacks/wejos-wp"
+assert_rc "Entfernen ist kein Verb" 64
+src cgroup-run add
+assert_rc "add ohne Pfad" 64
+src cgroup-run add "$SRC/stacks/wejos-wp" "$SRC/srv/daten"
+assert_rc "add mit zwei Pfaden" 64
+src cgroup-run status extra
+assert_rc "status mit Extra-Argument" 64
+
+echo "== sources status / add vor dem Anschluss =="
+src cgroup-run status
+assert_rc "status vor dem Anschluss" 0
+assert_out "status: nicht angeschlossen" "angeschlossen: nein"
+no_config_out "status zeigt config.yaml nicht"
+src cgroup-run add "$SRC/stacks/wejos-wp"
+assert_rc "add vor dem Anschluss abgewiesen" 1
+assert_no_file "add vor dem Anschluss legt keine Musterdatei an" "$PAT"
+
+echo "== sources connect: validate lehnt ab → alte config.yaml zurück =="
+: > "$WORK/validate-fail"
+src cgroup-run connect
+assert_rc "connect bei ungültiger Konfiguration" 1
+rm -f "$WORK/validate-fail"
+if cmp -s "$SRC/config.yaml" "$SRC/config-original" && ! ls "$SRC"/config.yaml.vor-* >/dev/null 2>&1; then ok "config.yaml unverändert, keine Sicherung liegen geblieben"; else bad "config.yaml nach gescheitertem connect verändert"; fi
+assert_no_file "neu angelegte Musterdatei wieder entfernt" "$PAT"
+no_config_out "gescheitertes connect zitiert config.yaml nicht"
+
+echo "== sources connect: Backup läuft =="
+: > "$WORK/borgmatic-busy"
+src cgroup-run connect
+assert_rc "connect während des Backups abgewiesen" 3
+rm -f "$WORK/borgmatic-busy"
+
+echo "== sources connect =="
+src cgroup-run connect
+assert_rc "connect" 0
+assert_out "connect meldet den Anschluss" "angeschlossen: $PAT"
+no_config_out "connect zitiert config.yaml nicht"
+if grep -qxF -- "    - $PAT" "$SRC/config.yaml" && grep -qx 'patterns_from:' "$SRC/config.yaml"; then ok "config.yaml nennt die Musterdatei per patterns_from"; else bad "patterns_from fehlt in config.yaml"; fi
+if [ "$(stat -c %a "$SRC"/config.yaml.vor-*)" = 600 ]; then ok "Sicherung von config.yaml bleibt 0600"; else bad "Sicherung von config.yaml nicht 0600"; fi
+assert_file "leere Musterdatei angelegt" "$PAT"
+src cgroup-run connect
+assert_rc "connect ein zweites Mal" 0
+assert_out "zweites connect ändert nichts" "schon angeschlossen"
+
+echo "== sources add: Pfadregeln =="
+for bad_path in "stacks/wejos-wp" "$SRC/stacks" "$SRC/geheim" "$SRC/stacks/verweis" "$SRC/stacks/fehlt" "$SRC/stacks/wejos-wp/../../geheim" "$SRC/stacks/wejos-wp/" "--exclude" "$SRC/stacks/a b"; do
+  src cgroup-run add "$bad_path"
+  assert_rc "abgewiesen: ${bad_path#"$SRC"/}" 64
+done
+if [ "$(r_lines)" = 0 ]; then ok "abgewiesene Pfade stehen nicht in der Musterdatei"; else bad "abgewiesener Pfad in der Musterdatei"; fi
+
+echo "== sources add: Backup läuft =="
+: > "$WORK/borgmatic-busy"
+src cgroup-run add "$SRC/stacks/wejos-wp"
+assert_rc "add während des Backups abgewiesen" 3
+rm -f "$WORK/borgmatic-busy"
+
+echo "== sources add =="
+src cgroup-run add "$SRC/stacks/wejos-wp"
+assert_rc "add" 0
+assert_out "add meldet den Pfad" "hinzugefügt: $SRC/stacks/wejos-wp"
+assert_out "add meldet die gültige Konfiguration" "konfiguration: gültig"
+no_config_out "add zitiert config.yaml nicht"
+if grep -qxF -- "R $SRC/stacks/wejos-wp" "$PAT"; then ok "R-Zeile in der Musterdatei"; else bad "R-Zeile fehlt"; fi
+if [ "$(stat -c %a "$PAT")" = 644 ]; then ok "Musterdatei 0644"; else bad "Musterdatei nicht 0644"; fi
+src cgroup-run add "$SRC/stacks/wejos-wp"
+assert_out "derselbe Pfad noch einmal ändert nichts" "schon drin"
+src cgroup-run add "$SRC/stacks/wejos-wp/data"
+assert_out "ein Unterpfad ist schon abgedeckt" "schon abgedeckt durch $SRC/stacks/wejos-wp"
+if [ "$(r_lines)" = 1 ]; then ok "weiter genau eine R-Zeile"; else bad "R-Zeilen: $(r_lines)"; fi
+
+echo "== sources add: validate lehnt ab → alte Musterdatei zurück =="
+cp -a "$PAT" "$SRC/pat-vorher"; backups_before="$(ls -1 "$PAT".vor-* 2>/dev/null | wc -l)"
+: > "$WORK/validate-fail"
+src cgroup-run add "$SRC/srv/daten"
+assert_rc "add bei ungültiger Konfiguration" 1
+rm -f "$WORK/validate-fail"
+if cmp -s "$PAT" "$SRC/pat-vorher" && [ "$(ls -1 "$PAT".vor-* 2>/dev/null | wc -l)" = "$backups_before" ]; then ok "Musterdatei unverändert, keine Sicherung liegen geblieben"; else bad "Musterdatei nach gescheitertem add verändert"; fi
+no_config_out "gescheitertes add zitiert config.yaml nicht"
+
+echo "== sources add (zweite Quelle), status, restore =="
+src cgroup-run add "$SRC/srv/daten"
+assert_rc "zweite Quelle" 0
+assert_out "alte Musterdatei als Rückweg" "alte datei: $PAT.vor-"
+src cgroup-run status
+assert_out "status: angeschlossen" "angeschlossen: ja"
+assert_out "status: zwei Quellen" "quellen: 2"
+assert_out "status nennt die Quelle" "quelle: $SRC/srv/daten"
+no_config_out "status zitiert config.yaml nicht"
+src cgroup-run restore
+assert_rc "restore" 0
+if [ "$(r_lines)" = 1 ] && grep -qxF -- "R $SRC/stacks/wejos-wp" "$PAT"; then ok "restore: Stand vor der zweiten Quelle"; else bad "restore: R-Zeilen $(r_lines)"; fi
+
+echo "== sources: Musterdatei als Symlink oder Hardlink, fremde Zeilen (Zweitprüfung PR #69, Befund 3) =="
+cp -a "$PAT" "$SRC/pat-echt"
+rm -f "$PAT"; ln -s "$SRC/config.yaml" "$PAT"
+src cgroup-run add "$SRC/srv/daten"
+assert_rc "add auf eine Musterdatei als Symlink abgewiesen" 1
+no_config_out "Symlink: config.yaml nicht in der Ausgabe"
+if [ -L "$PAT" ]; then ok "Symlink unverändert"; else bad "Symlink ersetzt"; fi
+rm -f "$PAT"; ln "$SRC/config.yaml" "$PAT"
+src cgroup-run add "$SRC/srv/daten"
+assert_rc "add auf eine Musterdatei als Hardlink abgewiesen" 1
+src cgroup-run status
+assert_rc "status auf eine Musterdatei als Hardlink abgewiesen" 1
+no_config_out "Hardlink: config.yaml nicht in der Ausgabe"
+rm -f "$PAT"; cp -a "$SRC/pat-echt" "$PAT"
+printf '! %s\n' "$SRC/stacks" >> "$PAT"
+src cgroup-run status
+assert_out "status meldet fremde Zeilen" "fremde zeilen: 1"
+cp -a "$SRC/pat-echt" "$PAT"
+src cgroup-run status
+assert_out "status ohne fremde Zeilen" "fremde zeilen: 0"
+
+echo "== sources disconnect =="
+cp -a "$SRC/config.yaml" "$SRC/config-angeschlossen"
+printf 'keep_daily: 1\n' >> "$SRC/config.yaml"
+src cgroup-run disconnect
+assert_rc "disconnect nach fremder Änderung an config.yaml abgewiesen" 1
+if grep -qx 'keep_daily: 1' "$SRC/config.yaml"; then ok "fremde Änderung bleibt stehen"; else bad "disconnect hat config.yaml trotzdem getauscht"; fi
+cp -a "$SRC/config-angeschlossen" "$SRC/config.yaml"
+src cgroup-run disconnect
+assert_rc "disconnect" 0
+if cmp -s "$SRC/config.yaml" "$SRC/config-original"; then ok "config.yaml wieder wie vor dem Anschluss"; else bad "config.yaml nach disconnect nicht wie vorher"; fi
+no_config_out "disconnect zitiert config.yaml nicht"
+src cgroup-run add "$SRC/srv/daten"
+assert_rc "add nach disconnect abgewiesen" 1
 
 echo
 printf 'bestanden: %s, fehlgeschlagen: %s\n' "$PASS" "$FAIL"
