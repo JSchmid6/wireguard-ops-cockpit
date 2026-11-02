@@ -165,7 +165,8 @@ jedes `cd`-Ziel aufgelöst. Kommentare zählen nicht.
   `borgmatic borg …`, ein `borgmatic`-Lauf mit anderer Konfiguration (`-c`) oder `--override`,
   `cockpit-borg-action` außer `status|check|db-access …|sources status|sources add <pfad>` (also auch
   `sources connect|disconnect|restore` und `sources add` mit einem Pfad außerhalb der Wurzeln oder
-  aus einer Variablen) — auch als Text in `sh -c '…'`, in einem Skript,
+  aus einer Variablen; auch als `bash|sh|source|. <helfer> …`; eine Kopie oder ein Link des Helfers per
+  `cp|ln|install|rsync`) — auch als Text in `sh -c '…'`, in einem Skript,
   das der Lauf schreibt, in einer Cron-Zeile oder in `echo/printf`;
 - jede Änderung der Aufbewahrung: `keep_*`/`--keep-*`, `keepDaily|Weekly|Monthly`,
   `backup_keep_time` (GitLab), außerhalb eines reinen Lesebefehls;

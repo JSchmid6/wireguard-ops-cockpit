@@ -25,6 +25,7 @@ const free: Array<[string, string]> = [
   ["backup db access", "/usr/local/sbin/cockpit-borg-action db-access status\n/usr/local/sbin/cockpit-borg-action db-access ensure\n/usr/local/sbin/cockpit-borg-action db-access check\n/usr/local/sbin/cockpit-borg-action db-access restore"],
   ["backup db access, Zwischenweg adopt", "/usr/local/sbin/cockpit-borg-action db-access adopt"],
   // Backup-Quellen ergänzen (t_2b394537): Hinzufügen stärkt den Rückweg.
+  ["backup source added through bash", "bash /usr/local/sbin/cockpit-borg-action sources add /opt/stacks/wejos-wp"],
   ["backup source added", "/usr/local/sbin/cockpit-borg-action sources status\n/usr/local/sbin/cockpit-borg-action sources add /opt/stacks/wejos-wp\n/usr/local/sbin/cockpit-borg-action sources add /var/lib/docker/volumes/forgejo-data/_data\n/usr/local/sbin/cockpit-borg-action sources add '/srv/daten'"],
   ["Lab0 status file", "curl -fsS http://10.0.0.5:8088/status.txt"],
   ["GitLab stage", "gitlab-backup create STRATEGY=copy\ngitlab-ctl reconfigure\ngitlab-ctl status"],
@@ -90,6 +91,12 @@ const needsApproval: Array<[string, string]> = [
   ["sources: an option instead of a path", "/usr/local/sbin/cockpit-borg-action sources add --exclude"],
   ["sources: writing the patterns file directly", "printf 'R /opt/stacks/x\\n' > /etc/borgmatic/cockpit-sources.patterns"],
   ["sources: emptying the patterns file", "truncate -s 0 /etc/borgmatic/cockpit-sources.patterns"],
+  // Zweitprüfung PR #69, Befund 1: der Helfer über eine Shell, per source oder unter anderem Namen.
+  ["sources restore through bash", "bash /usr/local/sbin/cockpit-borg-action sources restore"],
+  ["sources disconnect through source", ". /usr/local/sbin/cockpit-borg-action sources disconnect"],
+  ["repair through sh with options", "sh -e -- /usr/local/sbin/cockpit-borg-action repair"],
+  ["the helper linked under another name", "ln -s /usr/local/sbin/cockpit-borg-action /usr/local/bin/cba\ncba sources restore"],
+  ["the helper copied", "cp /usr/local/sbin/cockpit-borg-action /tmp/x"],
   ["retention edit", "sed -i 's/keep_daily: 7/keep_daily: 1/' /etc/borgmatic/config.yaml"],
   ["retention written by heredoc", "cat > /etc/borgmatic/config.yaml <<'EOF'\nkeep_daily: 1\nEOF"],
   ["config moved away", "mv /etc/borgmatic /tmp/"],

@@ -342,11 +342,21 @@ Grenzen:
   beim Anhängen/Vergleichen berührt, nie ausgegeben; die Ausgabe von `borgmatic config validate`
   wird verworfen (sie zitiert bei Schemafehlern Werte), nach aussen geht nur „gültig“.
 * **Sperre:** jede Änderung nimmt `/run/lock/cockpit-borg.lock` und weist ab, solange das Backup
-  läuft (rc=3) — eine Musterdatei wechselt nie mitten in einem `borg create`.
+  (`borgmatic.service`, im installierten Helfer fest) läuft (rc=3) — eine Musterdatei wechselt nie mitten in einem `borg create`.
 * **Wurzeln** stehen doppelt fest: im Helfer (`SOURCES_ROOTS_FIXED`) und im Riegel
   (`SOURCE_ROOTS` in `deploy/helpers/cockpit-backup-guard.mjs`, prüft den wörtlichen Pfad; ein Pfad
   aus einer Variablen ist für den Riegel unlesbar und geht an Jochen). `/etc`, `/opt/<dienst>`,
   `/var/www` sind schon ganze Quellen und darum keine Wurzeln.
+* **Musterdatei nur als eigene, gewöhnliche Datei:** ist sie ein Symlink, ein Hardlink oder
+  keine reguläre Datei, weisen `add` und `status` ab (rc=1) — sonst läse `add` etwa `config.yaml`
+  und legte sie 0644 ab. `status` zählt außerdem „fremde Zeilen“ (alles außer Kommentaren und
+  `R`-Zeilen, z. B. ein Ausschluss `! /srv`, der eine Quelle wieder ausschlösse).
+* **Kein Kürzen bei Schreibfehlern:** jeder Schreibschritt von `add` wird geprüft, und vor dem
+  Tausch muss die neue Datei die alte vollständig enthalten und genau eine `R`-Zeile mehr haben
+  (volles Dateisystem → rc=1, nichts verändert).
+* **Riegel über Umwege:** `bash|sh|source|. /usr/local/sbin/cockpit-borg-action …` prüft der Riegel
+  wie den Helfer selbst; eine Kopie oder ein Link des Helfers (`cp`, `ln`, `install`, `rsync`)
+  geht an Jochen, weil der Riegel ihn unter anderem Namen nicht mehr erkennt (Zweitprüfung PR #69).
 * Mehr Quellen heißen mehr Platz auf der Kiste (RAID, `DF` in `status`): `add` nennt die Größe,
   die Entscheidung bleibt „ergänzen ist frei“.
 

@@ -1363,6 +1363,27 @@ src cgroup-run restore
 assert_rc "restore" 0
 if [ "$(r_lines)" = 1 ] && grep -qxF -- "R $SRC/stacks/wejos-wp" "$PAT"; then ok "restore: Stand vor der zweiten Quelle"; else bad "restore: R-Zeilen $(r_lines)"; fi
 
+echo "== sources: Musterdatei als Symlink oder Hardlink, fremde Zeilen (Zweitprüfung PR #69, Befund 3) =="
+cp -a "$PAT" "$SRC/pat-echt"
+rm -f "$PAT"; ln -s "$SRC/config.yaml" "$PAT"
+src cgroup-run add "$SRC/srv/daten"
+assert_rc "add auf eine Musterdatei als Symlink abgewiesen" 1
+no_config_out "Symlink: config.yaml nicht in der Ausgabe"
+if [ -L "$PAT" ]; then ok "Symlink unverändert"; else bad "Symlink ersetzt"; fi
+rm -f "$PAT"; ln "$SRC/config.yaml" "$PAT"
+src cgroup-run add "$SRC/srv/daten"
+assert_rc "add auf eine Musterdatei als Hardlink abgewiesen" 1
+src cgroup-run status
+assert_rc "status auf eine Musterdatei als Hardlink abgewiesen" 1
+no_config_out "Hardlink: config.yaml nicht in der Ausgabe"
+rm -f "$PAT"; cp -a "$SRC/pat-echt" "$PAT"
+printf '! %s\n' "$SRC/stacks" >> "$PAT"
+src cgroup-run status
+assert_out "status meldet fremde Zeilen" "fremde zeilen: 1"
+cp -a "$SRC/pat-echt" "$PAT"
+src cgroup-run status
+assert_out "status ohne fremde Zeilen" "fremde zeilen: 0"
+
 echo "== sources disconnect =="
 cp -a "$SRC/config.yaml" "$SRC/config-angeschlossen"
 printf 'keep_daily: 1\n' >> "$SRC/config.yaml"
