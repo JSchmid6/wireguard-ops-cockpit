@@ -14,14 +14,18 @@
 # the web unit start (only when inactive, before the new image exists), that the
 # data directory's mode survives every run, and that the borgmatic.service drop-in
 # lands next to a foreign drop-in that stays untouched in both directions (R2).
+# The pinned Node runtime: installed from .node-version when the host lacks it
+# (real tarball, checksum against a SHASUMS256.txt fixture, before the build),
+# not downloaded again when it is there, and 70 + rollback on a checksum mismatch,
+# a failed download or a .node-version that is not one clean x.y.z.
 #
 # Everything lives below one fresh mktemp directory under /tmp; the harness
 # refuses to run otherwise. Call as root (install -o root):
 #   sudo bash test/vps-cockpit-deploy.test.sh
-# In a container the image needs git and python3 (the script edits state.json with
-# python3), e.g.:
+# In a container the image needs git, python3 (the script edits state.json with
+# python3), curl, tar and xz (the runtime fixture and the script's own download):
 #   docker --context werkstatt run --rm -v /austausch/<klon>:/w:ro ubuntu:24.04 \
-#     bash -c 'apt-get update -qq && apt-get install -y git python3 && bash /w/test/vps-cockpit-deploy.test.sh'
+#     bash -c 'apt-get update -qq && apt-get install -y git python3 curl tar xz-utils && bash /w/test/vps-cockpit-deploy.test.sh'
 # ============================================================================
 set -eu
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -35,12 +39,14 @@ trap 'rm -rf -- "$FIX"' EXIT
 g() { git -c user.name=t -c user.email=t@t "$@"; }
 mapfile -t SOURCES < <(grep -oE '^  "[^"|]+\|' "$SCRIPT" | tr -d ' "|')
 [ "${#SOURCES[@]}" -ge 20 ] || { echo "FEHLER: Tabelle nicht gelesen (${#SOURCES[@]})" >&2; exit 2; }
+NODE_V=22.23.4   # the pin the fixture stands carry; the script reads it from .node-version
 
 # --- origin with commit A (base) and B (new helper bytes) ----------------------
 git init -q --bare -b main "$FIX/origin.git"
 g clone -q "$FIX/origin.git" "$FIX/work" 2>/dev/null
 mkdir -p "$FIX/work/deploy/vps"
 for src in "${SOURCES[@]}"; do mkdir -p "$FIX/work/$(dirname "$src")"; echo "A $src" > "$FIX/work/$src"; done
+echo "$NODE_V" > "$FIX/work/.node-version"
 cp "$SCRIPT" "$FIX/work/deploy/vps/vps-cockpit-deploy.sh"
 echo "services: {}" > "$FIX/work/docker-compose.vps.yml"
 (cd "$FIX/work" && g add -A && g commit -qm A && g push -q origin HEAD:main)
@@ -48,6 +54,11 @@ A=$(git -C "$FIX/work" rev-parse HEAD)
 for src in "${SOURCES[@]}"; do [ "$src" = deploy/vps/vps-cockpit-deploy.sh ] || echo "B $src" > "$FIX/work/$src"; done
 (cd "$FIX/work" && g commit -qam B && g push -q origin HEAD:main)
 B=$(git -C "$FIX/work" rev-parse HEAD)
+# C: a .node-version that is not one clean x.y.z (a version pin must never become
+# a path or a URL that this root script follows).
+printf '%s\n' "$NODE_V/../../evil" > "$FIX/work/.node-version"
+(cd "$FIX/work" && g commit -qam C && g push -q origin HEAD:main)
+C=$(git -C "$FIX/work" rev-parse HEAD)
 git -C "$FIX/work" checkout -q -b seite "$A"; echo x > "$FIX/work/x"; (cd "$FIX/work" && g add x && g commit -qm seite && g push -q origin seite)
 SEITE=$(git -C "$FIX/work" rev-parse HEAD)
 
@@ -86,13 +97,41 @@ exit 0
 EOF
 chmod 755 "$FIX/stub/"*
 
+# --- the pinned Node runtime: fixture host tree and a nodejs.org-like release ---
+fake_runtime() { # fake_runtime <host root> — a runtime whose node reports v<NODE_V>
+  local d="$1/opt/node-v$NODE_V-linux-x64"
+  install -d -m 0755 "$1/opt" "$d/bin"
+  printf '#!/bin/sh\necho v%s\n' "$NODE_V" > "$d/bin/node"
+  chmod 755 "$d/bin/node"
+}
+make_dist() { # make_dist [kaputt] — v<ver>/ with the tarball and SHASUMS256.txt
+  # The tarball is real (tar -xJf in the deploy unpacks it), the checksum is
+  # computed here the way nodejs.org computes it, and the list carries a decoy
+  # entry of another architecture so a sloppy selection cannot pass.
+  rm -rf "$FIX/dist" "$FIX/pkg"
+  install -d "$FIX/dist/v$NODE_V" "$FIX/pkg/node-v$NODE_V-linux-x64/bin"
+  printf '#!/bin/sh\necho v%s\n' "$NODE_V" > "$FIX/pkg/node-v$NODE_V-linux-x64/bin/node"
+  chmod 755 "$FIX/pkg/node-v$NODE_V-linux-x64/bin/node"
+  tar -cJf "$FIX/dist/v$NODE_V/node-v$NODE_V-linux-x64.tar.xz" -C "$FIX/pkg" "node-v$NODE_V-linux-x64"
+  {
+    printf '%064d  %s\n' 0 "node-v$NODE_V-aix-ppc64.tar.gz"
+    printf '%s  %s\n' "$(sha256sum "$FIX/dist/v$NODE_V/node-v$NODE_V-linux-x64.tar.xz" | cut -d' ' -f1)" \
+      "node-v$NODE_V-linux-x64.tar.xz"
+  } > "$FIX/dist/v$NODE_V/SHASUMS256.txt"
+  # after the list was written: the bytes no longer match what it promises
+  [ "${1:-}" != kaputt ] || printf 'x' >> "$FIX/dist/v$NODE_V/node-v$NODE_V-linux-x64.tar.xz"
+}
+
 targets() { grep -oE '^  "[^"|]+\|[^"|]+\|' "$SCRIPT" | cut -d'|' -f2 | sed -E \
   -e 's#\$LIB#/usr/local/lib/wireguard-ops-cockpit#' -e 's#\$SBIN#/usr/local/sbin#' \
   -e 's#\$UNITS#/etc/systemd/system#' -e 's#\$SUDOERS#/etc/sudoers.d/cockpit-executor#' -e 's#^\$ROOT##'; }
-fresh_host() { # host root: half the targets with old bytes, the other half absent; repo at A
+fresh_host() { # fresh_host [ohne-runtime] — half the targets with old bytes, the other half absent; repo at A
   rm -rf "$FIX/root" "$FIX/repo" "$FIX/calls.log" "$FIX/fail-visudo" "$FIX/fail-build" "$FIX/fail-webbuild" "$FIX/web-active" \
     "$FIX/web-built" "$FIX/web-swapped" "$FIX/web-stale" "$FIX/fail-webps"
   mkdir -p "$FIX/root/var/lib/wireguard-ops-cockpit"; chmod 750 "$FIX/root/var/lib/wireguard-ops-cockpit"
+  # A host that already carries the pinned runtime (the normal case) unless the
+  # case is about installing it.
+  [ "${1:-}" = ohne-runtime ] || fake_runtime "$FIX/root"
   # Fremdes Drop-in in dem Verzeichnis, in das unser neues Drop-in kommt (der
   # Host hat dort z. B. nach-gitlab-backup.conf): es gehört nicht zu diesem
   # Repository und darf weder beim Installieren noch beim Rückfall angefasst
@@ -111,7 +150,8 @@ deploy() { # deploy <sha> [mode]
   env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root REPO_COMMIT="$1" COCKPIT_RESTART_MODE="${2:-now}" \
     VPS_DEPLOY_ROOT="$FIX/root" VPS_DEPLOY_REPO="$FIX/repo" VPS_DEPLOY_ORIGIN="$FIX/origin.git" \
     VPS_DEPLOY_SYSTEMCTL="$FIX/stub/systemctl" VPS_DEPLOY_VISUDO="$FIX/stub/visudo" VPS_DEPLOY_DOCKER="$FIX/stub/docker" \
-    VPS_DEPLOY_BUILD="[ ! -e $FIX/fail-build ] || [ \"\$(git rev-parse HEAD)\" != $B ]" \
+    VPS_DEPLOY_NODE_DIST="file://$FIX/dist" \
+    VPS_DEPLOY_BUILD="[ -x $FIX/root/opt/node-v$NODE_V-linux-x64/bin/node ] || { echo 'build: the pinned runtime is missing (bin/with-runtime would exit 69)' >&2; exit 69; }; [ ! -e $FIX/fail-build ] || [ \"\$(git rev-parse HEAD)\" != $B ]" \
     bash "$FIX/repo/deploy/vps/vps-cockpit-deploy.sh" > "$FIX/out.log" 2>&1
 }
 fails=0
@@ -148,7 +188,7 @@ fresh_host; : > "$FIX/fail-visudo"; code=0; deploy "$B" now || code=$?
 check "Rückfall: Exit ungleich 0" '[ "$code" != 0 ]'
 check "Rückfall: Host-Dateien bytegenau wie vorher (fehlende wieder weg)" '[ "$(after_sums)" = "$(cat "$FIX/vorher.sums")" ]'
 check "Rückfall: Checkout wieder auf A" '[ "$(git -C "$FIX/repo" rev-parse HEAD)" = "$A" ]'
-check "Rückfall: vollständig gemeldet, kein Neustart" 'grep -q "rollback complete" "$FIX/out.log" && ! grep -q "^systemctl restart" "$FIX/calls.log"'
+check "Rückfall: vollständig gemeldet, kein Neustart" 'grep -q "rollback: pinned runtime ok" "$FIX/out.log" && grep -q "rollback complete" "$FIX/out.log" && ! grep -q "^systemctl restart" "$FIX/calls.log"'
 check "Rückfall: kein state.json geschrieben" '[ ! -e "$FIX/root/var/lib/wireguard-ops-cockpit/self-update/state.json" ]'
 check "Rückfall: Datenordner des Dienstes bleibt 750" '[ "$(parent_mode)" = 750 ]'
 check "Rückfall: Drop-in wieder weg (lag vorher nicht da)" '[ ! -e "$FIX/root/etc/systemd/system/borgmatic.service.d/cockpit-borg-lock.conf" ]'
@@ -183,6 +223,37 @@ fresh_host; : > "$FIX/web-active"; : > "$FIX/fail-webps"; code=0; deploy "$B" de
 check "Web-Container nicht auffindbar: Exit ungleich 0, Dateien bytegenau zurück" '[ "$code" != 0 ] && [ "$(after_sums)" = "$(cat "$FIX/vorher.sums")" ]'
 # (a second, swallowed rollback in the $(...) subshell would show up as a second tag reset)
 check "Web-Container nicht auffindbar: genau ein Rückfall, vollständig im Log" '[ "$(grep -c "^docker image tag " "$FIX/calls.log")" = 1 ] && grep -q "rollback complete" "$FIX/out.log"'
+
+# 9: the host lacks the pinned runtime -> installed from .node-version before the build
+# (the build stub below fails with 69 without it, exactly like bin/with-runtime)
+fresh_host ohne-runtime; make_dist; code=0; deploy "$B" now || code=$?
+check "Runtime fehlt: Exit 0" '[ "$code" = 0 ]'
+check "Runtime fehlt: aus .node-version installiert (root, meldet v$NODE_V)" '[ "$(stat -c %U "$FIX/root/opt/node-v$NODE_V-linux-x64/bin/node" 2>/dev/null)" = root ] && [ "$("$FIX/root/opt/node-v$NODE_V-linux-x64/bin/node" --version 2>/dev/null)" = "v$NODE_V" ]'
+check "Runtime fehlt: Prüfsumme gegen die SHASUMS256.txt der Verteilung geprüft" 'grep -q "node-v$NODE_V-linux-x64.tar.xz: OK" "$FIX/out.log"'
+check "Runtime fehlt: der Bau lief erst danach (er braucht die Laufzeit)" 'grep -q "pinned Node v$NODE_V installed at" "$FIX/out.log"'
+check "Runtime fehlt: nur die Laufzeit unter opt, kein Rest der Entpackung" '[ "$(ls -A "$FIX/root/opt")" = "node-v$NODE_V-linux-x64" ]'
+
+# 10: second run (runtime present) -> no download at all (the release is gone)
+mv "$FIX/dist" "$FIX/dist.weg"; code=0; deploy "$B" now || code=$?
+check "Runtime da: zweiter Lauf braucht keinen Download (Exit 0)" '[ "$code" = 0 ] && grep -q "pinned Node v$NODE_V is already installed" "$FIX/out.log"'
+
+# 11: the published checksum does not match the tarball -> 70, nothing unpacked, rollback
+fresh_host ohne-runtime; make_dist kaputt; code=0; deploy "$B" now || code=$?
+check "Prüfsumme falsch: Exit 70" '[ "$code" = 70 ]'
+check "Prüfsumme falsch: nichts entpackt, Host-Dateien bytegenau" '[ ! -e "$FIX/root/opt" ] && [ "$(after_sums)" = "$(cat "$FIX/vorher.sums")" ] && grep -q "does not match nodejs.org" "$FIX/out.log"'
+check "Prüfsumme falsch: Rückfall auf A, Schritt nicht wiederholt" '[ "$(git -C "$FIX/repo" rev-parse HEAD)" = "$A" ] && grep -q "rollback: pinned runtime step skipped" "$FIX/out.log"'
+
+# 12: no release to download from -> 70, nothing written below /opt
+fresh_host ohne-runtime; rm -rf "$FIX/dist"; code=0; deploy "$B" now || code=$?
+check "Download scheitert: Exit 70, kein /opt angelegt" '[ "$code" = 70 ] && [ ! -e "$FIX/root/opt" ] && grep -q "could not download node-v$NODE_V-linux-x64.tar.xz" "$FIX/out.log"'
+# The host never had a runtime, so the old build cannot run either: the rollback must
+# say so instead of claiming success.
+check "Download scheitert: Rückfall ehrlich als unvollständig gemeldet" '[ "$(git -C "$FIX/repo" rev-parse HEAD)" = "$A" ] && grep -q "rollback: pinned runtime step skipped" "$FIX/out.log" && grep -q "rollback INCOMPLETE" "$FIX/out.log"'
+
+# 13: .node-version is not one clean x.y.z -> refused before anything is fetched
+fresh_host ohne-runtime; make_dist; code=0; deploy "$C" now || code=$?
+check ".node-version unsauber: Exit 70, kein Pfad/URL daraus gebaut" '[ "$code" = 70 ] && [ ! -e "$FIX/root/opt" ] && grep -q "does not name one Node version" "$FIX/out.log"'
+check ".node-version unsauber: Rückfall auf A" '[ "$(git -C "$FIX/repo" rev-parse HEAD)" = "$A" ]'
 
 echo
 [ "$fails" = 0 ] && echo "alles grün" || { echo "$fails rot"; exit 1; }
