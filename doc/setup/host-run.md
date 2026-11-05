@@ -123,6 +123,22 @@ Datenbank-Passwörter ist dort immer ein Befund, egal wohin die Ausgabe geht. Ro
 Routine: Paket-Updates aus den eingetragenen Quellen, Docker-Pulls, Kernel mit Neustart,
 GitLab-Stufen, Dienst-Neustarts.
 
+**Jedes ausgeführte Skript steht wörtlich im Plan** (05.11.2026, Befund X5 aus Job 26fb0860,
+Karte t_41cb8b49): Ein stündlicher root-Dienst führte ein Skript aus, das der Lauf nur per Hash
+festnagelte (`printf '<sha256>  /pfad' | sha256sum -c -`); die Unit-Datei stand per Heredoc
+wörtlich im Plan, das Skript nicht — der Türsteher sah einen Hash statt Code. Seitdem lehnt schon
+`parseHostRunManifest` (Planer-Stufe, also auch das Manifest aus dem Intent) einen Plan ab, in dem
+derselbe wörtliche Pfad per Prüfsumme festgenagelt (`sha*sum`, `b2sum`, `md5sum`, `shasum`,
+`cksum`, `openssl dgst` mit einem Hex-Digest im selben Schritt) **und** ausgeführt wird
+(`ExecStart=`-Zeile, Befehlswort, Shell/Interpreter/`source` mit dem Pfad, auch hinter `sudo`,
+`timeout`, `systemd-run` …), ohne dass ein Heredoc dieses Laufs ihn schreibt. Die Meldung nennt
+Pfad, Ausführungs- und Pin-Zeile; der Weg ist das Muster der Units: Inhalt per
+`cat > /pfad <<'EOF' … EOF` in den Lauf, eine Hash-Prüfung danach ist erlaubt. Bewusst eng: Ein
+geprüfter Download, der nur entpackt wird, und ein Skript ohne Hash bleiben frei; Code, den der
+Plan anders verbirgt (Pfad aus einer Variablen, Skript von anderswo), bleibt Fokus des Riegels
+(„content this plan does not show“) und X5 des Türstehers. Tests:
+`apps/api/test/host-run-visible-scripts.test.ts`.
+
 ## 2a. Backup-Riegel: Backups löschen nur mit Freigabe
 
 Jochen, 30.09.2026: „Ein Admin muss auch die Backups löschen können. Aber halt mit Freigabe.“
