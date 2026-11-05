@@ -167,7 +167,13 @@ jedes `cd`-Ziel aufgelöst. Kommentare zählen nicht.
   `sources connect|disconnect|restore` und `sources add` mit einem Pfad außerhalb der Wurzeln oder
   aus einer Variablen; auch als `bash|sh|source|. <helfer> …`; eine Kopie oder ein Link des Helfers per
   `cp|ln|install|rsync`) — auch als Text in `sh -c '…'`, in einem Skript,
-  das der Lauf schreibt, in einer Cron-Zeile oder in `echo/printf`;
+  das der Lauf schreibt, in einer Cron-Zeile oder in `echo/printf`; seit 05.11.2026 (Karte
+  t_5ce5f79f) allgemein jeder Befehl, der den Helfer nennt (Name, auch in Quotes; Glob auf seinen
+  Pfad; find-Filter `-name|-path|-regex`, der auf ihn passt) und weder die freie Direktform noch
+  reines Lesen oder Textausgabe ist: `find … -exec {} …`, `xargs` auf einer Zeile, die ihn nennt,
+  Inline-Code (`perl -e`, `python3 -c`, `ruby`, `node`, `php`, Heredoc für `python3 -`) mit seinem
+  Namen — gleich mit welchem Verb —, und ein Argument in Quotes über das Zeilenende neben ihm
+  (Einzelheiten `doc/setup/borg-maintenance.md`, „Riegel über Umwege“);
 - jede Änderung der Aufbewahrung: `keep_*`/`--keep-*`, `keepDaily|Weekly|Monthly`,
   `backup_keep_time` (GitLab), außerhalb eines reinen Lesebefehls;
 - Schreiben in die Konfiguration: `/etc/borgmatic`, `/etc/borgmatic.d`, `/root/.config/borg`
@@ -214,8 +220,9 @@ jedes `cd`-Ziel aufgelöst. Kommentare zählen nicht.
 - `uncertain` — der Text, der läuft, ist nicht der Text im Plan: `ssh`/`scp`/`rsync` zu einem
   anderen Rechner, `eval`, Dekodieren, `$'\x..'`, Code aus einer Pipe, `alias`, `PATH`/
   `BASH_ENV`/`LD_PRELOAD`/`BORG_*`, ein Skript, das der Lauf nicht selbst schreibt, ein
-  Befehlsname oder Ziel aus einem unbekannten Wert (`$CMD`, `rm -rf "$X"`, `xargs`), Inline-Code
-  mit Prozessen oder Dateizugriffen.
+  Befehlsname oder Ziel aus einem unbekannten Wert (`$CMD`, `rm -rf "$X"`, `xargs`), ein
+  Platzhalter als Befehlswort (`find … -exec {} …`, `xargs -I{} {}`; nennt die Zeile den
+  Backup-Helfer, ist es ein Riegel-Treffer), Inline-Code mit Prozessen oder Dateizugriffen.
 
 **Frei** (weder Riegel noch Hinweis) bleiben die Routine und das Lesen: `systemctl start
 borgmatic.service`, ein nacktes `borgmatic` (konfigurierte Aufbewahrung),
@@ -258,8 +265,10 @@ sichtbare Routine (Dienst-Neustart, Status, Logs) bleibt trotzdem frei.
 
 Ehrliche Grenze: Programme, die schon auf dem Host liegen und über ihren Namen oder aus den
 System-Verzeichnissen (`/usr`, `/opt/gitlab`) aufgerufen werden, nimmt der Riegel für das, was ihr
-Name sagt; ihren Inhalt sieht er nicht. Ein Interpreter-Programm ohne Löschwort und ohne
-geschützten Pfad wird nicht weiter zerlegt. Dort bleibt der Türsteher (X4) die Sicherung.
+Name sagt; ihren Inhalt sieht er nicht. Ein Interpreter-Programm ohne Löschwort, ohne
+geschützten Pfad und ohne den Namen des Backup-Helfers wird nicht weiter zerlegt. Einen Helfer-Namen,
+der erst zur Laufzeit entsteht (zusammengesetzt, dekodiert, aus einer Datei), sieht der Riegel
+nicht. Dort bleibt der Türsteher (X4) die Sicherung.
 
 Tests: `apps/api/test/backup-guard.test.ts` (Korpus frei / Riegel / nur Hinweis, die echten Pläne
 vom 10.10.2026 aus `fixtures/host-run-plans-2026-10-10.json`, Policy),

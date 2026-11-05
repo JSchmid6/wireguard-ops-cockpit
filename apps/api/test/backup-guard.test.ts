@@ -62,6 +62,10 @@ const free: Array<[string, string]> = [
   ["glob in another working directory", "cd /tmp/build && rm -f *.deb"],
   ["heredoc printed to stdout", "cat <<'EOF'\nHinweis: borg prune läuft nachts über borgmatic\nEOF"],
   ["find -exec rm outside the backups", "find /var/log/app -name '*.gz' -mtime +30 -exec rm -f {} \\;\nfind /tmp -name '*.tmp' | xargs -I{} rm -f {}"],
+  // t_5ce5f79f: den Helfer lesen, seinen Status und seine Units ansehen bleibt frei.
+  ["reading the backup helper", "ls -l /usr/local/sbin/cockpit-borg-action\nsha256sum /usr/local/sbin/cockpit-borg-action\ntest -x /usr/local/sbin/cockpit-borg-action\ncommand -v cockpit-borg-action"],
+  ["the helper's units by a glob", "journalctl -u 'cockpit-borg-*' -n 50\nsystemctl status 'cockpit-borg-*'"],
+  ["the helper named in text output", "echo 'cockpit-borg-action sources add folgt'"],
   ["notes and logs that mention the backups", "cat > /root/NOTIZ.md <<'EOF'\nAlte Dumps unter /var/backups nie per rm löschen\nEOF\necho \"borgmatic: create, dann prune\" | tee -a /var/log/cockpit.log"],
 ];
 
@@ -107,6 +111,36 @@ const needsApproval: Array<[string, string]> = [
   ["the helper named by a glob after a separator inside sh -c", "sh -c 'true; /usr/local/sbin/cockpit-borg-actio? sources restore'"],
   ["the helper through source, named by a bracket glob", ". /usr/local/sbin/cockpit-borg-actio[n] sources disconnect"],
   ["the helper through bash under another path", "bash /usr/local/bin/cockpit-borg-action sources add /opt/stacks/x"],
+  // Zweitpruefung t_f65aa80e, Befund B1 (Karte t_5ce5f79f): der Helfer ueber find -exec,
+  // xargs oder Interpreter-Code - dort liest der Riegel sein Verb nicht.
+  ["the helper through find -exec, disconnect", "find /usr/local/sbin -name cockpit-borg-action -exec {} sources disconnect \;"],
+  ["the helper through find -exec, restore", "find /usr/local/sbin -name cockpit-borg-action -exec {} sources restore \;"],
+  ["the helper through find -exec, name glob", "find /usr/local/sbin -name 'cockpit-borg-*' -exec {} sources restore \;"],
+  ["the helper through xargs -I{}", "ls /usr/local/sbin/cockpit-borg-action | xargs -I{} {} sources restore"],
+  ["the helper through perl -e system()", "perl -e 'system(\"/usr/local/sbin/cockpit-borg-action repair\")'"],
+  ["the helper through python3 -c os.system()", "python3 -c 'import os; os.system(\"/usr/local/sbin/cockpit-borg-action sources restore\")'"],
+  ["the helper through find -execdir", "find /usr/local/sbin -name cockpit-borg-action -execdir {} sources disconnect \;"],
+  ["the helper through find -ok with a quoted terminator", "find /usr/local/sbin -name cockpit-borg-action -ok {} repair ';'"],
+  ["the helper through find -path", "find /usr/local -path '*/sbin/cockpit-borg-*' -exec {} repair \;"],
+  ["the helper through find -regex", "find /usr/local/sbin -regex '.*borg-act.*' -exec {} repair \;"],
+  ["the helper through find -exec sh -c", "find /usr/local/sbin -name cockpit-borg-action -exec sh -c '\"$1\" sources restore' _ {} \;"],
+  ["the helper in a second -exec of find", "find /usr/local/sbin -name x -exec true \; -o -name 'cockpit-borg-act*' -exec {} repair \;"],
+  ["the helper as the command of find -exec", "find /tmp -maxdepth 0 -exec /usr/local/sbin/cockpit-borg-action sources restore \;"],
+  ["the helper through xargs -I %", "echo /usr/local/sbin/cockpit-borg-action | xargs -I % % sources restore"],
+  ["the helper through xargs -i sh -c", "echo /usr/local/sbin/cockpit-borg-action | xargs -i sh -c '{} repair'"],
+  ["the helper through xargs with a placeholder in the path", "ls /usr/local/sbin | xargs -I{} /usr/local/sbin/{} sources restore"],
+  ["the helper found by find, run by xargs", "find /usr/local/sbin -name 'cockpit-borg-*' | xargs -I{} {} sources restore"],
+  ["the helper from a command substitution", "$(ls /usr/local/sbin/cockpit-borg-action) sources restore"],
+  ["the helper through perl -le exec", "perl -le 'exec qw[/usr/local/sbin/cockpit-borg-action repair]'"],
+  ["the helper through ruby -e", "ruby -e 'system(\"/usr/local/sbin/cockpit-borg-action sources disconnect\")'"],
+  ["the helper through node -e", "node -e 'require(\"child_process\").execSync(\"/usr/local/sbin/cockpit-borg-action repair\")'"],
+  ["the helper through php -r", "php -r 'system(\"/usr/local/sbin/cockpit-borg-action repair\");'"],
+  ["the helper through python by a glob", "python3 -c \"import glob,os; os.system(glob.glob('/usr/local/sbin/cockpit-borg-*')[0] + ' repair')\""],
+  ["the helper through a python heredoc", "python3 - <<'PY'\nimport subprocess\nsubprocess.run(['/usr/local/sbin/cockpit-borg-action', 'sources', 'restore'])\nPY"],
+  ["the helper as text piped into a shell", "echo '/usr/local/sbin/cockpit-borg-action repair' | sh"],
+  ["the helper in a cron line", "echo '0 3 * * * root /usr/local/sbin/cockpit-borg-action sources restore' > /etc/cron.d/x"],
+  // Hinweis H1: ein Argument in Quotes ueber das Zeilenende.
+  ["sources add with a quoted argument over two lines", "/usr/local/sbin/cockpit-borg-action sources add '/opt/stacks/x\n- /etc'"],
   ["retention edit", "sed -i 's/keep_daily: 7/keep_daily: 1/' /etc/borgmatic/config.yaml"],
   ["retention written by heredoc", "cat > /etc/borgmatic/config.yaml <<'EOF'\nkeep_daily: 1\nEOF"],
   ["config moved away", "mv /etc/borgmatic /tmp/"],
@@ -257,6 +291,9 @@ const doorkeeperDecides: Array<[string, string]> = [
   ["docker run with a backup mount", "docker run --rm -v /var/backups:/b alpine ls /b"],
   ["rm with a variable target", "rm -rf \"$X\""],
   ["ssh to Lab0 that reads", "ssh borg@10.0.0.5 df -h /media/RAID"],
+  // t_5ce5f79f: ein Platzhalter als Befehlswort ohne den Helfer in der Zeile.
+  ["find runs what it finds", "find /opt/app/bin -name 'job-*' -exec {} --once \;"],
+  ["xargs runs what it reads", "ls /opt/app/bin | xargs -I{} /opt/app/bin/{} --once"],
 ];
 
 describe("backup bolt: the routine and ordinary host work stay free", () => {
