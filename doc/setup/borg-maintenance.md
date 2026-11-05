@@ -363,8 +363,39 @@ Grenzen:
   `/usr/local/sbin/cockpit-borg-action` aufgerufen wird und dort liegt — eine Kopie (`cat > …`),
   ein Link oder ein anderer Pfad endet mit rc=64. Offline nicht prüfbar (braucht die cgroup einer
   Lauf-Unit), die Bedingung steht vor der Grammatik.
+* **Allgemeine Regel seit der Zweitprüfung t_f65aa80e (Karte t_5ce5f79f, 05.11.2026):** `find -exec {}`,
+  `xargs -I{} {}`, `perl -e 'system(…)'` oder `python3 -c 'os.system(…)'` rufen genau den
+  installierten Pfad auf — der Selbstschutz greift dort nicht, und der Riegel las das Verb nicht.
+  Darum gilt jetzt: **nennt ein Befehl den Helfer und ist er weder die freie Direktform noch reines
+  Lesen, ist er ein Treffer.** „Nennen“ heißt: der Name `cockpit-borg-action` (Wortgrenze, auch in
+  Quotes), ein Glob, der auf `/usr/local/sbin/cockpit-borg-action` passt (`{}` zählt dabei wie `*`),
+  oder ein find-Filter (`-name`, `-path`, `-regex`, auch `-i…`), der auf ihn passt, unter einem
+  Startpfad, der ihn enthält. Frei bleiben nur: der Helfer als Befehlswort (oder die Shell-Form
+  oben) mit `status|check|db-access …|sources status|sources add <wörtlicher Pfad>`, Lesebefehle
+  (`ls`, `sha256sum`, `test`, `journalctl`, `systemctl status` …) und Textausgabe (`echo`,
+  `printf`, `logger`). Fließt Text, der den Helfer nennt, in eine Shell, in eine Datei, die laufen
+  kann (Cron, Skript), oder steht er in Code einer anderen Sprache (`python -c`, `perl -e`, `ruby`,
+  `node`, `php`, ein Heredoc für `python3 -`), ist auch das ein Treffer — gleich mit welchem Verb.
+  `xargs` und der Rest von `find` nach einem `\;` sind ein Treffer, wenn die Zeile den Helfer nennt
+  (`ls …/cockpit-borg-action | xargs -I{} {} …`). Ein Platzhalter als Befehlswort ohne den Helfer in
+  der Zeile (`find /opt/app -exec {} \;`, `xargs -I{} {}`) ist ein Hinweis für den Türsteher
+  (`uncertain`), kein Treffer. Ein Argument in Quotes, das über das Zeilenende reicht, neben dem
+  Helfer ist ein Treffer (der Riegel liest jede Zeile für sich; Hinweis H1). Tests:
+  `apps/api/test/backup-guard.test.ts` (die sechs Fälle der Zweitprüfung und Varianten).
+  Grenze, ehrlich: Ein Programm, das den Helfer weder nennt noch per Glob oder find-Filter trifft
+  (Name aus Teilen zusammengesetzt, dekodiert, aus einer Datei gelesen), sieht der Riegel nicht;
+  das bleibt Verschleierung und damit Sache des Türstehers (X4, `doc/setup/host-run.md` 2a).
+* **Offene Entscheidung (05.11.2026, Karte t_5ce5f79f): Freigabe-Markierung im Helfer.** Erwogen:
+  die schwächenden Verben (`sources connect|disconnect|restore`, `repair`) laufen in einer
+  host-run-cgroup nur, wenn `cockpit-host-run` für genau diesen Job eine root-eigene Markierung
+  „operatorApproved“ aus dem geprüften Envelope abgelegt hat. Nicht gebaut: die Schritte eines Laufs
+  laufen selbst als root und könnten die Markierung schreiben; gegen das Fälschen schützte wieder
+  nur der Riegel am Pfad (oder der Türsteher bei Verschleierung) — der Gewinn ist kleiner, als er
+  aussieht, und es ist eine Änderung an Schloss und Helfer zugleich (G2, G10). Entscheidet Jochen.
 * Mehr Quellen heißen mehr Platz auf der Kiste (RAID, `DF` in `status`): `add` nennt die Größe,
-  die Entscheidung bleibt „ergänzen ist frei“.
+  die Entscheidung bleibt „ergänzen ist frei“. **Offen (Hinweis H2, 05.11.2026):** `add` hat keine
+  Größengrenze; eine große Quelle kann das RAID auf Lab0 füllen, dann scheitern alle Nachtläufe.
+  Eine Grenze (fest oder gegen den freien Platz aus `status`) ist nicht gebaut.
 
 Ablauf für eine neue Quelle (ohne Jochen, sobald angeschlossen): ein host-run mit dem Schritt
 `/usr/local/sbin/cockpit-borg-action sources add <pfad>`, Prüfung `… sources status`, Rückweg

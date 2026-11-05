@@ -138,6 +138,54 @@ export function sourcesFree(args) {
   if (path.includes(OPAQUE) || !SOURCE_PATH.test(path) || `${path}/`.includes("/./") || `${path}/`.includes("/../")) return false;
   return SOURCE_ROOTS.some((root) => path.startsWith(`${root}/`) && path.length > root.length + 1);
 }
+// Der Helfer, wo der Riegel ihn nicht am Befehlswort lesen kann (Zweitprüfung
+// t_f65aa80e, Karte t_5ce5f79f): find -exec {}, xargs -I{} {}, perl -e
+// 'system(…)', python -c 'os.system(…)' rufen genau den installierten Pfad auf,
+// und der Selbstschutz des Helfers greift dort nicht. Darum gilt allgemein:
+// nennt ein Befehl den Helfer (Name, auch in Quotes; ein Glob auf seinen Pfad;
+// ein find-Namensfilter, der auf ihn passt) und ist er weder die freie
+// Direktform noch reines Lesen, ist er ein Treffer.
+const HELPER_NAME = /\bcockpit-borg-action\b/;
+const FIND_EXEC = /^-(?:exec|execdir|ok|okdir)$/;
+const HELPER_ANCESTORS = ["/", "/usr", "/usr/local", "/usr/local/sbin", BORG_ACTION_PATH];
+// Liegt der Helfer in diesem Pfad (oder einem, auf den der Glob passt)?
+function coversHelper(path) {
+  return GLOB.test(path) ? HELPER_ANCESTORS.some((ancestor) => globRegex(path).test(ancestor)) : HELPER_ANCESTORS.includes(path.replace(/(.)\/$/, "$1"));
+}
+// find mit einem Namensfilter, der auf den Helfer passt, unter einem Start, der
+// ihn enthält. Ohne Namensfilter nennt find den Helfer nicht (nur der
+// Platzhalter ist dann ein Hinweis).
+function findNamesHelper(args, cwds) {
+  const starts = findStarts(args);
+  if (!(starts.length ? starts : ["."]).some((start) => start.includes(OPAQUE) || [...cwds].some((cwd) => coversHelper(resolvePath(start, cwd))))) return false;
+  return args.some((flag, index) => {
+    const value = args[index + 1];
+    if (value === undefined) return false;
+    if (/^-i?name$/.test(flag)) return globRegex(value).test("cockpit-borg-action");
+    if (/^-i?(?:path|wholename)$/.test(flag)) return globRegex(value, true).test(BORG_ACTION_PATH);
+    if (/^-i?regex$/.test(flag)) { try { return new RegExp(`^(?:${value})$`, flag === "-iregex" ? "i" : "").test(BORG_ACTION_PATH); } catch { return true; } }
+    return false;
+  });
+}
+// Nennt dieser (normalisierte) Text den Helfer? Ein {} (find, xargs) zählt im
+// Glob wie *.
+function namesHelper(text, cwds) {
+  if (HELPER_NAME.test(text)) return true;
+  const words = text.split(/\s+/).filter(Boolean);
+  if (words.some((word) => GLOB.test(word) && !word.includes(OPAQUE) && [...cwds].some((cwd) => globRegex(resolvePath(word.replace(/^[({]+(?=\/)/, "").replaceAll("{}", "*"), cwd)).test(BORG_ACTION_PATH)))) return true;
+  const command = commandOf(words, false);
+  return Boolean(command.word) && baseName(command.word) === "find" && findNamesHelper(command.args, cwds);
+}
+// Dasselbe für die ganze logische Zeile (ls … | xargs -I{} {} …, find … \; -exec {} …).
+function lineNamesHelper(line, cwds) {
+  if (line.namesHelper === undefined) {
+    const inner = [];
+    const texts = [extractSubstitutions(normalize(line.code), inner), ...inner];
+    line.namesHelper = texts.some((text) => namesHelper(text, cwds) || splitSegments(text).some((segment) => namesHelper(segment.text, cwds)));
+  }
+  return line.namesHelper;
+}
+
 // Lesen, die einen ganzen Baum durchgehen (grep -r /etc) oder einhängen.
 const TREE_READERS = /^(?:rg|sshfs|mount|bindfs|rclone)$/;
 const BORG_READ_OUT = new Set(["mount", "extract", "export-tar"]);
@@ -625,11 +673,11 @@ function resolvePath(path, cwd) {
   return `/${out.join("/")}`;
 }
 
-function globRegex(glob) {
+function globRegex(glob, slash = false) {
   let pattern = "";
   for (let i = 0; i < glob.length; i += 1) {
     const char = glob[i];
-    if (char === "*") pattern += "[^/]*";
+    if (char === "*") pattern += slash ? ".*" : "[^/]*";
     else if (char === "?") pattern += "[^/]";
     else if (char === "[") { const end = glob.indexOf("]", i + 1); if (end < 0) pattern += "\\["; else { pattern += `[${glob.slice(i + 1, end).replace(/^!/, "^").replace(/\\/g, "\\\\")}]`; i = end; } }
     else if (char === "{") { const end = glob.indexOf("}", i + 1); if (end < 0) pattern += "\\{"; else { pattern += `(?:${glob.slice(i + 1, end).split(",").map((alt) => alt.replace(/[.+^$()|\\]/g, "\\$&").replace(/\*/g, "[^/]*").replace(/\?/g, "[^/]")).join("|")})`; i = end; } }
@@ -834,6 +882,10 @@ function codeBolt(raw) {
   const phrase = phraseBolt(normalized);
   if (phrase) return phrase;
   const paths = pathTokens(normalized);
+  // Code einer anderen Sprache (perl -e 'system(…)', python -c 'os.system(…)'),
+  // eine Cron-Zeile oder ein Text, der in eine Shell fließt: welches Verb der
+  // Helfer dort bekommt, liest der Riegel nicht (t_5ce5f79f).
+  if (HELPER_NAME.test(normalized) || paths.some((path) => GLOB.test(path) && globRegex(path).test(BORG_ACTION_PATH))) return "code that runs the backup helper, where the bolt cannot read its verb";
   if (CODE_DELETE.test(raw) && paths.some((path) => touchesBolted(path) || namesUnit(path))) return "code that deletes or moves backups or their configuration";
   if (CODE_WRITE.test(raw) && paths.some((path) => touchesConfig(path) || namesUnit(path))) return "code that writes the backup configuration, retention or timer";
   return null;
@@ -902,7 +954,11 @@ function analyzeScript(prefix, text, context, hits, language = "shell") {
   for (const { line, segments } of prepared) {
     const code = line.raw;
     const onLab0Block = quote ? lab0Block : null;
+    const quotedBefore = quote;
     quote = openQuoteAfter(line.raw, quote);
+    // Ein Argument in Quotes über das Zeilenende (sources add '/opt/stacks/x<NL>- /etc'):
+    // der Riegel liest jede Zeile für sich, der Helfer bekäme beide (t_5ce5f79f, H1).
+    if ((quotedBefore || quote) && HELPER_NAME.test(normalize(line.code))) hit(line.id, "backup", "a quoted argument spans lines next to the backup helper; the bolt reads each line on its own", code);
     if (!quote) lab0Block = null;
     else if (!onLab0Block) lab0Block = segments.map((segment) => commandOf(segment.words, false)).map((head) => (head.word ? remoteCommand(baseName(head.word), head.args) : null)).find((remote) => remote && remote.lab0)?.host || null;
     if (onLab0Block && REMOTE_DELETE.test(` ${line.raw}`)) hit(line.id, "backup", `deletes on Lab0 (${onLab0Block}), the machine that holds the borg repository`, code);
@@ -1102,7 +1158,7 @@ function segmentBolt(text, command, name, readOnly, cwds, context, line, piped) 
   // lesen den Code woanders her und machen die Form selbst nicht frei.
   // Greift, sobald irgendein Argument der Helfer ist (auch hinter -v, -O …, -o …);
   // frei bleibt nur die exakte Form.
-  const viaShell = (SHELLS.has(name) || name === "source" || name === ".") ? args.findIndex((arg) => baseName(arg) === "cockpit-borg-action" || (GLOB.test(arg) && globRegex(arg).test(BORG_ACTION_PATH))) : -1;
+  const viaShell = shellHelperArg(name, args);
   if (viaShell >= 0) {
     const inner = args.slice(viaShell + 1);
     const innerDb = inner.length === 2 && inner[0] === "db-access" && ["status", "check", "ensure", "adopt", "restore"].includes(inner[1]);
@@ -1180,6 +1236,27 @@ function segmentBolt(text, command, name, readOnly, cwds, context, line, piped) 
   return null;
 }
 
+// Welches Argument einer Shell (bash|sh|source|.) der Helfer ist; -1: keins.
+function shellHelperArg(name, args) {
+  if (!SHELLS.has(name) && name !== "source" && name !== ".") return -1;
+  return args.findIndex((arg) => baseName(arg) === "cockpit-borg-action" || (GLOB.test(arg) && globRegex(arg).test(BORG_ACTION_PATH)));
+}
+
+// Der Helfer in einer Form, die segmentBolt nicht nach Verben liest (t_5ce5f79f):
+// frei bleiben nur die Direktform (Befehlswort = Helfer) und die Shell-Form —
+// beide urteilt segmentBolt genau —, reines Lesen (ls, sha256sum, journalctl …)
+// und Textausgabe (echo/printf/logger; in eine Datei, die laufen kann, oder in
+// eine Pipe prüft codeBolt den Text).
+function helperBolt(text, command, name, cwds, line) {
+  if (name === "cockpit-borg-action" || ECHOES.has(name) || shellHelperArg(name, command.args) >= 0) return null;
+  if (readOnlyForm({ ...command, prefixes: [] }, text)) return null;
+  if (namesHelper(text, cwds)) return "names the backup helper in a form whose verb the bolt cannot read (find -exec, xargs, an interpreter, another program); free is only the helper itself with status, check, db-access, sources status or sources add <path>";
+  // xargs, oder der Rest von find nach einem \; (-exec {} …): der Befehl entsteht
+  // aus Text, und die Zeile nennt den Helfer.
+  if ((command.prefixes.includes("xargs") || name.startsWith("-")) && lineNamesHelper(line, cwds)) return "builds a command from input on a line that names the backup helper (find, xargs)";
+  return null;
+}
+
 // Die Startpfade von find: nach -H/-L/-P/-O3/-D <x>, bis zum ersten Ausdruck.
 function findStarts(args) {
   let i = 0;
@@ -1223,10 +1300,12 @@ function checkSegment(text, { piped, quoted }, line, context, cwds, hit) {
   // Ein Glob, der auf den Backup-Helfer passt, ist der Helfer in einer Form, die
   // der Riegel nicht nach seinen Verben lesen kann — auch in Quotes (sh -c '…; …'),
   // wo die innere Shell ihn expandiert (Zweitprüfung PR #69).
-  if (GLOB.test(word) && globRegex(word).test(BORG_ACTION_PATH)) hit(line.id, "backup", "the backup helper named by a glob", code);
-  // Wer läuft? Ein dynamischer Name ist unsicher.
+  if (GLOB.test(word) && globRegex(word.replaceAll("{}", "*")).test(BORG_ACTION_PATH)) hit(line.id, "backup", "the backup helper named by a glob", code);
+  // Wer läuft? Ein dynamischer Name ist unsicher — und ein Treffer, wenn die
+  // Zeile den Helfer nennt (ls …/cockpit-borg-action | xargs -I{} {} restore).
   if (word.includes(OPAQUE) || word.startsWith("$") || !quoted && GLOB.test(word)) {
     hit(line.id, "uncertain", "the command name is built at run time", code);
+    if (lineNamesHelper(line, cwds)) hit(line.id, "backup", "the command name is built at run time on a line that names the backup helper", code);
     const bolt = phraseBolt(text);
     if (bolt) hit(line.id, "backup", bolt, code);
     return { touching: true, readOnly: false, name, deletesFromInput: false, runsInput: true, echoed: null, found: [] };
@@ -1246,6 +1325,10 @@ function checkSegment(text, { piped, quoted }, line, context, cwds, hit) {
   }
   if (command.fromStdin && command.prefixes.includes("xargs") && !readOnlyForm({ ...command, prefixes: [] }, text)) {
     hit(line.id, "uncertain", "xargs builds the arguments from its input", code);
+  }
+  // find -exec {} …: find führt aus, was es findet.
+  if (name === "find" && command.args.some((arg, index) => FIND_EXEC.test(arg) && (command.args[index + 1] || "").includes("{}"))) {
+    hit(line.id, "uncertain", "find runs what it finds as a command", code);
   }
   if (isShell || isInterpreter || name === "source" || name === ".") {
     const args = [...command.args];
@@ -1280,7 +1363,7 @@ function checkSegment(text, { piped, quoted }, line, context, cwds, hit) {
 
   // Der Riegel: löscht oder verkürzt der Befehl Sicherungen, schaltet er sie ab?
   const readOnly = readOnlyForm(strict, text);
-  const bolt = segmentBolt(text, command, name, readOnly, cwds, context, line, piped);
+  const bolt = segmentBolt(text, command, name, readOnly, cwds, context, line, piped) || helperBolt(text, command, name, cwds, line);
   if (bolt) hit(line.id, "backup", bolt, code);
 
   // Sonst: nennt oder berührt er die Backups? Dann ist es ein Hinweis.
