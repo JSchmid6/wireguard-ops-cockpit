@@ -115,6 +115,101 @@ function script(value: unknown, where: string): string {
   return value.replace(/\r\n/g, "\n").trim();
 }
 
+// ── Visible scripts (Befund X5, Job 26fb0860, Karte t_41cb8b49) ─────────────
+// A run that executes a file it only pins by hash ("printf '<hash>  /path' |
+// sha256sum -c -") shows the doorkeeper the hash, never the code: a root
+// service ran a script whose source was not in the review material. The
+// planner stage refuses such a plan; the fix is the pattern the units already
+// use — write the script literally in a heredoc in this run, a hash check may
+// follow. Deterministic and narrow on purpose: it fires only where a hash pin
+// and an execution name the same literal path. Other code the plan does not
+// show (variables, a script from elsewhere) stays the guard's focus
+// ("content this plan does not show") and the doorkeeper's X5.
+
+const DIGEST_TOOL = /\b(?:sha(?:1|224|256|384|512)sum|b2sum|md5sum|shasum|cksum)\b|\bopenssl\s+dgst\b/;
+const DIGEST = /\b[0-9a-fA-F]{32,128}\b/;
+const ABSOLUTE_PATH = /(?<![\w.~$-])\/[A-Za-z0-9._+@%/-]*[A-Za-z0-9_+@%-]/g;
+const SHELL_WORDS = /^(?:sh|bash|dash|zsh|ksh|ash|busybox|python[\d.]*|perl[\d.]*|ruby[\d.]*|node|nodejs|php[\d.]*|lua[\d.]*|Rscript|pwsh|source|\.)$/;
+const WRAPPERS = /^(?:if|elif|while|until|sudo|exec|env|nice|ionice|nohup|setsid|stdbuf|chrt|time|timeout|flock|systemd-run|systemd-cat|runuser|chroot|xargs)$/;
+
+export interface HiddenPinnedScript {
+  path: string;
+  pinnedAt: string;
+  executedAt: string;
+}
+
+function unquote(word: string): string {
+  return word.replace(/^['"]+|['"]+$/g, "");
+}
+
+function pathsOn(line: string): string[] {
+  return (line.match(ABSOLUTE_PATH) || []).filter((path) => !DIGEST_TOOL.test(path.split("/").pop() || ""));
+}
+
+// The file a command line runs: the command word, the script of a shell or an
+// interpreter, the program behind a wrapper (sudo, env, timeout, systemd-run …).
+function executedPaths(line: string): string[] {
+  const exec = line.match(/^\s*Exec[A-Za-z]*\s*=\s*[-@:+!|]*(.*)$/);
+  const code = exec ? exec[1] : line.replace(/(^|\s)#.*$/, "");
+  const found: string[] = [];
+  for (const segment of code.split(/&&|\|\||[;&|`]|\$\(|\(|\)|\bthen\b|\bdo\b|\belse\b/)) {
+    const words = segment.trim().split(/\s+/).filter(Boolean).map(unquote);
+    let i = 0;
+    while (i < words.length) {
+      const word = words[i];
+      const base = word.split("/").pop() || word;
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word) || word.startsWith("-") || /^\d+[smhd]?$/.test(word) || word === "!") { i += 1; continue; }
+      if (WRAPPERS.test(base)) { i += 1; continue; }
+      if (SHELL_WORDS.test(base)) {
+        const script = words.slice(i + 1).find((arg) => !arg.startsWith("-"));
+        if (words.slice(i + 1).some((arg) => /^-[a-zA-Z]*c$|^-e$|^--eval$/.test(arg))) break;
+        if (script?.startsWith("/")) found.push(script);
+        break;
+      }
+      if (word.startsWith("/")) found.push(word);
+      break;
+    }
+  }
+  return found;
+}
+
+// Paths a heredoc in this run writes (cat > /p <<'EOF', cat <<EOF >/p, tee [-a] /p <<EOF).
+function heredocTargets(line: string): string[] {
+  if (!/<<-?\s*['"]?\w/.test(line)) return [];
+  const targets: string[] = [];
+  for (const match of line.matchAll(/>>?\s*['"]?(\/[^\s'";|&<>]+)/g)) targets.push(match[1]);
+  const tee = line.match(/\btee\b((?:\s+-\S+)*)((?:\s+['"]?\/[^\s'";|&<>]+['"]?)+)/);
+  if (tee) targets.push(...tee[2].trim().split(/\s+/).map(unquote));
+  return targets;
+}
+
+export function hiddenPinnedScripts(manifest: Pick<HostRunManifest, "steps" | "checks">): HiddenPinnedScript[] {
+  const scripts = [
+    ...manifest.steps.flatMap((step, index) => step.reboot ? [] : [{ prefix: `S${index + 1}`, text: step.run || "" }]),
+    ...manifest.checks.map((check, index) => ({ prefix: `C${index + 1}`, text: check.run })),
+  ];
+  const pinned = new Map<string, string>();
+  const written = new Set<string>();
+  const executed: Array<{ path: string; where: string }> = [];
+  for (const { prefix, text: body } of scripts) {
+    const lines = body.split("\n");
+    const hasDigest = DIGEST.test(body);
+    lines.forEach((line, index) => {
+      const where = `${prefix}:L${index + 1}`;
+      if (hasDigest && DIGEST_TOOL.test(line)) for (const path of pathsOn(line)) if (!pinned.has(path)) pinned.set(path, where);
+      for (const path of heredocTargets(line)) written.add(path);
+      for (const path of executedPaths(line)) executed.push({ path, where });
+    });
+  }
+  const seen = new Set<string>();
+  return executed.flatMap(({ path, where }) => {
+    const pinnedAt = pinned.get(path);
+    if (!pinnedAt || written.has(path) || seen.has(path)) return [];
+    seen.add(path);
+    return [{ path, pinnedAt, executedAt: where }];
+  });
+}
+
 const HOST_RUN_FENCE = /```(?:json\s+)?host-run\s*\n([\s\S]*?)```/i;
 const HOST_RUN_JSON_FENCE = /```(?:json)?\s*\n([\s\S]*?"version"\s*:\s*"cockpit-host-run\/v1"[\s\S]*?)```/i;
 
@@ -197,6 +292,10 @@ export function parseHostRunManifest(plan: string): HostRunManifest | null {
     fail(`host-run manifest has an unknown risk class: field risk must list only ${[...validRisks].join(", ")}, got ${JSON.stringify(value.risk).slice(0, 200)}`);
   }
   const risk = Array.isArray(value.risk) ? (value.risk as HostRunRisk[]) : [];
+  const hidden = hiddenPinnedScripts({ steps, checks });
+  if (hidden.length) {
+    fail(`host-run manifest runs a script it only pins by hash, so the doorkeeper never sees its code: ${hidden.map((item) => `${item.path} (runs at ${item.executedAt}, pinned at ${item.pinnedAt})`).join("; ")} — field steps[].run must write each such script literally in a heredoc in this run (cat > ${hidden[0].path} <<'EOF' … EOF, like the unit files); a hash check may follow`);
+  }
   return {
     version: HOST_RUN_VERSION, name, purpose, mutates, steps, checks, rollback,
     risk: risk.length ? [...new Set(risk)].sort() : ["contained"],
@@ -723,6 +822,7 @@ export function hostRunPlannerContract(): string {
     "Split big work into stages with a check each (for GitLab: the official upgrade stops, gitlab-backup before each stage, gitlab-ctl reconfigure and a health check after). Use apt-get with -y and noninteractive defaults; hold packages explicitly when a stage must not touch them (apt-mark hold).",
     "risk: [\"contained\"] unless the run opens or widens what is reachable (exposure: a new public hostname, port, vhost or firewall opening), can lose existing data (data_loss) or changes identities, keys or secrets (identity_or_secret). Any declared class other than contained always waits for the operator's approval, whatever the doorkeeper says; declare it honestly, the doorkeeper reads the steps as well.",
     "Deleting backups, changing their retention or switching them off always waits for the operator's approval, whatever the doorkeeper says: borg/borgmatic delete, prune, compact, recreate, break-lock, key changes, retention edits (/etc/borgmatic, keep_*, GitLab backup_keep_time), deleting, moving or overwriting in the repository path, /var/backups or /var/opt/gitlab/backups (also over ssh on Lab0, 10.0.0.5), stopping, disabling or masking borgmatic.timer or Lab0's retention service (cockpit-borg-retention set below its minimum or with --freigabe, freigeben, stopping/disabling its timer, editing its files), deleting a machine snapshot. Package updates, reading (borg list/info/check/create, docker ps/inspect/logs, systemctl status), plain borgmatic, cockpit-borg-action status|check, cockpit-borg-action sources status|add <directory below /opt/stacks, /srv or /var/lib/docker/volumes> (adding a backup source; connect, disconnect and restore wait for the operator), systemctl start borgmatic.service, new backup copies and on Lab0 /usr/local/sbin/cockpit-borg-retention status|run or set <keep_daily> <keep_weekly> <keep_monthly> <HH:MM> inside the fixed bounds (doc/setup/borg-retention.md) do not. Code the plan does not show (eval, decoding, piping into a shell, running a script the run did not write in a heredoc, commands or targets from values the plan does not show, ssh to another machine) makes the doorkeeper look hard: write the literal commands instead.",
+    "Every script the run executes (a unit's ExecStart=, python3 /path, bash /path, /path) must appear literally in the manifest: write it in a heredoc in this run (cat > /path <<'EOF' … EOF), as with unit files, even when it is already deployed. Pinning it only by hash (printf '<sha256>  /path' | sha256sum -c -) without writing it is refused before review; a hash check after the heredoc is fine.",
     "Never read, print or send secrets (Cockpit configuration in /etc/wireguard-ops-cockpit, agent credentials, private keys, /etc/shadow, borg keys, database passwords), never send host data off the host, and never change users, sudoers, SSH keys, firewall rules or the Cockpit's own code: the doorkeeper stops those for the operator.",
   ].join("\n");
 }
