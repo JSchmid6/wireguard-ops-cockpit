@@ -77,6 +77,7 @@ import {
 import {
   applyUpdateReviewPolicy,
   buildUpdateReviewPasses,
+  githubApiFetch,
   normalizeUpdateBindings,
   parseUpdateDiff,
   redactSecrets,
@@ -85,8 +86,11 @@ import {
   summarizeUpdateReview,
   updateBindings,
   updateReviewEvidence,
+  updateReviewFindings,
   updateTargets as reviewedUpdateTargets,
+  verifySecondReview,
   UPDATE_KINDS,
+  type GithubFetch,
   type UpdateBinding,
   type UpdateDiff,
   type UpdateKind,
@@ -124,6 +128,9 @@ interface AppOptions {
   // The doorkeeper of the general host door (prompt in, raw answer out).
   // Defaults to the agent broker's safety role; tests inject a stub.
   hostRunReviewRunner?: (prompt: string) => Promise<string>;
+  // Reads the GitHub API for the second review of a self-update
+  // (verifySecondReview). Defaults to api.github.com; tests inject a stub.
+  githubFetch?: GithubFetch;
   // Interval of host.status polls while a host run is going (tests shorten it).
   hostRunPollMs?: number;
   // Takt und Höchstdauer des Wartens auf den Platz am Host (tests shorten them).
@@ -2159,6 +2166,7 @@ export async function createApp(options: AppOptions = {}) {
     if (!config.agentBrokerSocket) throw new Error("the isolated reviewer needs the agent broker");
     return await runBrokerAgent(config.agentBrokerSocket, "safety", prompt);
   });
+  const githubFetch = options.githubFetch || githubApiFetch();
   const hostRunPollMs = options.hostRunPollMs ?? HOST_RUN_POLL_MS;
   const hostRunSlotPollMs = options.hostRunSlotPollMs ?? HOST_RUN_SLOT_POLL_MS;
   const hostRunSlotWaitMs = options.hostRunSlotWaitMs ?? HOST_RUN_SLOT_WAIT_MS;
@@ -2357,6 +2365,12 @@ export async function createApp(options: AppOptions = {}) {
     await writeFile(reviewPath, record, { encoding: "utf-8", mode: 0o600 });
     const outcome: UpdateReviewOutcome = { kind, bindings: updateBindings(diffs), coverage };
     Object.assign(outcome, await runUpdateReviewPasses(prompts, updateReviewRunner));
+    // A self-update review that would stop looks for a second review of
+    // exactly these commits, which the Cockpit verifies itself (4b).
+    if (kind === "self" && updateReviewFindings(outcome).result !== "pass") {
+      outcome.secondReview = [];
+      for (const binding of outcome.bindings) outcome.secondReview.push(await verifySecondReview(binding, githubFetch));
+    }
     return { diffs, reviewPath, outcome };
   }
 
@@ -2676,6 +2690,12 @@ export async function createApp(options: AppOptions = {}) {
       // The review of the new code decides only here, after every plan check:
       // a stop turns an allowed plan into an operator decision.
       if (updateReview) policy = applyUpdateReviewPolicy(policy, updateReview.outcome);
+      const reviewSummary = (reviewRecord as { updateReview?: Record<string, unknown> }).updateReview;
+      if (updateReview && reviewSummary?.reported === true) {
+        database.createAudit({ actorId: actor.id, action: "hermes.update_review.reported", targetType: "job", targetId: job.id, details: {
+          result: reviewSummary.result, secondReview: updateReview.outcome.secondReview ?? [],
+        } });
+      }
       const envelope = createExecutionEnvelope({
         jobId: job.id, actorId: actor.id, sessionId: session.id, intent,
         evidence: [...untrustedEvidence, ...updateReviewEvidence(updateReview?.outcome.bindings ?? [])],
@@ -4387,15 +4407,23 @@ Follow these rules:
     // but the operator must know, and a revised plan whose new review passes
     // must not bury it. Listed for seven days; James forwards it. A job James
     // withdrew keeps its finding listed: withdrawing must not hide it either.
-    const reviewFindings = (["blocked_prerequisite", "blocked_policy", "withdrawn"] as const)
+    // A review that only reported (second review verified, 4b) is listed the
+    // same way, whatever became of the job: it did not stop, so this is where
+    // the operator learns of it.
+    const blockedAnyway = new Set<string>(["blocked_prerequisite", "blocked_policy", "withdrawn"]);
+    const reviewFindings = ([
+      "blocked_prerequisite", "blocked_policy", "withdrawn", "pending", "pending_approval", "running", "completed", "blocked_user_approval",
+      "blocked_runner_busy", "failed_execution", "failed_verification", "rollback_completed", "rejected", "failed",
+    ] as const)
       .flatMap((status) => database.listJobsByStatus("hermes-change", status))
       .filter((job) => visible(job.id) && Date.parse(job.updatedAt) >= now - 7 * 24 * 3_600_000)
       .flatMap((job) => {
         const review = job.output?.updateReview as Record<string, unknown> | undefined;
-        if (!review || review.result !== "finding") return [];
+        const reported = review?.reported === true;
+        if (!review || !(reported || (review.result === "finding" && blockedAnyway.has(job.status)))) return [];
         const findings = Array.isArray(review.findings) ? review.findings as Array<Record<string, unknown>> : [];
         return [{
-          jobId: job.id, status: job.status, at: job.updatedAt,
+          jobId: job.id, status: job.status, at: job.updatedAt, ...(reported ? { reported: true, result: String(review.result ?? "") } : {}),
           intent: String((job.output?.explanation as Record<string, unknown> | undefined)?.intent ?? ""),
           findings: findings.filter((finding) => !/^UNVERIFIABLE\b/.test(String(finding.guarantee ?? "")))
             .map((finding) => ({ title: String(finding.title ?? ""), guarantee: String(finding.guarantee ?? ""), file: String(finding.file ?? "") })),

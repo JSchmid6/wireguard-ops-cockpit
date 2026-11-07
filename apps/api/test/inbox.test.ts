@@ -202,9 +202,9 @@ describe("GET /api/inbox", () => {
     const { app, admin, automation, fresh, inspect } = await setup();
     const db = inspect();
     const sessionId = db.getJob(fresh.id)!.sessionId!;
-    const reviewed = (status: "blocked_prerequisite" | "blocked_policy", result: string) => db.createJob({
+    const reviewed = (status: "blocked_prerequisite" | "blocked_policy" | "completed", result: string, reported = false) => db.createJob({
       sessionId, kind: "runbook", subjectId: "hermes-change", status, requiresApproval: false,
-      output: { explanation: { intent: "update the cockpit" }, updateReview: { result, findings: [
+      output: { explanation: { intent: "update the cockpit" }, updateReview: { result, ...(reported ? { reported: true } : {}), findings: [
         { title: "repair runs on read-only runs", guarantee: "G5", file: "deploy/helpers/cockpit-host-run" },
         { title: "Dockerfile.api not in the material", guarantee: "UNVERIFIABLE", file: "Dockerfile.api" },
       ] } },
@@ -212,11 +212,15 @@ describe("GET /api/inbox", () => {
     const prerequisite = reviewed("blocked_prerequisite", "finding");
     const policy = reviewed("blocked_policy", "finding");
     reviewed("blocked_prerequisite", "incomplete");
+    // A finding that only reported (second review verified, 4b) is listed although the job ran.
+    const reported = reviewed("completed", "finding", true);
+    reviewed("completed", "finding");
     db.close();
     for (const headers of [admin, automation]) {
       const listed = (await app.inject({ method: "GET", url: "/api/inbox", headers })).json().reviewFindings;
-      expect(listed.map((item: { jobId: string }) => item.jobId).sort()).toEqual([prerequisite.id, policy.id].sort());
-      expect(listed[0]).toMatchObject({ intent: "update the cockpit", findings: [{ title: "repair runs on read-only runs", guarantee: "G5", file: "deploy/helpers/cockpit-host-run" }] });
+      expect(listed.map((item: { jobId: string }) => item.jobId).sort()).toEqual([prerequisite.id, policy.id, reported.id].sort());
+      expect(listed.find((item: { jobId: string }) => item.jobId === prerequisite.id)).toMatchObject({ intent: "update the cockpit", findings: [{ title: "repair runs on read-only runs", guarantee: "G5", file: "deploy/helpers/cockpit-host-run" }] });
+      expect(listed.find((item: { jobId: string }) => item.jobId === reported.id)).toMatchObject({ status: "completed", reported: true, result: "finding" });
     }
   });
 
