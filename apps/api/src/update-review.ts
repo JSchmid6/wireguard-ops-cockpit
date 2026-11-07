@@ -182,6 +182,19 @@ export interface UpdateReviewOutcome {
   coverage: UpdateReviewCoverage[];
   answer?: UpdateReviewAnswer | null;
   reviewerError?: string | null;
+  // What the Cockpit itself found on GitHub about a second review of exactly
+  // the installed commits (verifySecondReview). Only a self-update has one.
+  secondReview?: SecondReviewCheck[];
+}
+
+// One installed commit's second review, as the Cockpit verified it.
+export interface SecondReviewCheck {
+  sha: string;
+  verified: boolean;
+  reason: string;
+  pr?: number;
+  headSha?: string;
+  url?: string;
 }
 
 // Structurally identical to the plan policy in app.ts.
@@ -768,10 +781,25 @@ export function updateReviewFindings(outcome: UpdateReviewOutcome): {
 // - incomplete: blocked_prerequisite (zone red) — also over a plan that would
 //   otherwise ask the operator, because an unreviewed update is never offered
 //   for approval. Only blocked_policy, which nobody can approve either, stays.
+// - report instead of a stop (operator decision 07.11.2026, „ja alles“, 4b):
+//   a finding or an incomplete review of a self-update whose every installed
+//   commit carries a second review the Cockpit verified itself on GitHub
+//   (secondReviewCovers) keeps the plan's own status. The review still ran and
+//   is recorded; the job and GET /api/inbox carry it as a report. A plan block
+//   stays, and so does every other stop outside this review.
 export function applyUpdateReviewPolicy<P extends ReviewedPolicy>(policy: P, outcome: UpdateReviewOutcome): P {
   const { result, findings, gaps, evidence, needed } = updateReviewFindings(outcome);
   const merged = { ...policy, evidence: [...policy.evidence, ...evidence] };
   if (result === "pass") return merged;
+  if (secondReviewCovers(outcome)) {
+    const checks = outcome.secondReview ?? [];
+    return {
+      ...merged,
+      evidence: [...merged.evidence, ...checks.map((check) => `second review verified for ${check.sha.slice(0, 12)}: ${check.reason}`),
+        `pre-install review ${result} reported, not a stop: ${[...findings, ...gaps].join("; ").slice(0, 600)}`],
+      neededToContinue: [...policy.neededToContinue, "Tell the operator about the reported pre-install review (GET /api/inbox lists it under reviewFindings)."],
+    };
+  }
   const subject = UPDATE_KINDS[kindOf(outcome.kind)].subject;
   const stillBlocked = (reason: string, status: P["status"]): P => policy.allowed
     ? { ...merged, zone: "red", allowed: false, status, reason, neededToContinue: needed }
@@ -849,5 +877,106 @@ export function summarizeUpdateReview(diffs: UpdateDiff[], outcome: UpdateReview
     problem: outcome.answer?.problem ?? null,
     findings: outcome.answer?.findings ?? [],
     notes: outcome.answer?.notes ?? "",
+    secondReview: outcome.secondReview ?? [],
+    // A finding or gap that did not stop the job because of the second review.
+    reported: updateReviewFindings(outcome).result !== "pass" && secondReviewCovers(outcome),
+  };
+}
+
+// --- Second review (operator decision 07.11.2026, „ja alles“, point 4b) ---
+//
+// The same diff used to be judged twice: by the Opus second review of the pull
+// request and by this pre-install review. When the Cockpit verifies on its own
+// (never from what the requester says) that exactly the commit it installs is
+// the merge of a pull request whose head an Opus second review approved, its
+// own review becomes a report instead of a stop. The proof, all from the
+// GitHub API of the allowlisted repository, for every installed sha:
+// 1. sha is a merge commit with two parents; its first parent is the reviewed
+//    base, so the installed diff base..sha is the diff of this one merge.
+// 2. A pull request into main, merged, with merge_commit_sha == sha and
+//    head.sha == the second parent.
+// 3. head.sha contains base (compare base...head: behind_by 0) and sha has the
+//    tree of head.sha: the installed code is byte for byte the reviewed head.
+// 4. A comment or review on that pull request by an account with write access
+//    (OWNER, MEMBER, COLLABORATOR) holds the marker line
+//    `Cockpit-Zweitpruefung: FREIGABE <head sha, 40 hex> opus`.
+// Anything not provable (network, rate limit, a page that does not parse, a
+// missing step) is no proof: the review keeps its stop.
+// Honest limit: the marker proves that the review record exists for exactly
+// this head, not who wrote it beyond the account's write access — the agent
+// posts it with the owner's token. Its worth is the binding to the sha and the
+// public, immutable record, not a second principal.
+export const SECOND_REVIEW_REPOSITORY = "JSchmid6/wireguard-ops-cockpit";
+export const SECOND_REVIEW_MARKER = /^Cockpit-Zweitpruefung: FREIGABE ([a-f0-9]{40}) opus[ \t]*$/m;
+const SECOND_REVIEW_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
+
+// GET of one GitHub API path (relative to https://api.github.com), parsed JSON.
+export type GithubFetch = (apiPath: string) => Promise<unknown>;
+
+export function secondReviewCovers(outcome: UpdateReviewOutcome): boolean {
+  if (kindOf(outcome.kind) !== "self" || outcome.unavailable || outcome.bindings.length === 0) return false;
+  const checks = outcome.secondReview ?? [];
+  return outcome.bindings.every((binding) => checks.some((check) => check.sha === binding.sha && check.verified));
+}
+
+function record(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function field(value: unknown, ...keys: string[]): unknown {
+  return keys.reduce<unknown>((current, key) => record(current)[key], value);
+}
+
+export async function verifySecondReview(binding: UpdateBinding, github: GithubFetch): Promise<SecondReviewCheck> {
+  const { sha, base } = binding;
+  const no = (reason: string): SecondReviewCheck => ({ sha, verified: false, reason });
+  if (!SHA.test(sha) || !SHA.test(base)) return no("malformed sha");
+  const repo = `/repos/${SECOND_REVIEW_REPOSITORY}`;
+  try {
+    const commit = await github(`${repo}/commits/${sha}`);
+    const parents = Array.isArray(field(commit, "parents")) ? (field(commit, "parents") as unknown[]).map((parent) => field(parent, "sha")) : [];
+    if (parents.length !== 2) return no(`${sha.slice(0, 12)} is not the merge commit of one pull request`);
+    if (parents[0] !== base) return no(`the first parent of ${sha.slice(0, 12)} is not the reviewed base ${base.slice(0, 12)}`);
+    const head = parents[1];
+    if (typeof head !== "string" || !SHA.test(head)) return no("the merged head is unreadable");
+    const pulls = await github(`${repo}/commits/${sha}/pulls`);
+    const pr = (Array.isArray(pulls) ? pulls : []).find((item) =>
+      typeof field(item, "merged_at") === "string" && field(item, "merge_commit_sha") === sha
+      && field(item, "head", "sha") === head && field(item, "base", "ref") === "main"
+      && field(item, "base", "repo", "full_name") === SECOND_REVIEW_REPOSITORY);
+    const number = field(pr, "number");
+    if (typeof number !== "number" || !Number.isInteger(number)) return no(`no merged pull request into main has ${sha.slice(0, 12)} as its merge commit`);
+    const compare = await github(`${repo}/compare/${base}...${head}`);
+    if (field(compare, "behind_by") !== 0) return no(`the head of #${number} does not contain the reviewed base`);
+    const headCommit = await github(`${repo}/commits/${head}`);
+    const tree = field(commit, "commit", "tree", "sha");
+    if (typeof tree !== "string" || tree !== field(headCommit, "commit", "tree", "sha")) return no(`${sha.slice(0, 12)} does not carry the tree of the reviewed head`);
+    const comments = await github(`${repo}/issues/${number}/comments?per_page=100`);
+    const reviews = await github(`${repo}/pulls/${number}/reviews?per_page=100`);
+    const approval = [...(Array.isArray(comments) ? comments : []), ...(Array.isArray(reviews) ? reviews : [])].find((item) => {
+      const body = field(item, "body");
+      const marker = typeof body === "string" ? SECOND_REVIEW_MARKER.exec(body) : null;
+      return marker?.[1] === head && SECOND_REVIEW_ASSOCIATIONS.has(String(field(item, "author_association")));
+    });
+    if (!approval) return no(`#${number} carries no second-review marker for head ${head.slice(0, 12)}`);
+    const url = field(approval, "html_url");
+    return {
+      sha, verified: true, pr: number, headSha: head, ...(typeof url === "string" ? { url } : {}),
+      reason: `merge of #${number} (head ${head.slice(0, 12)}, same tree), second review by ${String(field(approval, "user", "login") || "?")}`,
+    };
+  } catch (error) {
+    return no(`GitHub not readable: ${(error instanceof Error ? error.message : "request failed").slice(0, 200)}`);
+  }
+}
+
+// The default GitHub reader: unauthenticated (public repository), bounded.
+export function githubApiFetch(timeoutMs = 15_000): GithubFetch {
+  return async (apiPath) => {
+    const response = await fetch(`https://api.github.com${apiPath}`, {
+      headers: { accept: "application/vnd.github+json", "user-agent": "wireguard-ops-cockpit-update-review", "x-github-api-version": "2022-11-28" },
+      redirect: "error", signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!response.ok) throw new Error(`GET ${apiPath.split("?")[0]} answered ${response.status}`);
+    return await response.json();
   };
 }

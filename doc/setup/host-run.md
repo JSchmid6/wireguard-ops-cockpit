@@ -669,6 +669,17 @@ hebt. Der Normalfall ist Durchlaufen. Das gilt für beide Prüfungen: den Türst
   Grenze, Risikozone rot, nicht autorisierte Capability, `shell.exception`, `borg.repair`).
 - Die Sicherungskette vor einem verändernden Lauf (borg-Prüfung, Snapshot) hängt nicht an dieser
   Matrix und bleibt unverändert.
+- **Zweitprüfung (Jochen, 07.11.2026, „ja alles“, Punkt 4b), nur Selbstupdate:** Prüft das Cockpit
+  selbst über die GitHub-API, dass jeder zu installierende Commit genau der Merge eines PR nach
+  `main` ist, dessen Head eine Opus-Zweitprüfung mit dem Marker
+  `Cockpit-Zweitpruefung: FREIGABE <head-sha> opus` freigegeben hat (Einzelheiten:
+  `doc/setup/self-update.md`, „Second review“), werden FINDING und INCOMPLETE der
+  Vor-Installations-Prüfung zur **Meldung**: der Job behält den Status seines Plans, die Prüfung
+  läuft und steht im Job (`output.updateReview.reported: true`), im Audit
+  (`hermes.update_review.reported`) und sieben Tage in `GET /api/inbox` unter `reviewFindings`
+  (`reported: true`); James meldet sie Jochen. Ohne prüfbaren Nachweis bleibt alles wie oben.
+  Fehlt die Bindung des geprüften Diffs (Eingabe nicht verfügbar), bleibt es `blocked_prerequisite`.
+  Plan-Policy, Safety review, Backup- und Risiko-Riegel und `dienste.update` sind davon nicht berührt.
 
 ## Tests
 
