@@ -50,9 +50,11 @@ Auf die Box kommt nur `sha256(<hex>)` (`/etc/box-bootstrap/cockpit-token.sha256`
 kein Passwort-Login) an und trägt den Hash unter dem Label `hermes-tresor` mit den Routen aus
 `deploy/config/automation-scopes.json` ein — gemessen am 08.11.2026 auf VPS und Lab0 (identisch: jede
 Route mit dem Token aufgerufen, 403 „not authorized for this endpoint“ = nicht im Scope). Steht schon ein
-`hermes-tresor`-Token (Rotation per `plugins/cockpit/schluessel.py --instanz box`), bleibt er: ein
-späterer Deploy holt den Bootstrap-Hash nie zurück. Ein Konto gleichen Namens mit anderer Rolle bricht
-ab, ohne etwas zu ändern.
+`hermes-tresor`-Token, bleibt er. Danach ist die Hash-Datei verbraucht (`….sha256.used`): Das Deploy ruft
+den Helfer nur, solange die unverbrauchte Datei da ist — ein später per Löschen der Zeile widerrufener
+Token kommt mit keinem weiteren Deploy oder self.update zurück. Ein Konto gleichen Namens mit anderer Rolle
+bricht ab, ohne etwas zu ändern (die Datei bleibt dann unverbraucht). Rotation:
+`plugins/cockpit/schluessel.py --instanz box` (Hermes), ersetzt nur den Hash, über die Tür der Box.
 
 ## Nachweis
 

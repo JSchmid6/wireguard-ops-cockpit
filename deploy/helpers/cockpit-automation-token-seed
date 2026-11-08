@@ -19,8 +19,11 @@
 #     <scopes-file> (deploy/config/automation-scopes.json — the route set the
 #     automation token holds on the VPS and on Lab0),
 #   - and does nothing if the account already has a hermes-tresor token: a
-#     rotation (plugins/cockpit/schluessel.py) replaced it since, and a re-run of
-#     the deploy (self-update) must never bring back the bootstrap hash.
+#     rotation (plugins/cockpit/schluessel.py) replaced it since.
+#   - After either outcome the hash file is consumed (renamed to <hash-file>.used):
+#     the deploy calls this helper only while the unconsumed file exists, so a
+#     token revoked later by deleting its row never comes back with a re-run of
+#     the deploy (self-update) — the bootstrap hash is good for one seed only.
 #
 # Output: one JSON line {"ok": true, "action": "created"|"kept", "account": ...}.
 # Exit codes: 0 ok, 64 usage, 65 refused (input or account), 66 database missing.
@@ -69,6 +72,11 @@ def read_scopes(path):
     return sorted(set(scopes))
 
 
+def consume(hash_path):
+    """The bootstrap hash seeds once: afterwards the deploy no longer finds the file."""
+    os.replace(hash_path, hash_path + ".used")
+
+
 def seed(db_path, hash_path, scopes_path):
     token_hash = read_hash(hash_path)
     scopes = read_scopes(scopes_path)
@@ -88,14 +96,17 @@ def seed(db_path, hash_path, scopes_path):
                 raise Failure(65, "account %s has role %r, not automation — nothing changed" % (ACCOUNT, row[1]))
             present = db.execute("SELECT count(*) FROM api_tokens WHERE user_id = ? AND label = ?", (row[0], LABEL)).fetchone()[0]
             if present:
-                return {"ok": True, "action": "kept", "account": ACCOUNT, "label": LABEL, "accountCreated": created_account}
-            db.execute("INSERT INTO api_tokens (id, user_id, label, token_hash, scopes_json, created_at, last_used_at) "
-                       "VALUES (?, ?, ?, ?, ?, ?, NULL)",
-                       (str(uuid.uuid4()), row[0], LABEL, token_hash, json.dumps(scopes), stamp()))
+                result = {"ok": True, "action": "kept", "account": ACCOUNT, "label": LABEL, "accountCreated": created_account}
+            else:
+                result = None
+                db.execute("INSERT INTO api_tokens (id, user_id, label, token_hash, scopes_json, created_at, last_used_at) "
+                           "VALUES (?, ?, ?, ?, ?, ?, NULL)",
+                           (str(uuid.uuid4()), row[0], LABEL, token_hash, json.dumps(scopes), stamp()))
     finally:
         db.close()
-    return {"ok": True, "action": "created", "account": ACCOUNT, "label": LABEL, "scopes": len(scopes),
-            "accountCreated": created_account}
+    consume(hash_path)   # erst nach dem Commit
+    return result or {"ok": True, "action": "created", "account": ACCOUNT, "label": LABEL, "scopes": len(scopes),
+                      "accountCreated": created_account}
 
 
 def main(argv):

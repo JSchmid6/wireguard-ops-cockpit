@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -56,6 +56,19 @@ describe("cockpit-automation-token-seed", () => {
     expect(identity?.actor).toMatchObject({ username: "hermes-automation", role: "automation" });
     expect(identity?.scopes).toContain("POST /api/hermes/runbook");
     expect(identity?.scopes).not.toContain("POST /api/hermes/jobs/:jobId/approval");
+    // The bootstrap hash seeds once: the file is consumed.
+    expect(existsSync(path.join(dir, "hash"))).toBe(false);
+    expect(existsSync(path.join(dir, "hash.used"))).toBe(true);
+  });
+
+  it("a token revoked by deleting its row does not come back: the hash file is gone after the first seed", () => {
+    expect(seed().code).toBe(0);
+    const raw = new Database(dbPath);
+    raw.prepare("DELETE FROM api_tokens WHERE label = 'hermes-tresor'").run();
+    raw.close();
+    const again = seed();
+    expect(again.code).not.toBe(0);
+    expect(inspect().findUserByApiToken(`cpt_${RAW}`)).toBeNull();
   });
 
   it("keeps an existing hermes-tresor token (a rotation must survive every re-run)", () => {
@@ -63,6 +76,7 @@ describe("cockpit-automation-token-seed", () => {
     writeFileSync(path.join(dir, "hash"), `${"c".repeat(64)}\n`);
     const again = seed();
     expect(JSON.parse(again.stdout)).toMatchObject({ action: "kept", accountCreated: false });
+    expect(existsSync(path.join(dir, "hash"))).toBe(false);
     expect(inspect().findUserByApiToken(`cpt_${RAW}`)).not.toBeNull();
   });
 
@@ -73,6 +87,7 @@ describe("cockpit-automation-token-seed", () => {
     const promoted = seed();
     expect(promoted.code).toBe(65);
     expect(promoted.stderr).toContain("nothing changed");
+    expect(existsSync(path.join(dir, "hash"))).toBe(true);   // not consumed on a refusal
     writeFileSync(path.join(dir, "bad-hash"), "nicht-hex\n");
     expect(seed(path.join(dir, "bad-hash")).code).toBe(65);
     writeFileSync(path.join(dir, "scopes.json"), JSON.stringify({ scopes: ["GET /api/me; rm -rf /"] }));

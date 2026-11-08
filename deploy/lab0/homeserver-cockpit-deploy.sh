@@ -839,7 +839,9 @@ fi
 # ---------------------------------------------------------------------------
 # 12a) James' Bearer auf der Box (Rolle box): Konto hermes-automation, Label
 #      hermes-tresor, Hash aus dem Erststart. Der Token selbst kommt nie auf den Host;
-#      steht schon ein hermes-tresor-Token (Rotation), bleibt er (Helfer: kept).
+#      steht schon ein hermes-tresor-Token (Rotation), bleibt er (Helfer: kept). Danach ist
+#      die Hash-Datei verbraucht (…sha256.used): ein später per Löschen widerrufener Token
+#      kommt mit keinem weiteren Deploy/self.update zurück.
 # ---------------------------------------------------------------------------
 if [ "$COCKPIT_ROLE" = "box" ]; then
   TOKEN_HASH_FILE=/etc/box-bootstrap/cockpit-token.sha256
@@ -848,8 +850,10 @@ if [ "$COCKPIT_ROLE" = "box" ]; then
       "$TOKEN_HASH_FILE" "$COCKPIT_DIR/deploy/config/automation-scopes.json")" \
       || die "Automation-Token konnte nicht eingetragen werden (cockpit-automation-token-seed, siehe stderr)."
     echo "Automation-Token: $seeded"
+  elif [ -f "$TOKEN_HASH_FILE.used" ]; then
+    echo "Automation-Token: Bootstrap-Hash schon verbraucht — nichts eingetragen."
   else
-    echo "HINWEIS: $TOKEN_HASH_FILE fehlt — kein Automation-Token eingetragen (James erreicht dieses Cockpit erst nach schluessel.py --instanz box)."
+    echo "HINWEIS: $TOKEN_HASH_FILE fehlt — kein Automation-Token eingetragen."
   fi
 fi
 
