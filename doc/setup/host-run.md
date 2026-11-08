@@ -431,10 +431,10 @@ und das prüft der Türsteher) spannt der Helfer das Netz seiner Instanz.
 ### Netz je Instanzrolle (16.10.2026)
 
 Es bleibt **eine** Tür, ein Helfer und ein Envelope; nur das Netz hängt an der Rolle der Instanz.
-Die Rolle steht in `/etc/wireguard-ops-cockpit/instance-role.env` (`COCKPIT_INSTANCE_ROLE=vps|lab0`,
+Die Rolle steht in `/etc/wireguard-ops-cockpit/instance-role.env` (`COCKPIT_INSTANCE_ROLE=vps|lab0|box`,
 root, 0600). Diese Datei legt **nur das Deploy** ab — `vps-cockpit-deploy.sh` aus
 `deploy/vps/instance-role.env` (Tabelle, mit Rückfall), `homeserver-cockpit-deploy.sh` aus
-`deploy/lab0/instance-role.env`. Plan, Manifest, Envelope und Umgebung des Aufrufers tragen keine
+`deploy/lab0/instance-role.env` bzw. (mit `COCKPIT_ROLE=box`, Proxmox-Host) aus `deploy/box/instance-role.env`. Plan, Manifest, Envelope und Umgebung des Aufrufers tragen keine
 Rolle (sudo setzt die Umgebung zurück; der Helfer liest nur diese Datei). Fail closed: fehlt die
 Datei, gehört sie nicht root, ist sie für Gruppe/andere schreibbar, steht keine, eine unbekannte
 oder mehr als eine Rolle darin, scheitert der Lauf mit `preflight_failed`, kein Schritt läuft.
@@ -442,7 +442,8 @@ oder mehr als eine Rolle darin, scheitert der Lauf mit `preflight_failed`, kein 
 Dieselbe Datei sagt dem **Türsteher**, auf welchem Host er steht: Die API-Unit liest sie als
 optionales `EnvironmentFile=-` (systemd liest als root, die API sieht nur `COCKPIT_INSTANCE_ROLE`).
 Mit Rolle `lab0` beginnt seine Anweisung mit Lab0 (Backup-Ziel, borg-Repository = Familiendaten,
-X1/X4), sonst — `vps`, fehlende oder unbekannte Rolle — mit dem strengsten Text, dem
+X1/X4), mit Rolle `box` mit dem Proxmox-Host (Gäste HAOS/UniFi, ihre Platten, Snapshots und vzdump-Sicherungen
+= X4), sonst — `vps`, fehlende oder unbekannte Rolle — mit dem strengsten Text, dem
 Produktionshost. Der Rest des Vertrags (X1–X6, Antwortformat) ist auf beiden Hosts gleich. Grund:
 Auf Lab0 hielt der Türsteher einen Lab0-Plan für einen Widerspruch zum Produktionshost (X5) und
 stoppte jeden verändernden Lauf. Die Rolle ändert nur den Text, nie Schloss, Netz oder Riegel.
@@ -521,6 +522,32 @@ Maschinen-Snapshot passen dort nicht (Lauf 98a12e31 vom 16.10.2026 scheiterte ge
    erst beim Zugriff, beschreibbar). Sonst `preflight_failed`, kein Schritt. Nach einem Neustart
    prüft die neue Unit dasselbe, wenn der Systemstart durch ist, vor dem nächsten Schritt; sonst
    endet der Lauf `failed`.
+
+**box** (Proxmox-Host „Narrow Box“, 10.0.0.6; Karte t_88f1e802, 08.11.2026): kein borg-Client, kein
+Hoster — und anders als Lab0 liegen die schützenswerten Daten nicht in Pfaden, sondern in den Platten der
+Gäste (HAOS-VM, UniFi). Darum:
+
+1. `cockpit-host-snapshot create cockpit-run-<job> --guests`: derselbe Host-Snapshot wie auf Lab0 — `/etc`
+   enthält hier `/etc/pve` mit allen Gast-Konfigurationen — und danach ein Proxmox-Snapshot gleichen Namens
+   (`.` wird `-`) **jeder** VM und **jedes** Containers des Knotens (`qm snapshot` / `pct snapshot`, ohne
+   RAM-Zustand: absturzkonsistent, auf LVM-thin/ZFS Sekunden). Vorlagen (`template: 1`) entfallen. Je Gast
+   bleiben die fünf jüngsten eigenen Snapshots, rotiert wird nur die eigene Namensform (`qm|pct delsnapshot`).
+   Lässt sich ein Gast nicht sichern (Speicher ohne Snapshots, gesperrt), scheitert der ganze Snapshot →
+   `preflight_failed`, kein Schritt. Kein Gast ist ein gültiges Netz (leere Liste).
+2. Keine borg-Prüfung, keine Datensperre: Ein Lauf auf dem Proxmox-Host soll gerade Gäste ändern dürfen; ihr
+   Rückweg ist der Gast-Snapshot, nicht eine schreibgeschützte Platte.
+3. Warum Snapshot statt `vzdump` vor jedem Lauf: `vzdump` kopiert jede Gastplatte vollständig (Minuten, Platz
+   in Größe der Gäste) und lief damit vor jedem auch kleinen Lauf; ein Snapshot ist sofort da und für den Fall
+   „Lauf hat den Gast verdorben“ der bessere Rückweg. Ein `vzdump` als Sicherung *außerhalb* der Box (nach
+   Lab0) ist ein eigener, regelmäßiger Auftrag — kein Teil des Netzes der Tür.
+
+Ehrliche Grenze von box: Was nicht auf einer Gastplatte liegt (`/var/lib/vz` mit ISO-Abbildern und
+vzdump-Sicherungen, weiterer Speicher), deckt kein Snapshot; ein Snapshot liegt auf demselben Speicher wie
+der Gast (fällt die NVMe aus, ist beides weg); und was ein Gast nach außen geschickt hat, holt kein Rollback
+zurück. Einen Gast oder seine Volumes zerstören, einen Gast-Snapshot löschen oder zurückrollen,
+vzdump-Sicherungen löschen, Speicher entfernen ist für den Türsteher X4. Zurückgerollt wird nur mit Jochens
+Freigabe (`qm rollback <vmid> <name>` bzw. `pct rollback …`; das Protokoll nennt die Gast-Snapshots als
+Rückweg).
 
 Ehrliche Grenze von lab0: der Host-Snapshot ist kein Maschinen-Snapshot. Er deckt Konfiguration,
 Paketstand und Unit-Zustände, keine Daten und keinen Paketinhalt (ein Downgrade braucht die alte

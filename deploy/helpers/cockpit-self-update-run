@@ -139,11 +139,14 @@ HOST_DOOR_FILES = (
     "deploy/helpers/cockpit-host-snapshot",
     "deploy/lab0/instance-role.env",
     "deploy/vps/instance-role.env",
+    "deploy/box/instance-role.env",
 )
 # File-level focus: (kind, guarantees, reason, matcher).
 FILE_AREAS = (
     ("approval-and-auth", ("G1", "G6"), "sign-in, bearer-token scopes, the approval route, configuration and secrets",
-     lambda path: path in ("apps/api/src/app.ts", "apps/api/src/auth.ts", "apps/api/src/config.ts", "apps/api/src/db.ts")
+     lambda path: path in ("apps/api/src/app.ts", "apps/api/src/auth.ts", "apps/api/src/config.ts", "apps/api/src/db.ts",
+                           # The routes James' automation token gets on a fresh instance (role box).
+                           "deploy/config/automation-scopes.json")
      or bool(AUTH_PATH_RE.search(path))),
     ("brokers-and-agents", ("G3", "G6"), "executor/agent brokers, envelope code, reviewer and agent prompts",
      lambda path: path.startswith(("apps/executor-broker/", "apps/agent-broker/")) or path in (
@@ -154,7 +157,7 @@ FILE_AREAS = (
     ("capability-sandbox", ("G5",), "dynamic capability sandbox and protected paths",
      lambda path: path in ("deploy/helpers/cockpit-capability-action", "apps/api/src/capability-manifest.ts")),
     ("root-helpers", ("G4", "G5"), "root helpers, systemd units, sudoers sources and the root-run deploy scripts",
-     lambda path: path.startswith(("deploy/helpers/", "deploy/systemd/", "deploy/sudoers/", "deploy/lab0/", "deploy/vps/"))),
+     lambda path: path.startswith(("deploy/helpers/", "deploy/systemd/", "deploy/sudoers/", "deploy/lab0/", "deploy/vps/", "deploy/box/"))),
     ("ci", ("G7",), "CI workflow definitions (the merge gate behind G7)", lambda path: bool(CI_PATH_RE.search(path))),
 )
 # Excerpt order: what the reviewer must see first comes first.
@@ -822,11 +825,21 @@ def http_body(url, max_time=10, insecure=False):
     return result.stdout if result.returncode == 0 else ""
 
 
-def wg_ip_present():
+def wg_ip_for(web_url):
+    """The WireGuard address the web check needs: the host of web_url when it lies in the
+    WireGuard net 10.0.0.0/24 (Lab0 10.0.0.5, box 10.0.0.6), else WG_IP. An explicit
+    COCKPIT_SELF_UPDATE_WG_IP (harness) always wins."""
+    if "COCKPIT_SELF_UPDATE_WG_IP" in os.environ:
+        return WG_IP
+    match = re.match(r"^https?://(10\.0\.0\.\d{1,3}):\d+/?$", web_url or "")
+    return match.group(1) if match else WG_IP
+
+
+def wg_ip_present(address=None):
     result = run([IP, "-brief", "a"], timeout=15)
     if result.returncode != 0:
         return False
-    return re.search(r"(?:^|\s)%s(?:/\d+)?(?:\s|$)" % re.escape(WG_IP), result.stdout) is not None
+    return re.search(r"(?:^|\s)%s(?:/\d+)?(?:\s|$)" % re.escape(address or WG_IP), result.stdout) is not None
 
 
 def socket_ok(path):
@@ -924,7 +937,7 @@ def verify_phase(retries, delay, include_web, after_activation):
         raise Failure(68, "verify", "ttyd did not answer HTTP 200 (got %s)" % ttyd_code)
     checks["ttyd"] = "ok"
     web_url = state_web_url()
-    if include_web and web_url and wg_ip_present():
+    if include_web and web_url and wg_ip_present(wg_ip_for(web_url)):
         web_code = "000"
         for _ in range(retries):
             web_code = http_code(web_url + "/", insecure=True)

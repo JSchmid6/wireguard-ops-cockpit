@@ -9,11 +9,13 @@ describe("loadConfig", () => {
     expect(loadConfig({ COCKPIT_MAX_FAILED_CHANGES_PER_HOUR: "drei", COCKPIT_MAX_FAILED_CHANGES_PER_HOUR_GLOBAL: "0" })).toMatchObject({ maxFailedChangesPerHour: 3, maxFailedChangesPerHourGlobal: 10 });
   });
 
-  it("reads the instance role only as vps or lab0", () => {
+  it("reads the instance role only as vps, lab0 or box", () => {
     expect(loadConfig({}).instanceRole).toBeNull();
     expect(loadConfig({ COCKPIT_INSTANCE_ROLE: "lab0" }).instanceRole).toBe("lab0");
     expect(loadConfig({ COCKPIT_INSTANCE_ROLE: " vps\n" }).instanceRole).toBe("vps");
     expect(loadConfig({ COCKPIT_INSTANCE_ROLE: "dev" }).instanceRole).toBeNull();
+    expect(loadConfig({ COCKPIT_INSTANCE_ROLE: "box" }).instanceRole).toBe("box");
+    expect(loadConfig({ COCKPIT_INSTANCE_ROLE: "Box" }).instanceRole).toBeNull();
   });
 
   it("provides safe local defaults", () => {

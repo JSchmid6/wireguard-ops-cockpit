@@ -73,15 +73,26 @@
 #         scheitert er, läuft kein Schritt (preflight_failed). Ausrollen per
 #         self.update: der erste Lauf führt noch das alte installierte Skript aus und
 #         installiert erst dieses; Rolle + Helfer kommen mit dem nächsten self.update.
+#         08.11.2026 (Kanban t_88f1e802): Instanzrolle als Parameter — COCKPIT_ROLE=lab0
+#         (Vorgabe, Lab0 unverändert) oder box (Proxmox-Host „Narrow Box“, 10.0.0.6).
+#         Die Rolle kommt beim ersten Lauf aus COCKPIT_ROLE, danach aus der installierten
+#         instance-role.env; ein Wechsel per Deploy wird verweigert (das Netz der Tür hängt
+#         an ihr). box: kein IMSM-Disk-Helfer, kein borg-Aufräumdienst; Web per TLS auf
+#         10.0.0.6:8180 mit dem box-Zertifikat der internen CA (/etc/pve/local/pveproxy-ssl.*,
+#         vom Erststart gelegt); Netz = Host-Snapshot + Proxmox-Snapshot jedes Gastes;
+#         James' Bearer: Konto hermes-automation, Label hermes-tresor, Hash aus
+#         /etc/box-bootstrap/cockpit-token.sha256 (cockpit-automation-token-seed).
 #
 # Aufruf (als root AUF DER KISTE):
-#   bash homeserver-cockpit-deploy.sh
+#   bash homeserver-cockpit-deploy.sh                   # Lab0 bzw. die installierte Rolle
+#   COCKPIT_ROLE=box bash homeserver-cockpit-deploy.sh  # Erstinstallation auf der Box
 #   WEB_PORT=8180 bash homeserver-cockpit-deploy.sh   # nur bei gewolltem Portwechsel
 #
 # Voraussetzungen (Das Skript prüft sie und bricht klar benannt ab):
 #   - Debian/Ubuntu-artiges Linux, x86_64 (sonst: stoppen + melden)
 #   - Internet: apt-Mirror, github.com, registry.npmjs.org, nodejs.org
-#   - /root/cockpit-deploy/deepseek.env mit DEEPSEEK_API_KEY=... (kommt vom VPS)
+#   - /root/cockpit-deploy/deepseek.env mit DEEPSEEK_API_KEY=... (kommt vom VPS;
+#     auf der Box legt es box-stage2.sh aus einem nur für die Box entschlüsselbaren Block ab)
 #
 # Sicherheit / Design:
 #   - Rein additiv: berührt KEINE bestehenden Dienste oder Daten.
@@ -120,7 +131,7 @@ AGENT_DIR="/var/lib/wireguard-ops-agent"
 EXEC_DIR="/var/lib/wireguard-ops-executor"
 WEBROOT="/var/www/wireguard-ops-cockpit"
 SECRETS_DIR="/root/cockpit-deploy"
-WG_BIND_IP="${WG_BIND_IP:-10.0.0.5}"
+WG_BIND_IP="${WG_BIND_IP:-}"   # Vorgabe je Rolle, siehe Preflight
 NODE_PKG_URL="https://nodejs.org/dist/v22.23.4/node-v22.23.4-linux-x64.tar.xz"
 # Hinweis WEB_PORT: nicht hier vorbelegen — der effektive Wert wird in Abschnitt 0b
 # aus dem Site-Ist-Zustand abgeleitet (Default = vorhandener Site-Port).
@@ -134,6 +145,30 @@ die()  { printf '\nFEHLER: %s\n' "$*" >&2; exit 1; }
 log "0) Preflight"
 [ "$(id -u)" -eq 0 ] || die "Als root auf der Kiste ausführen."
 [ "$(uname -m)" = "x86_64" ] || die "Erwartet x86_64, gefunden: $(uname -m)"
+
+# Instanzrolle (doc/setup/host-run.md, „Netz je Instanzrolle“): beim ersten Lauf aus
+# COCKPIT_ROLE (Vorgabe lab0), danach aus der installierten Datei. Ein Wechsel per Deploy
+# wird verweigert — die Rolle bestimmt das Netz jedes späteren Laufs der Tür.
+# Der markierte Block wird vom Test (host-run-helper.test.ts) 1:1 ausgeführt.
+# >>> rollen-logik
+INSTALLED_ROLE=""
+if [ -f "$ENV_DIR/instance-role.env" ]; then
+  INSTALLED_ROLE="$(sed -n 's/^COCKPIT_INSTANCE_ROLE=//p' "$ENV_DIR/instance-role.env" | head -n1)"
+fi
+COCKPIT_ROLE="${COCKPIT_ROLE:-${INSTALLED_ROLE:-lab0}}"
+case "$COCKPIT_ROLE" in
+  lab0) WG_BIND_IP="${WG_BIND_IP:-10.0.0.5}" ;;
+  box)  WG_BIND_IP="${WG_BIND_IP:-10.0.0.6}" ;;
+  *) die "Unbekannte Rolle '$COCKPIT_ROLE' — erwartet lab0 oder box." ;;
+esac
+if [ -n "$INSTALLED_ROLE" ] && [ "$INSTALLED_ROLE" != "$COCKPIT_ROLE" ]; then
+  die "Installierte Rolle ist '$INSTALLED_ROLE', verlangt '$COCKPIT_ROLE' — ein Rollenwechsel geht nicht per Deploy. Nichts geändert."
+fi
+echo "Rolle: $COCKPIT_ROLE (WireGuard-IP $WG_BIND_IP)"
+# <<< rollen-logik
+if [ "$COCKPIT_ROLE" = "box" ]; then
+  command -v pveversion >/dev/null 2>&1 || die "Rolle box erwartet einen Proxmox-VE-Host (pveversion fehlt)."
+fi
 
 if [ -r /etc/os-release ]; then . /etc/os-release; fi
 case "${ID:-}${ID_LIKE:-}" in
@@ -325,8 +360,29 @@ site_url() {
 }
 # <<< site-logik
 
+# Rolle box: das Web läuft per TLS mit dem box-Zertifikat der internen CA, das der
+# Erststart für pveproxy abgelegt hat (/etc/pve/local, pmxcfs). nginx bekommt eine eigene
+# Kopie (root, 0600) — /etc/pve hängt am Proxmox-Cluster-Dienst und ist beim Start von
+# nginx nicht sicher da. Ersetzt nur bei Abweichung; der Erststart erneuert beide nie.
+if [ "$COCKPIT_ROLE" = "box" ]; then
+  for f in /etc/pve/local/pveproxy-ssl.pem /etc/pve/local/pveproxy-ssl.key; do
+    [ -r "$f" ] || die "Rolle box: $f fehlt — der Erststart hat das box-Zertifikat nicht gelegt. Nichts geändert."
+  done
+  install -d -m 0700 -o root -g root "$(dirname "$TLS_CERT_FALLBACK")"
+  cmp -s /etc/pve/local/pveproxy-ssl.pem "$TLS_CERT_FALLBACK" \
+    || install -m 0644 -o root -g root /etc/pve/local/pveproxy-ssl.pem "$TLS_CERT_FALLBACK"
+  cmp -s /etc/pve/local/pveproxy-ssl.key "$TLS_KEY_FALLBACK" \
+    || install -m 0600 -o root -g root /etc/pve/local/pveproxy-ssl.key "$TLS_KEY_FALLBACK"
+fi
+
 site_detect
 site_resolve
+# Neuanlage auf der Box: TLS auf 8180 wie Lab0 (das Plugin spricht nur https://10.0.0.6:8180).
+if [ "$COCKPIT_ROLE" = "box" ] && [ "$SITE_EXISTS" = "no" ]; then
+  if [ "$WEB_PORT_EXPLICIT" = "no" ]; then WEB_PORT=8180; fi
+  WEB_TLS="yes"; WEB_CERT="$TLS_CERT_FALLBACK"; WEB_KEY="$TLS_KEY_FALLBACK"
+  WEB_PORT_QUELLE="Rolle box, Neuanlage (${WEB_PORT}, TLS)"
+fi
 log "0b) Web-Site (Ist-Zustand)"
 if [ "$SITE_EXISTS" = "yes" ]; then
   echo "Datei:     $SITE_FILE — vorhanden (${SITE_LISTEN_COUNT} listen-Zeile(n))"
@@ -544,13 +600,15 @@ sed -i 's/apache2|wireguard-ops-cockpit-ttyd/nginx|wireguard-ops-cockpit-ttyd/' 
 grep -q 'nginx|wireguard-ops-cockpit-ttyd' /usr/local/sbin/cockpit-service-action \
   || die "Allowlist-Anpassung cockpit-service-action fehlgeschlagen."
 
-# Typed-Disk-Helfer (mdadm auf dem IMSM-Container /dev/md127; disk.manage)
-[ -f "$COCKPIT_DIR/deploy/helpers/cockpit-disk-action" ] \
-  || die "deploy/helpers/cockpit-disk-action fehlt im Checkout ($REPO_COMMIT) — Skript mit REPO_COMMIT=<merge-sha> erneut ausführen."
-install -m 755 -o root -g root "$COCKPIT_DIR/deploy/helpers/cockpit-disk-action" \
-  /usr/local/sbin/cockpit-disk-action
-command -v mdadm >/dev/null 2>&1 \
-  || echo "HINWEIS: mdadm fehlt — cockpit-disk-action kann erst nach 'apt-get install -y mdadm' arbeiten."
+# Typed-Disk-Helfer (mdadm auf dem IMSM-Container /dev/md127; disk.manage) — nur Lab0
+if [ "$COCKPIT_ROLE" = "lab0" ]; then
+  [ -f "$COCKPIT_DIR/deploy/helpers/cockpit-disk-action" ] \
+    || die "deploy/helpers/cockpit-disk-action fehlt im Checkout ($REPO_COMMIT) — Skript mit REPO_COMMIT=<merge-sha> erneut ausführen."
+  install -m 755 -o root -g root "$COCKPIT_DIR/deploy/helpers/cockpit-disk-action" \
+    /usr/local/sbin/cockpit-disk-action
+  command -v mdadm >/dev/null 2>&1 \
+    || echo "HINWEIS: mdadm fehlt — cockpit-disk-action kann erst nach 'apt-get install -y mdadm' arbeiten."
+fi
 
 install -m 755 -o root -g root "$COCKPIT_DIR/deploy/helpers/cockpit-capability-action" \
   /usr/local/lib/wireguard-ops-cockpit/cockpit-capability-action.mjs
@@ -592,6 +650,10 @@ install -m 755 -o root -g root "$COCKPIT_DIR/deploy/helpers/cockpit-host-run" \
   /usr/local/lib/wireguard-ops-cockpit/cockpit-host-run.mjs
 install -m 644 -o root -g root "$COCKPIT_DIR/deploy/helpers/cockpit-backup-guard.mjs" \
   /usr/local/lib/wireguard-ops-cockpit/cockpit-backup-guard.mjs
+# Der Riegel importiert die Grenzen-Datei des Aufräum-Dienstes — auf jeder Rolle, auch
+# ohne den Dienst (box), sonst bricht der Root-Helfer mit ERR_MODULE_NOT_FOUND ab.
+install -m 644 -o root -g root "$COCKPIT_DIR/deploy/helpers/cockpit-borg-retention-rules.mjs" \
+  /usr/local/lib/wireguard-ops-cockpit/cockpit-borg-retention-rules.mjs
 # Zustandsschritte nie mittendrin abbrechen: die eine Erkennung, die der Helfer
 # importiert (fehlte bis 16.10.2026 → ERR_MODULE_NOT_FOUND im Root-Helfer).
 install -m 644 -o root -g root "$COCKPIT_DIR/deploy/helpers/cockpit-state-steps.mjs" \
@@ -602,15 +664,17 @@ install -m 644 "$COCKPIT_DIR/deploy/systemd/wireguard-ops-cockpit-host-run-resum
 # Rolle lab0 aus dieser root-eigenen Datei, Sicherung = lokaler Host-Snapshot
 # (Konfiguration, Paketstand, Unit-Zustände) statt borg-Frische + Hoster-Snapshot.
 # Ohne Rolle oder Snapshot-Helfer scheitert jeder verändernde Lauf im Preflight.
-for f in deploy/helpers/cockpit-host-snapshot deploy/lab0/instance-role.env; do
+# Rolle box: dieselbe Datei aus deploy/box/ (Netz: Host-Snapshot + Proxmox-Snapshot je Gast).
+for f in deploy/helpers/cockpit-host-snapshot "deploy/$COCKPIT_ROLE/instance-role.env"; do
   [ -f "$COCKPIT_DIR/$f" ] \
     || die "$f fehlt im Checkout ($REPO_COMMIT) — Skript mit REPO_COMMIT=<merge-sha> erneut ausführen."
 done
 install -m 644 -o root -g root "$COCKPIT_DIR/deploy/helpers/cockpit-host-snapshot" \
   /usr/local/lib/wireguard-ops-cockpit/cockpit-host-snapshot
 install -d -m 0700 -o root -g root /var/lib/wireguard-ops-cockpit-host-snapshots
-install -m 600 -o root -g root "$COCKPIT_DIR/deploy/lab0/instance-role.env" "$ENV_DIR/instance-role.env"
+install -m 600 -o root -g root "$COCKPIT_DIR/deploy/$COCKPIT_ROLE/instance-role.env" "$ENV_DIR/instance-role.env"
 
+if [ "$COCKPIT_ROLE" = "lab0" ]; then
 # Aufräum-Dienst des borg-Repos (Vertrag + Grenzen: doc/setup/borg-retention.md).
 # Läuft als borg (Besitzer des Repos); die Passphrase legt Jochen/Claude einmalig
 # als /etc/cockpit-borg-retention/passphrase (root, 0600) ab — nicht dieses Skript.
@@ -621,8 +685,6 @@ install -m 755 -o root -g root "$COCKPIT_DIR/deploy/helpers/cockpit-borg-retenti
   /usr/local/sbin/cockpit-borg-retention
 install -m 755 -o root -g root "$COCKPIT_DIR/deploy/helpers/cockpit-borg-retention.mjs" \
   /usr/local/lib/wireguard-ops-cockpit/cockpit-borg-retention.mjs
-install -m 644 -o root -g root "$COCKPIT_DIR/deploy/helpers/cockpit-borg-retention-rules.mjs" \
-  /usr/local/lib/wireguard-ops-cockpit/cockpit-borg-retention-rules.mjs
 install -m 644 "$COCKPIT_DIR/deploy/systemd/cockpit-borg-retention.service" \
   /etc/systemd/system/cockpit-borg-retention.service
 install -m 644 "$COCKPIT_DIR/deploy/systemd/cockpit-borg-retention.timer" \
@@ -630,6 +692,7 @@ install -m 644 "$COCKPIT_DIR/deploy/systemd/cockpit-borg-retention.timer" \
 install -d -m 0755 -o root -g root /etc/cockpit-borg-retention
 [ -f /etc/cockpit-borg-retention/passphrase ] \
   || echo "HINWEIS: /etc/cockpit-borg-retention/passphrase fehlt — der Aufräum-Dienst startet erst, wenn sie (root, 0600) abgelegt ist."
+fi   # Ende Aufräum-Dienst (nur lab0: das borg-Ziel)
 
 visudo -cf "$COCKPIT_DIR/deploy/sudoers/cockpit-executor" >/dev/null \
   || die "sudoers-Vorlage ungültig — nichts installiert, nichts aktiv."
@@ -710,8 +773,8 @@ else
 fi
 systemctl enable --now wireguard-ops-cockpit-api wireguard-ops-cockpit-ttyd \
   wireguard-ops-cockpit-agent wireguard-ops-cockpit-executor
-# Aufräum-Dienst: nur der Timer läuft dauerhaft; der Lauf selbst ist ein oneshot.
-systemctl enable --now cockpit-borg-retention.timer
+# Aufräum-Dienst (nur lab0): nur der Timer läuft dauerhaft; der Lauf selbst ist ein oneshot.
+if [ "$COCKPIT_ROLE" = "lab0" ]; then systemctl enable --now cockpit-borg-retention.timer; fi
 # Tür: Fortsetzen nach einem Neustart-Schritt (nur enable, wie auf dem VPS).
 systemctl enable --quiet wireguard-ops-cockpit-host-run-resume.service
 # Re-Run-Falle (Befund 25.09., Review t_57244697/I2): 'enable --now' startet einen
@@ -771,6 +834,27 @@ if ip -brief a 2>/dev/null | grep -qw "$WG_BIND_IP"; then
   echo "Web→API: $WEB_URL/api/health = ok."
 else
   echo "HINWEIS: $WG_BIND_IP ist derzeit nicht lokal aktiv (WireGuard noch nicht oben?) — Web-Check übersprungen."
+fi
+
+# ---------------------------------------------------------------------------
+# 12a) James' Bearer auf der Box (Rolle box): Konto hermes-automation, Label
+#      hermes-tresor, Hash aus dem Erststart. Der Token selbst kommt nie auf den Host;
+#      steht schon ein hermes-tresor-Token (Rotation), bleibt er (Helfer: kept). Danach ist
+#      die Hash-Datei verbraucht (…sha256.used): ein später per Löschen widerrufener Token
+#      kommt mit keinem weiteren Deploy/self.update zurück.
+# ---------------------------------------------------------------------------
+if [ "$COCKPIT_ROLE" = "box" ]; then
+  TOKEN_HASH_FILE=/etc/box-bootstrap/cockpit-token.sha256
+  if [ -f "$TOKEN_HASH_FILE" ]; then
+    seeded="$(python3 "$COCKPIT_DIR/deploy/helpers/cockpit-automation-token-seed" "$STATE_DIR/cockpit.sqlite" \
+      "$TOKEN_HASH_FILE" "$COCKPIT_DIR/deploy/config/automation-scopes.json")" \
+      || die "Automation-Token konnte nicht eingetragen werden (cockpit-automation-token-seed, siehe stderr)."
+    echo "Automation-Token: $seeded"
+  elif [ -f "$TOKEN_HASH_FILE.used" ]; then
+    echo "Automation-Token: Bootstrap-Hash schon verbraucht — nichts eingetragen."
+  else
+    echo "HINWEIS: $TOKEN_HASH_FILE fehlt — kein Automation-Token eingetragen."
+  fi
 fi
 
 # ---------------------------------------------------------------------------

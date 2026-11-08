@@ -36,6 +36,10 @@ const SHA = "0123456789abcdef0123456789abcdef01234567";
 const BASE = "89abcdef0123456789abcdef0123456789abcdef";
 const HASH = "a".repeat(64);
 const NONCE = "feedfacecafebeef";
+// A deliberately small pass: the review instructions plus room for about one focus file.
+// Was 16_000 bytes; the instructions grew with the box role in G5 (t_88f1e802), so the
+// room the tests rely on is kept, not the absolute number.
+const SMALL_PASS = 16_500;
 
 function section(path: string, lines: string[]): { path: string; text: string } {
   return { path, text: `${[`diff --git a/${path} b/${path}`, "--- a/" + path, "+++ b/" + path, ...lines].join("\n")}\n` };
@@ -156,8 +160,8 @@ describe("self-update pre-install review", () => {
 
   it("stops when a focus-area file is larger than a whole pass", () => {
     const big = section("apps/api/src/hermes-security.ts", ["@@ -1,400 +1,400 @@", ...Array.from({ length: 400 }, (_, index) => `+line ${index} ${"x".repeat(60)}`)]);
-    const { prompts, coverage } = buildUpdateReviewPrompt([diff({ excerpt: [big] })], { nonce: NONCE, limit: 16_000 });
-    expect(prompts.every((prompt) => Buffer.byteLength(prompt) <= 16_000)).toBe(true);
+    const { prompts, coverage } = buildUpdateReviewPrompt([diff({ excerpt: [big] })], { nonce: NONCE, limit: SMALL_PASS });
+    expect(prompts.every((prompt) => Buffer.byteLength(prompt) <= SMALL_PASS)).toBe(true);
     // Never cut into pieces: left out whole, and that stops.
     expect(coverage[0]).toMatchObject({ incomplete: ["apps/api/src/hermes-security.ts"], cut: [], omitted: ["apps/api/src/hermes-security.ts"] });
     expect(prompts.join("\n")).toContain("The excerpt is INCOMPLETE. Cut: none. Left out: apps/api/src/hermes-security.ts.");
@@ -302,7 +306,7 @@ describe("self-update pre-install review", () => {
     const { prompts, coverage } = buildUpdateReviewPrompt([diff({
       files: [...diff().files, { status: "M", path: "Dockerfile.api", added: 400, deleted: 400, class: "other" }],
       filesTotal: 3, excerpt: [...diff().excerpt, huge],
-    })], { nonce: NONCE, limit: 16_000 });
+    })], { nonce: NONCE, limit: SMALL_PASS });
     expect(coverage[0]).toMatchObject({ cut: [], omitted: ["Dockerfile.api"], incomplete: ["Dockerfile.api"] });
     expect(prompts.join("\n")).toContain("Left out: Dockerfile.api.");
     const policy = applyUpdateReviewPolicy(readyPolicy, outcome({ coverage, answer: parseUpdateReviewAnswer("VERDICT: approve") }));
@@ -382,7 +386,7 @@ describe("self-update pre-install review", () => {
       files: [{ status: "D", path: "test/example.test.sh", added: 0, deleted: 400, class: "test-deleted" }], filesTotal: 1,
       focusAreas: [area("tests-deleted", ["test/example.test.sh"], [])],
       excerpt: [section("test/example.test.sh", ["@@ -1,400 +0,0 @@", ...Array.from({ length: 400 }, (_, index) => `-check ${index} ${"z".repeat(60)}`)])],
-    })], { nonce: NONCE, limit: 16_000 });
+    })], { nonce: NONCE, limit: SMALL_PASS });
     expect(deleted.coverage[0].incomplete).toEqual(["test/example.test.sh"]);
   });
 

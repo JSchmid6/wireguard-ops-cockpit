@@ -94,6 +94,84 @@ describe("cockpit-host-snapshot", () => {
     expect(readdirSync(path.join(dir, "store"))).toEqual([]);
   });
 
+  // --guests (role box): pvesh lists the guests and their snapshots from a
+  // fixture directory, qm/pct log what they were asked and create the snapshot there.
+  function proxmoxStubs(guests: { qemu?: object[]; lxc?: object[] }, snapshots: Record<string, object[]> = {}) {
+    const fx = path.join(dir, "pve");
+    mkdirSync(fx, { recursive: true });
+    writeFileSync(path.join(fx, "qemu.json"), JSON.stringify(guests.qemu ?? []));
+    writeFileSync(path.join(fx, "lxc.json"), JSON.stringify(guests.lxc ?? []));
+    for (const [vmid, list] of Object.entries(snapshots)) writeFileSync(path.join(fx, `snap-${vmid}.json`), JSON.stringify(list));
+    write(path.join(dir, "bin", "pvesh"), [
+      "#!/bin/bash",
+      `case "$2" in`,
+      `  */qemu/*/snapshot|*/lxc/*/snapshot) id=$(echo "$2" | cut -d/ -f5); cat "${fx}/snap-$id.json" 2>/dev/null || echo '[{"name":"current"}]' ;;`,
+      `  */qemu) cat "${fx}/qemu.json" ;;`,
+      `  */lxc) cat "${fx}/lxc.json" ;;`,
+      "  *) exit 2 ;;",
+      "esac",
+    ].join("\n"));
+    for (const tool of ["qm", "pct"]) {
+      write(path.join(dir, "bin", tool), [
+        "#!/bin/bash",
+        `echo "${tool} $*" >> "${dir}/guest.log"`,
+        `[ -e "${fx}/fail-$2" ] && { echo "snapshot feature is not available" >&2; exit 255; }`,
+        "exit 0",
+      ].join("\n"));
+    }
+    return fx;
+  }
+
+  it("--guests: snapshots every VM and container of the node with the same name, skips templates", () => {
+    proxmoxStubs({ qemu: [{ vmid: 101, name: "haos" }, { vmid: 9000, template: 1 }], lxc: [{ vmid: 200, name: "unifi" }] });
+    const out = snap(["create", "cockpit-run-98a1.e31", "--guests"]);
+    expect(out.code).toBe(0);
+    const result = JSON.parse(out.stdout);
+    expect(result.snapshot.snapshotId).toBe("cockpit-run-98a1.e31");
+    expect(result.guests).toEqual([
+      { vmid: 101, type: "qemu", snapshot: "cockpit-run-98a1-e31", rotated: [] },
+      { vmid: 200, type: "lxc", snapshot: "cockpit-run-98a1-e31", rotated: [] },
+    ]);
+    const log = readFileSync(path.join(dir, "guest.log"), "utf8").trim().split("\n");
+    expect(log).toEqual([
+      "qm snapshot 101 cockpit-run-98a1-e31 --description cockpit host run (rollback: operator)",
+      "pct snapshot 200 cockpit-run-98a1-e31 --description cockpit host run (rollback: operator)",
+    ]);
+  });
+
+  it("--guests: rotates only its own snapshots per guest, newest KEEP stay", () => {
+    proxmoxStubs({ qemu: [{ vmid: 101 }] }, {
+      101: [{ name: "vor-update", snaptime: 1 }, { name: "cockpit-run-a", snaptime: 2 }, { name: "cockpit-run-b", snaptime: 3 },
+        { name: "cockpit-run-c", snaptime: 4 }, { name: "current" }],
+    });
+    const result = JSON.parse(snap(["create", "cockpit-run-c", "--guests"], { COCKPIT_HOST_SNAPSHOT_KEEP: "2" }).stdout);
+    expect(result.guests[0].rotated).toEqual(["cockpit-run-a"]);
+    expect(readFileSync(path.join(dir, "guest.log"), "utf8")).toContain("qm delsnapshot 101 cockpit-run-a\n");
+    expect(readFileSync(path.join(dir, "guest.log"), "utf8")).not.toContain("vor-update");
+  });
+
+  it("--guests: no guests is a valid net (empty list)", () => {
+    proxmoxStubs({});
+    const out = snap(["create", "cockpit-run-x", "--guests"]);
+    expect(out.code).toBe(0);
+    expect(JSON.parse(out.stdout).guests).toEqual([]);
+  });
+
+  it("--guests: a guest that cannot be snapshotted fails the create", () => {
+    const fx = proxmoxStubs({ qemu: [{ vmid: 101 }] });
+    writeFileSync(path.join(fx, "fail-101"), "");
+    const out = snap(["create", "cockpit-run-x", "--guests"]);
+    expect(out.code).toBe(67);
+    expect(JSON.parse(out.stderr).error).toContain("snapshot feature is not available");
+  });
+
+  it("--guests: refuses an unreadable guest list and a name Proxmox cannot take", () => {
+    proxmoxStubs({ qemu: [{ name: "ohne-vmid" }] });
+    expect(snap(["create", "cockpit-run-x", "--guests"]).code).toBe(67);
+    expect(snap(["create", `cockpit-run-${"a".repeat(30)}`, "--guests"]).code).toBe(64);
+    expect(snap(["create", "cockpit-run-y", "--guest"]).code).toBe(64);
+  });
+
   it("refuses a store that belongs to someone else or is no directory", () => {
     writeFileSync(path.join(dir, "store"), "not a directory");
     expect(snap(["create", "cockpit-run-q"]).code).toBe(65);

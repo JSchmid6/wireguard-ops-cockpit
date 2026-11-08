@@ -1,0 +1,56 @@
+#!/bin/bash
+# box-stage2.sh — zweite Stufe der Erstinstallation der Cockpit-Instanz box
+# (doc/setup/box-bootstrap.md). Vorlage; die ausgefüllte, signierte Kopie liegt einmalig
+# im vpsdrop des VPS (http://10.0.0.1:8899/box-stage2.sh + .sig).
+#
+# Läuft als root aus der Einmal-Tür box-bootstrap.service, nachdem die Tür die Signatur
+# geprüft hat (ssh-keygen -Y verify, Namespace box-stage2). Ausgabe nach
+# /var/log/box-stage2.log — nichts Geheimes darin.
+#
+#   1. Planner-Schlüssel: der Block unten ist DEEPSEEK_API_KEY=… als CMS, verschlüsselt
+#      für das box-Zertifikat der internen CA. Entschlüsseln kann ihn nur der Schlüssel,
+#      den der Erststart als /etc/pve/local/pveproxy-ssl.key abgelegt hat. Das vpsdrop ist
+#      für alle WireGuard-Peers lesbar; darum geht der Schlüssel nie im Klartext hinein.
+#   2. Deploy-Skript am gepinnten Merge-Commit von GitHub holen, gegen die sha256 in
+#      dieser (signierten) Datei prüfen und mit COCKPIT_ROLE=box ausführen. Das Skript
+#      checkt das Repo am selben Commit aus — die ganze Kette hängt an der Signatur.
+set -euo pipefail
+
+REPO_COMMIT="@@REPO_COMMIT@@"
+DEPLOY_SHA256="@@DEPLOY_SHA256@@"
+DEPLOY_URL="https://raw.githubusercontent.com/JSchmid6/wireguard-ops-cockpit/${REPO_COMMIT}/deploy/lab0/homeserver-cockpit-deploy.sh"
+SECRETS_DIR=/root/cockpit-deploy
+
+echo "$(date -Is) box-stage2: Pin ${REPO_COMMIT}"
+printf '%s' "$REPO_COMMIT" | grep -Eq '^[a-f0-9]{40}$' || { echo "Pin ist kein voller Commit"; exit 1; }
+
+# --- 1. Planner-Schlüssel ---------------------------------------------------
+install -d -m 0700 -o root -g root "$SECRETS_DIR"
+if [ ! -s "$SECRETS_DIR/deepseek.env" ]; then
+  umask 077
+  tmp="$(mktemp "$SECRETS_DIR/deepseek.env.XXXXXX")"
+  trap 'rm -f "$tmp"' EXIT
+  openssl cms -decrypt -inform PEM -inkey /etc/pve/local/pveproxy-ssl.key \
+    -recip /etc/pve/local/pveproxy-ssl.pem -out "$tmp" <<'CMS'
+@@DEEPSEEK_CMS@@
+CMS
+  grep -Eq '^DEEPSEEK_API_KEY=[A-Za-z0-9_-]{16,200}$' "$tmp" && [ "$(wc -l < "$tmp")" -eq 1 ] \
+    || { echo "Planner-Schlüssel: entschlüsselter Block hat nicht die erwartete Form"; exit 1; }
+  chmod 0600 "$tmp"
+  mv -f "$tmp" "$SECRETS_DIR/deepseek.env"
+  trap - EXIT
+  umask 022
+  echo "Planner-Schlüssel abgelegt: $SECRETS_DIR/deepseek.env (root, 0600)."
+else
+  echo "Planner-Schlüssel schon vorhanden — unverändert."
+fi
+
+# --- 2. Deploy am gepinnten Stand -------------------------------------------
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+curl -fsSL --max-time 120 -o "$work/deploy.sh" "$DEPLOY_URL"
+echo "${DEPLOY_SHA256}  $work/deploy.sh" | sha256sum -c - >/dev/null \
+  || { echo "Deploy-Skript: sha256 stimmt nicht mit der signierten Vorgabe überein — nicht ausgeführt"; exit 1; }
+echo "Deploy-Skript geprüft (sha256 ${DEPLOY_SHA256:0:12}…), starte mit COCKPIT_ROLE=box."
+COCKPIT_ROLE=box REPO_COMMIT="$REPO_COMMIT" bash "$work/deploy.sh"
+echo "$(date -Is) box-stage2: fertig"

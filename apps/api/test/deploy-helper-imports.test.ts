@@ -23,8 +23,14 @@ function vpsInstalled(): Installed {
   return out;
 }
 
-function lab0Installed(): Installed {
-  const text = readFileSync(join(REPO, "deploy/lab0/homeserver-cockpit-deploy.sh"), "utf8");
+// Dasselbe Skript mit COCKPIT_ROLE=box: Blöcke, die nur für lab0 laufen
+// (`if [ "$COCKPIT_ROLE" = "lab0" ]; then` … `fi` am Zeilenanfang), fehlen dort.
+function boxInstalled(): Installed {
+  return lab0Installed((text) => text.replace(/^if \[ "\$COCKPIT_ROLE" = "lab0" \]; then\n[\s\S]*?^fi\b[^\n]*\n/gm, ""));
+}
+
+function lab0Installed(filter: (text: string) => string = (text) => text): Installed {
+  const text = filter(readFileSync(join(REPO, "deploy/lab0/homeserver-cockpit-deploy.sh"), "utf8"));
   const out: Installed = new Map();
   const re = /^install\b[^\n]*"\$COCKPIT_DIR\/([^"]+)"\s*\\\n\s*(\S+)/gm;
   for (const m of text.matchAll(re)) {
@@ -65,7 +71,8 @@ function missingImports(installed: Installed): string[] {
 
 describe.each([
   ["vps", vpsInstalled],
-  ["lab0", lab0Installed],
+  ["lab0", () => lab0Installed()],
+  ["box", boxInstalled],
 ])("%s deploy: installierte Helfer bringen ihre Importe mit", (_name, collect) => {
   const installed = collect();
 
