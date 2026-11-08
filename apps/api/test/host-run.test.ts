@@ -172,8 +172,14 @@ describe("buildHostRunReviewPrompt", () => {
     expect(lab0).toContain("general host door on Lab0 (10.0.0.5)");
     expect(lab0).toContain("The borg repository here is family data");
     expect(lab0).not.toContain("run as root on the production host");
+    const box = buildHostRunReviewPrompt(parsed(), { nonce: "n", role: "box" }).prompt;
+    expect(box).toContain("general host door on box (10.0.0.6), the family's Proxmox VE host");
+    expect(box).toContain("deleting or rolling back a guest snapshot");
+    expect(box).toContain("a Proxmox snapshot of every VM and container on the node");
+    expect(box).not.toContain("run as root on the production host");
     // Everything after the opening paragraph is the same contract on both hosts.
     expect(lab0.slice(lab0.indexOf("Underneath you"))).toBe(vps.slice(vps.indexOf("Underneath you")));
+    expect(box.slice(box.indexOf("Underneath you"))).toBe(vps.slice(vps.indexOf("Underneath you")));
   });
 
   it("shows every step and check line with its id between nonce markers", () => {

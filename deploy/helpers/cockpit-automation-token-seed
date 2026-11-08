@@ -1,0 +1,115 @@
+#!/usr/bin/python3
+# cockpit-automation-token-seed — James' bearer on a fresh instance without a
+# root shell in the loop (role box, doc/setup/host-run.md "Instanz box").
+#
+# Not a sudo target: only the deploy script calls it, as root, after the API has
+# created its database.
+#
+#   cockpit-automation-token-seed <db> <hash-file> <scopes-file>
+#
+# The token itself never reaches the host. It was generated in Hermes, lies in
+# the Nextcloud password store (entry cockpit-token-box), and the host only got
+# sha256 of its hex part (the form of db.ts rotateApiToken/findUserByApiToken)
+# in <hash-file>. This helper
+#   - creates the account hermes-automation with role automation if it is
+#     missing (password "!": no password login; automation cannot sign in
+#     anyway) and refuses, changing nothing, if the account exists with another
+#     role (no silent promotion),
+#   - inserts that hash under the label hermes-tresor with the scopes from
+#     <scopes-file> (deploy/config/automation-scopes.json — the route set the
+#     automation token holds on the VPS and on Lab0),
+#   - and does nothing if the account already has a hermes-tresor token: a
+#     rotation (plugins/cockpit/schluessel.py) replaced it since, and a re-run of
+#     the deploy (self-update) must never bring back the bootstrap hash.
+#
+# Output: one JSON line {"ok": true, "action": "created"|"kept", "account": ...}.
+# Exit codes: 0 ok, 64 usage, 65 refused (input or account), 66 database missing.
+import datetime
+import json
+import os
+import re
+import sqlite3
+import sys
+import uuid
+
+ACCOUNT = "hermes-automation"
+LABEL = "hermes-tresor"
+HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+# A route of the API as requireActor names it ("GET /api/hermes/jobs/:jobId").
+SCOPE_RE = re.compile(r"^(GET|POST|PUT|PATCH|DELETE) /api/[A-Za-z0-9/_:.-]+$")
+
+
+class Failure(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def stamp():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def read_hash(path):
+    with open(path, encoding="ascii") as handle:
+        value = handle.read().strip()
+    if not HASH_RE.match(value):
+        raise Failure(65, "%s does not hold one sha256 (64 lowercase hex)" % path)
+    return value
+
+
+def read_scopes(path):
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+    scopes = data.get("scopes") if isinstance(data, dict) else None
+    if not isinstance(scopes, list) or not scopes:
+        raise Failure(65, "%s has no scope list" % path)
+    if not all(isinstance(scope, str) and SCOPE_RE.match(scope) for scope in scopes):
+        raise Failure(65, "%s holds a scope that is not a route" % path)
+    return sorted(set(scopes))
+
+
+def seed(db_path, hash_path, scopes_path):
+    token_hash = read_hash(hash_path)
+    scopes = read_scopes(scopes_path)
+    if not os.path.isfile(db_path):
+        raise Failure(66, "database %s is missing (has the API started once?)" % db_path)
+    db = sqlite3.connect(db_path, timeout=30)
+    try:
+        with db:
+            row = db.execute("SELECT id, role FROM users WHERE username = ?", (ACCOUNT,)).fetchone()
+            created_account = False
+            if row is None:
+                db.execute("INSERT INTO users (id, username, password_hash, role, created_at) VALUES (?, ?, '!', 'automation', ?)",
+                           (str(uuid.uuid4()), ACCOUNT, stamp()))
+                row = db.execute("SELECT id, role FROM users WHERE username = ?", (ACCOUNT,)).fetchone()
+                created_account = True
+            if row[1] != "automation":
+                raise Failure(65, "account %s has role %r, not automation — nothing changed" % (ACCOUNT, row[1]))
+            present = db.execute("SELECT count(*) FROM api_tokens WHERE user_id = ? AND label = ?", (row[0], LABEL)).fetchone()[0]
+            if present:
+                return {"ok": True, "action": "kept", "account": ACCOUNT, "label": LABEL, "accountCreated": created_account}
+            db.execute("INSERT INTO api_tokens (id, user_id, label, token_hash, scopes_json, created_at, last_used_at) "
+                       "VALUES (?, ?, ?, ?, ?, ?, NULL)",
+                       (str(uuid.uuid4()), row[0], LABEL, token_hash, json.dumps(scopes), stamp()))
+    finally:
+        db.close()
+    return {"ok": True, "action": "created", "account": ACCOUNT, "label": LABEL, "scopes": len(scopes),
+            "accountCreated": created_account}
+
+
+def main(argv):
+    if len(argv) != 3:
+        raise Failure(64, "usage: cockpit-automation-token-seed <db> <hash-file> <scopes-file>")
+    sys.stdout.write(json.dumps(seed(*argv)) + "\n")
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except Failure as failure:
+        sys.stderr.write(json.dumps({"ok": False, "code": failure.code, "error": failure.message}) + "\n")
+        sys.exit(failure.code)
+    except (OSError, ValueError, sqlite3.Error) as error:
+        sys.stderr.write(json.dumps({"ok": False, "code": 65, "error": "%s: %s" % (type(error).__name__, error)}) + "\n")
+        sys.exit(65)
