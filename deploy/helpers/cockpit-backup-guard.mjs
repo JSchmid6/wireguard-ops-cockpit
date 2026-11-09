@@ -181,9 +181,35 @@ function lineNamesHelper(line, cwds) {
   if (line.namesHelper === undefined) {
     const inner = [];
     const texts = [extractSubstitutions(normalize(line.code), inner), ...inner];
-    line.namesHelper = texts.some((text) => namesHelper(text, cwds) || splitSegments(text).some((segment) => namesHelper(segment.text, cwds)));
+    line.namesHelper = texts.some((text) => namesHelper(text, cwds) || splitSegments(text).some((segment) => namesHelper(segment.text, cwds)))
+      || grepNamesHelper(texts.flatMap((text) => splitSegments(text)), cwds);
   }
   return line.namesHelper;
+}
+
+// ls oder find über das Verzeichnis des Helfers, gefiltert mit einem grep-Muster,
+// das auf seinen Namen passt (cd /usr/local/sbin && ls | grep borg-action | …):
+// das nennt den Helfer wie ein find-Namensfilter (Zweitprüfung t_5dd27194, H-1).
+function grepNamesHelper(segments, cwds) {
+  const heads = segments.map((segment) => commandOf(segment.text.split(/\s+/).filter(Boolean), false)).filter((command) => command.word);
+  const lists = heads.some(({ word, args }) => {
+    const name = baseName(word);
+    if (name === "find") return (findStarts(args).length ? findStarts(args) : ["."]).some((start) => !start.includes(OPAQUE) && [...cwds].some((cwd) => coversHelper(resolvePath(start, cwd))));
+    if (name !== "ls") return false;
+    const operands = args.filter((arg) => !arg.startsWith("-"));
+    return (operands.length ? operands : ["."]).some((operand) => !operand.includes(OPAQUE) && [...cwds].some((cwd) => {
+      const path = resolvePath(operand, cwd);
+      return GLOB.test(path) ? globRegex(path).test("/usr/local/sbin") || globRegex(path).test(BORG_ACTION_PATH) : path === "/usr/local/sbin" || path === BORG_ACTION_PATH;
+    }));
+  });
+  if (!lists) return false;
+  return heads.some(({ word, args }) => {
+    if (!/^(?:grep|egrep|fgrep)$/.test(baseName(word))) return false;
+    const valued = args.findIndex((arg) => arg === "-e" || arg === "--regexp");
+    const pattern = valued >= 0 ? args[valued + 1] : args.find((arg) => !arg.startsWith("-"));
+    if (!pattern || pattern.includes(OPAQUE) || args.includes("-v") || args.includes("--invert-match")) return false;
+    try { return new RegExp(baseName(word) === "fgrep" || args.includes("-F") ? pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") : pattern, args.some((arg) => /^-[a-zA-Z]*i/.test(arg)) ? "i" : "").test("cockpit-borg-action"); } catch { return true; }
+  });
 }
 
 // Lesen, die einen ganzen Baum durchgehen (grep -r /etc) oder einhängen.
@@ -331,7 +357,17 @@ function splitScript(prefix, text) {
     const id = `${prefix}:L${index + 1}`;
     let raw = physical[index];
     index += 1;
-    while (/(^|[^\\])(\\\\)*\\$/.test(raw) && index < physical.length) { raw = raw.slice(0, -1) + physical[index]; index += 1; }
+    // Bash setzt eine Zeile auch nach |, |&, && und || am Zeilenende fort
+    // (ls … | sed … |<NL>sh): der Riegel liest das wie die Backslash-Fortsetzung
+    // als eine logische Zeile (Zweitprüfung t_5dd27194, B2). Nicht, wenn die
+    // Zeile einen Heredoc öffnet (dessen Körper folgt zuerst) oder ein Quote
+    // offen bleibt (dann ist das | nur Text).
+    for (;;) {
+      while (/(^|[^\\])(\\\\)*\\$/.test(raw) && index < physical.length) { raw = raw.slice(0, -1) + physical[index]; index += 1; }
+      const scanned = scanUnquoted(raw);
+      if (index >= physical.length || scanned.heredocs.length > 0 || openQuoteAfter(raw, null) !== null || !/(?:\||&&|\|&)\s*$/.test(scanned.code)) break;
+      raw = `${scanned.code.replace(/\s+$/, "")} ${physical[index]}`; index += 1;
+    }
     const { heredocs: opened, code } = scanUnquoted(raw);
     const line = { id, raw, code, heredocs: [] };
     lines.push(line);
@@ -530,13 +566,26 @@ function splitSegments(text) {
   let nextPiped = false;
   let quoted = false;
   let nextQuoted = false;
+  // Eine Gruppe ( … ) oder { …; } hinter einer Pipe liest die Pipe: jeder
+  // Befehl darin bekommt sie als Eingabe (echo '…' | (exec bash), | { cd /; sh; };
+  // Zweitprüfung t_5dd27194, B1). Der Stapel merkt sich das je Gruppe.
+  const groups = [];
+  const inPipedGroup = () => groups.length > 0 && groups.at(-1);
   const push = () => {
-    if (current.trim()) segments.push({ text: current.trim(), piped, quoted });
+    if (current.trim()) segments.push({ text: current.trim(), piped: piped || inPipedGroup(), quoted });
     current = ""; piped = nextPiped; nextPiped = false; quoted = nextQuoted; nextQuoted = false;
   };
+  const opensGroup = () => { groups.push(piped || inPipedGroup()); };
   for (let i = 0; i < cleaned.length; i += 1) {
     if (cleaned[i] === IN_QUOTES) { nextQuoted = true; continue; }
     const char = cleaned[i];
+    if ((char === "(" || char === "{" && /\s/.test(cleaned[i + 1] ?? "")) && !current.trim()) {
+      const wasPiped = piped;
+      push(); piped = wasPiped; opensGroup(); piped = false; continue;
+    }
+    if (char === ")" || char === "}" && !current.trim() && /^(?:[\s;&|)]|$)/.test(cleaned[i + 1] ?? "")) {
+      push(); groups.pop(); piped = false; continue;
+    }
     if (char === "|" && cleaned[i + 1] === "|") { push(); piped = false; i += 1; continue; }
     if (char === "|" && cleaned[i + 1] === IN_QUOTES && cleaned[i + 2] === "|") { push(); piped = false; i += 2; continue; }
     if (char === "&" && cleaned[i + 1] === "&") { push(); piped = false; i += 1; continue; }
@@ -994,6 +1043,7 @@ function analyzeScript(prefix, text, context, hits, language = "shell") {
     // Ebenso: ein Löschwort, das echo/printf in eine Pipe gibt (echo 'borg
     // delete' | tee s.sh), und Pfade aus find, die xargs löscht.
     let carry = false;
+    let pipeNames = false;
     let echoed = null;
     let found = [];
     // ssh lab0 'a; b | c': was nach einem Trenner in Quotes kommt, läuft auf Lab0.
@@ -1013,6 +1063,7 @@ function analyzeScript(prefix, text, context, hits, language = "shell") {
       const remote = head.word ? remoteCommand(baseName(head.word), head.args) : null;
       if (remote && remote.lab0) lab0 = remote.host;
       let touching = false;
+      let named = false;
       let nextEchoed = null;
       let nextFound = [];
       for (const text of variants) {
@@ -1023,10 +1074,16 @@ function analyzeScript(prefix, text, context, hits, language = "shell") {
         }
         if (segment.piped && echoed && (result.runsInput || (echoed.retention && !result.readOnly))) hit(line.id, "backup", `${echoed.reason} (text piped into ${result.name || "a command"})`, code);
         if (segment.piped && result.deletesFromInput && found.some((path) => touchesBolted(path))) hit(line.id, "backup", `${result.name} deletes what find lists in the backups`, code);
+        // Pipe-Ausgabe, deren Quelle den Helfer nennt, landet in einer Datei, die
+        // laufen kann (> /etc/cron.d/x, | tee /tmp/r, dann bash /tmp/r): dort läuft
+        // der Helfer mit einem Verb, das der Riegel nicht liest (Zweitprüfung t_5dd27194, B3/B4).
+        if (segment.piped && pipeNames && (result.writes || []).some((target) => runnableTarget(target, context))) hit(line.id, "backup", `pipe output on a line that names the backup helper is written into a file that can run (${result.name || "a redirect"})`, code);
+        named ||= result.namesHelper;
         touching ||= result.touching;
         nextEchoed ||= result.echoed;
         nextFound.push(...result.found);
       }
+      pipeNames = segment.piped ? pipeNames || named : named;
       carry = segment.piped ? carry || touching : touching;
       echoed = segment.piped ? echoed || nextEchoed : nextEchoed;
       found = segment.piped ? [...found, ...nextFound] : nextFound;
@@ -1324,6 +1381,9 @@ function checkSegment(text, { piped, quoted }, line, context, cwds, hit) {
     if (bolt) hit(line.id, "backup", bolt, code);
     return { touching: true, readOnly: false, name, deletesFromInput: false, runsInput: true, echoed: null, found: [] };
   }
+  // eval führt Text aus, der erst zur Laufzeit entsteht (eval "$(echo '…/cockpit-borg-action repair')"):
+  // auf einer Zeile, die den Helfer nennt, ein Treffer wie sh -c "$(…)" (Zweitprüfung t_5dd27194, B5).
+  if (name === "eval" && lineNamesHelper(line, cwds)) hit(line.id, "backup", "eval runs text built at run time on a line that names the backup helper", code);
   if (name === "alias" || name === "hash" && command.args.includes("-p") || name === "enable" && command.args.some((arg) => arg.startsWith("-f"))) {
     hit(line.id, "uncertain", `${name} changes what a command name runs`, code);
   }
@@ -1402,6 +1462,12 @@ function checkSegment(text, { piped, quoted }, line, context, cwds, hit) {
   }
   return {
     touching, readOnly, name,
+    // Nennt der Befehl den Helfer, ohne ihn selbst zu sein? Seine Ausgabe kann
+    // dann eine Helfer-Zeile mit beliebigem Verb sein (ls …/cockpit-borg-action | sed 's/$/ repair/').
+    namesHelper: name !== "cockpit-borg-action" && shellHelperArg(name, command.args) < 0 && namesHelper(text, cwds),
+    // Wohin er schreibt: Umleitung und tee.
+    writes: [...redirectTargets(text), ...(name === "tee" ? command.args.filter((arg) => !arg.startsWith("-")) : [])]
+      .filter((target) => !target.includes(OPAQUE)).flatMap((target) => [...cwds].map((cwd) => resolvePath(target, cwd))),
     deletesFromInput: command.prefixes.includes("xargs") && (DELETERS.has(name) || name === "mv"),
     // Führt der Befehl seine Eingabe aus oder schreibt er sie dorthin, wo sie
     // später laufen kann? Frei: Lesen, logger, tee/Umleitung nur in Datendateien.

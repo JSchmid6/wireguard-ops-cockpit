@@ -70,6 +70,10 @@ const free: Array<[string, string]> = [
   ["the helper's free direct forms", "/usr/local/sbin/cockpit-borg-action status\n/usr/local/sbin/cockpit-borg-action check\n/usr/local/sbin/cockpit-borg-action db-access status\n/usr/local/sbin/cockpit-borg-action sources status\n/usr/local/sbin/cockpit-borg-action sources add /opt/stacks/wejos-wp"],
   ["a pipe into sh -c without the helper", "journalctl -u borgmatic | grep x | sh -c cat"],
   ["xargs -I@ with another command", "ls /tmp | xargs -I@ echo @"],
+  // t_3dce65e1: Fortsetzung nach | und &&, Gruppen und Helfer-Ausgabe in Datendateien bleiben frei.
+  ["pipes and lists continued on the next line", "/usr/local/sbin/cockpit-borg-action status |\n  jq .\napt-get update &&\n  apt-get -y upgrade"],
+  ["the helper's status into a data file", "/usr/local/sbin/cockpit-borg-action status | jq . > /tmp/borg-status.json"],
+  ["a subshell after a pipe without the helper", "journalctl -u borgmatic -n 20 | (grep -c x)"],
   ["notes and logs that mention the backups", "cat > /root/NOTIZ.md <<'EOF'\nAlte Dumps unter /var/backups nie per rm löschen\nEOF\necho \"borgmatic: create, dann prune\" | tee -a /var/log/cockpit.log"],
 ];
 
@@ -155,6 +159,20 @@ const needsApproval: Array<[string, string]> = [
   ["the helper through xargs -I@ in the path", "ls /usr/local/sbin | grep borg | xargs -I@ /usr/local/sbin/@ repair"],
   ["the helper through xargs -I @ in the path", "ls /usr/local/sbin | grep borg | xargs -I @ /usr/local/sbin/@ repair"],
   ["the helper through xargs --replace=XX in the path", "ls /usr/local/sbin | grep borg | xargs --replace=XX /usr/local/sbin/XX repair"],
+  // Zweitpruefung t_5dd27194 (Karte t_3dce65e1): B1 Gruppe als Pipe-Ziel, B2 | am Zeilenende,
+  // B3 Pipe-Ausgabe in eine Datei, die laufen kann, B4 tee und spaeter bash, B5 eval, H-1 grep-Filter.
+  ["B1: the helper as text piped into a subshell", "echo '/usr/local/sbin/cockpit-borg-action repair' | (bash)"],
+  ["B1: the helper as text piped into exec bash in a subshell", "echo '/usr/local/sbin/cockpit-borg-action repair' | (exec bash)"],
+  ["B1: the helper piped into a group that changes directory first", "echo '/usr/local/sbin/cockpit-borg-action repair' | { cd /; sh; }"],
+  ["B2: the helper named by ls, sed, | at the end of the line", "ls /usr/local/sbin/cockpit-borg-action | sed 's/$/ repair/' |\nsh"],
+  ["B2: the helper as text, | at the end of the line", "echo '/usr/local/sbin/cockpit-borg-action repair' |\nsh"],
+  ["B2: && at the end of the line", "true &&\n/usr/local/sbin/cockpit-borg-action repair"],
+  ["B2: || at the end of the line", "false ||\n/usr/local/sbin/cockpit-borg-action sources restore"],
+  ["B3: pipe output naming the helper into a cron file", "ls /usr/local/sbin/cockpit-borg-action | sed 's/$/ repair/' > /etc/cron.d/x"],
+  ["B3: pipe output naming the helper into root's crontab", "ls /usr/local/sbin/cockpit-borg-action | sed 's/$/ repair/' >> /var/spool/cron/crontabs/root"],
+  ["B4: pipe output naming the helper through tee, run on the next line", "ls /usr/local/sbin/cockpit-borg-action | sed 's/$/ repair/' | tee /tmp/r >/dev/null\nbash /tmp/r"],
+  ["B5: eval of a command substitution that names the helper", "eval \"$(echo '/usr/local/sbin/cockpit-borg-action repair')\""],
+  ["H-1: grep filter on the helper's directory into sh", "cd /usr/local/sbin && ls | grep borg-action | sed 's/$/ repair/' | sh"],
   // Hinweis H1: ein Argument in Quotes ueber das Zeilenende.
   ["sources add with a quoted argument over two lines", "/usr/local/sbin/cockpit-borg-action sources add '/opt/stacks/x\n- /etc'"],
   ["retention edit", "sed -i 's/keep_daily: 7/keep_daily: 1/' /etc/borgmatic/config.yaml"],

@@ -176,8 +176,12 @@ jedes `cd`-Ziel aufgelöst. Kommentare zählen nicht.
   (seit 09.11.2026, Karte t_fd6dfaa4) eine Shell, ein Interpreter, `source` oder `at`, die Text
   aus einer Pipe oder ein Skript, das der Plan nicht zeigt (`<(…)`), auf einer Zeile ausführen,
   die ihn nennt (`ls <helfer> | sed 's/$/ repair/' | sh`, `bash <(echo '<helfer> repair')`); der
-  Wert von `xargs -I|-i|--replace` zählt dabei wie `{}` (`xargs -I@ /usr/local/sbin/@ repair`)
-  (Einzelheiten `doc/setup/borg-maintenance.md`, „Riegel über Umwege“);
+  Wert von `xargs -I|-i|--replace` zählt dabei wie `{}` (`xargs -I@ /usr/local/sbin/@ repair`);
+  seit Karte t_3dce65e1 (09.11.2026) auch eine Gruppe `( … )`/`{ …; }` als Pipe-Ziel, eine über
+  `|`/`&&`/`||` am Zeilenende fortgesetzte Zeile (als eine logische Zeile gelesen), Pipe-Ausgabe,
+  deren Quelle den Helfer nennt, in eine Datei, die laufen kann (`> /etc/cron.d/x`, `| tee /tmp/r`),
+  `eval` auf einer Zeile, die ihn nennt, und ein `grep`-Filter auf seinen Namen über seinem
+  Verzeichnis (Einzelheiten `doc/setup/borg-maintenance.md`, „Riegel über Umwege“);
 - jede Änderung der Aufbewahrung: `keep_*`/`--keep-*`, `keepDaily|Weekly|Monthly`,
   `backup_keep_time` (GitLab), außerhalb eines reinen Lesebefehls;
 - Schreiben in die Konfiguration: `/etc/borgmatic`, `/etc/borgmatic.d`, `/root/.config/borg`

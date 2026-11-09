@@ -392,6 +392,19 @@ Grenzen:
   geht an Jochen — wer die Status-Ausgabe auswerten will, nimmt `grep`, `awk` oder `jq`.
   Ein Argument in Quotes, das über das Zeilenende reicht, neben dem Helfer ist ein Treffer (der Riegel liest jede Zeile für sich; Hinweis H1). Tests:
   `apps/api/test/backup-guard.test.ts` (die sechs Fälle der Zweitprüfung und Varianten).
+  **Nachtrag Zweitprüfung t_5dd27194 (Karte t_3dce65e1, 09.11.2026):** (B1) Eine Gruppe hinter einer
+  Pipe liest die Pipe: jeder Befehl in `( … )` oder `{ …; }` gilt als „liest aus der Pipe“
+  (`echo '…/cockpit-borg-action repair' | (exec bash)`, `| { cd /; sh; }`). (B2) Endet eine Zeile
+  außerhalb von Quotes auf `|`, `|&`, `&&` oder `||`, setzt Bash sie fort; der Riegel fügt sie wie
+  die Backslash-Fortsetzung zu einer logischen Zeile zusammen (nicht, wenn die Zeile einen Heredoc
+  öffnet). (B3/B4) Pipe-Ausgabe, deren Quelle den Helfer nennt (ohne der Helfer selbst zu sein), in
+  eine Datei, die laufen kann (Umleitung oder `tee`; alles außer reinen Datendateien wie `.json`,
+  `.txt`, `.log`), ist ein Treffer — `ls <helfer> | sed 's/$/ repair/' > /etc/cron.d/x`,
+  `… | tee /tmp/r` vor `bash /tmp/r`. `<helfer> status | jq . > /tmp/s.json` bleibt frei. (B5) `eval`
+  auf einer Zeile, die den Helfer nennt (auch in `$(…)`), ist ein Treffer wie `sh -c "$(…)"`.
+  (H-1) Ein `grep`-Muster, das auf den Namen passt, nennt den Helfer, wenn dieselbe Zeile `ls`
+  über `/usr/local/sbin` (bzw. den Helfer) oder `find` über einen Vorfahren listet
+  (`cd /usr/local/sbin && ls | grep borg-action | sed 's/$/ repair/' | sh`); `grep -v` nicht.
   Grenze, ehrlich: Ein Programm, das den Helfer weder nennt noch per Glob oder find-Filter trifft
   (Name aus Teilen zusammengesetzt, dekodiert, aus einer Datei gelesen), sieht der Riegel nicht;
   das bleibt Verschleierung und damit Sache des Türstehers (X4, `doc/setup/host-run.md` 2a).
