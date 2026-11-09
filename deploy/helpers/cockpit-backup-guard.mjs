@@ -880,44 +880,70 @@ function clip(text, limit = 300) { return text.length > limit ? `${text.slice(0,
 
 // ── Zeilen, Heredocs ───────────────────────────────────────────────────────
 
-// Außerhalb von Quotes: wo ein Kommentar beginnt und welche Heredocs die Zeile
-// öffnet. Ein "<<X" in Quotes oder in einem Kommentar öffnet keinen.
-function scanUnquoted(line) {
+// Der eine Leser für Quotes, Kommentare und Heredocs einer Zeile, ausgehend
+// vom Quote, der am Anfang offen war. Ein "<<X" in Quotes oder in einem
+// Kommentar öffnet keinen Heredoc.
+//
+// Kommentar wie in Bash nur am Wortanfang (Zweitprüfung t_ba8ceb38, Karte
+// t_8f78c1ac): nach Leerraum, ; & | ( und nach dem ) einer Gruppe (…) oder
+// eines Befehls ((…)). Kein Kommentar ist # direkt nach dem ) einer Ersetzung
+// $(…), $((…)), <(…), >(…) (echo $(true)#; … läuft weiter), in ${…}, in
+// Arithmetik und in `…` (dort endet der Kommentar am Backtick, nicht an der
+// Zeile). Im Zweifel kein Kommentar und kein Heredoc mehr in dieser Zeile:
+// ein ), dessen ( der Riegel nicht in der Zeile sieht (x=$(<NL>…<NL>)#; …),
+// kann eine Ersetzung schließen — dann liest der Riegel lieber zu viel.
+function scanShell(line, quote = null) {
   const heredocs = [];
-  let quote = null;
   let commentAt = -1;
-  let arithmetic = 0; // (( a << b )) und $[ … ] schieben Bits, sie öffnen keinen Heredoc
+  const open = []; // "group" ((), "word" ($( <( >( ), "arith" ((( ), "warith" ($(( ), "square" ($[ ), "brace" (${)
+  let closed = null; // was das ) direkt vor i geschlossen hat
+  let backtick = false;
+  let noHeredoc = false;
+  const inArithmetic = () => open.some((kind) => kind === "arith" || kind === "warith" || kind === "square");
   for (let i = 0; i < line.length; i += 1) {
     const char = line[i];
+    const after = closed;
+    closed = null;
     if (quote === "'") { if (char === "'") quote = null; continue; }
     if (char === "\\") { i += 1; continue; }
     if (quote === '"') { if (char === '"') quote = null; continue; }
     if (char === "'" || char === '"') { quote = char; continue; }
-    if (char === "(" && line[i + 1] === "(" || char === "$" && line[i + 1] === "[") { arithmetic += 1; i += 1; continue; }
-    if (arithmetic > 0 && (char === ")" && line[i + 1] === ")" || char === "]")) { arithmetic -= 1; if (char === ")") i += 1; continue; }
-    if (char === "#" && (i === 0 || /[\s;&|()]/.test(line[i - 1]))) { commentAt = i; break; }
-    if (arithmetic === 0 && char === "<" && line[i + 1] === "<" && line[i + 2] !== "<" && line[i - 1] !== "<") {
+    if (char === "`") { backtick = !backtick; continue; }
+    if (char === "$" && line[i + 1] === "(" && line[i + 2] === "(") { open.push("warith"); i += 2; continue; }
+    if (char === "$" && line[i + 1] === "[") { open.push("square"); i += 1; continue; }
+    if (char === "$" && line[i + 1] === "(" || (char === "<" || char === ">") && line[i + 1] === "(") { open.push("word"); i += 1; continue; }
+    if (char === "$" && line[i + 1] === "{") { open.push("brace"); i += 1; continue; }
+    if (char === "(" && line[i + 1] === "(") { open.push("arith"); i += 1; continue; }
+    if (char === "(") { open.push("group"); continue; }
+    if (char === ")") {
+      const top = open.at(-1);
+      if ((top === "arith" || top === "warith") && line[i + 1] === ")") { open.pop(); i += 1; closed = top; continue; }
+      if (top === "square" || top === "brace") continue; // ) in $[ … ] bzw. ${ … }
+      closed = open.length > 0 ? open.pop() : "unknown";
+      continue;
+    }
+    if (char === "]" && open.at(-1) === "square") { open.pop(); closed = "warith"; continue; }
+    if (char === "}" && open.at(-1) === "brace") { open.pop(); continue; }
+    if (char === "#" && !backtick && !open.includes("brace") && !inArithmetic()) {
+      if (after === "unknown") { noHeredoc = true; continue; }
+      if (i === 0 || /[\s;&|(]/.test(line[i - 1]) || after === "group" || after === "arith") { commentAt = i; break; }
+      continue;
+    }
+    if (!noHeredoc && !backtick && !open.includes("brace") && !inArithmetic() && char === "<" && line[i + 1] === "<" && line[i + 2] !== "<" && line[i - 1] !== "<") {
       const match = line.slice(i + 2).match(/^(-?)\s*(['"]?)\\?([A-Za-z_][\w.-]*)\2/);
       // Ein Begrenzer in Quotes oder mit \ (<<'EOF', <<\EOF): Bash erweitert den Körper nicht.
       if (match) { heredocs.push({ strip: match[1] === "-", word: match[3], quoted: match[2] !== "" || match[0].includes("\\") }); i += 1 + match[0].length; }
     }
   }
-  return { heredocs, code: commentAt >= 0 ? line.slice(0, commentAt) : line };
+  return { heredocs, quote, code: commentAt >= 0 ? line.slice(0, commentAt) : line };
 }
+
+// Außerhalb von Quotes: wo ein Kommentar beginnt und welche Heredocs die Zeile öffnet.
+function scanUnquoted(line) { return scanShell(line, null); }
 
 // Der Quote, der am Ende einer Zeile noch offen ist ('…<NL>…'), ausgehend vom
 // Quote, der am Anfang offen war. null: alle Quotes geschlossen.
-function openQuoteAfter(line, quote) {
-  for (let i = 0; i < line.length; i += 1) {
-    const char = line[i];
-    if (quote === "'") { if (char === "'") quote = null; continue; }
-    if (char === "\\") { i += 1; continue; }
-    if (quote === '"') { if (char === '"') quote = null; continue; }
-    if (char === "'" || char === '"') { quote = char; continue; }
-    if (char === "#" && (i === 0 || /[\s;&|()]/.test(line[i - 1]))) break;
-  }
-  return quote;
-}
+function openQuoteAfter(line, quote) { return scanShell(line, quote).quote; }
 
 // Logische Zeilen (Fortsetzungen verbunden) und Heredoc-Körper, jede mit der
 // Kennung ihrer ersten physischen Zeile (S<n>:L<n> wie beim Türsteher).

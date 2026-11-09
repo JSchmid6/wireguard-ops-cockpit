@@ -516,6 +516,20 @@ Grenzen:
   `/opt/data/out/t_2e391eba/sonden/probe-r5.mjs` (65 Fälle) und `bash-real-r5.mjs` (48 von 51
   Treffer-Formen laufen in echter Bash; PS0, PS3 und `$((10#$z))` sind Treffer der Regel, ohne
   dass sie hier liefen). Tests: `apps/api/test/backup-guard.test.ts` (P, PS4, S).
+* **Kommentar wie in Bash (09.11.2026, Zweitprüfung t_ba8ceb38, Karte t_8f78c1ac).** Der Riegel
+  las `#` nach Leerraum, `;&|()` als Kommentarbeginn und sah den Rest der Zeile nicht — auch eine
+  direkte `repair`-Zeile: `echo $(true)#; …/cockpit-borg-action repair` lief in echter Bash, der Riegel
+  blieb frei (schon auf main). Bash beginnt einen Kommentar nur am Wortanfang. Jetzt liest **ein**
+  Leser (`scanShell`, für Kommentar, Heredoc und offenen Quote) die Zeile: Kommentar nach Leerraum,
+  `;&|(`, und nach dem `)` einer Gruppe `(…)` oder eines Befehls `((…))`; kein Kommentar ist `#`
+  direkt nach dem `)` von `$(…)`, `$((…))`, `<(…)`, `>(…)`, nach `$[…]`, in `${…}`, in Arithmetik und
+  in `` `…` `` (dort endet ein Kommentar am Backtick, belegt). Im Zweifel liest er zu viel: ein `)`,
+  dessen `(` nicht in der Zeile steht (`x=$(⏎…⏎)#; …`), macht `#` nicht zum Kommentar, und danach
+  öffnet die Zeile keinen Heredoc mehr; in `${…}` und `` `…` `` öffnet `<<` keinen Heredoc. Preis:
+  `case x in x)# …` ist in Bash ein Kommentar, der Riegel liest den Rest (ein Treffer zu viel).
+  Gemessen: alle Sonden der früheren Runden unverändert (`/opt/data/out/t_8f78c1ac/sonden-*`), die
+  Fälle aus t_ba8ceb38 (`faelle*.mjs`) sind alle Treffer, wo Bash `repair` startet. Tests:
+  `apps/api/test/backup-guard.test.ts` (t_8f78c1ac).
 * **Offene Entscheidung (05.11.2026, Karte t_5ce5f79f): Freigabe-Markierung im Helfer.** Erwogen:
   die schwächenden Verben (`sources connect|disconnect|restore`, `repair`) laufen in einer
   host-run-cgroup nur, wenn `cockpit-host-run` für genau diesen Job eine root-eigene Markierung

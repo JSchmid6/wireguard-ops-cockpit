@@ -96,6 +96,12 @@ const free: Array<[string, string]> = [
   ["t_2e391eba: a quoted heredoc is not expanded", "ls -l /usr/local/sbin/cockpit-borg-action\ncat <<'EOF'\n$((z)) ${x@P}\nEOF"],
   ["t_2e391eba: an unmarked plan keeps its arithmetic and prompt expansion", "for ((i=0; i<3; i++)); do echo $i; done\nx='\\u@\\h'\necho \"${x@P}\"\n/usr/local/sbin/cockpit-borg-action status"],
   ["the helper's status through a variable", "h=/usr/local/sbin/cockpit-borg-action\n$h status"],
+  // Zweitpruefung t_ba8ceb38 (Karte t_8f78c1ac): ein Kommentar am Wortanfang bleibt Kommentar, wie in Bash.
+  ["t_8f78c1ac: a comment right after a subshell", "(true)# ; /usr/local/sbin/cockpit-borg-action repair"],
+  ["t_8f78c1ac: a comment right after an arithmetic command", "(( 1 ))#; /usr/local/sbin/cockpit-borg-action repair"],
+  ["t_8f78c1ac: a comment after a blank", "hostname # /usr/local/sbin/cockpit-borg-action repair"],
+  ["t_8f78c1ac: a comment after a semicolon", "hostname;# /usr/local/sbin/cockpit-borg-action repair"],
+  ["t_8f78c1ac: a comment at the start of a command substitution", "x=$(# /usr/local/sbin/cockpit-borg-action repair\nhostname)\necho \"$x\""],
 ];
 
 // Jede Form aus dem Auftrag, und Umwege, die der Text verdeckt.
@@ -290,6 +296,16 @@ const needsApproval: Array<[string, string]> = [
   ["S: integer variable RANDOM", "x='a['\ny='$(sh)]'\nz=$x$y\necho '/usr/local/sbin/cockpit-borg-action repair' | RANDOM=$z"],
   ["S: integer variable OPTIND through read", "x='a['\ny='$(sh)]'\nz=$x$y\necho '/usr/local/sbin/cockpit-borg-action repair' | { read -r -u 3 OPTIND 3<<< \"$z\"; }"],
   ["S: test -v with a subscript from a name", "x='a['\ny='$(sh)]'\nz=$x$y\nread -ra b <<< '1 2'\necho '/usr/local/sbin/cockpit-borg-action repair' | test -v 'b[z]'"],
+  // Zweitpruefung t_ba8ceb38 (Karte t_8f78c1ac): # mitten im Wort oder in ${…} ist kein Kommentar.
+  ["t_8f78c1ac: # right after $(…)", "echo $(true)#; /usr/local/sbin/cockpit-borg-action repair"],
+  ["t_8f78c1ac: # right after $((…))", "echo $((1))#; /usr/local/sbin/cockpit-borg-action repair"],
+  ["t_8f78c1ac: # right after <(…)", "cat <(true)#; /usr/local/sbin/cockpit-borg-action repair"],
+  ["t_8f78c1ac: # right after >(…)", "echo >(true)#; /usr/local/sbin/cockpit-borg-action repair"],
+  ["t_8f78c1ac: # right after $(…) before &&", "true $(true)#&& /usr/local/sbin/cockpit-borg-action repair"],
+  ["t_8f78c1ac: # inside ${x:- …}", "echo ${x:- #}; /usr/local/sbin/cockpit-borg-action repair"],
+  ["t_8f78c1ac: # inside ${x/ …/}", "x=a; echo ${x/ #/}; /usr/local/sbin/cockpit-borg-action repair"],
+  ["t_8f78c1ac: # inside backticks ends with them", "echo `true #`; /usr/local/sbin/cockpit-borg-action repair"],
+  ["t_8f78c1ac: # after a ) whose ( is on an earlier line", "x=$(\ntrue\n)#; /usr/local/sbin/cockpit-borg-action repair"],
   ["S: arithmetic in a heredoc", "x='a['\ny='$(sh)]'\nz=$x$y\necho '/usr/local/sbin/cockpit-borg-action repair' | cat <<EOF\n$((z))\nEOF"],
   ["price: the helper's checksum next to other work", "sha256sum /usr/local/sbin/cockpit-borg-action\napt-get update"],
   // Hinweis H1: ein Argument in Quotes ueber das Zeilenende.
