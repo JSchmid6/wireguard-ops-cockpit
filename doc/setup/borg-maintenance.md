@@ -435,6 +435,54 @@ Grenzen:
   `… status | tee -a /var/log/cockpit-borg.log`, `ls /usr/local/sbin | grep -v borg-action`. Der Preis:
   eine Zeile, die den Helfer nennt und daneben etwas Fremdes tut (`ls -l <helfer> && systemctl
   restart x`), geht an Jochen — wer beides will, schreibt zwei Zeilen. Tests: `apps/api/test/backup-guard.test.ts` (N1–N8).
+  **Nachtrag Zweitprüfung t_20ae3cda (Karte t_d16c58d1, 09.11.2026): Plan-Umfang statt Zeile.** Die
+  Zeilen-Allowlist urteilte über Namen und Syntax **einer** Zeile; die fünfte Runde fand Fluss über
+  Zeilen, in echter Bash belegt: (A) ein Filter-Name, umgebunden in einer Vorzeile (`cat(){ sh; }`⏎
+  `echo '<helfer> repair' | cat`, ebenso `function head {…}`, `alias tail=sh`, `hash -p /bin/sh cat`,
+  eigenes `cat` plus `export PATH=…`, `echo(){ sh -c "$*"; }`); (C) Arithmetik, die `$(…)` mit der
+  Pipe als Eingabe ausführt (`| echo "$(( $(sh) ))"`, `printf -v 'a[$(sh)]' x`,
+  `test -v "a[\$($x repair)]"`) — der Riegel hatte `$((…))` durch `0` ersetzt, ohne hineinzusehen;
+  (E) `sed` mit anderem Trenner (`s|$| repair|e`, `s,$, repair,e`, `s|$||w /etc/cron.d/x`); (F) eine
+  „Datensenke“, die eine andere Zeile ausführt (`tail -f /tmp/p.txt | sh &`, `sh < /tmp/r.txt`,
+  `bash -s < r.log`, `cat r.txt | sh`, `$(cat r.txt)`, `$(< r.txt)`, `while read -r l; do $l; done`,
+  `xargs -a r.txt … sh -c`, `BASH_ENV=r.txt bash -c true`, ein FIFO `f.log`, ein Symlink
+  `/tmp/r.txt → /etc/cron.d/x`); (G) Variablen ohne `$name` (`${!y}`, `declare -n r=x`, `export X=…`
+  plus `printenv X`/`env`, `x=$(compgen -c | grep borg-action)`). Entscheidung: keine sechste
+  Senken-Liste, sondern der Geltungsbereich wird **der ganze Plan**. Ein erster Durchgang über alle
+  Schritte und Prüfschritte (samt ausgeführter Heredocs) stellt fest, ob der Plan den Helfer
+  außerhalb seiner freien Formen nennt. Frei sind dabei nur die Direktform (bzw. Shell-Form) und
+  `test`/`[`/`[[` auf ihn, denn sie geben keinen Text aus, der anderswo laufen könnte; alles andere
+  macht seinen Namen zu Text (`echo`, `ls`, `stat`, `sha256sum`, ein Glob, ein find-Filter, ein
+  `grep` über seinem Verzeichnis, das Listen dieses Verzeichnisses, eine Variable mit seinem Namen).
+  Nennt der Plan ihn so, gilt im zweiten Durchgang für **jede** Zeile: jeder einfache Befehl ist
+  Filter oder Datensenke (Liste oben; dazu `set` mit Optionen, `exit`/`return` mit Zahl, `compgen`
+  ohne `-C`/`-F`, `locate`), und nichts bindet um — keine Funktionsdefinition, kein `alias`, `hash`,
+  `enable`, keine Zuweisung an PATH, BASH_ENV, ENV, LD_* & Co. (außer dem Standard-PATH), kein
+  `${!…}`, kein `declare -n`, kein `export` einer Variablen, deren Wert den Helfer nennt. Damit
+  fallen F und A ohne eigene Regel: wer eine Datei, ein FIFO oder `tail -f` ausführt, braucht eine
+  Shell, `xargs`, `less`, `ln`, `mkfifo` oder einen Befehlsnamen aus einem Wert — keiner davon ist ein
+  Filter. Arithmetik: `$((…))`, `((…))` und Array-Indizes werden durchlaufen, jedes `$(…)`/`` `…` ``
+  darin wird ein eigener Befehl; ein Index mit `$(…)` in einem Argument (`printf -v`, `read`,
+  `test -v`, `declare`) ist kein Filter, ebenso `mapfile -C`. `sed` wird positiv gelesen statt per
+  Regex auf `/`: Optionen nur `-n -E -r -s -u -z -l`, `-e`/`--expression`, `--posix`, `--debug`,
+  `--sandbox`; Programme nur Adressen (Zahl, `$`, `/re/`, `\cREc`, `first~step`, Bereiche, `!`),
+  `s` und `y` mit beliebigem Trenner, `s`-Flags nur `g p i I m M <Zahl>`, dazu `p P d D n N g G h H
+  x l z = F q Q`, `: b t T`, `a i c`, `{ }`; alles andere (`e`, `w`, `W`, `r`, `R`, `v`, das e-/w-Flag,
+  ein Programm aus einer Variablen oder `$(…)`) ist kein Filter. `awk` bleibt eine Wortprüfung,
+  zusätzlich ohne `-E`, `-i`, `-l`, `--include`, `--load` und ohne indirekten Aufruf `@f(…)`.
+  **Preis (gemessen, `/opt/data/out/t_d16c58d1/probe-preis.log`):** frei bleiben die Direktformen
+  neben fremder Arbeit (`<helfer> status | jq .` plus `apt-get -y upgrade`, `sources add` plus
+  `systemctl restart`, `db-access status` plus `a2dissite`), `test -x <helfer> && <helfer> status`
+  neben `docker compose pull`, und Pläne, die nur lesen und filtern (`stat <helfer>` plus
+  `docker compose ps`, `set -euo pipefail` plus `sha256sum <helfer> | tee /tmp/h.txt`). An Jochen geht
+  neu ein Plan, der den Helfer als Text nennt **und** daneben etwas ändert: `sha256sum <helfer>` oder
+  `ls -l <helfer>` plus `apt-get`/`systemctl restart`, `echo "<helfer>"` plus Arbeit,
+  `h=<helfer>; $h status` plus Arbeit. Ausweg: den Pfad wörtlich schreiben, `test -x` statt `ls`,
+  oder zwei Läufe (der Satz „schreibt zwei Zeilen“ im Nachtrag oben gilt damit nicht mehr). Tests:
+  `apps/api/test/backup-guard.test.ts` (A1–G10 und die freien Fälle `t_d16c58d1: …`), Sonden
+  `/opt/data/out/t_20ae3cda/sonden/probe-t20.mjs` (0 Abweichungen außer Z10, das schon auf main ein
+  Treffer ist). Auch der in Bash ungültige Plan „`|` am Anfang der Folgezeile“ ist jetzt ein Treffer
+  (er nennt den Helfer und hat ein `sh`); Bash würde ihn ohnehin nicht ausführen.
   Grenze, ehrlich: Ein Programm, das den Helfer weder nennt noch per Glob oder find-Filter trifft
   (Name aus Teilen zusammengesetzt, dekodiert, aus einer Datei gelesen), sieht der Riegel nicht;
   das bleibt Verschleierung und damit Sache des Türstehers (X4, `doc/setup/host-run.md` 2a).

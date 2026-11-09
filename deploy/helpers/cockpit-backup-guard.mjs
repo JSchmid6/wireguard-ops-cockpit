@@ -236,9 +236,152 @@ const FILTER_WORDS = new Set(["grep", "egrep", "fgrep", "zgrep", "jq", "head", "
 // Vorsätze, die nur Rechte, Umgebung, Zeit oder Priorität ändern.
 const PLAIN_PREFIXES = new Set(["sudo", "doas", "env", "timeout", "nice", "ionice", "command"]);
 const DATA_DEVICES = /^\/dev\/(?:null|stdout|stderr|fd\/[12])$/;
-// sed, das seinen Pattern Space ausführt (s///e, e-Befehl) oder in eine Datei schreibt (s///w, w-Befehl).
-const SED_EXEC = /\bsed\b[^|;]*\s(?:-[a-zA-Z]*e\s+)?\S*(?:\/[gpIiMm0-9]*e[gpIiMm0-9]*(?:\s|$)|(?:^|;)\s*e\b)/;
-const SED_WRITE = /\bsed\b[^|]*(?:\/[gpIiMm0-9]*[wW]\s*\S|(?:^|[\s;{}])[0-9,$]*[wW]\s+\S)/;
+
+// Die Wörter eines rohen Befehls, wie Bash sie sieht (Quotes aufgelöst, keine
+// Erweiterung). dynamic: das Wort enthält außerhalb von '…' ein $, ` oder eine
+// Ersetzung — sein Wert steht erst zur Laufzeit fest.
+function shellWords(text) {
+  const words = [];
+  let word = null;
+  let i = 0;
+  const add = (chars, dynamic = false) => { word ??= { value: "", dynamic: false }; word.value += chars; word.dynamic ||= dynamic; };
+  while (i < text.length) {
+    const char = text[i];
+    if (/\s/.test(char)) { if (word) words.push(word); word = null; i += 1; continue; }
+    if (char === "\\") { add(text[i + 1] ?? ""); i += 2; continue; }
+    if (char === "'") { const end = text.indexOf("'", i + 1); const stop = end < 0 ? text.length : end; add(text.slice(i + 1, stop)); i = stop + 1; continue; }
+    if (char === '"') {
+      let j = i + 1;
+      add("");
+      while (j < text.length && text[j] !== '"') {
+        if (text[j] === "\\" && /[$`"\\\n]/.test(text[j + 1] ?? "")) { add(text[j + 1]); j += 2; continue; }
+        add(text[j], /[$`]/.test(text[j]) || text[j] === OPAQUE); j += 1;
+      }
+      i = j + 1; continue;
+    }
+    add(char, /[$`]/.test(char) || char === OPAQUE); i += 1;
+  }
+  if (word) words.push(word);
+  return words;
+}
+
+// Ein sed-Programm, das nur liest, ersetzt und ausgibt (Zweitprüfung t_20ae3cda,
+// E; Karte t_d16c58d1): Adressen (Zahl, $, /re/, \cREc, first~step, Bereich,
+// !), s mit beliebigem Trenner und den Flags g p i I m M <Zahl>, y, Ausgabe und
+// Puffer (p P d D n N g G h H x l z = F q Q), Sprünge (: b t T), Text (a i c)
+// und { }. Alles andere — das e- und w-Flag, die Befehle e w W r R v — und
+// was sich nicht lesen lässt, ist kein Filter. Positiv statt eines Regex auf
+// /…/e: der Trenner ist frei wählbar (s|$| repair|e).
+function sedScriptFilters(script) {
+  const n = script.length;
+  let i = 0;
+  const blanks = () => { while (i < n && /[ \t]/.test(script[i])) i += 1; };
+  const digits = () => { while (i < n && /\d/.test(script[i])) i += 1; };
+  // Bis zum (nicht maskierten) Trenner; false, wenn er fehlt.
+  const until = (delimiter) => {
+    while (i < n && script[i] !== delimiter) { if (script[i] === "\\") i += 1; i += 1; }
+    if (i >= n) return false;
+    i += 1; return true;
+  };
+  // true: Adresse gelesen, null: keine da, false: kaputt.
+  const address = () => {
+    if (/\d/.test(script[i] ?? "")) { digits(); if (script[i] === "~") { i += 1; digits(); } return true; }
+    if (script[i] === "$") { i += 1; return true; }
+    if (script[i] === "/" || script[i] === "\\") {
+      const delimiter = script[i] === "/" ? "/" : script[i + 1];
+      i += script[i] === "/" ? 1 : 2;
+      if (!delimiter || delimiter === "\n" || !until(delimiter)) return false;
+      while (i < n && /[IM]/.test(script[i])) i += 1;
+      return true;
+    }
+    return null;
+  };
+  const restOfLine = () => { while (i < n && script[i] !== "\n") { if (script[i] === "\\") i += 1; i += 1; } };
+  while (i < n) {
+    blanks();
+    if (i >= n) break;
+    if (/[;\n}]/.test(script[i])) { i += 1; continue; }
+    if (script[i] === "#") { restOfLine(); continue; }
+    const first = address();
+    if (first === false) return false;
+    if (first) {
+      blanks();
+      if (script[i] === ",") {
+        i += 1; blanks();
+        if (script[i] === "+" || script[i] === "~") { i += 1; digits(); } else if (address() !== true) return false;
+      }
+    }
+    blanks();
+    while (script[i] === "!") { i += 1; blanks(); }
+    const command = script[i];
+    i += 1;
+    if (command === undefined) return !first;
+    if (command === "{") continue;
+    if ("pPdDnNgGhHxlz=F".includes(command)) continue;
+    if ("qQ".includes(command)) { blanks(); digits(); continue; }
+    if (":btT".includes(command)) { while (i < n && !/[;\n]/.test(script[i])) i += 1; continue; }
+    if ("aic".includes(command)) { restOfLine(); continue; }
+    if (command === "s" || command === "y") {
+      const delimiter = script[i];
+      i += 1;
+      if (!delimiter || delimiter === "\\" || delimiter === "\n" || !until(delimiter) || !until(delimiter)) return false;
+      if (command === "y") continue;
+      while (i < n && !/[;\n}]/.test(script[i])) {
+        if (/[gpiImM0-9 \t]/.test(script[i])) { i += 1; continue; }
+        return false; // e führt aus, w/W schreibt, alles andere ist unbekannt
+      }
+      continue;
+    }
+    return false; // e, w, W, r, R, v und Unbekanntes
+  }
+  return true;
+}
+
+// Führt dieser sed-Aufruf nur Programme aus, die filtern? Die Optionen und
+// Programme kommen aus dem rohen Text; ein Programm, das erst zur Laufzeit
+// feststeht (sed "s/a/$x/"), ist kein Filter.
+function sedFilters(text) {
+  const words = shellWords(text);
+  const at = words.findIndex((word) => !word.dynamic && baseName(word.value) === "sed");
+  if (at < 0) return false;
+  const args = words.slice(at + 1);
+  const scripts = [];
+  let explicit = false;
+  let operands = false;
+  for (let k = 0; k < args.length; k += 1) {
+    const { value, dynamic } = args[k];
+    if (operands || !value.startsWith("-") || value === "-") {
+      if (!explicit && scripts.length === 0) { if (dynamic) return false; scripts.push(value); }
+      operands = true; continue;
+    }
+    if (value === "--") { operands = true; continue; }
+    if (dynamic) return false;
+    const long = value.match(/^--([a-z-]+)(?:=(.*))?$/s);
+    if (long) {
+      const [, option, inline] = long;
+      if (option === "expression") {
+        const program = inline ?? args[k += 1]?.value;
+        if (program === undefined || (inline === undefined && args[k].dynamic)) return false;
+        scripts.push(program); explicit = true; continue;
+      }
+      if (option === "line-length") { if (inline === undefined) k += 1; continue; }
+      if (/^(?:quiet|silent|regexp-extended|separate|unbuffered|null-data|posix|debug|sandbox|follow-symlinks)$/.test(option)) continue;
+      return false;
+    }
+    for (let c = 1; c < value.length; c += 1) {
+      const flag = value[c];
+      if ("nErsuz".includes(flag)) continue;
+      if (flag === "l") { if (c === value.length - 1) k += 1; break; }
+      if (flag === "e") {
+        const program = c < value.length - 1 ? value.slice(c + 1) : args[k += 1]?.value;
+        if (program === undefined || (c === value.length - 1 && args[k].dynamic)) return false;
+        scripts.push(program); explicit = true; break;
+      }
+      return false; // -i, -f und Unbekanntes
+    }
+  }
+  return scripts.length > 0 && scripts.every((script) => !script.includes(OPAQUE) && sedScriptFilters(script));
+}
 
 // Wo ein Ausdruck in Klammern endet (Index hinter der schließenden), Quotes beachtet.
 function parenEnd(src, from) {
@@ -261,6 +404,20 @@ function parenEnd(src, from) {
 // >(…) werden zu OPAQUE, ihr Inhalt zu eigenen Befehlen.
 function rawSegments(code) {
   const out = [];
+  // $((…)), ((…)) und ein Array-Index rechnen, und Bash führt dabei jedes $(…)
+  // und `…` darin aus (echo $(( $(sh) )) liest die Pipe; Zweitprüfung
+  // t_20ae3cda, C). Der Ausdruck selbst ist kein Befehl, aber seine Ersetzungen
+  // werden eigene Befehle (Karte t_d16c58d1).
+  const arith = (src, depth) => {
+    let j = 0;
+    while (j < src.length) {
+      if (src[j] === "\\") { j += 2; continue; }
+      if (src.startsWith("$((", j)) { const end = parenEnd(src, j + 2); arith(src.slice(j + 3, end - 2), depth); j = end; continue; }
+      if (src.startsWith("$(", j)) { const end = parenEnd(src, j + 2); walk(src.slice(j + 2, end - 1), depth + 1); j = end; continue; }
+      if (src[j] === "`") { const end = src.indexOf("`", j + 1); const stop = end < 0 ? src.length : end; walk(src.slice(j + 1, stop), depth + 1); j = stop + 1; continue; }
+      j += 1;
+    }
+  };
   const walk = (src, depth) => {
     let current = "";
     let piped = false;
@@ -280,15 +437,15 @@ function rawSegments(code) {
         let text = '"';
         while (j < src.length && src[j] !== '"') {
           if (src[j] === "\\") { text += src.slice(j, j + 2); j += 2; continue; }
-          if (src.startsWith("$((", j)) { const end = parenEnd(src, j + 2); text += "0"; j = end; continue; }
+          if (src.startsWith("$((", j)) { const end = parenEnd(src, j + 2); arith(src.slice(j + 3, end - 2), depth); text += "0"; j = end; continue; }
           if (src.startsWith("$(", j)) { const end = parenEnd(src, j + 2); walk(src.slice(j + 2, end - 1), depth + 1); text += OPAQUE; j = end; continue; }
           if (src[j] === "`") { const end = src.indexOf("`", j + 1); const stop = end < 0 ? src.length : end; walk(src.slice(j + 1, stop), depth + 1); text += OPAQUE; j = stop + 1; continue; }
           text += src[j]; j += 1;
         }
         current += `${text}"`; i = j + 1; continue;
       }
-      if (src.startsWith("$((", i)) { current += "0"; i = parenEnd(src, i + 2); continue; }
-      if (src.startsWith("((", i) && !current.trim()) { current += "true"; i = parenEnd(src, i + 1); continue; }
+      if (src.startsWith("$((", i)) { const end = parenEnd(src, i + 2); arith(src.slice(i + 3, end - 2), depth); current += "0"; i = end; continue; }
+      if (src.startsWith("((", i) && !current.trim()) { const end = parenEnd(src, i + 1); arith(src.slice(i + 2, end - 2), depth); current += "true"; i = end; continue; }
       if ((char === "$" || char === "<" || char === ">") && src[i + 1] === "(") {
         const end = parenEnd(src, i + 2);
         walk(src.slice(i + 2, end - 1), depth + 1);
@@ -362,6 +519,9 @@ function notAFilter(segment, cwds, context, resolve) {
     return !DATA_DEVICES.test(path) && runnableTarget(path, context);
   });
   if (targets.some(runnable)) return "a redirect into a file that can run";
+  // Ein Array-Index rechnet, und die Rechnung führt $(…) aus (printf -v 'a[$(sh)]',
+  // test -v "a[\$(…)]", read 'a[$(sh)]'; Zweitprüfung t_20ae3cda, C).
+  if (/[A-Za-z_]\w*\[[^\]]*(?:\$\(|`|\u0001)/.test(text)) return "an array subscript that runs a command";
   if (!command.word) return command.prefixes.length === 0 ? null : "a prefix without a command";
   if (command.word.includes(OPAQUE) || command.word.includes("$")) {
     // $h status mit h=…/cockpit-borg-action: die freie Direktform über eine Variable.
@@ -375,14 +535,19 @@ function notAFilter(segment, cwds, context, resolve) {
   if (command.word.includes("/") && !SYSTEM_PREFIXES.some((prefix) => command.word.startsWith(prefix))) return `${command.word} (a program this plan does not show)`;
   if (name === "cockpit-borg-action") return null; // seine Verben urteilt segmentBolt
   if (ECHOES.has(name)) return null;
+  if (/^(?:mapfile|readarray)$/.test(name) && command.args.some((arg) => /^-[a-zA-Z]*C/.test(arg))) return `${name} with a callback`;
+  if (name === "set" && command.args.every((arg) => /^[-+][a-zA-Z]+$/.test(arg) || /^(?:errexit|nounset|pipefail|xtrace|verbose|noclobber|noglob|errtrace|functrace)$/.test(arg))) return null;
+  if ((name === "exit" || name === "return") && command.args.every((arg) => /^\d+$/.test(arg))) return null;
+  // Listen gibt nur Namen aus; compgen -C/-F rufen dagegen einen Befehl oder eine Funktion.
+  if (name === "compgen" && !command.args.some((arg) => /^-[a-zA-Z]*[CF]/.test(arg))) return null;
+  if (/^(?:locate|plocate|mlocate)$/.test(name)) return null;
   if (/^[gm]?awk$/.test(name)) {
-    if (command.args.some((arg) => /^-[a-zA-Z]*f$|^--file\b|^--exec\b/.test(arg))) return `${name} with a program from a file`;
+    if (command.args.some((arg) => /^-[a-zA-Z]*[fEil]$|^--(?:file|exec|include|load)\b/.test(arg))) return `${name} with a program from a file or a library`;
     return AWK_PRIMITIVES.test(text) ? `${name} that runs commands or writes files` : null;
   }
   if (name === "sed") {
     if (command.args.some((arg) => /^-[a-zA-Z]*[if]|^--in-place|^--file\b/.test(arg))) return "sed that edits a file or reads its program from one";
-    const program = normalize(text);
-    return SED_EXEC.test(program) ? "sed that executes its pattern space" : SED_WRITE.test(program) ? "sed that writes a file" : null;
+    return sedFilters(text) ? null : "sed with a command other than s, y, print, delete, quit (or an e/w flag)";
   }
   if (name === "tee") return command.args.filter((arg) => !arg.startsWith("-")).some(runnable) ? "tee into a file that can run" : null;
   if (name === "sort") return command.args.some((arg) => /^-[a-zA-Z]*o|^--output|^--compress-program/.test(arg)) ? "sort that writes a file or starts a program" : null;
@@ -391,10 +556,70 @@ function notAFilter(segment, cwds, context, resolve) {
   return name;
 }
 
+// Umbinden über Zeilen (Zweitprüfung t_20ae3cda, A und G; Karte t_d16c58d1):
+// Was ein Filter-Name ausführt, entscheidet eine Funktion, ein alias, hash -p
+// oder PATH aus einer anderen Zeile (cat(){ sh; }⏎echo '…' | cat); welchen
+// Wert eine Variable trägt, entscheiden ${!y}, declare -n, export und env. In
+// einem Plan, der den Helfer außerhalb seiner freien Formen nennt, ist darum
+// jede solche Zeile ein Treffer — die Allowlist allein sieht nur Namen.
+function rebindBolt(line, segments, helperVars) {
+  const bare = line.code.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, "Q");
+  if (/(?:^|[\s;&|(){}])function\s+[^\s;&|()<>]+|(?:^|[\s;&|{}])[^\s;&|(){}<>=$'"]+\s*\(\s*\)/.test(bare)) return "a function definition (it can rebind a filter's name)";
+  if (/\$\{!/.test(line.code.replace(/'[^']*'/g, "Q"))) return "an indirect variable reference ${!…}";
+  for (const segment of segments) {
+    const { command, norm } = segment;
+    if (command.problem) return command.problem;
+    for (const assignment of command.assignments) {
+      const variable = assignment.split("=")[0].replace(/\+$/, "");
+      if (CODE_ENV.test(variable) && !/^PATH=(?:\/usr\/local\/sbin:\/usr\/local\/bin:\/usr\/sbin:\/usr\/bin:\/sbin:\/bin)?$/.test(assignment)) return `${variable} decides which code runs`;
+    }
+    const declared = norm.match(/^(?:export|declare|typeset|local|readonly)\b(.*)$/);
+    if (declared && /^export\b|\s-[a-zA-Z]*x/.test(norm)) {
+      const exported = declared[1].split(/\s+/).filter((word) => /^[A-Za-z_]/.test(word)).map((word) => word.split("=")[0].replace(/\+$/, ""));
+      const helper = exported.find((variable) => helperVars.has(variable));
+      if (helper) return `exports ${helper}, whose value names the backup helper (env, printenv and child shells read it)`;
+    }
+  }
+  return null;
+}
+
+// Nennt der Plan den Helfer außerhalb seiner freien Formen? Frei sind nur die
+// Direktform (Befehlswort = Helfer, auch über die Shell-Form) und test/[/[[
+// (sie geben nichts aus). Alles andere — echo/printf mit dem Namen, ls,
+// sha256sum oder stat auf ihn, ein Glob, ein find-Filter, das Listen seines
+// Verzeichnisses, eine Variable mit seinem Namen — macht seinen Namen zu Text,
+// der über eine andere Zeile laufen kann (Datei, FIFO, tail -f, Funktion,
+// export). Null: der Plan nennt ihn nicht so.
+function planTaint(lines, cwds, helperVars) {
+  if (helperVars.size > 0) return `a variable holds the backup helper's name (${[...helperVars][0]})`;
+  for (const line of lines) {
+    const segments = line.rawSegments ??= rawSegments(line.code);
+    for (const segment of segments) {
+      if (listsHelperDir(segment.command, cwds)) return "a command lists the backup helper's directory";
+      if (segment.name === "cockpit-borg-action" || shellHelperArg(segment.name, segment.command.args) >= 0) continue;
+      if (/^(?:test|\[|\[\[)$/.test(segment.name) && !segment.text.includes(OPAQUE)) continue;
+      if (namesHelper(segment.norm, cwds)) return "a command names the backup helper outside its free forms";
+    }
+    if (grepNamesHelper(segments.map((segment) => ({ text: segment.norm })), cwds)) return "a filter over a listing names the backup helper";
+  }
+  return null;
+}
+
 // Der Grund, wenn die Zeile den Helfer nennt (oder sein Verzeichnis in eine
-// Pipe listet) und dabei etwas anderes tut als filtern und Daten ablegen.
+// Pipe listet) und dabei etwas anderes tut als filtern und Daten ablegen. Nennt
+// der Plan den Helfer außerhalb seiner freien Formen (context.tainted), gilt
+// das für jede Zeile des Plans, dazu kein Umbinden (rebindBolt).
 function allowlistBolt(line, cwds, context, resolve, helperVars) {
   const segments = line.rawSegments ??= rawSegments(line.code);
+  if (context.tainted) {
+    const rebind = rebindBolt(line, segments, helperVars);
+    if (rebind) return `a plan that names the backup helper outside its free forms may not rebind names or values; here: ${rebind}`;
+    for (const segment of segments) {
+      const what = notAFilter(segment, cwds, context, resolve);
+      if (what) return `a plan that names the backup helper outside its free forms (${context.tainted}) may only filter and store data on every line; here: ${what}`;
+    }
+    return null;
+  }
   const usesHelperVar = (segment) => [...helperVars].some((name) => new RegExp(`\\$\\{?${name}\\b`).test(segment.text));
   const names = (segment) => usesHelperVar(segment)
     || (segment.name !== "cockpit-borg-action" && shellHelperArg(segment.name, segment.command.args) < 0 && namesHelper(segment.norm, cwds));
@@ -508,7 +733,7 @@ const OBFUSCATION = [
 const INLINE_CODE = /(\b(?:python[\d.]*|perl[\d.]*|ruby[\d.]*|node|nodejs|php[\d.]*|lua[\d.]*|tclsh|Rscript|pwsh)\s+(?:-[\w-]+\s+)*-(?:c|e|E|r|-eval|-command|Command)\s+)('[^']*'|"(?:[^"\\]|\\.)*")/g;
 const INLINE_INTERPRETER = /\b(?:python[\d.]*|perl[\d.]*|ruby[\d.]*|node|nodejs|php[\d.]*|lua[\d.]*|tclsh|Rscript|pwsh)\s+(?:-[\w-]+\s+)*-(?:c|e|E|r|-eval|-command|Command)\b/;
 const CODE_PRIMITIVES = /\b(?:system|popen|exec[a-z]*|spawn[a-z]*|fork|subprocess|shutil|pathlib|open|unlink|rmtree|remove|rename|symlink|eval|compile|__import__|importlib|getattr|setattr|globals|chr|fromCharCode|atob|b64decode|decode|codecs|socket|paramiko|ctypes|pty|require|child_process|qx|glob|Buffer|os\s*\.\s*(?!path\b)\w+)\b|`/;
-const AWK_PRIMITIVES = /\bsystem\s*\(|\|\s*getline|\|&|\bprint[^;}]*[>|]/;
+const AWK_PRIMITIVES = /\bsystem\s*\(|\|\s*getline|\|&|\bprint[^;}]*[>|]|@[A-Za-z_]\w*\s*\(/;
 
 // ── Was den Riegel auslöst ─────────────────────────────────────────────────
 // Im normalisierten Text eines Befehls (ohne Quotes), auch in sh -c '…', in
@@ -1249,6 +1474,9 @@ function analyzeScript(prefix, text, context, hits, language = "shell") {
   }
 
   const helperVars = helperVariables(lines, cwds);
+  // Erster Durchgang von analyzeManifest: merkt, ob der Plan den Helfer
+  // außerhalb seiner freien Formen nennt.
+  context.taint ||= planTaint(lines, cwds, helperVars);
 
   // ssh lab0 '<NL>python3 -c …<NL>': ein Quote, der über das Zeilenende reicht,
   // trägt den Befehl nach Lab0 in die Folgezeilen. Dort ist jedes Löschen und
@@ -1764,6 +1992,14 @@ function analyzeManifest(manifest) {
     ...(Array.isArray(manifest?.checks) ? manifest.checks : []).flatMap((check, index) => (check && typeof check.run === "string" ? [{ prefix: `C${index + 1}`, text: check.run }] : [])),
   ];
   const context = collectContext(scripts);
+  // Plan-Umfang (Zweitprüfung t_20ae3cda, Karte t_d16c58d1): ein erster
+  // Durchgang stellt fest, ob irgendeine Zeile den Helfer außerhalb seiner
+  // freien Formen nennt; dann gilt die Allowlist im zweiten für alle Zeilen.
+  context.taint = null;
+  for (const { prefix, text } of scripts) {
+    try { analyzeScript(prefix, text, context, []); } catch { /* der zweite Durchgang meldet es */ }
+  }
+  context.tainted = context.taint;
   const hits = [];
   for (const { prefix, text } of scripts) {
     try {

@@ -188,7 +188,17 @@ jedes `cd`-Ziel aufgelöst. Kommentare zählen nicht.
   `sed` ohne `e`/`w`/`-i`, Lesebefehle, `echo`, `tee` bzw. Umleitung nur in Datendateien); listet ein
   Befehl sein Verzeichnis (`ls /usr/local/sbin`, `find` über einem Vorfahren ohne fremden
   Namensfilter, `compgen -c`, `locate`), gilt dasselbe für die Befehle hinter ihm in der Pipe.
-  `|&` ist eine Pipe (Einzelheiten `doc/setup/borg-maintenance.md`, „Riegel über Umwege“);
+  `|&` ist eine Pipe. Seit Karte t_d16c58d1 (09.11.2026, Zweitprüfung t_20ae3cda) gilt das für den
+  **ganzen Plan**: nennt irgendeine Zeile (Schritte und Prüfschritte) den Helfer außerhalb seiner
+  freien Formen — frei sind nur die Direktform und `test`/`[`/`[[` auf ihn; `echo` seines Namens,
+  `ls`/`stat`/`sha256sum` auf ihn, ein Glob, ein find-Filter, das Listen seines Verzeichnisses oder
+  eine Variable mit seinem Namen sind es nicht —, muss **jede** Zeile filtern und Daten ablegen, und
+  nichts darf Namen oder Werte umbinden (Funktion, `alias`, `hash`, PATH/BASH_ENV/ENV, `${!…}`,
+  `declare -n`, `export` eines Helfer-Werts); Arithmetik `$((…))`/`((…))` und Array-Indizes werden
+  nach `$(…)` durchsucht, `sed` wird positiv gelesen (jeder Trenner, ohne `e`/`w`). Preis: ein Plan,
+  der den Helfer so nennt und daneben fremde Arbeit tut (`sha256sum <helfer>` plus `apt-get
+  upgrade`), geht an Jochen — dafür zwei Läufe (Einzelheiten `doc/setup/borg-maintenance.md`,
+  „Riegel über Umwege“);
 - jede Änderung der Aufbewahrung: `keep_*`/`--keep-*`, `keepDaily|Weekly|Monthly`,
   `backup_keep_time` (GitLab), außerhalb eines reinen Lesebefehls;
 - Schreiben in die Konfiguration: `/etc/borgmatic`, `/etc/borgmatic.d`, `/root/.config/borg`
