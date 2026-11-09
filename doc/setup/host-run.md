@@ -181,7 +181,14 @@ jedes `cd`-Ziel aufgelöst. Kommentare zählen nicht.
   `|`/`&&`/`||` am Zeilenende fortgesetzte Zeile (als eine logische Zeile gelesen), Pipe-Ausgabe,
   deren Quelle den Helfer nennt, in eine Datei, die laufen kann (`> /etc/cron.d/x`, `| tee /tmp/r`),
   `eval` auf einer Zeile, die ihn nennt, und ein `grep`-Filter auf seinen Namen über seinem
-  Verzeichnis (Einzelheiten `doc/setup/borg-maintenance.md`, „Riegel über Umwege“);
+  Verzeichnis; seit Karte t_6735af09 (09.11.2026) statt weiterer Senken eine **Zeilen-Allowlist**:
+  nennt eine logische Zeile den Helfer außerhalb der freien Formen (auch über eine Variable, deren
+  Wert ihn nennt, in einer späteren Zeile), dürfen alle übrigen Befehle der Zeile nur Filter oder
+  Datensenken sein (`grep`, `jq`, `head`, `tail`, `wc`, `sort`, `cut`, `tr`, `awk` ohne `system`/`|`,
+  `sed` ohne `e`/`w`/`-i`, Lesebefehle, `echo`, `tee` bzw. Umleitung nur in Datendateien); listet ein
+  Befehl sein Verzeichnis (`ls /usr/local/sbin`, `find` über einem Vorfahren ohne fremden
+  Namensfilter, `compgen -c`, `locate`), gilt dasselbe für die Befehle hinter ihm in der Pipe.
+  `|&` ist eine Pipe (Einzelheiten `doc/setup/borg-maintenance.md`, „Riegel über Umwege“);
 - jede Änderung der Aufbewahrung: `keep_*`/`--keep-*`, `keepDaily|Weekly|Monthly`,
   `backup_keep_time` (GitLab), außerhalb eines reinen Lesebefehls;
 - Schreiben in die Konfiguration: `/etc/borgmatic`, `/etc/borgmatic.d`, `/root/.config/borg`

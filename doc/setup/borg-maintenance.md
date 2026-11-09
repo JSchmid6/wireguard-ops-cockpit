@@ -405,6 +405,36 @@ Grenzen:
   (H-1) Ein `grep`-Muster, das auf den Namen passt, nennt den Helfer, wenn dieselbe Zeile `ls`
   über `/usr/local/sbin` (bzw. den Helfer) oder `find` über einen Vorfahren listet
   (`cd /usr/local/sbin && ls | grep borg-action | sed 's/$/ repair/' | sh`); `grep -v` nicht.
+  **Nachtrag Zweitprüfung t_605da75b (Karte t_6735af09, 09.11.2026): Zeilen-Allowlist statt
+  Senken-Liste.** Die vierte Runde fand wieder neue Senken: `|&` galt nicht als Pipe (die Doku oben
+  behauptete es), `if/while/until/for/case/select` als Pipe-Ziel, Schreiber wie `dd of=`,
+  `cp|install /dev/stdin`, `sponge`, `crontab -`, `xargs … bash -c` (entgegen dem Satz oben),
+  `awk '{system($0)}'`, GNU-`sed …/e`, `eval "$x"` eine Zeile nach `x="$(ls <helfer> | sed …)"`,
+  `awk`/`sed -n`/`compgen -c` statt `grep` über dem Verzeichnis, `coproc bash` und
+  `exec 3> >(bash)` — alle in echter Bash als wirksam belegt. Entscheidung: nicht die fünfte Liste,
+  sondern eine Allowlist je logischer Zeile. **Nennt ein Befehl der Zeile den Helfer außerhalb seiner
+  freien Formen** (Direkt- und Shell-Form urteilt der Riegel weiter nach Verben), **dürfen alle
+  übrigen einfachen Befehle der Zeile** — auch in `$(…)`, `<(…)`, `>(…)`, Gruppen und
+  `if/while/for/case` — **nur Filter oder Datensenken sein**: `grep`, `jq`, `head`, `tail`, `wc`,
+  `sort` (ohne `-o`, `--compress-program`), `uniq`, `cut`, `tr`, `cat`, `awk` ohne `system()`,
+  `| getline`, `print … >|` und ohne `-f`, `sed` ohne `e`, `w`, `-i`, `-f`, Lesebefehle (`ls`,
+  `sha256sum`, `journalctl`, `systemctl status` …), `echo|printf|logger`, `read`, `test`, `cd`,
+  `tee` und Umleitung nur in Datendateien (`.json`, `.txt`, `.log`, `/var/log/…`, `/dev/null`);
+  Vorsätze nur `sudo`, `env`, `timeout`, `nice`, `ionice`, `command`. Alles andere — eine Shell, ein
+  Interpreter, `eval`, `source`, `xargs`, `exec`, `coproc`, `crontab`, `at`, `dd`, `cp`, `install`,
+  `sponge`, `ssh`, ein Befehlsname aus einer Variablen, eine Umleitung in einen Deskriptor (`>&3`) —
+  ist ein Treffer, gleich welche Senke es ist. Listet ein Befehl das Verzeichnis des Helfers
+  (`ls /usr/local/sbin` bzw. `-R` über einem Vorfahren, `find` über einem Vorfahren ohne fremden
+  Namensfilter, `du -a`, `tree`, `compgen -c`, `locate`), gilt dieselbe Regel für die Befehle hinter
+  ihm in der Pipe. Über Zeilen hinweg: eine Variable, deren Wert den Helfer nennt (`x="$(ls <helfer>)"`,
+  `c='<helfer> repair'`, `read -r c < <(ls <helfer>)`, auch weitergereicht `y="$x repair"`), nennt
+  ihn in jeder Zeile, in der sie vorkommt; frei bleibt der Wert der freien Direktform
+  (`s=$(<helfer> status); echo "$s" | grep ok`). `|&` ist jetzt eine Pipe. Für die Allowlist zerlegt
+  der Riegel die Zeile eigens mit Quotes und Ersetzungen, damit ein `sed`- oder `awk`-Programm in
+  Quotes nicht an `;`, `(` oder `|` zerfällt. Frei bleiben `<helfer> status |& tee /tmp/borg.log`,
+  `… status | tee -a /var/log/cockpit-borg.log`, `ls /usr/local/sbin | grep -v borg-action`. Der Preis:
+  eine Zeile, die den Helfer nennt und daneben etwas Fremdes tut (`ls -l <helfer> && systemctl
+  restart x`), geht an Jochen — wer beides will, schreibt zwei Zeilen. Tests: `apps/api/test/backup-guard.test.ts` (N1–N8).
   Grenze, ehrlich: Ein Programm, das den Helfer weder nennt noch per Glob oder find-Filter trifft
   (Name aus Teilen zusammengesetzt, dekodiert, aus einer Datei gelesen), sieht der Riegel nicht;
   das bleibt Verschleierung und damit Sache des Türstehers (X4, `doc/setup/host-run.md` 2a).
