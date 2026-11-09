@@ -36,7 +36,7 @@ export interface AppConfig {
   // Rolle der Instanz aus instance-role.env (vom Deploy root-eigen gelegt, von
   // der API-Unit als optionales EnvironmentFile gelesen). Sagt dem Türsteher,
   // auf welchem Host er steht; fehlt sie, gilt der strengste Text (VPS).
-  instanceRole?: "vps" | "lab0" | null;
+  instanceRole?: "vps" | "lab0" | "box" | null;
 }
 
 // A breaker limit from the environment: a positive whole number, else the
@@ -90,6 +90,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     executorBrokerSecret: env.COCKPIT_EXECUTOR_BROKER_SECRET?.trim() || null,
     nodeEnv,
     webUrl: env.COCKPIT_WEB_URL?.trim() || null,
-    instanceRole: env.COCKPIT_INSTANCE_ROLE?.trim() === "lab0" ? "lab0" : env.COCKPIT_INSTANCE_ROLE?.trim() === "vps" ? "vps" : null
+    instanceRole: instanceRoleOf(env.COCKPIT_INSTANCE_ROLE)
   };
+}
+
+// Nur die drei bekannten Rollen; alles andere ist keine Rolle (strengster Text).
+function instanceRoleOf(value: string | undefined): "vps" | "lab0" | "box" | null {
+  const role = value?.trim();
+  return role === "vps" || role === "lab0" || role === "box" ? role : null;
 }

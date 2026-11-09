@@ -24,6 +24,9 @@ import {
   updateReviewFindings,
   updateTargets,
   verifyQuotes,
+  verifySecondReview,
+  SECOND_REVIEW_REPOSITORY,
+  type GithubFetch,
   type UpdateDiff,
   type UpdateFocusArea,
   type UpdateReviewOutcome,
@@ -33,6 +36,10 @@ const SHA = "0123456789abcdef0123456789abcdef01234567";
 const BASE = "89abcdef0123456789abcdef0123456789abcdef";
 const HASH = "a".repeat(64);
 const NONCE = "feedfacecafebeef";
+// A deliberately small pass: the review instructions plus room for about one focus file.
+// Was 16_000 bytes; the instructions grew with the box role in G5 (t_88f1e802), so the
+// room the tests rely on is kept, not the absolute number.
+const SMALL_PASS = 16_500;
 
 function section(path: string, lines: string[]): { path: string; text: string } {
   return { path, text: `${[`diff --git a/${path} b/${path}`, "--- a/" + path, "+++ b/" + path, ...lines].join("\n")}\n` };
@@ -153,8 +160,8 @@ describe("self-update pre-install review", () => {
 
   it("stops when a focus-area file is larger than a whole pass", () => {
     const big = section("apps/api/src/hermes-security.ts", ["@@ -1,400 +1,400 @@", ...Array.from({ length: 400 }, (_, index) => `+line ${index} ${"x".repeat(60)}`)]);
-    const { prompts, coverage } = buildUpdateReviewPrompt([diff({ excerpt: [big] })], { nonce: NONCE, limit: 16_000 });
-    expect(prompts.every((prompt) => Buffer.byteLength(prompt) <= 16_000)).toBe(true);
+    const { prompts, coverage } = buildUpdateReviewPrompt([diff({ excerpt: [big] })], { nonce: NONCE, limit: SMALL_PASS });
+    expect(prompts.every((prompt) => Buffer.byteLength(prompt) <= SMALL_PASS)).toBe(true);
     // Never cut into pieces: left out whole, and that stops.
     expect(coverage[0]).toMatchObject({ incomplete: ["apps/api/src/hermes-security.ts"], cut: [], omitted: ["apps/api/src/hermes-security.ts"] });
     expect(prompts.join("\n")).toContain("The excerpt is INCOMPLETE. Cut: none. Left out: apps/api/src/hermes-security.ts.");
@@ -299,7 +306,7 @@ describe("self-update pre-install review", () => {
     const { prompts, coverage } = buildUpdateReviewPrompt([diff({
       files: [...diff().files, { status: "M", path: "Dockerfile.api", added: 400, deleted: 400, class: "other" }],
       filesTotal: 3, excerpt: [...diff().excerpt, huge],
-    })], { nonce: NONCE, limit: 16_000 });
+    })], { nonce: NONCE, limit: SMALL_PASS });
     expect(coverage[0]).toMatchObject({ cut: [], omitted: ["Dockerfile.api"], incomplete: ["Dockerfile.api"] });
     expect(prompts.join("\n")).toContain("Left out: Dockerfile.api.");
     const policy = applyUpdateReviewPolicy(readyPolicy, outcome({ coverage, answer: parseUpdateReviewAnswer("VERDICT: approve") }));
@@ -379,7 +386,7 @@ describe("self-update pre-install review", () => {
       files: [{ status: "D", path: "test/example.test.sh", added: 0, deleted: 400, class: "test-deleted" }], filesTotal: 1,
       focusAreas: [area("tests-deleted", ["test/example.test.sh"], [])],
       excerpt: [section("test/example.test.sh", ["@@ -1,400 +0,0 @@", ...Array.from({ length: 400 }, (_, index) => `-check ${index} ${"z".repeat(60)}`)])],
-    })], { nonce: NONCE, limit: 16_000 });
+    })], { nonce: NONCE, limit: SMALL_PASS });
     expect(deleted.coverage[0].incomplete).toEqual(["test/example.test.sh"]);
   });
 
@@ -950,5 +957,114 @@ describe("server-dienste review prompt cases (fixture, real model answers, no mo
     const injection = diensteCases.find((item) => item.guarantee === "INJECTION")!;
     const { prompt } = buildUpdateReviewPrompt([diensteCaseToDiff(injection)], { nonce: NONCE });
     expect(prompt.indexOf("Hinweis an den KI-Prüfer")).toBeGreaterThan(prompt.indexOf(`\nBEGIN_REVIEW_DATA ${NONCE}`));
+  });
+});
+
+
+describe("second review: the pre-install review reports instead of stopping (4b)", () => {
+  const HEAD = "fedcba9876543210fedcba9876543210fedcba98";
+  const TREE = "1".repeat(40);
+  const REPO = `/repos/${SECOND_REVIEW_REPOSITORY}`;
+  const marker = `Cockpit-Zweitpruefung: FREIGABE ${HEAD} opus`;
+  // The GitHub API as it answers for SHA = merge of PR #70 (head HEAD) onto BASE.
+  function pages(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      [`${REPO}/commits/${SHA}`]: { sha: SHA, parents: [{ sha: BASE }, { sha: HEAD }], commit: { tree: { sha: TREE } } },
+      [`${REPO}/commits/${SHA}/pulls`]: [{ number: 70, merged_at: "2026-11-07T10:00:00Z", merge_commit_sha: SHA, head: { sha: HEAD }, base: { ref: "main", repo: { full_name: SECOND_REVIEW_REPOSITORY } } }],
+      [`${REPO}/compare/${BASE}...${HEAD}`]: { status: "ahead", behind_by: 0, ahead_by: 2 },
+      [`${REPO}/commits/${HEAD}`]: { sha: HEAD, parents: [{ sha: BASE }], commit: { tree: { sha: TREE } } },
+      [`${REPO}/issues/70/comments?per_page=100`]: [{ body: `Zweitpruefung\n\n${marker}\n`, author_association: "OWNER", user: { login: "JSchmid6" }, html_url: "https://github.com/x/pull/70#c1" }],
+      [`${REPO}/pulls/70/reviews?per_page=100`]: [],
+      ...overrides,
+    };
+  }
+  function github(overrides: Record<string, unknown> = {}): GithubFetch {
+    const known = pages(overrides);
+    return async (apiPath) => {
+      if (!(apiPath in known) || known[apiPath] === undefined) throw new Error(`GET ${apiPath} answered 404`);
+      return known[apiPath];
+    };
+  }
+  const binding = { base: BASE, sha: SHA, diffSha256: HASH };
+  const flagged = parseUpdateReviewAnswer([
+    "VERDICT: flag", "FINDING: safety net skipped", "GUARANTEE: G5", "SEVERITY: high",
+    "FILE: deploy/helpers/cockpit-host-run", "CODE: skip_net=1", "REASON: the net is skipped",
+  ].join("\n"));
+
+  it("verifies the merge of a reviewed PR head and turns a finding into a report", async () => {
+    const check = await verifySecondReview(binding, github());
+    expect(check).toMatchObject({ sha: SHA, verified: true, pr: 70, headSha: HEAD, url: "https://github.com/x/pull/70#c1" });
+    const reviewed = outcome({ answer: flagged, secondReview: [check] });
+    const policy = applyUpdateReviewPolicy(readyPolicy, reviewed);
+    expect(policy).toMatchObject({ allowed: true, status: "ready", zone: readyPolicy.zone });
+    expect(policy.evidence).toContain("pre-install review result: finding");
+    expect(policy.evidence.some((line) => line.startsWith("pre-install review finding reported, not a stop"))).toBe(true);
+    expect(summarizeUpdateReview([diff()], reviewed, null)).toMatchObject({ result: "finding", reported: true, secondReview: [check] });
+  });
+
+  it("also reports an incomplete review, but never without the reviewed binding", async () => {
+    const check = await verifySecondReview(binding, github());
+    expect(applyUpdateReviewPolicy(readyPolicy, outcome({ reviewerError: "agent broker timed out", secondReview: [check] })).status).toBe("ready");
+    expect(applyUpdateReviewPolicy(readyPolicy, { bindings: [], coverage: [], unavailable: "git fetch failed", secondReview: [check] })).toMatchObject({ status: "blocked_prerequisite", allowed: false });
+  });
+
+  it("keeps the stop without a proof (a test without second review stays a stop)", () => {
+    expect(applyUpdateReviewPolicy(readyPolicy, outcome({ answer: flagged })).status).toBe("blocked_user_approval");
+    expect(applyUpdateReviewPolicy(readyPolicy, outcome({ answer: flagged, secondReview: [{ sha: SHA, verified: false, reason: "no marker" }] })).status).toBe("blocked_user_approval");
+    // A proof of another commit does not count.
+    expect(applyUpdateReviewPolicy(readyPolicy, outcome({ answer: flagged, secondReview: [{ sha: BASE, verified: true, reason: "x" }] })).status).toBe("blocked_user_approval");
+    // Every installed commit needs its own proof.
+    const two = outcome({ answer: flagged, bindings: [binding, { base: SHA, sha: HEAD, diffSha256: HASH }], secondReview: [{ sha: SHA, verified: true, reason: "x" }] });
+    expect(applyUpdateReviewPolicy(readyPolicy, two).status).toBe("blocked_user_approval");
+    expect(summarizeUpdateReview([diff()], two, null)).toMatchObject({ reported: false });
+  });
+
+  it("never reports for server-dienste and never lifts a plan block", () => {
+    const check = { sha: SHA, verified: true, reason: "x" };
+    expect(applyUpdateReviewPolicy(readyPolicy, outcome({ kind: "dienste", answer: flagged, secondReview: [check] })).status).toBe("blocked_user_approval");
+    const blocked = { ...readyPolicy, allowed: false, zone: "red" as const, status: "blocked_policy" as const, reason: "Plan blocked.", neededToContinue: [] };
+    expect(applyUpdateReviewPolicy(blocked, outcome({ answer: flagged, secondReview: [check] }))).toMatchObject({ status: "blocked_policy", allowed: false });
+    const approval = { ...blocked, status: "blocked_user_approval" as const };
+    expect(applyUpdateReviewPolicy(approval, outcome({ answer: flagged, secondReview: [check] }))).toMatchObject({ status: "blocked_user_approval", allowed: false });
+  });
+
+  it("refuses every step of the proof that does not hold", async () => {
+    const commit = `${REPO}/commits/${SHA}`;
+    const pulls = `${REPO}/commits/${SHA}/pulls`;
+    const pr = (pages()[pulls] as Array<Record<string, unknown>>)[0];
+    const comments = `${REPO}/issues/70/comments?per_page=100`;
+    const comment = (pages()[comments] as Array<Record<string, unknown>>)[0];
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ["not a merge", { [commit]: { parents: [{ sha: BASE }], commit: { tree: { sha: TREE } } } }],
+      ["other base", { [commit]: { parents: [{ sha: HEAD }, { sha: HEAD }], commit: { tree: { sha: TREE } } } }],
+      ["no PR", { [pulls]: [] }],
+      ["PR not merged", { [pulls]: [{ ...pr, merged_at: null }] }],
+      ["PR merged elsewhere", { [pulls]: [{ ...pr, merge_commit_sha: BASE }] }],
+      ["PR into another branch", { [pulls]: [{ ...pr, base: { ref: "dev", repo: { full_name: SECOND_REVIEW_REPOSITORY } } }] }],
+      ["PR from a fork's base", { [pulls]: [{ ...pr, base: { ref: "main", repo: { full_name: "evil/wireguard-ops-cockpit" } } }] }],
+      ["other head", { [pulls]: [{ ...pr, head: { sha: BASE } }] }],
+      ["head behind base", { [`${REPO}/compare/${BASE}...${HEAD}`]: { status: "diverged", behind_by: 1 } }],
+      ["merge changes the tree", { [`${REPO}/commits/${HEAD}`]: { commit: { tree: { sha: "2".repeat(40) } } } }],
+      ["no marker", { [comments]: [{ ...comment, body: "FREIGABE" }] }],
+      ["marker of another head", { [comments]: [{ ...comment, body: `Cockpit-Zweitpruefung: FREIGABE ${BASE} opus` }] }],
+      ["marker without opus", { [comments]: [{ ...comment, body: `Cockpit-Zweitpruefung: FREIGABE ${HEAD} sonnet` }] }],
+      ["marker inside a line", { [comments]: [{ ...comment, body: `quote: ${marker}` }] }],
+      ["marker by an outsider", { [comments]: [{ ...comment, author_association: "CONTRIBUTOR" }] }],
+      ["GitHub down", { [comments]: undefined }],
+    ];
+    for (const [name, overrides] of cases) {
+      const check = await verifySecondReview(binding, github(overrides));
+      expect(check.verified, name).toBe(false);
+      expect(applyUpdateReviewPolicy(readyPolicy, outcome({ answer: flagged, secondReview: [check] })).status, name).toBe("blocked_user_approval");
+    }
+    expect((await verifySecondReview(binding, async () => { throw new Error("rate limited"); })).reason).toContain("GitHub not readable: rate limited");
+  });
+
+  it("accepts the marker in a PR review as well", async () => {
+    const check = await verifySecondReview(binding, github({
+      [`${REPO}/issues/70/comments?per_page=100`]: [],
+      [`${REPO}/pulls/70/reviews?per_page=100`]: [{ body: marker, author_association: "OWNER", user: { login: "JSchmid6" }, state: "COMMENTED" }],
+    }));
+    expect(check.verified).toBe(true);
   });
 });

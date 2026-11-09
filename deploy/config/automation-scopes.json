@@ -1,0 +1,18 @@
+{
+  "comment": "Routes of James' automation token (account hermes-automation, label hermes-tresor). Measured 08.11.2026 on the VPS and on Lab0 (identical): every route of apps/api/src/app.ts called with the token, 403 'not authorized for this endpoint' = not in scope. Used by deploy/helpers/cockpit-automation-token-seed for a fresh instance (role box). No approval, inbox, borg, schedule or admin route: automation tokens never approve their own work.",
+  "scopes": [
+    "GET /api/agents",
+    "GET /api/hermes/jobs/:jobId",
+    "GET /api/me",
+    "GET /api/runbooks",
+    "GET /api/scripts",
+    "GET /api/sessions",
+    "GET /api/sessions/:sessionId",
+    "GET /api/sessions/:sessionId/output",
+    "POST /api/hermes/jobs/:jobId/withdraw",
+    "POST /api/hermes/research",
+    "POST /api/hermes/runbook",
+    "POST /api/runbooks/:runbookId/execute",
+    "POST /api/sessions"
+  ]
+}

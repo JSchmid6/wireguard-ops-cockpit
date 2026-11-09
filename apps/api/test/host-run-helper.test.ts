@@ -764,6 +764,66 @@ describe("cockpit-host-run: safety net per instance role", () => {
     nothingRan();
   });
 
+  // box: the Proxmox host. Same host snapshot tool, called with --guests; the stub
+  // answers with one VM and one container.
+  function boxSnapshotStub(guests: string) {
+    write(path.join(dir, "host-snapshot"), [
+      "#!/bin/bash",
+      `echo "$*" >> "${dir}/host-snapshot.log"`,
+      `[ -e "${dir}/host-snapshot-fail" ] && { echo '{"ok": false, "code": 67, "error": "qm snapshot 101 failed"}' >&2; exit 67; }`,
+      `echo '{"snapshot":{"snapshotId":"'"$2"'","name":"'"$2"'"},"rotated":null${guests},"seconds":1}'`,
+    ].join("\n"));
+  }
+
+  it("box: takes the host snapshot with a snapshot of every guest, no borg, no hoster, no data lock", () => {
+    setRole("COCKPIT_INSTANCE_ROLE=box\n");
+    boxSnapshotStub(`,"guests":[{"vmid":100,"type":"qemu","snapshot":"'"$2"'","rotated":[]},{"vmid":200,"type":"lxc","snapshot":"'"$2"'","rotated":[]}]`);
+    run(["start"], request(manifest()));
+    const { state, logTail } = status();
+    expect(state.status).toBe("success");
+    expect(state.role).toBe("box");
+    expect(state.borg).toBeNull();
+    expect(state.snapshot).toMatchObject({ kind: "host", snapshotId: "cockpit-run-job-1",
+      guests: [{ vmid: 100, type: "qemu", snapshot: "cockpit-run-job-1" }, { vmid: 200, type: "lxc", snapshot: "cockpit-run-job-1" }] });
+    expect(readFileSync(path.join(dir, "host-snapshot.log"), "utf8").trim()).toBe("create cockpit-run-job-1 --guests");
+    expect(existsSync(path.join(dir, "borg.log"))).toBe(false);
+    expect(existsSync(path.join(dir, "snapshot.log"))).toBe(false);
+    expect(existsSync(path.join(dir, "readonly.log"))).toBe(false);
+    expect(logTail).toContain("instance role box: Proxmox host");
+    expect(logTail).toContain("== guest snapshots: qemu 100@cockpit-run-job-1, lxc 200@cockpit-run-job-1");
+  });
+
+  it("box: names the guest snapshots as the return path when a step fails", () => {
+    setRole("COCKPIT_INSTANCE_ROLE=box\n");
+    boxSnapshotStub(`,"guests":[{"vmid":100,"type":"qemu","snapshot":"'"$2"'","rotated":[]}]`);
+    run(["start"], request(manifest({ steps: [{ name: "fails", run: "exit 3", timeoutSeconds: 30 }] })));
+    const { state, logTail } = status();
+    expect(state.status).toBe("failed");
+    expect(logTail).toContain("return path: host snapshot cockpit-run-job-1 (revert only with operator approval)");
+    expect(logTail).toContain("return path: guest snapshots qemu 100@cockpit-run-job-1 (rollback only with operator approval)");
+  });
+
+  it("box: a host snapshot without guest list stops the run before any step", () => {
+    setRole("COCKPIT_INSTANCE_ROLE=box\n");
+    boxSnapshotStub("");
+    run(["start"], request(manifest()));
+    const { state } = status();
+    expect(state.status).toBe("preflight_failed");
+    expect(state.error).toContain("returned no guest snapshots");
+    nothingRan();
+  });
+
+  it("box: a failing guest snapshot stops the run before any step", () => {
+    setRole("COCKPIT_INSTANCE_ROLE=box\n");
+    boxSnapshotStub(`,"guests":[]`);
+    writeFileSync(path.join(dir, "host-snapshot-fail"), "");
+    run(["start"], request(manifest()));
+    const { state } = status();
+    expect(state.status).toBe("preflight_failed");
+    expect(state.error).toContain("qm snapshot 101 failed");
+    nothingRan();
+  });
+
   it("no role file: preflight_failed, nothing executed, no net asked", () => {
     rmSync(roleFile());
     run(["start"], request(manifest()));
@@ -844,9 +904,33 @@ describe("cockpit-host-run: safety net per instance role", () => {
     expect(vps).toContain('"deploy/vps/instance-role.env|$ROOT/etc/wireguard-ops-cockpit/instance-role.env|600"');
     expect(vps).not.toContain("deploy/lab0/instance-role.env");
     const lab0 = readFileSync(path.join(REPO, "deploy/lab0/homeserver-cockpit-deploy.sh"), "utf8");
-    expect(lab0).toContain('install -m 600 -o root -g root "$COCKPIT_DIR/deploy/lab0/instance-role.env" "$ENV_DIR/instance-role.env"');
+    expect(lab0).toContain('install -m 600 -o root -g root "$COCKPIT_DIR/deploy/$COCKPIT_ROLE/instance-role.env" "$ENV_DIR/instance-role.env"');
     expect(lab0).toContain("/usr/local/lib/wireguard-ops-cockpit/cockpit-host-snapshot");
     expect(lab0).not.toContain("deploy/vps/instance-role.env");
+    expect(readFileSync(path.join(REPO, "deploy/box/instance-role.env"), "utf8")).toMatch(/^COCKPIT_INSTANCE_ROLE=box$/m);
+  });
+
+  // The role of the Lab0/box deploy script: first run from COCKPIT_ROLE (default
+  // lab0), later from the installed file; a change through the deploy is refused.
+  it.each([
+    ["first run, no role given: lab0 as before", null, {}, "lab0 10.0.0.5"],
+    ["first run on the box", null, { COCKPIT_ROLE: "box" }, "box 10.0.0.6"],
+    ["self-update on the box: the installed role, no variable", "box", {}, "box 10.0.0.6"],
+    ["self-update on Lab0", "lab0", {}, "lab0 10.0.0.5"],
+    ["a role change through the deploy", "lab0", { COCKPIT_ROLE: "box" }, "FEHLER"],
+    ["an unknown role", null, { COCKPIT_ROLE: "vps" }, "FEHLER"],
+  ])("deploy role: %s", (_name, installed, extra, expected) => {
+    const script = readFileSync(path.join(REPO, "deploy/lab0/homeserver-cockpit-deploy.sh"), "utf8");
+    const block = script.slice(script.indexOf("# >>> rollen-logik"), script.indexOf("# <<< rollen-logik"));
+    expect(block).toContain("INSTALLED_ROLE");
+    const envDir = path.join(dir, "role-env");
+    mkdirSync(envDir, { recursive: true });
+    if (installed) writeFileSync(path.join(envDir, "instance-role.env"), `# vom Deploy\nCOCKPIT_INSTANCE_ROLE=${installed}\n`);
+    const out = spawnSync("bash", ["-c", `set -euo pipefail\ndie() { echo "FEHLER: $*"; exit 1; }\n${block}\necho "$COCKPIT_ROLE $WG_BIND_IP"`], {
+      encoding: "utf8", env: { PATH: process.env.PATH, ENV_DIR: envDir, ...extra },
+    });
+    expect(out.stdout.trim().split("\n").at(-1)).toContain(expected);
+    expect(out.status).toBe(expected === "FEHLER" ? 1 : 0);
   });
 });
 

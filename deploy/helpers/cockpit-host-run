@@ -43,6 +43,11 @@
 //                      Schritt in /proc/self/mountinfo, dass jeder vorhandene
 //                      Datenpfad samt Untermounts wirklich ro ist (Datensperre,
 //                      Jochen 17.10.2026).
+//                box   der Proxmox-Host (Narrow Box), ohne borg und Hoster:
+//                      derselbe Host-Snapshot (/etc samt /etc/pve mit den
+//                      Gast-Konfigurationen) und dazu ein Proxmox-Snapshot
+//                      jeder VM und jedes Containers (cockpit-host-snapshot
+//                      --guests). Scheitert einer, läuft kein Schritt.
 //              Fehlt die Rolle, ist sie unbekannt oder scheitert ein Teil des
 //              Netzes, läuft kein Schritt (preflight_failed).
 //   Kein Abbruch  Ein Schritt, der Zustand ändert (Pakete, GitLab,
@@ -96,6 +101,9 @@ const HOST_SNAPSHOT = env.HOST_RUN_HOST_SNAPSHOT ? [env.HOST_RUN_HOST_SNAPSHOT] 
 const NETS = {
   vps: { borg: true, kind: "machine", snapshot: SNAPSHOT, args: ["--wait", "900"] },
   lab0: { borg: false, kind: "host", snapshot: HOST_SNAPSHOT, args: [], dataLock: true },
+  // Proxmox-Host (Narrow Box): Host-Snapshot wie Lab0, dazu ein Proxmox-Snapshot
+  // jeder VM und jedes Containers (ihre Platten deckt /etc nicht ab).
+  box: { borg: false, kind: "host", snapshot: HOST_SNAPSHOT, args: ["--guests"], guests: true },
 };
 const ROLE_FILE = "instance-role.env";
 // Datensperre auf Lab0: Pfade, die der Host-Snapshot nicht abdeckt. Ein Lauf
@@ -647,6 +655,9 @@ function finish(state, status, error = null) {
   log(`== ${now()} run finished: ${status}${error ? ` — ${error}` : ""}`);
   if (state.snapshot?.snapshotId && status !== "success") {
     log(`== return path: ${state.snapshot.kind || "machine"} snapshot ${state.snapshot.snapshotId} (revert only with operator approval)`);
+    if (state.snapshot.guests?.length) {
+      log(`== return path: guest snapshots ${state.snapshot.guests.map((guest) => `${guest.type} ${guest.vmid}@${guest.snapshot}`).join(", ")} (rollback only with operator approval)`);
+    }
   }
 }
 
@@ -844,7 +855,9 @@ function takeSnapshot(jobId, net) {
   let result;
   try { result = JSON.parse(made.stdout); } catch { return { ok: false, why: `${what} returned no result` }; }
   if (!result?.snapshot?.snapshotId) return { ok: false, why: `${what} returned no id` };
-  return { ok: true, record: { kind: net.kind, snapshotId: result.snapshot.snapshotId, name: result.snapshot.name, rotated: result.rotated || null, seconds: result.seconds ?? null } };
+  if (net.guests && !Array.isArray(result.guests)) return { ok: false, why: `${what} returned no guest snapshots` };
+  const guests = net.guests ? result.guests.map((guest) => ({ vmid: guest.vmid, type: guest.type, snapshot: guest.snapshot })) : undefined;
+  return { ok: true, record: { kind: net.kind, snapshotId: result.snapshot.snapshotId, name: result.snapshot.name, rotated: result.rotated || null, seconds: result.seconds ?? null, ...(guests ? { guests } : {}) } };
 }
 
 async function payload(jobId) {
@@ -879,6 +892,8 @@ async function payload(jobId) {
           log(`== instance role ${role.role}; borg: ${borg.why}`);
           log(`== net exception ${exception.kind}: ${exception.why} — runs without a young backup; the machine snapshot is still taken`);
         }
+      } else if (net.guests) {
+        log(`== instance role ${role.role}: Proxmox host — no backup age check; a local host snapshot and a snapshot of every guest instead`);
       } else {
         log(`== instance role ${role.role}: the borg target, not a borg client — no backup age check; a local host snapshot instead`);
       }
@@ -891,6 +906,9 @@ async function payload(jobId) {
       if (!snap.ok) return finish(state, "preflight_failed", `${snap.why}; nothing was executed`);
       state.snapshot = snap.record;
       log(`== ${net.kind} snapshot ${snap.record.snapshotId}${snap.record.rotated ? ` (rotated ${snap.record.rotated.snapshotId})` : ""}`);
+      if (snap.record.guests) {
+        log(`== guest snapshots: ${snap.record.guests.length ? snap.record.guests.map((guest) => `${guest.type} ${guest.vmid}@${guest.snapshot}`).join(", ") : "none (no guests on this node)"}`);
+      }
     } else {
       log("== declared read-only (mutates false): no snapshot, no backup check");
     }

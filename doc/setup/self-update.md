@@ -354,6 +354,50 @@ Flow of a Hermes change job whose plan contains `self.update <sha>` lines:
    the operator after a pass. The full matrix is in
    `doc/setup/host-run.md`, "Freigabe-Matrix".
 
+**Second review: a report instead of a stop** (operator decision 07.11.2026,
+„ja alles“, point 4b; `verifySecondReview`, `secondReviewCovers` in
+`update-review.ts`). The same diff used to be judged twice — by the Opus second
+review of the pull request and by this review — and the second judgement
+stopped twice on what the first had already cleared (PR #64, t_ff43a907). When a
+self-update review comes to `finding` or `incomplete`, the running Cockpit looks
+on GitHub itself — never at what the requester says — for proof that **every**
+installed commit is exactly a reviewed pull request. All of it, per sha, from
+the unauthenticated API of `JSchmid6/wireguard-ops-cockpit` (bounded, 15 s per
+request):
+
+1. `GET /commits/<sha>`: a merge commit with exactly two parents, the first
+   parent is the reviewed `base` (so `base..sha` is the diff of this one merge).
+2. `GET /commits/<sha>/pulls`: a pull request into `main` of this repository,
+   merged, with `merge_commit_sha == sha` and `head.sha ==` the second parent.
+3. `GET /compare/<base>...<head>`: `behind_by == 0` (the head contains the
+   base), and `GET /commits/<head>` has the same tree as `sha`: the installed
+   code is byte for byte the reviewed head.
+4. `GET /issues/<n>/comments` or `GET /pulls/<n>/reviews` (first 100 each): a
+   comment or review by an account with write access (`author_association`
+   `OWNER`, `MEMBER` or `COLLABORATOR`) with the line, alone on its line,
+
+   ```
+   Cockpit-Zweitpruefung: FREIGABE <head sha, 40 lowercase hex> opus
+   ```
+
+   The second review posts this line in the PR when it approves, naming the
+   head it reviewed. A later push changes the head, and the old marker no
+   longer counts. The line never goes into a commit message (the reviewer
+   would read it as an injection, see the cockpit skill).
+
+With that proof the review stays recorded but keeps the plan's own status:
+evidence `second review verified for <sha>` and `pre-install review <result>
+reported, not a stop`, `output.updateReview.secondReview` and `reported: true`,
+audit `hermes.update_review.reported`, and `GET /api/inbox` lists it under
+`reviewFindings` with `reported: true` for seven days, whatever became of the
+job. Without the proof — a step fails, GitHub is unreachable or rate-limited, a
+page does not parse — nothing changes. A plan block (`evaluatePlanPolicy`), a
+missing binding (`unavailable`), `dienste.update`, the safety review, the
+envelope binding of the reviewed hash and the runner's own checks are not
+touched. Honest limit: the marker is posted with the owner's token, the same
+the agent holds; it proves a review record for exactly this head, not a second
+principal. Way back: revert the change and self-update to the previous commit.
+
 **What the owner sees — only for a finding.** The job explanation's `reason`
 names why (the flagged findings; for `blocked_prerequisite` the agent reads the
 same fields: unavailable/incomplete input, reviewer failure, parse failure,
@@ -414,11 +458,11 @@ finding names a concrete way **past** one of its guards, or a weakening of it:
 
 | Guarantee | holds |
 | --- | --- |
-| G1 Approval | only the admin session approves; a bearer token never approves or sets `operatorApproved`/`gatePassed`. A `host.run` start on the doorkeeper's pass is intended. A job that needed the operator (evidenced finding, bolt hit, a declared risk other than `contained`, a door without doorkeeper) never runs without the operator's approval. |
+| G1 Approval | only the admin session approves; a bearer token never approves or sets `operatorApproved`/`gatePassed`. A `host.run` start on the doorkeeper's pass is intended. A job that needed the operator (evidenced finding, bolt hit, a declared risk other than `contained`, a door without doorkeeper) never runs without the operator's approval. Exception by decision (07.11.2026): a self-update review finding whose commits carry a second review the Cockpit verified itself on GitHub is a report, not a stop ([Second review](#review-before-install)). |
 | G2 Lock | HMAC envelope (timing-safe, host secret), bound to plan and `manifestHash`, with expiry, capability and the job id (its form; the run directory is named by it); the root helper checks it at the start and on every resume; a blocked job's envelope never opens. |
 | G3 Doors | `host.run` is the one general door; every other action stays typed and narrow. No second general door, no way into `host.run` past G2, G9, G10. |
 | G4 Root helpers and sudoers | narrow, typed; the host-run helper keeps exactly `start` and `status <job>`. |
-| G5 Sandbox and safety net | the special doors' sandbox is not broader; `host.run` has none by design, but before every run with `mutates: true` the net of the instance role, otherwise no step runs: role `vps` a return path — the last successfully finished borg backup at most 30 h old (a later failed run does not take it away; without it only the two typed exceptions of `doc/setup/host-run.md` run, emergency shutdown and backup repair, recognized by fixed forms only) — and a machine snapshot; role `lab0` (the borg target, no hoster) a complete local host snapshot (`/etc`, packages, unit states) plus the data lock: the run unit mounts `/media` (borg repository), `/home`, `/mnt`, `/srv` read-only and the run confirms it in its mount table before the first step and after a reboot (Jochen, 17.10.2026: on Lab0 this replaces borg freshness and the machine snapshot). The role comes only from the root-owned `instance-role.env` the deploy installs; missing, foreign-writable or unknown → no step runs (16.10.2026). Snapshot revert/delete stays the operator's decision (at the door through the doorkeeper's X4, not a rule). |
+| G5 Sandbox and safety net | the special doors' sandbox is not broader; `host.run` has none by design, but before every run with `mutates: true` the net of the instance role, otherwise no step runs: role `vps` a return path — the last successfully finished borg backup at most 30 h old (a later failed run does not take it away; without it only the two typed exceptions of `doc/setup/host-run.md` run, emergency shutdown and backup repair, recognized by fixed forms only) — and a machine snapshot; role `lab0` (the borg target, no hoster) a complete local host snapshot (`/etc`, packages, unit states) plus the data lock: the run unit mounts `/media` (borg repository), `/home`, `/mnt`, `/srv` read-only and the run confirms it in its mount table before the first step and after a reboot (Jochen, 17.10.2026: on Lab0 this replaces borg freshness and the machine snapshot); role `box` (Proxmox host, t_88f1e802) the same host snapshot plus a Proxmox snapshot of every guest (VM and container); a guest that cannot be snapshotted stops the run; no data lock (the guests' snapshots are their way back). The role comes only from the root-owned `instance-role.env` the deploy installs; missing, foreign-writable or unknown → no step runs (16.10.2026). Snapshot revert/delete stays the operator's decision (at the door through the doorkeeper's X4, not a rule). |
 | G6 Secrets | redaction of outputs, logs and prompts; the host-run log redacted line by line and 0600. The doorkeeper's unredacted material is intended. |
 | G7, G8 | unchanged (self-update path, dependencies). |
 | G9 Doorkeeper | isolated safety review; a pass only with complete material; incomplete or unreadable review and findings without evidence stop without a pass; its finding classes (secrets/egress, authority, exposure, loss of the way back, false read-only claim, hidden code, injection) do not narrow. |
@@ -467,7 +511,9 @@ under the state directory — never a bare exit code.
   foreign files untouched, refusals (name, existing, incomplete, space),
   rotation.
 - `apps/api/test/update-review.test.ts` — prompt assembly, answer parser,
-  coverage/truncation stop, policy, envelope binding, prompt cases.
+  coverage/truncation stop, policy, envelope binding, prompt cases, second
+  review (every step of the GitHub proof refused on its own, report only with
+  the full proof, never for `dienste.update` or over a plan block).
 - `bash test/cockpit-self-update-e2e.sh` — disposable privileged container with
   real systemd: installs the module at its production paths, runs the update
   from a sandbox-mimicking transient unit (`ProtectSystem=true`,

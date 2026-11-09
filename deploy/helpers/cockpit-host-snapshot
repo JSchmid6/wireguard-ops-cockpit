@@ -1,13 +1,25 @@
 #!/usr/bin/python3
-# cockpit-host-snapshot — the safety net of the general door on Lab0
-# (doc/setup/host-run.md, "Netz je Instanzrolle").
+# cockpit-host-snapshot — the safety net of the general door on Lab0 and on the
+# Proxmox host box (doc/setup/host-run.md, "Netz je Instanzrolle").
 #
 # Not a sudo target and not meant to be run by hand: only cockpit-host-run
 # calls it (as root, inside the run unit), before the first step of a run with
-# mutates true on an instance whose deploy-installed role is lab0.
+# mutates true on an instance whose deploy-installed role is lab0 or box.
 #
-#   create <name>   copy the host state a host run can change into <store>/<name>/
-#   list            the snapshots in the store (JSON)
+#   create <name>            copy the host state a host run can change into <store>/<name>/
+#   create <name> --guests   the same, then a Proxmox snapshot <name> of every guest
+#                            (VM and container) on this node (role box)
+#   list                     the snapshots in the store (JSON)
+#
+# --guests (role box, Proxmox VE): /etc carries the guest configuration
+# (/etc/pve), the guest disks are not in it. Each guest therefore gets a storage
+# snapshot of the same name (qm snapshot / pct snapshot, without RAM state:
+# crash-consistent, seconds on LVM-thin or ZFS). The newest KEEP snapshots of our
+# name form stay per guest; only that form is ever removed (qm/pct delsnapshot).
+# A guest that cannot be snapshotted (storage without snapshots, locked) fails
+# the whole create — the door then runs no step. Templates are skipped (read-only
+# by design). A rollback stays the operator's decision, like a revert on the VPS:
+#   qm rollback <vmid> <name>   pct rollback <vmid> <name>
 #
 # Why not borg and the hoster snapshot as on the VPS: Lab0 *is* the borg
 # backup target, not a borg client, and has no hoster. Its net is this local
@@ -31,6 +43,8 @@
 # Output of `create` is the shape cockpit-vps-snapshot prints, so the host-run
 # helper reads both the same way:
 #   {"snapshot": {"snapshotId", "name", "path"}, "rotated": {"snapshotId"}|null, "seconds"}
+# with --guests additionally
+#   "guests": [{"vmid", "type": "qemu"|"lxc", "snapshot", "rotated": [names]}]
 #
 # Exit codes: 0 ok, 64 usage, 65 refused (name, store), 66 no space,
 # 67 copy failed.
@@ -55,6 +69,10 @@ KEEP = int(os.environ.get("COCKPIT_HOST_SNAPSHOT_KEEP", "5"))
 MARGIN = int(os.environ.get("COCKPIT_HOST_SNAPSHOT_MARGIN", str(256 * 1024 * 1024)))
 # cockpit-host-run names it cockpit-run-<first 8 characters of the job id>.
 NAME_RE = re.compile(r"^cockpit-run-[A-Za-z0-9._-]{1,40}$")
+# Proxmox snapshot names (pve-configid): a letter first, then letters, digits, _ and -,
+# at most 40. Our guest snapshots carry the store name with "." as "-".
+GUEST_NAME_RE = re.compile(r"^cockpit-run-[A-Za-z0-9_-]{1,28}$")
+GUEST_TOOL = {"qemu": "qm", "lxc": "pct"}
 
 
 class Failure(Exception):
@@ -110,9 +128,11 @@ def snapshots():
     return sorted(found)
 
 
-def create(name):
+def create(name, guests=False):
     if not NAME_RE.match(name):
         raise Failure(64, "snapshot name must look like cockpit-run-<job>")
+    if guests and not GUEST_NAME_RE.match(name.replace(".", "-")):
+        raise Failure(64, "snapshot name is too long for a Proxmox guest snapshot")
     check_store()
     target = os.path.join(STORE, name)
     if os.path.lexists(target):
@@ -158,19 +178,70 @@ def create(name):
             continue
         shutil.rmtree(os.path.join(STORE, old), ignore_errors=True)
         rotated = rotated or {"snapshotId": old}
-    return {"snapshot": {"snapshotId": name, "name": name, "path": target}, "rotated": rotated,
-            "seconds": round(time.monotonic() - started, 1)}
+    result = {"snapshot": {"snapshotId": name, "name": name, "path": target}, "rotated": rotated}
+    if guests:
+        result["guests"] = snapshot_guests(name.replace(".", "-"))
+    result["seconds"] = round(time.monotonic() - started, 1)
+    return result
+
+
+def pvesh(path):
+    done = subprocess.run(["pvesh", "get", path, "--output-format", "json"], capture_output=True, text=True)
+    if done.returncode != 0:
+        raise Failure(67, "pvesh get %s failed (exit %s): %s" % (path, done.returncode, done.stderr.strip()[-300:]))
+    try:
+        data = json.loads(done.stdout or "[]")
+    except ValueError:
+        raise Failure(67, "pvesh get %s returned no JSON" % path)
+    if not isinstance(data, list):
+        raise Failure(67, "pvesh get %s returned no list" % path)
+    return data
+
+
+def guest_tool(kind, *args):
+    done = subprocess.run([GUEST_TOOL[kind], *args], capture_output=True, text=True)
+    if done.returncode != 0:
+        raise Failure(67, "%s %s failed (exit %s): %s" % (GUEST_TOOL[kind], " ".join(args), done.returncode,
+                                                          done.stderr.strip()[-300:]))
+
+
+def snapshot_guests(name):
+    """A Proxmox snapshot <name> of every guest on this node; rotate only our own name form."""
+    if not GUEST_NAME_RE.match(name):
+        raise Failure(64, "guest snapshot name %r is not a Proxmox snapshot name of our form" % name)
+    node = os.uname().nodename.split(".")[0]
+    taken = []
+    for kind in ("qemu", "lxc"):
+        listed = pvesh("/nodes/%s/%s" % (node, kind))
+        if not all(isinstance(item, dict) and str(item.get("vmid", "")).isdigit() for item in listed):
+            raise Failure(67, "pvesh listed a %s guest without a numeric vmid" % kind)
+        for guest in sorted(listed, key=lambda item: int(item["vmid"])):
+            vmid = str(guest["vmid"])
+            if str(guest.get("template", 0)) == "1":
+                continue
+            guest_tool(kind, "snapshot", vmid, name, "--description", "cockpit host run (rollback: operator)")
+            own = sorted((int(item.get("snaptime") or 0), item["name"])
+                         for item in pvesh("/nodes/%s/%s/%s/snapshot" % (node, kind, vmid))
+                         if isinstance(item, dict) and GUEST_NAME_RE.match(str(item.get("name", ""))))
+            rotated = []
+            for _, old in own[:-KEEP] if KEEP > 0 else []:
+                if old == name:
+                    continue
+                guest_tool(kind, "delsnapshot", vmid, old)
+                rotated.append(old)
+            taken.append({"vmid": int(vmid), "type": kind, "snapshot": name, "rotated": rotated})
+    return taken
 
 
 def main(argv):
-    if len(argv) == 2 and argv[0] == "create":
-        result = create(argv[1])
+    if len(argv) in (2, 3) and argv[0] == "create" and argv[2:] in ([], ["--guests"]):
+        result = create(argv[1], guests=argv[2:] == ["--guests"])
     elif len(argv) == 1 and argv[0] == "list":
         check_store()
         result = {"snapshots": [{"name": name, "createdAt": created, "etcEntries": data.get("etcEntries")}
                                 for created, name, data in snapshots()]}
     else:
-        raise Failure(64, "usage: cockpit-host-snapshot create <name> | list")
+        raise Failure(64, "usage: cockpit-host-snapshot create <name> [--guests] | list")
     sys.stdout.write(json.dumps(result) + "\n")
 
 
