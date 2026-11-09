@@ -11,7 +11,9 @@ WorkingDirectory=/opt/wireguard-ops-cockpit
 Environment=PATH=/opt/node-v22.23.4-linux-x64/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=COCKPIT_DB_PATH=/var/lib/wireguard-ops-cockpit/cockpit.sqlite
 EnvironmentFile=/opt/wireguard-ops-cockpit/.env
-ExecStart=/usr/bin/ttyd -i 127.0.0.1 -p 7681 -W -a -b /terminal /opt/wireguard-ops-cockpit/bin/ttyd-session-attach.sh
+# ttyd ohne Pfad: systemd sucht in /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin —
+# Paket (/usr/bin, Ubuntu) oder gepinntes Release-Binary (/usr/local/bin, Debian trixie).
+ExecStart=ttyd -i 127.0.0.1 -p 7681 -W -a -b /terminal /opt/wireguard-ops-cockpit/bin/ttyd-session-attach.sh
 Restart=always
 RestartSec=5
 
