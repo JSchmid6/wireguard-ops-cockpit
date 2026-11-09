@@ -65,7 +65,7 @@ const free: Array<[string, string]> = [
   // t_5ce5f79f: den Helfer lesen, seinen Status und seine Units ansehen bleibt frei.
   ["reading the backup helper", "ls -l /usr/local/sbin/cockpit-borg-action\nsha256sum /usr/local/sbin/cockpit-borg-action\ntest -x /usr/local/sbin/cockpit-borg-action\ncommand -v cockpit-borg-action"],
   ["the helper's units by a glob", "journalctl -u 'cockpit-borg-*' -n 50\nsystemctl status 'cockpit-borg-*'"],
-  ["the helper named in text output", "echo 'cockpit-borg-action sources add folgt'"],
+  ["the helper named in text output", "echo 'cockpit-borg-action sources add /opt/stacks/neu folgt'"],
   // t_fd6dfaa4: die freien Direktformen und eine Pipe in eine Shell ohne den Helfer.
   ["the helper's free direct forms", "/usr/local/sbin/cockpit-borg-action status\n/usr/local/sbin/cockpit-borg-action check\n/usr/local/sbin/cockpit-borg-action db-access status\n/usr/local/sbin/cockpit-borg-action sources status\n/usr/local/sbin/cockpit-borg-action sources add /opt/stacks/wejos-wp"],
   ["a pipe into sh -c without the helper", "journalctl -u borgmatic | grep x | sh -c cat"],
@@ -97,11 +97,32 @@ const free: Array<[string, string]> = [
   ["t_2e391eba: an unmarked plan keeps its arithmetic and prompt expansion", "for ((i=0; i<3; i++)); do echo $i; done\nx='\\u@\\h'\necho \"${x@P}\"\n/usr/local/sbin/cockpit-borg-action status"],
   ["the helper's status through a variable", "h=/usr/local/sbin/cockpit-borg-action\n$h status"],
   // Zweitpruefung t_ba8ceb38 (Karte t_8f78c1ac): ein Kommentar am Wortanfang bleibt Kommentar, wie in Bash.
-  ["t_8f78c1ac: a comment right after a subshell", "(true)# ; /usr/local/sbin/cockpit-borg-action repair"],
-  ["t_8f78c1ac: a comment right after an arithmetic command", "(( 1 ))#; /usr/local/sbin/cockpit-borg-action repair"],
-  ["t_8f78c1ac: a comment after a blank", "hostname # /usr/local/sbin/cockpit-borg-action repair"],
-  ["t_8f78c1ac: a comment after a semicolon", "hostname;# /usr/local/sbin/cockpit-borg-action repair"],
-  ["t_8f78c1ac: a comment at the start of a command substitution", "x=$(# /usr/local/sbin/cockpit-borg-action repair\nhostname)\necho \"$x\""],
+  // Seit Karte t_8334eec9 kostet der Helfer mit repair im Kommentar die Freigabe (Rohtext-Riegel, unten);
+  // der Leser selbst liest den Kommentar weiter richtig, geprueft mit borg delete statt des Helfers.
+  ["t_8f78c1ac: a comment right after a subshell", "(true)# ; borg delete ::a"],
+  ["t_8f78c1ac: a comment right after an arithmetic command", "(( 1 ))#; borg delete ::a"],
+  ["t_8f78c1ac: a comment after a blank", "hostname # borg delete ::a"],
+  ["t_8f78c1ac: a comment after a semicolon", "hostname;# borg delete ::a"],
+  ["t_8f78c1ac: a comment at the start of a command substitution", "x=$(# borg delete ::a\nhostname)\necho \"$x\""],
+  // Zweitpruefung t_a7b9a156 (Karte t_8334eec9): echte Kommentare bleiben frei, auch mit der freien Form darin.
+  ["t_8334eec9: a quote over two lines, then a real comment", "echo 'a\nb' # '; borg delete ::a"],
+  ["t_8334eec9: a comment ending in a backslash, the next line runs", "hostname # x \\\nuptime"],
+  ["t_8334eec9: status with a comment", "/usr/local/sbin/cockpit-borg-action status # Stand zeigen"],
+  ["t_8334eec9: a comment line before status", "# Stand der Sicherung\n/usr/local/sbin/cockpit-borg-action status"],
+  ["t_8334eec9: status | jq with a comment", "/usr/local/sbin/cockpit-borg-action status | jq .  # nur lesen"],
+  ["t_8334eec9: comments next to routine", "df -h /  # Platz\nuptime"],
+  ["t_8334eec9: case with a comment", "case \"$1\" in\n  a) echo a ;; # erster\n  *) echo b ;;\nesac"],
+  ["t_8334eec9: a note heredoc with a comment", "cat > /tmp/n.txt <<'EOF'\n# notiz\nEOF\n/usr/local/sbin/cockpit-borg-action status"],
+  ["t_8334eec9: a comment that names a free form, text after it", "# danach /usr/local/sbin/cockpit-borg-action status pruefen\napt-get -y upgrade"],
+  ["t_8334eec9: a comment that names db-access", "# siehe Doku: cockpit-borg-action db-access status\nuptime"],
+  ["t_8334eec9: logger text with a free form", "logger -t wartung \"cockpit-borg-action status ok\""],
+  ["t_8334eec9: a note heredoc with a free form", "cat > /tmp/notiz.txt <<'EOF'\nVorher cockpit-borg-action status laufen lassen\nEOF"],
+  ["t_8334eec9: checksum of two helpers", "sha256sum /usr/local/sbin/cockpit-borg-action /usr/local/sbin/cockpit-host-run"],
+  ["t_8334eec9: sources add over a continuation", "/usr/local/sbin/cockpit-borg-action sources add \\\n  /opt/stacks/app"],
+  ["t_8334eec9: status with a redirect", "/usr/local/sbin/cockpit-borg-action status 2>&1 | tail -n 5"],
+  ["t_8334eec9: a longer file name", "grep -c repair /var/log/cockpit-borg-action.log"],
+  ["t_8334eec9: an array with a comment", "pkgs=(nginx php-fpm) # Dienste\nsystemctl restart \"${pkgs[@]}\""],
+  ["t_8334eec9: a quoted heredoc delimiter that closes", "cat <<E\"OF\"\nborg delete ::a\nEOF"],
 ];
 
 // Jede Form aus dem Auftrag, und Umwege, die der Text verdeckt.
@@ -306,6 +327,44 @@ const needsApproval: Array<[string, string]> = [
   ["t_8f78c1ac: # inside ${x/ …/}", "x=a; echo ${x/ #/}; /usr/local/sbin/cockpit-borg-action repair"],
   ["t_8f78c1ac: # inside backticks ends with them", "echo `true #`; /usr/local/sbin/cockpit-borg-action repair"],
   ["t_8f78c1ac: # after a ) whose ( is on an earlier line", "x=$(\ntrue\n)#; /usr/local/sbin/cockpit-borg-action repair"],
+  // Zweitpruefung t_a7b9a156 (Karte t_8334eec9): was der Leser fuer Kommentar, Quote oder Heredoc-Koerper
+  // hielt, Bash aber ausfuehrt. Jede Form zweimal: mit dem Helfer (Rohtext-Riegel und Leser) und mit
+  // borg delete (nur der Leser, der Rohtext-Riegel kennt nur den Helfer).
+  ...([
+    ["a comment ending in a backslash", "true # x \\\nREST"],
+    ["a comment line ending in a backslash", "# notiz \\\nREST"],
+    ["line 2 of a '-quote starting with #", "echo 'a\n# '; REST"],
+    ["line 2 of a \"-quote starting with #", "echo \"a\n#\"; REST"],
+    ["ANSI-C quote with \\' then #", "echo $'a\\' #'; REST"],
+    ["ANSI-C quote with \\' without #", "echo $'a\\' x'; REST"],
+    ["extglob @(x)#", "shopt -s extglob\necho @(x)#; REST"],
+    ["extglob !(x)#", "shopt -s extglob\necho !(x)#; REST"],
+    ["extglob +(x)#", "shopt -s extglob\necho +(x)#; REST"],
+    ["extglob *(x)#", "shopt -s extglob\necho *(x)#; REST"],
+    ["extglob ?(x)#", "shopt -s extglob\necho ?(x)#; REST"],
+    ["[[ == @(a)# ]]", "[[ a == @(a)#x ]]; REST"],
+    ["array a=(x)#", "a=(x)#; REST"],
+    ["heredoc <<E\"OF\" closes at EOF", "cat <<E\"OF\"\nEOF\nREST\nE"],
+    ["heredoc <<E\\OF closes at EOF", "cat <<E\\OF\nEOF\nREST\nE"],
+    ["heredoc delimiter over a continuation E\\<NL>OF", "cat <<EOF\nE\\\nOF\nREST\nEOF"],
+  ] as Array<[string, string]>).flatMap(([label, run]): Array<[string, string]> => [
+    [`t_8334eec9: ${label}`, run.replace("REST", "/usr/local/sbin/cockpit-borg-action repair")],
+    [`t_8334eec9 (reader): ${label}`, run.replace("REST", "borg delete ::a")],
+  ]),
+  ["t_8334eec9: sources disconnect behind a comment backslash", "# x \\\n/usr/local/sbin/cockpit-borg-action sources disconnect"],
+  ["t_8334eec9: a variable set behind a comment backslash", "# x \\\nh=/usr/local/sbin/cockpit-borg-action\n$h repair"],
+  ["t_8334eec9: helper and verb split over a continuation", "/usr/local/sbin/cockpit-borg-action \\\nrepair"],
+  ["t_8334eec9: helper with a verb from a value", "/usr/local/sbin/cockpit-borg-action $'\\x72epair'"],
+  // Preis des Rohtext-Riegels (Karte t_8334eec9): der Helfer ohne freie Form in Kommentar oder Text.
+  ["price t_8334eec9: repair in a comment after a subshell", "(true)# ; /usr/local/sbin/cockpit-borg-action repair"],
+  ["price t_8334eec9: repair in a comment after an arithmetic command", "(( 1 ))#; /usr/local/sbin/cockpit-borg-action repair"],
+  ["price t_8334eec9: repair in a comment after a blank", "hostname # /usr/local/sbin/cockpit-borg-action repair"],
+  ["price t_8334eec9: repair in a comment at the start of a command substitution", "x=$(# /usr/local/sbin/cockpit-borg-action repair\nhostname)\necho \"$x\""],
+  ["price t_8334eec9: only the helper's path in a comment", "# Helfer liegt unter /usr/local/sbin/cockpit-borg-action\napt-get update"],
+  ["price t_8334eec9: echo text that names repair", "echo \"cockpit-borg-action repair braucht Freigabe\""],
+  ["price t_8334eec9: echo text with sources add but no path", "echo 'cockpit-borg-action sources add folgt'"],
+  ["price t_8334eec9: a note heredoc that names repair", "cat > /tmp/notiz.txt <<'EOF'\nrepair: cockpit-borg-action repair (nur mit Freigabe)\nEOF"],
+  ["price t_8334eec9: a note heredoc with only the path", "cat > /tmp/notiz.txt <<'EOF'\nHelfer: /usr/local/sbin/cockpit-borg-action\nEOF"],
   ["S: arithmetic in a heredoc", "x='a['\ny='$(sh)]'\nz=$x$y\necho '/usr/local/sbin/cockpit-borg-action repair' | cat <<EOF\n$((z))\nEOF"],
   ["price: the helper's checksum next to other work", "sha256sum /usr/local/sbin/cockpit-borg-action\napt-get update"],
   // Hinweis H1: ein Argument in Quotes ueber das Zeilenende.
@@ -495,9 +554,13 @@ describe("backup bolt: needs the operator's approval", () => {
 
   it("names the line where bash evaluates a value as code (t_2e391eba)", () => {
     const run = "x='a['\ny='$(sh)]'\nz=$x$y\necho '/usr/local/sbin/cockpit-borg-action repair' | echo $((z))";
-    expect(hits(run)).toEqual([expect.objectContaining({ where: "S1:L4", kind: "backup", reason: expect.stringContaining("evaluate a value as code") })]);
+    // Dazu der Rohtext-Riegel (Karte t_8334eec9) auf derselben Zeile; der Grund des Lesers steht vorn.
+    const found = hits(run);
+    expect(found[0]).toEqual(expect.objectContaining({ where: "S1:L4", kind: "backup", reason: expect.stringContaining("evaluate a value as code") }));
+    expect(found.map((hit) => hit.where)).toEqual(["S1:L4", "S1:L4"]);
     const ps4 = hits("PS4='$(sh) '\nset -x\necho '/usr/local/sbin/cockpit-borg-action repair' | cat");
-    expect(ps4).toEqual([expect.objectContaining({ where: "S1:L1", reason: expect.stringContaining("PS4 decides which code runs") })]);
+    expect(ps4[0]).toEqual(expect.objectContaining({ where: "S1:L1", reason: expect.stringContaining("PS4 decides which code runs") }));
+    expect(ps4.slice(1)).toEqual([expect.objectContaining({ where: "S1:L3", reason: expect.stringContaining("unabridged text") })]);
   });
 });
 

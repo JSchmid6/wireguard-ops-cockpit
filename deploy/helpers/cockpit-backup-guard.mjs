@@ -212,6 +212,60 @@ function grepNamesHelper(segments, cwds) {
   });
 }
 
+// ── Ungekürzter Text (Zweitprüfung t_a7b9a156, Karte t_8334eec9) ───────────
+//
+// Sechs Runden lang fand jede Zweitprüfung eine neue Stelle, an der der Leser
+// Text für Kommentar, Quote oder Heredoc-Körper hielt, den Bash ausführt (# nach
+// $(…), in ${…}, \<NL> am Kommentarende, Zeile 2 eines Quotes, $'…', @(…)#,
+// <<E"OF"). Darum gilt der Helfer-Riegel zusätzlich auf dem ungekürzten Text,
+// jede physische Zeile mit Kommentar, Heredoc-Körper eingeschlossen, egal was
+// der Leser daraus macht (fail-closed):
+// - Folgt auf den Namen des Helfers ein Wort, muss dort eine freie Form
+//   beginnen (status, check, db-access <status|check|ensure|adopt|restore>,
+//   sources status, sources add <Pfad unter den Wurzeln>); ein absoluter Pfad
+//   als Wort (sha256sum …/cockpit-borg-action /usr/…) nimmt der Helfer nicht an.
+// - Nennt eine Zeile den Helfer ohne freie Form öfter, als der Leser in ihrem
+//   Code sieht (im Kommentar, im Körper eines Heredocs, den der Riegel nicht als
+//   Skript liest), ist das ebenfalls ein Treffer.
+// Preis: ein Kommentar oder Heredoc-Text „…cockpit-borg-action repair“ (oder
+// nur der Name ohne freie Form) kostet die Freigabe des Operators.
+const HELPER_MENTION = /\bcockpit-borg-action\b/g;
+// Was nach einer vollständigen freien Form folgt, ist frei: der Helfer prüft bei
+// jedem Verb die genaue Zahl der Argumente und bricht sonst mit 64 ab, bevor er
+// etwas tut („status prüfen“ in einem Kommentar ruft nichts auf).
+const HELPER_FREE_FOLLOWER = /^[ \t]+(?:status|check|db-access[ \t]+(?:status|check|ensure|adopt|restore)|sources[ \t]+status|sources[ \t]+add[ \t]+([^\s;&|)<>`]+))(?=$|[\s;&|)<>`])/;
+const HELPER_BARE_FOLLOWER = /^(?:[ \t]*(?:$|[;&|)<>`#]|\d*[<>])|[ \t]+\/[^\s;&|)<>`$*?[\]{}\u0001]*(?=[ \t]*(?:$|[;&|)<>`#]|\d*[<>]|[ \t]\/)))/;
+// Jede Nennung des Helfers in einem Text: "free" (freie Form), "bare" (nur der
+// Name, ohne Argument oder mit einem festen absoluten Pfad) oder "arg" (ein
+// anderes Wort folgt: repair, sources restore, $v, $(…), ein Glob …).
+function helperMentions(text) {
+  const norm = normalize(text).replaceAll(IN_QUOTES, "");
+  return [...norm.matchAll(HELPER_MENTION)].map((match) => {
+    const after = norm.slice(match.index + match[0].length);
+    // Ein längerer fester Name (…/cockpit-borg-action.log) ist ein anderes Wort;
+    // was danach folgt, zählt wie hinter dem Helfer. $, ` und Globs bleiben Folge.
+    const rest = after.replace(/^[\w.,:@%+=/-]+/, "");
+    const free = rest === after ? rest.match(HELPER_FREE_FOLLOWER) : null;
+    if (free && (free[1] === undefined || sourcesFree(["sources", "add", free[1]]))) return "free";
+    return HELPER_BARE_FOLLOWER.test(rest) ? "bare" : "arg";
+  });
+}
+// Physische Zeilen [from, to), blind an jedem \<NL> verbunden: wo Bash
+// verbindet, sieht der Riegel dasselbe, wo nicht (Kommentar, '…'), nur mehr.
+function rawChunks(physical, from, to) {
+  const chunks = [];
+  for (let k = from; k < to; k += 1) {
+    const index = k;
+    let text = physical[k];
+    while (/(^|[^\\])(\\\\)*\\$/.test(text) && k + 1 < to) { k += 1; text = text.slice(0, -1) + physical[k]; }
+    chunks.push({ index, text });
+  }
+  return chunks;
+}
+const HELPER_ARG_REASON = "names the backup helper with a word other than its free forms (status, check, db-access, sources status, sources add <path>); the bolt reads this on the unabridged text, comments and here-document bodies included";
+const HELPER_HIDDEN_REASON = "names the backup helper outside its free forms where the bolt reads a comment or a here-document body; the bolt reads the unabridged text";
+function countNonFree(mentions) { return mentions.filter((kind) => kind !== "free").length; }
+
 // ── Zeilen-Allowlist (Zweitprüfung t_605da75b, Karte t_6735af09) ───────────
 //
 // Vier Runden lang hat der Riegel Senken nachgezogen (Shell als Pipe-Ziel,
@@ -892,23 +946,33 @@ function clip(text, limit = 300) { return text.length > limit ? `${text.slice(0,
 // Zeile). Im Zweifel kein Kommentar und kein Heredoc mehr in dieser Zeile:
 // ein ), dessen ( der Riegel nicht in der Zeile sieht (x=$(<NL>…<NL>)#; …),
 // kann eine Ersetzung schließen — dann liest der Riegel lieber zu viel.
+//
+// Runde 6 (Zweitprüfung t_a7b9a156, Karte t_8334eec9): $'…' endet nicht an
+// \' (ANSI-C-Quote); ( nach @ ! + * ? (extglob) und nach = (Array a=(…)) öffnet
+// ein Wort, keine Gruppe — # direkt nach seinem ) ist kein Kommentar.
+// continues: die Zeile endet mit einem \, das Bash als Fortsetzung liest
+// (nicht im Kommentar, nicht in '…' oder $'…').
 function scanShell(line, quote = null) {
   const heredocs = [];
   let commentAt = -1;
-  const open = []; // "group" ((), "word" ($( <( >( ), "arith" ((( ), "warith" ($(( ), "square" ($[ ), "brace" (${)
+  const open = []; // "group" ((), "word" ($( <( >( @( a=( ), "arith" ((( ), "warith" ($(( ), "square" ($[ ), "brace" (${)
   let closed = null; // was das ) direkt vor i geschlossen hat
   let backtick = false;
   let noHeredoc = false;
+  let continues = false;
   const inArithmetic = () => open.some((kind) => kind === "arith" || kind === "warith" || kind === "square");
   for (let i = 0; i < line.length; i += 1) {
     const char = line[i];
     const after = closed;
     closed = null;
     if (quote === "'") { if (char === "'") quote = null; continue; }
-    if (char === "\\") { i += 1; continue; }
+    if (quote === "$'") { if (char === "\\") i += 1; else if (char === "'") quote = null; continue; }
+    if (char === "\\") { if (i === line.length - 1) continues = true; i += 1; continue; }
     if (quote === '"') { if (char === '"') quote = null; continue; }
+    if (char === "$" && line[i + 1] === "'") { quote = "$'"; i += 1; continue; }
     if (char === "'" || char === '"') { quote = char; continue; }
     if (char === "`") { backtick = !backtick; continue; }
+    if (char === "(" && i > 0 && /[@!+*?=]/.test(line[i - 1])) { open.push("word"); continue; }
     if (char === "$" && line[i + 1] === "(" && line[i + 2] === "(") { open.push("warith"); i += 2; continue; }
     if (char === "$" && line[i + 1] === "[") { open.push("square"); i += 1; continue; }
     if (char === "$" && line[i + 1] === "(" || (char === "<" || char === ">") && line[i + 1] === "(") { open.push("word"); i += 1; continue; }
@@ -930,12 +994,36 @@ function scanShell(line, quote = null) {
       continue;
     }
     if (!noHeredoc && !backtick && !open.includes("brace") && !inArithmetic() && char === "<" && line[i + 1] === "<" && line[i + 2] !== "<" && line[i - 1] !== "<") {
-      const match = line.slice(i + 2).match(/^(-?)\s*(['"]?)\\?([A-Za-z_][\w.-]*)\2/);
-      // Ein Begrenzer in Quotes oder mit \ (<<'EOF', <<\EOF): Bash erweitert den Körper nicht.
-      if (match) { heredocs.push({ strip: match[1] === "-", word: match[3], quoted: match[2] !== "" || match[0].includes("\\") }); i += 1 + match[0].length; }
+      const delimiter = heredocDelimiter(line, i + 2);
+      // Ein Begrenzer in Quotes oder mit \ (<<'EOF', <<\EOF, <<E"OF"): Bash erweitert den Körper nicht.
+      if (delimiter) { heredocs.push({ strip: delimiter.strip, word: delimiter.word, quoted: delimiter.quoted }); i = delimiter.end - 1; }
     }
   }
-  return { heredocs, quote, code: commentAt >= 0 ? line.slice(0, commentAt) : line };
+  return { heredocs, quote, continues, code: commentAt >= 0 ? line.slice(0, commentAt) : line };
+}
+
+// Der Begrenzer eines Heredocs hinter << (ab from): das ganze Wort bis zum
+// ersten Trenner, Quotes und \ aufgelöst (<<E"OF" und <<E\OF enden an EOF,
+// Zweitprüfung t_a7b9a156). Ein Wort, das kein Name ist (<<1, <<$x), öffnet
+// für den Riegel keinen Heredoc: er liest die Folgezeilen dann als Befehle.
+function heredocDelimiter(line, from) {
+  let i = from;
+  const strip = line[i] === "-";
+  if (strip) i += 1;
+  while (line[i] === " " || line[i] === "\t") i += 1;
+  let word = "";
+  let quoted = false;
+  while (i < line.length && !/[\s;&|<>()]/.test(line[i])) {
+    const char = line[i];
+    if (char === "\\") { word += line[i + 1] ?? ""; quoted = true; i += 2; continue; }
+    if (char === "'" || char === '"') {
+      const end = line.indexOf(char, i + 1);
+      if (end < 0) return null;
+      word += line.slice(i + 1, end); quoted = true; i = end + 1; continue;
+    }
+    word += char; i += 1;
+  }
+  return /^[A-Za-z_][\w.-]*$/.test(word) ? { strip, word, quoted, end: i } : null;
 }
 
 // Außerhalb von Quotes: wo ein Kommentar beginnt und welche Heredocs die Zeile öffnet.
@@ -947,13 +1035,22 @@ function openQuoteAfter(line, quote) { return scanShell(line, quote).quote; }
 
 // Logische Zeilen (Fortsetzungen verbunden) und Heredoc-Körper, jede mit der
 // Kennung ihrer ersten physischen Zeile (S<n>:L<n> wie beim Türsteher).
+// Runde 6 (Zweitprüfung t_a7b9a156, Karte t_8334eec9): der Quote, der am Ende
+// einer Zeile offen bleibt, gilt am Anfang der nächsten (echo 'a<NL># '; …: das #
+// steht in Bash noch im Quote); \<NL> verbindet nur, wo Bash es tut (nicht am
+// Ende eines Kommentars, nicht in '…' oder $'…'); im Körper eines Heredocs
+// ohne Quotes am Begrenzer verbindet \<NL> vor dem Vergleich mit dem Begrenzer.
+// span: die physischen Zeilen [von, bis) der logischen Zeile.
 function splitScript(prefix, text) {
   const physical = text.replace(/\r\n/g, "\n").split("\n");
   const lines = [];
   const heredocs = [];
   let index = 0;
+  let quote = null;
   while (index < physical.length) {
     const id = `${prefix}:L${index + 1}`;
+    const from = index;
+    const startQuote = quote;
     let raw = physical[index];
     index += 1;
     // Bash setzt eine Zeile auch nach |, |&, && und || am Zeilenende fort
@@ -962,23 +1059,28 @@ function splitScript(prefix, text) {
     // Zeile einen Heredoc öffnet (dessen Körper folgt zuerst) oder ein Quote
     // offen bleibt (dann ist das | nur Text).
     for (;;) {
-      while (/(^|[^\\])(\\\\)*\\$/.test(raw) && index < physical.length) { raw = raw.slice(0, -1) + physical[index]; index += 1; }
-      const scanned = scanUnquoted(raw);
-      if (index >= physical.length || scanned.heredocs.length > 0 || openQuoteAfter(raw, null) !== null || !/(?:\||&&|\|&)\s*$/.test(scanned.code)) break;
+      while (scanShell(raw, startQuote).continues && index < physical.length) { raw = raw.slice(0, -1) + physical[index]; index += 1; }
+      const scanned = scanShell(raw, startQuote);
+      if (index >= physical.length || scanned.heredocs.length > 0 || scanned.quote !== null || !/(?:\||&&|\|&)\s*$/.test(scanned.code)) break;
       raw = `${scanned.code.replace(/\s+$/, "")} ${physical[index]}`; index += 1;
     }
-    const { heredocs: opened, code } = scanUnquoted(raw);
-    const line = { id, raw, code, heredocs: [] };
+    const scanned = scanShell(raw, startQuote);
+    quote = scanned.quote;
+    const line = { id, raw, code: scanned.code, heredocs: [], span: [from, index] };
     lines.push(line);
-    for (const doc of opened) {
+    for (const doc of scanned.heredocs) {
       const body = [];
       let closed = false;
       while (index < physical.length) {
-        const bodyLine = physical[index];
-        const bodyId = `${prefix}:L${index + 1}`;
+        // Verglichen wird die verbundene Zeile, im Körper stehen die physischen.
+        const start = index;
+        let bodyLine = physical[index];
         index += 1;
+        if (!doc.quoted) {
+          while (/(^|[^\\])(\\\\)*\\$/.test(bodyLine) && index < physical.length) { bodyLine = bodyLine.slice(0, -1) + physical[index]; index += 1; }
+        }
         if ((doc.strip ? bodyLine.replace(/^\t+/, "") : bodyLine) === doc.word) { closed = true; break; }
-        body.push({ id: bodyId, raw: bodyLine });
+        for (let k = start; k < index; k += 1) body.push({ id: `${prefix}:L${k + 1}`, raw: physical[k] });
       }
       const heredoc = { line, body, closed, quoted: doc.quoted };
       line.heredocs.push(heredoc);
@@ -1002,6 +1104,9 @@ function normalize(code) {
   for (let i = 0; i < code.length; i += 1) {
     const char = code[i];
     if (quote === "'") { if (char === "'") quote = null; else if (!literal || char !== "$" && char !== "`") out += QUOTED_SEPARATOR.test(char) ? IN_QUOTES + char : char; continue; }
+    // $'…' (ANSI-C): \' schließt nicht; das $ bleibt stehen (der Wert entsteht erst in Bash).
+    if (quote === "$'") { if (char === "'") quote = null; else { if (char === "\\") { out += char; i += 1; } const next = code[i] ?? ""; out += QUOTED_SEPARATOR.test(next) ? IN_QUOTES + next : next; } continue; }
+    if (char === "$" && code[i + 1] === "'" && quote === null) { out += "$"; quote = "$'"; i += 1; continue; }
     if (char === "\\") { const next = code[i + 1] ?? ""; if (next !== "$" && next !== "`") out += next; i += 1; continue; }
     if (char === '"') { quote = quote === '"' ? null : '"'; continue; }
     if (char === "'" && quote === null) { quote = "'"; literal = OWN_LANGUAGE.test(code.slice(0, i)); continue; }
@@ -1576,6 +1681,10 @@ function analyzeScript(prefix, text, context, hits, language = "shell") {
       rawCheck(id, raw);
       codeCheck(id, raw, "code");
       if (CODE_PRIMITIVES.test(raw)) hit(id, "uncertain", `${language} code that starts processes, touches files or builds code at run time`, raw);
+      // Code einer anderen Sprache liest der Riegel nicht: jede Nennung des Helfers ohne freie Form zählt.
+      const mentions = helperMentions(raw);
+      if (mentions.includes("arg")) hit(id, "backup", HELPER_ARG_REASON, raw);
+      else if (countNonFree(mentions) > 0) hit(id, "backup", HELPER_HIDDEN_REASON, raw);
     });
     return;
   }
@@ -1754,6 +1863,24 @@ function analyzeScript(prefix, text, context, hits, language = "shell") {
         for (const found of sub) hits.push({ ...found, where: shiftLine(found.where, line) });
       }
     }
+    // Ein Körper, den der Riegel nicht als Skript liest: jede Nennung des
+    // Helfers ohne freie Form zählt (Karte t_8334eec9) — wie wenn der Leser
+    // den Begrenzer falsch liest und Bash die Zeile ausführt.
+    for (const chunk of rawChunks(heredoc.body.map((item) => item.raw), 0, heredoc.body.length)) {
+      if (countNonFree(helperMentions(chunk.text)) > 0) hit(heredoc.body[chunk.index].id, "backup", HELPER_HIDDEN_REASON, chunk.text);
+    }
+  }
+
+  // Ungekürzter Text (Karte t_8334eec9): der Helfer-Riegel auf jeder physischen
+  // Zeile, Kommentare und Heredoc-Körper eingeschlossen (siehe helperMentions).
+  // Zuletzt, damit der genauere Grund des Lesers vorn steht.
+  const physical = text.replace(/\r\n/g, "\n").split("\n");
+  for (const chunk of rawChunks(physical, 0, physical.length)) {
+    if (helperMentions(chunk.text).includes("arg")) hit(`${prefix}:L${chunk.index + 1}`, "backup", HELPER_ARG_REASON, chunk.text);
+  }
+  for (const line of lines) {
+    const named = rawChunks(physical, line.span[0], line.span[1]).reduce((sum, chunk) => sum + countNonFree(helperMentions(chunk.text)), 0);
+    if (named > countNonFree(helperMentions(line.code))) hit(line.id, "backup", HELPER_HIDDEN_REASON, line.raw);
   }
 }
 

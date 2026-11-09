@@ -530,6 +530,43 @@ Grenzen:
   Gemessen: alle Sonden der früheren Runden unverändert (`/opt/data/out/t_8f78c1ac/sonden-*`), die
   Fälle aus t_ba8ceb38 (`faelle*.mjs`) sind alle Treffer, wo Bash `repair` startet. Tests:
   `apps/api/test/backup-guard.test.ts` (t_8f78c1ac).
+* **Helfer-Riegel auf dem ungekürzten Text (09.11.2026, Zweitprüfung t_a7b9a156, Karte
+  t_8334eec9).** Runde 6 fand die sechste Leser-Lücke derselben Art (in echter Bash belegt, Riegel
+  frei, Fokus leer, alle schon auf main): `\⏎` am Ende eines Kommentars (`true # x \⏎…repair`;
+  Bash beendet den Kommentar an der Zeile), Zeile 2 eines mehrzeiligen Quotes (`echo 'a⏎# '; …
+  repair` — der Leser las jede Zeile ab „kein Quote offen“), `$'a\' #'` (`\'` schließt `$'…'`
+  nicht), extglob `@(x)#`/`!(x)#`/`+(x)#` und `a=(x)#` (das `)` schließt keine Gruppe), dazu
+  mit Hinweis `[[ a == @(a)#x ]]` und Heredoc-Begrenzer `<<E"OF"`, `<<E\OF` und `E\⏎OF` im Körper.
+  **Entscheidung (PO James): nicht nur Einzelformen nachziehen, sondern fail-closed** — der
+  Helfer-Riegel gilt zusätzlich auf dem ungekürzten Text, jede physische Zeile mit Kommentar und
+  Heredoc-Körper, egal was der Leser daraus macht (`helperMentions` in
+  `deploy/helpers/cockpit-backup-guard.mjs`, Zeilen an jedem `\⏎` blind verbunden): (1) folgt auf
+  den Namen des Helfers ein Wort, muss dort eine freie Form beginnen (`status`, `check`,
+  `db-access status|check|ensure|adopt|restore`, `sources status`, `sources add <Pfad unter den
+  Wurzeln>`), sonst Treffer — ein fester absoluter Pfad als Wort (`sha256sum …/cockpit-borg-action
+  /usr/…`) zählt nicht, ebenso ein längerer Dateiname (`…/cockpit-borg-action.log`); Text nach einer
+  vollständigen freien Form ist frei, weil der Helfer bei jedem Verb die genaue Zahl der Argumente
+  prüft und sonst mit 64 abbricht, bevor er etwas tut; (2) nennt eine logische Zeile den Helfer
+  ohne freie Form öfter, als der Leser in ihrem Code sieht (Kommentar), oder ein Heredoc-Körper, den
+  der Riegel nicht als Skript liest, ihn überhaupt ohne freie Form, ist das ebenfalls ein Treffer.
+  Zusätzlich liest der Leser die Formen jetzt wie Bash, damit Variablen und Plan-Umfang stimmen:
+  der offene Quote einer Zeile gilt am Anfang der nächsten, `\⏎` verbindet nur außerhalb von
+  Kommentar, `'…'` und `$'…'`, `$'…'` endet nicht an `\'`, `(` nach `@ ! + * ? =` öffnet ein Wort,
+  der Heredoc-Begrenzer ist das ganze Wort ohne Quotes und `\`, und im Körper ohne Quotes am
+  Begrenzer verbindet `\⏎` vor dem Vergleich. **Preis (gemessen, `/opt/data/out/t_8334eec9/`):**
+  Kommentar oder Text, der den Helfer mit einem anderen Wort als einer freien Form nennt
+  (`# … cockpit-borg-action repair`, `echo "cockpit-borg-action repair …"`,
+  `echo 'cockpit-borg-action sources add folgt'`) oder ihn in Kommentar/Notiz-Heredoc nur beim
+  Namen nennt, kostet die Freigabe des Operators — auch die bisherigen Kontrollen
+  `(true)# ; … repair`, `hostname # … repair`; der Leser selbst liest diese Kommentare weiter
+  richtig (geprüft mit `borg delete` statt des Helfers). Frei bleiben Kommentare und Text mit einer
+  freien Form (`# danach … status prüfen`, `logger "cockpit-borg-action status ok"`), `ls`/`sha256sum`
+  des Helfers, Fortsetzungen in `sources add \⏎ <pfad>`. `probe-preis` gegen bdd3c56 unverändert 5/15;
+  `preis-r7.mjs` (18 Routine-Pläne mit dem Helfer in Kommentar/Text): 6 Treffer, gegen bba18be 1 (5 neu,
+  alle Kommentar/Text mit `repair` oder nur dem Pfad). Echte Korrektur: `echo 'a⏎b' # '; borg delete …`
+  ist in Bash ein Kommentar und jetzt frei (vorher ein Treffer zu viel). Alle Sonden der früheren
+  Runden byteweise unverändert gegenüber bba18be; `faelle-r6.mjs` 26/26 Treffer, kein FREE+LÄUFT.
+  Tests: `apps/api/test/backup-guard.test.ts` (t_8334eec9, je Form mit Helfer und mit `borg delete`).
 * **Offene Entscheidung (05.11.2026, Karte t_5ce5f79f): Freigabe-Markierung im Helfer.** Erwogen:
   die schwächenden Verben (`sources connect|disconnect|restore`, `repair`) laufen in einer
   host-run-cgroup nur, wenn `cockpit-host-run` für genau diesen Job eine root-eigene Markierung
