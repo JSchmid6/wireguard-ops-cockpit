@@ -39,6 +39,19 @@
 //                       (cockpit-vps-snapshot delete, DELETE …/snapshots). Die
 //                       Rotation des Werkzeugs selbst (create räumt den ältesten
 //                       eigenen Snapshot) bleibt frei (Jochen, 28.09.2026);
+//                     - auf dem Proxmox-Host (Rolle box, Karte t_5f5c89fe; der
+//                       Riegel gilt rollenunabhängig, anderswo gibt es die
+//                       Werkzeuge nicht): vzdump-Sicherungen löschen, kürzen oder
+//                       verschieben (/var/lib/vz/dump, /mnt/pve/<speicher>/dump,
+//                       vzdump-*, *.vma*), pvesm free auf …:backup/…, pvesm
+//                       prune-backups, vzdump --remove, prune-backups/maxfiles
+//                       ändern (pvesm, pvesh, /etc/vzdump.conf, /etc/pve/
+//                       storage.cfg, /etc/pve/jobs.cfg), einen Backup-Auftrag
+//                       ändern oder löschen, qm|pct delsnapshot|rollback|destroy
+//                       und ihre API-Formen (pvesh, curl auf /api2/…). Die
+//                       Rotation von cockpit-host-snapshot (delsnapshot im
+//                       Helfer, create auch aus dem Plan) bleibt frei, ein
+//                       delsnapshot im Plan nicht — auch nicht für cockpit-run-*;
 //                     - dem Lesen der Zugangsdaten (borgmatic-Konfiguration,
 //                       borg-Schlüssel, Passphrase des Aufräum-Dienstes) und des
 //                       Repo-Inhalts (cat, cp, scp, rsync, sshfs …; borg/borgmatic
@@ -76,11 +89,11 @@
 
 import { classifyRetention, parseRetentionArgs } from "./cockpit-borg-retention-rules.mjs";
 
-export const BACKUP_GUARD_VERSION = "cockpit-backup-guard/v4";
+export const BACKUP_GUARD_VERSION = "cockpit-backup-guard/v5";
 
 // Was die Backups sind. TOKEN greift im normalisierten Text (ohne Quotes und
 // Backslashes), also auch in b"o"rg und bo\rg.
-const TOKEN = /borg|backup_vserver|\/media\/raid|\b10\.0\.0\.5\b|\blab0\b|timers\.target|api\.contabo\.com/i;
+const TOKEN = /borg|backup_vserver|\/media\/raid|\b10\.0\.0\.5\b|\blab0\b|timers\.target|api\.contabo\.com|vzdump|\/var\/lib\/vz\/dump/i;
 // Was der Riegel schützt. CONFIG: jedes Schreiben dort ändert, was gesichert
 // und wie lange aufbewahrt wird, oder schaltet die Sicherung ab.
 const CONFIG = [
@@ -96,6 +109,8 @@ const CONFIG = [
   "/usr/local/lib/wireguard-ops-cockpit/cockpit-borg-retention.mjs", "/usr/local/lib/wireguard-ops-cockpit/cockpit-borg-retention-rules.mjs",
   "/etc/systemd/system/cockpit-borg-retention.service", "/etc/systemd/system/cockpit-borg-retention.service.d",
   "/etc/systemd/system/cockpit-borg-retention.timer", "/etc/systemd/system/cockpit-borg-retention.timer.d",
+  // Proxmox (Rolle box): Aufbewahrung, Ziel und Zeitplan der vzdump-Sicherungen.
+  "/etc/vzdump.conf", "/etc/pve/storage.cfg", "/etc/pve/jobs.cfg", "/etc/pve/vzdump.cron", "/etc/cron.d/vzdump",
   // Drop-ins, die systemd ebenfalls auf diese Units anwendet, ohne dass ihr Name
   // "borg" enthält: Präfix-Drop-ins (cockpit-.service.d) und globale (service.d),
   // in jedem Unit-Verzeichnis. Darüber ließe sich der Dienst sonst still abschalten.
@@ -114,6 +129,7 @@ const DATA = [
   "/media/RAID/backup_VServer", // das Repo, falls es je eingehängt ist; macht /media zum Vorfahren
   "/var/backups",
   "/var/opt/gitlab/backups",
+  "/var/lib/vz/dump", // vzdump-Sicherungen im Speicher local (Rolle box); weitere Speicher: vzdumpTouches
 ];
 // Lesen ist hier schon der Schaden: die Zugangsdaten (Passphrase, Schlüssel) und
 // der Inhalt des Repos. Metadaten (ls, stat, du, df, test …) bleiben frei.
@@ -169,7 +185,12 @@ const READ_ONLY = new Set([
   "jq", "cut", "tr", "column", "nl", "tac", "strings", "zcat", "xzcat", "bzcat", "echo", "printf", "dpkg-query", "apt-cache", "sleep",
   "nproc", "uname", "whoami", "lsof", "ss", "find", "journalctl", "systemctl", "dpkg", "apt", "apt-mark", "command", "curl", "wget",
   "borg", "borgmatic", "cockpit-borg-action", "cockpit-borg-retention", "sort", ":", "docker",
+  "qm", "pct", "pvesm", "pvesh",
 ]);
+// Proxmox: lesende Verben (Rolle box).
+const PVE_GUEST_READ = new Set(["list", "listsnapshot", "config", "status", "pending", "showcmd", "df", "help"]);
+const PVESM_READ = new Set(["status", "list", "path", "scan", "nfsscan", "cifsscan", "lvmscan", "lvmthinscan", "zfsscan", "iscsiscan", "glusterfsscan", "pbsscan", "apiinfo", "help"]);
+const PVESH_READ = new Set(["get", "ls", "usage", "help"]);
 const DOCKER_READ = new Set(["ps", "images", "inspect", "logs", "stats", "version", "info", "top", "port", "diff", "history"]);
 const SYSTEMCTL_READ = new Set(["status", "is-active", "is-enabled", "is-failed", "show", "cat", "list-timers", "list-units", "list-unit-files", "list-dependencies", "help"]);
 const ROUTINE_UNITS = new Set(["borgmatic", "borgmatic.service", "borgmatic.timer", "cockpit-borg-retention", "cockpit-borg-retention.service", "cockpit-borg-retention.timer"]);
@@ -203,8 +224,25 @@ const AWK_PRIMITIVES = /\bsystem\s*\(|\|\s*getline|\|&|\bprint[^;}]*[>|]/;
 // Im normalisierten Text eines Befehls (ohne Quotes), auch in sh -c '…', in
 // einem Skript, das der Lauf schreibt, oder in einer Cron-Zeile.
 const DELETE_PHRASE = /\bborg(?:matic)?\b(?:[\s,[\]()]+[^\s,[\]()]+){0,8}?[\s,[\]()]+(?:delete|prune|compact|recreate|break-lock|rdelete|repo-delete|key[\s,[\]()]+(?:change-passphrase|import|migrate-to-repokey|change-location|change-algorithm))\b/i;
-const RETENTION_PHRASE = /\bkeep[_-](?:within|secondly|minutely|hourly|daily|weekly|monthly|yearly|last)\b|\bbackup_keep_time\b|\bkeep(?:Daily|Weekly|Monthly)\b/i;
-const SNAPSHOT_DELETE = /\bcockpit-vps-snapshot\s+delete\b|(?:\s-[a-zA-Z]*X|--request)[\s=]*DELETE\b[^\n]*\/snapshots\b|\/snapshots\b[^\n]*(?:\s-[a-zA-Z]*X|--request)[\s=]*DELETE\b/i;
+// prune-backups/maxfiles: die Aufbewahrung der vzdump-Sicherungen (Proxmox).
+const RETENTION_PHRASE = /\bkeep[_-](?:within|secondly|minutely|hourly|daily|weekly|monthly|yearly|last|all)\b|\bbackup_keep_time\b|\bkeep(?:Daily|Weekly|Monthly)\b|\bprune-?backups\b|\bmaxfiles\b/i;
+// Proxmox (Rolle box): Gast-Snapshots löschen oder zurückrollen, Gäste zerstören,
+// vzdump-Sicherungen löschen — als Befehl (qm, pct, pvesm, vzdump, pvesh) und
+// über die API (curl … /api2/json/…). Die Pfade der API und von pvesh sind
+// dieselben: …/snapshot/<name> (DELETE), …/snapshot/<name>/rollback (POST),
+// /nodes/<n>/qemu|lxc/<id> (DELETE), …/storage/<s>/content/<vol> (DELETE, set),
+// …/storage/<s>/prunebackups (DELETE), /cluster/backup/<id> (DELETE, set).
+const PVE_GUEST = /\b(?:qm|pct)[\s,[\]()'"]+(?:delsnapshot|rollback|destroy)\b/i;
+const PVE_BACKUP = /\bvzdump\b[^\n;&|]*?\s--remove(?![\s=]+(?:0|false|no|off)\b)(?=[\s=;&|]|$)|\bpvesm[\s,[\]()]+(?:prune-backups\b|free\b[^\n;&|]*(?::backup\/|\sbackup\/|vzdump-))/i;
+const PVE_API_PATH = String.raw`\/(?:snapshot\/[^\s/'"]+|(?:qemu|lxc)\/\d+|storage\/[^\s/'"]+\/(?:content\/[^\s/'"]+|prunebackups)|cluster\/backup\/[^\s/'"]+)`;
+const PVE_API_DELETE = new RegExp(String.raw`\bpvesh[\s,[\]()]+delete\s+(?:-\S+\s+)*\S*${PVE_API_PATH}(?:[\s/'"?]|$)|\bpvesh[\s,[\]()]+set\s+(?:-\S+\s+)*\S*\/(?:storage\/[^\s/'"]+\/content\/|cluster\/backup\/)|\/snapshot\/[^\s/'"]+\/rollback\b|(?:\s-[a-zA-Z]*X|--request|--method)[\s=]*DELETE\b[^\n]*\/api2\/\S*${PVE_API_PATH}(?:[\s/'"?]|$)|\/api2\/\S*${PVE_API_PATH}(?:[\s/'"?]|$)[^\n]*(?:\s-[a-zA-Z]*X|--request|--method)[\s=]*DELETE\b|(?:\s-[a-zA-Z]*X|--request|--method)[\s=]*(?:PUT|POST)\b[^\n]*\/api2\/\S*\/(?:cluster\/backup\/|storage\/[^\s/'"]+\/content\/)|\/api2\/\S*\/(?:cluster\/backup\/|storage\/[^\s/'"]+\/content\/)\S+[^\n]*(?:\s-[a-zA-Z]*X|--request|--method)[\s=]*(?:PUT|POST)\b`, "i");
+// Proxmox wirft leere Pfadteile weg (/qemu//100), und pvesh nimmt Pfade auch ohne
+// führenden Schrägstrich (cluster/backup/x): beides vor dem Vergleich angleichen.
+function pveApiText(text) {
+  return text.replace(/(?<!:)\/{2,}/g, "/")
+    .replace(/(\bpvesh[\s,[\]()]+(?:get|ls|set|create|delete|usage)\s+(?:-\S+\s+)*)(?=[^\s/-])/g, "$1/");
+}
+const SNAPSHOT_DELETE = /\bcockpit-vps-snapshot\s+delete\b|(?:\s-[a-zA-Z]*X|--request|--method)[\s=]*DELETE\b[^\n]*\/snapshots\b|\/snapshots\b[^\n]*(?:\s-[a-zA-Z]*X|--request|--method)[\s=]*DELETE\b/i;
 const BORG_DELETE = new Set(["delete", "prune", "compact", "recreate", "break-lock", "rdelete", "repo-delete"]);
 const BORG_KEY_CHANGE = new Set(["change-passphrase", "import", "migrate-to-repokey", "change-location", "change-algorithm"]);
 const BORGMATIC_DELETE = new Set([...BORG_DELETE, "borg", "key"]);
@@ -667,10 +705,28 @@ function pathTouches(path, bulk, list = PROTECTED, ancestors = ANCESTORS) {
   }
   return list.some((item) => within(path, item) || (bulk && within(item, path)));
 }
+// vzdump-Sicherungen außerhalb von /var/lib/vz/dump (Rolle box): eine Datei
+// vzdump-* oder *.vma* an jedem Ort, das dump-Verzeichnis jedes eingehängten
+// Speichers (/mnt/pve/<speicher>/dump) und — bei Bäumen — seine Vorfahren. Ein
+// Glob im Speichernamen kann jeden Speicher treffen. Das dump-Verzeichnis eines
+// Verzeichnis-Speichers an anderem Ort steht nur in storage.cfg; dort greifen die
+// Dateinamen.
+const VZDUMP_FILE = /vzdump-|\.vma(?:\.|$)/i;
+function vzdumpTouches(path, bulk) {
+  const parts = path.split("/").filter(Boolean);
+  if (VZDUMP_FILE.test(parts.at(-1) || "")) return true;
+  const fits = ["mnt", "pve", null, "dump"].every((want, index) => {
+    const part = parts[index];
+    if (part === undefined || want === null) return true;
+    return GLOB.test(part) ? globRegex(part).test(want) : part === want;
+  });
+  return fits && (parts.length >= 4 || (bulk && parts.length >= 1));
+}
+const vzdumpAny = (path, bulk) => expandBraces(path).some((variant) => vzdumpTouches(resolvePath(variant, "/"), bulk));
 const touchesConfig = (path) => pathTouches(path, false, CONFIG, []);
 const DATA_ANCESTORS = ancestorsOf(DATA);
-const touchesData = (path, bulk) => pathTouches(path, bulk, DATA, DATA_ANCESTORS);
-const touchesBolted = (path) => pathTouches(path, true, BOLTED, BOLTED_ANCESTORS);
+const touchesData = (path, bulk) => pathTouches(path, bulk, DATA, DATA_ANCESTORS) || vzdumpAny(path, bulk);
+const touchesBolted = (path) => pathTouches(path, true, BOLTED, BOLTED_ANCESTORS) || vzdumpAny(path, true);
 const touchesGuardedRead = (path, tree) => pathTouches(path, tree, GUARDED_READ, GUARDED_READ_ANCESTORS);
 
 // Quellen einer Eingabe-Umleitung (cat < f, done < f); nicht <<, <<<, <(, <&.
@@ -770,6 +826,19 @@ function readOnlyForm(command, segmentText) {
     case "apt": return ["list", "show", "policy", "search"].includes(firstVerb(args).verb || "");
     case "apt-mark": return /^show/.test(firstVerb(args).verb || "");
     case "command": return args[0] === "-v" || args[0] === "-V";
+    case "qm": case "pct": return PVE_GUEST_READ.has(args[0] || "");
+    case "pvesh": return PVESH_READ.has(args[0] || "");
+    case "pvesm": {
+      if (PVESM_READ.has(args[0] || "")) return true;
+      // prune-backups --dry-run listet nur, was ginge. Jede Schreibweise der Option
+      // (-dry-run, --dry, --dry-run=…; der letzte Wert gilt) muss wahr sein.
+      if (args[0] !== "prune-backups") return false;
+      const dries = args.map((arg, index) => ({ arg, index })).filter(({ arg }) => /^--?d(?:r(?:y(?:-(?:r(?:u(?:n)?)?)?)?)?)?(?:=|$)/.test(arg));
+      return dries.length > 0 && dries.every(({ arg, index }) => {
+        const value = arg.includes("=") ? arg.slice(arg.indexOf("=") + 1) : args[index + 1];
+        return arg.includes("=") ? /^(?:1|true|yes|on)$/i.test(value) : value === undefined || value.startsWith("-") || /^(?:1|true|yes|on)$/i.test(value);
+      });
+    }
     case "docker": {
       // Lesen am lokalen Daemon: ps, images, inspect, logs, stats, version, info …
       if (args.some((arg) => arg === "-H" || arg.startsWith("--host"))) return false;
@@ -814,6 +883,9 @@ function phraseBolt(text) {
   if (DELETE_PHRASE.test(text)) return "deletes backups (borg/borgmatic delete, prune, compact, recreate, break-lock or a key change)";
   if (RETENTION_PHRASE.test(text)) return "changes the retention of the backups";
   if (SNAPSHOT_DELETE.test(text)) return "deletes a machine snapshot";
+  if (PVE_GUEST.test(text)) return "deletes or rolls back a Proxmox guest snapshot or destroys a guest (qm/pct delsnapshot, rollback, destroy)";
+  if (PVE_BACKUP.test(text)) return "deletes vzdump backups (vzdump --remove, pvesm prune-backups, pvesm free on a backup volume)";
+  if (PVE_API_DELETE.test(pveApiText(text))) return "deletes or rolls back over the Proxmox API (guest snapshot, guest, storage content, pruning or a backup job)";
   return null;
 }
 
@@ -1140,7 +1212,11 @@ function segmentBolt(text, command, name, readOnly, cwds, context, line, piped) 
   if (DELETERS.has(name) || name === "mv" || (name === "git" && args.some((arg) => arg === "clean" || arg === "rm"))) deleted = resolveAll(words);
   else if (name === "find") {
     const exec = args.findIndex((arg) => /^-(?:exec|execdir|ok|okdir)$/.test(arg));
-    if (args.includes("-delete") || (exec >= 0 && /^(?:rm|rmdir|shred|unlink|mv)$/.test(baseName(args[exec + 1] || "")))) deleted = resolveAll(findStarts(args));
+    if (args.includes("-delete") || (exec >= 0 && /^(?:rm|rmdir|shred|unlink|mv)$/.test(baseName(args[exec + 1] || "")))) {
+      deleted = resolveAll(findStarts(args));
+      // vzdump-Sicherungen nach ihrem Namen, wo der Speicher dem Riegel unbekannt ist.
+      if (args.some((arg, index) => /^-(?:i?name|i?path|i?wholename|i?regex)$/.test(args[index - 1] || "") && VZDUMP_FILE.test(arg.replace(/^\*/, "")))) return "find deletes vzdump backups by their name";
+    }
   } else if (name === "rsync") {
     const dest = operands.at(-1);
     if (args.some((arg) => arg.startsWith("--remove-source-files"))) deleted = resolveAll(words);
