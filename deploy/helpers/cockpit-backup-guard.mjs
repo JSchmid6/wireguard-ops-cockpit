@@ -623,7 +623,21 @@ function commandOf(words, strict) {
     }
     if (name === "xargs") {
       prefixes.push(name); i += 1;
-      skipOptions(new Set(["-I", "-d", "-n", "-P", "-L", "-s", "-E", "-a", "--arg-file", "--delimiter", "--max-args", "--max-procs"]));
+      // Der Platzhalter aus -I/-i/--replace zählt wie {} (xargs -I@ /usr/local/sbin/@ repair;
+      // Hinweis H-a der Zweitprüfung t_0b3f7290).
+      const valued = new Set(["-I", "-d", "-n", "-P", "-L", "-s", "-E", "-a", "--arg-file", "--delimiter", "--max-args", "--max-procs"]);
+      let placeholder = null;
+      let end = i;
+      for (; end < words.length && words[end].startsWith("-") && words[end] !== "--"; end += 1) {
+        const flag = words[end];
+        if (flag === "-I") placeholder = words[end + 1] ?? null;
+        else if (/^-I./.test(flag)) placeholder = flag.slice(2);
+        else if (/^-i/.test(flag)) placeholder = flag.slice(2) || "{}";
+        else if (/^--replace(?:=|$)/.test(flag)) placeholder = flag.slice("--replace=".length) || "{}";
+        if (valued.has(flag)) end += 1;
+      }
+      if (placeholder && placeholder !== "{}") words = [...words.slice(0, end), ...words.slice(end).map((word) => word.replaceAll(placeholder, "{}"))];
+      skipOptions(valued);
       fromStdin = true;
       continue;
     }
@@ -1322,6 +1336,10 @@ function checkSegment(text, { piped, quoted }, line, context, cwds, hit) {
   const isInterpreter = INTERPRETERS.test(name);
   if (piped && (isShell || isInterpreter || name === "source" || name === "." || name === "at" || name === "batch")) {
     hit(line.id, "uncertain", `${name} runs text from a pipe`, code);
+    // Nennt die Zeile den Helfer, läuft er so mit einem Verb, das der Riegel
+    // nicht liest (ls …/cockpit-borg-action | sed 's/$/ repair/' | sh;
+    // Zweitprüfung t_0b3f7290).
+    if (lineNamesHelper(line, cwds)) hit(line.id, "backup", `${name} runs text from a pipe on a line that names the backup helper`, code);
   }
   if (command.fromStdin && command.prefixes.includes("xargs") && !readOnlyForm({ ...command, prefixes: [] }, text)) {
     hit(line.id, "uncertain", "xargs builds the arguments from its input", code);
@@ -1342,6 +1360,11 @@ function checkSegment(text, { piped, quoted }, line, context, cwds, hit) {
       const paths = [...cwds].map((cwd) => resolvePath(file, cwd));
       if (file.includes(OPAQUE) || !paths.some((path) => context.written.has(path) || SOURCE_OK.has(path) || SYSTEM_PREFIXES.some((prefix) => path.startsWith(prefix)))) {
         hit(line.id, "uncertain", `${name} runs a script whose content this plan does not show`, code);
+        // bash <(echo '…/cockpit-borg-action repair'): dasselbe über ein Skript,
+        // das der Plan nicht zeigt (Zweitprüfung t_0b3f7290).
+        if (shellHelperArg(name, command.args) < 0 && lineNamesHelper(line, cwds)) {
+          hit(line.id, "backup", `${name} runs a script this plan does not show on a line that names the backup helper`, code);
+        }
       }
     }
   } else if (word.includes("/")) {

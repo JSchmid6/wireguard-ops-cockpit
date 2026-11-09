@@ -66,6 +66,10 @@ const free: Array<[string, string]> = [
   ["reading the backup helper", "ls -l /usr/local/sbin/cockpit-borg-action\nsha256sum /usr/local/sbin/cockpit-borg-action\ntest -x /usr/local/sbin/cockpit-borg-action\ncommand -v cockpit-borg-action"],
   ["the helper's units by a glob", "journalctl -u 'cockpit-borg-*' -n 50\nsystemctl status 'cockpit-borg-*'"],
   ["the helper named in text output", "echo 'cockpit-borg-action sources add folgt'"],
+  // t_fd6dfaa4: die freien Direktformen und eine Pipe in eine Shell ohne den Helfer.
+  ["the helper's free direct forms", "/usr/local/sbin/cockpit-borg-action status\n/usr/local/sbin/cockpit-borg-action check\n/usr/local/sbin/cockpit-borg-action db-access status\n/usr/local/sbin/cockpit-borg-action sources status\n/usr/local/sbin/cockpit-borg-action sources add /opt/stacks/wejos-wp"],
+  ["a pipe into sh -c without the helper", "journalctl -u borgmatic | grep x | sh -c cat"],
+  ["xargs -I@ with another command", "ls /tmp | xargs -I@ echo @"],
   ["notes and logs that mention the backups", "cat > /root/NOTIZ.md <<'EOF'\nAlte Dumps unter /var/backups nie per rm löschen\nEOF\necho \"borgmatic: create, dann prune\" | tee -a /var/log/cockpit.log"],
 ];
 
@@ -139,6 +143,18 @@ const needsApproval: Array<[string, string]> = [
   ["the helper through a python heredoc", "python3 - <<'PY'\nimport subprocess\nsubprocess.run(['/usr/local/sbin/cockpit-borg-action', 'sources', 'restore'])\nPY"],
   ["the helper as text piped into a shell", "echo '/usr/local/sbin/cockpit-borg-action repair' | sh"],
   ["the helper in a cron line", "echo '0 3 * * * root /usr/local/sbin/cockpit-borg-action sources restore' > /etc/cron.d/x"],
+  // Zweitpruefung t_0b3f7290 (Karte t_fd6dfaa4): Text auf einer Zeile, die den Helfer nennt,
+  // ueber eine Pipe oder eine Prozess-Substitution in eine Shell.
+  ["the helper named by ls, sed into bash", "ls /usr/local/sbin/cockpit-borg-action | sed 's/$/ sources disconnect/' | bash"],
+  ["the helper named by ls, awk into sh", "ls /usr/local/sbin/cockpit-borg-action | awk '{print $1\" sources restore\"}' | sh"],
+  ["the helper found by find -printf into sh", "find /usr/local/sbin -name 'cockpit-borg*' -printf '%p repair\\n' | sh"],
+  ["the helper named by command -v, sed into sh", "command -v cockpit-borg-action | sed 's/$/ repair/' | sh"],
+  ["the helper through bash and a process substitution", "bash <(echo '/usr/local/sbin/cockpit-borg-action repair')"],
+  ["the helper through source and a process substitution", "source <(echo '/usr/local/sbin/cockpit-borg-action repair')"],
+  // Hinweis H-a: der Wert von xargs -I/-i/--replace zaehlt wie {}.
+  ["the helper through xargs -I@ in the path", "ls /usr/local/sbin | grep borg | xargs -I@ /usr/local/sbin/@ repair"],
+  ["the helper through xargs -I @ in the path", "ls /usr/local/sbin | grep borg | xargs -I @ /usr/local/sbin/@ repair"],
+  ["the helper through xargs --replace=XX in the path", "ls /usr/local/sbin | grep borg | xargs --replace=XX /usr/local/sbin/XX repair"],
   // Hinweis H1: ein Argument in Quotes ueber das Zeilenende.
   ["sources add with a quoted argument over two lines", "/usr/local/sbin/cockpit-borg-action sources add '/opt/stacks/x\n- /etc'"],
   ["retention edit", "sed -i 's/keep_daily: 7/keep_daily: 1/' /etc/borgmatic/config.yaml"],

@@ -172,7 +172,11 @@ jedes `cd`-Ziel aufgelöst. Kommentare zählen nicht.
   Pfad; find-Filter `-name|-path|-regex`, der auf ihn passt) und weder die freie Direktform noch
   reines Lesen oder Textausgabe ist: `find … -exec {} …`, `xargs` auf einer Zeile, die ihn nennt,
   Inline-Code (`perl -e`, `python3 -c`, `ruby`, `node`, `php`, Heredoc für `python3 -`) mit seinem
-  Namen — gleich mit welchem Verb —, und ein Argument in Quotes über das Zeilenende neben ihm
+  Namen — gleich mit welchem Verb —, ein Argument in Quotes über das Zeilenende neben ihm, und
+  (seit 09.11.2026, Karte t_fd6dfaa4) eine Shell, ein Interpreter, `source` oder `at`, die Text
+  aus einer Pipe oder ein Skript, das der Plan nicht zeigt (`<(…)`), auf einer Zeile ausführen,
+  die ihn nennt (`ls <helfer> | sed 's/$/ repair/' | sh`, `bash <(echo '<helfer> repair')`); der
+  Wert von `xargs -I|-i|--replace` zählt dabei wie `{}` (`xargs -I@ /usr/local/sbin/@ repair`)
   (Einzelheiten `doc/setup/borg-maintenance.md`, „Riegel über Umwege“);
 - jede Änderung der Aufbewahrung: `keep_*`/`--keep-*`, `keepDaily|Weekly|Monthly`,
   `backup_keep_time` (GitLab), außerhalb eines reinen Lesebefehls;
@@ -222,7 +226,8 @@ jedes `cd`-Ziel aufgelöst. Kommentare zählen nicht.
   `BASH_ENV`/`LD_PRELOAD`/`BORG_*`, ein Skript, das der Lauf nicht selbst schreibt, ein
   Befehlsname oder Ziel aus einem unbekannten Wert (`$CMD`, `rm -rf "$X"`, `xargs`), ein
   Platzhalter als Befehlswort (`find … -exec {} …`, `xargs -I{} {}`; nennt die Zeile den
-  Backup-Helfer, ist es ein Riegel-Treffer), Inline-Code mit Prozessen oder Dateizugriffen.
+  Backup-Helfer, ist es ein Riegel-Treffer — ebenso für Code aus einer Pipe und ein ungezeigtes
+  Skript), Inline-Code mit Prozessen oder Dateizugriffen.
 
 **Frei** (weder Riegel noch Hinweis) bleiben die Routine und das Lesen: `systemctl start
 borgmatic.service`, ein nacktes `borgmatic` (konfigurierte Aufbewahrung),

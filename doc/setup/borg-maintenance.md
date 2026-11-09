@@ -379,8 +379,18 @@ Grenzen:
   `xargs` und der Rest von `find` nach einem `\;` sind ein Treffer, wenn die Zeile den Helfer nennt
   (`ls …/cockpit-borg-action | xargs -I{} {} …`). Ein Platzhalter als Befehlswort ohne den Helfer in
   der Zeile (`find /opt/app -exec {} \;`, `xargs -I{} {}`) ist ein Hinweis für den Türsteher
-  (`uncertain`), kein Treffer. Ein Argument in Quotes, das über das Zeilenende reicht, neben dem
-  Helfer ist ein Treffer (der Riegel liest jede Zeile für sich; Hinweis H1). Tests:
+  (`uncertain`), kein Treffer. **Nachtrag Zweitprüfung t_0b3f7290 (Karte t_fd6dfaa4, 09.11.2026):**
+  Dieselbe Zeilenregel gilt für eine Shell, einen Interpreter, `source`/`.` oder `at|batch`, die
+  Text aus einer Pipe ausführen (`ls …/cockpit-borg-action | sed 's/$/ sources disconnect/' | bash`,
+  `find /usr/local/sbin -name 'cockpit-borg*' -printf '%p repair\n' | sh`,
+  `command -v cockpit-borg-action | sed 's/$/ repair/' | sh`), und für eine Shell oder `source`
+  mit einem Skript, das der Plan nicht zeigt (`bash <(echo '…/cockpit-borg-action repair')`):
+  nennt die Zeile den Helfer, ist es ein Treffer, sonst bleibt es `uncertain`
+  (`journalctl -u borgmatic | grep x | sh -c cat` bleibt frei). Der Wert von `xargs -I`, `-i` oder
+  `--replace` zählt wie `{}`, also nennt `ls /usr/local/sbin | grep borg | xargs -I@ /usr/local/sbin/@
+  repair` den Helfer per Glob (Hinweis H-a). Der Preis: auch `cockpit-borg-action status | python3 -c …`
+  geht an Jochen — wer die Status-Ausgabe auswerten will, nimmt `grep`, `awk` oder `jq`.
+  Ein Argument in Quotes, das über das Zeilenende reicht, neben dem Helfer ist ein Treffer (der Riegel liest jede Zeile für sich; Hinweis H1). Tests:
   `apps/api/test/backup-guard.test.ts` (die sechs Fälle der Zweitprüfung und Varianten).
   Grenze, ehrlich: Ein Programm, das den Helfer weder nennt noch per Glob oder find-Filter trifft
   (Name aus Teilen zusammengesetzt, dekodiert, aus einer Datei gelesen), sieht der Riegel nicht;
