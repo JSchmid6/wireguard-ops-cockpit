@@ -87,6 +87,14 @@ const free: Array<[string, string]> = [
   ["t_d16c58d1: set -euo pipefail next to a filtered checksum", "set -euo pipefail\nsha256sum /usr/local/sbin/cockpit-borg-action | tee /tmp/h.txt"],
   ["t_d16c58d1: sed with another delimiter, no e or w", "/usr/local/sbin/cockpit-borg-action status | sed -n 's|a|b|p;1,5p'\nls /usr/local/sbin/cockpit-borg-action | sed -E 's,x,y,g;$d;q'"],
   ["t_d16c58d1: arithmetic without commands", "n=$(( 3 + 4 ))\n(( n > 2 )) && /usr/local/sbin/cockpit-borg-action status"],
+  // Karte t_2e391eba: im gekennzeichneten Plan bleibt Arithmetik mit Zahlen frei, ebenso test/[ mit -eq
+  // (Bash rechnet dort nicht), ${s:-x}, ${a[@]}, ${x@Q} und set -x ohne eigenes PS4.
+  ["t_2e391eba: arithmetic with numbers only", "ls -l /usr/local/sbin/cockpit-borg-action\necho $((1 + 2)) $((0x1f + 2#101))\n[[ 3 -gt 2 ]] && echo ok"],
+  ["t_2e391eba: test and [ with -eq on a value", "ls -l /usr/local/sbin/cockpit-borg-action\nn=$(wc -l < /etc/passwd)\n[ \"$n\" -eq 0 ] || test \"$n\" -gt 1"],
+  ["t_2e391eba: defaults, whole arrays, quoting, literal substrings", "ls -l /usr/local/sbin/cockpit-borg-action\ns=abc\necho \"${s:-x} ${t:+y} ${s: -1} ${s:1:2} ${a[@]} ${#a[@]} ${a[0]} ${PIPESTATUS[0]} ${s@Q}\""],
+  ["t_2e391eba: set -x without an own PS4", "ls -l /usr/local/sbin/cockpit-borg-action\nset -x\nsystemctl status borgmatic.timer"],
+  ["t_2e391eba: a quoted heredoc is not expanded", "ls -l /usr/local/sbin/cockpit-borg-action\ncat <<'EOF'\n$((z)) ${x@P}\nEOF"],
+  ["t_2e391eba: an unmarked plan keeps its arithmetic and prompt expansion", "for ((i=0; i<3; i++)); do echo $i; done\nx='\\u@\\h'\necho \"${x@P}\"\n/usr/local/sbin/cockpit-borg-action status"],
   ["the helper's status through a variable", "h=/usr/local/sbin/cockpit-borg-action\n$h status"],
 ];
 
@@ -261,6 +269,28 @@ const needsApproval: Array<[string, string]> = [
   ["G3: export, then printenv into sh", "export X=/usr/local/sbin/cockpit-borg-action\nprintenv X | sed 's/$/ repair/' | sh"],
   ["G4: export, then env into bash", "export X=/usr/local/sbin/cockpit-borg-action\nenv | sed -n 's/^X=//p' | sed 's/$/ repair/' | bash"],
   ["G10: compgen -c into a variable", "x=$(compgen -c | grep borg-action)\n$x repair"],
+  // Zweitpruefung t_f1b3ea8c (Karte t_2e391eba): im gekennzeichneten Plan ist jede Erweiterung, die
+  // Bash als Code auswertet, kein Filter: ${x@P}, PS0-PS4, Arithmetik auf einem Namen oder Wert.
+  ["P3: prompt expansion of a value over lines", "x='$(sh)'\necho '/usr/local/sbin/cockpit-borg-action repair' | echo \"${x@P}\""],
+  ["S6: prompt expansion of a value built from parts", "x='$'\ny='(sh)'\nz=$x$y\necho '/usr/local/sbin/cockpit-borg-action repair' | echo \"${z@P}\""],
+  ["P: prompt expansion in a heredoc", "x='$(sh)'\necho '/usr/local/sbin/cockpit-borg-action repair' | cat <<EOF\n${x@P}\nEOF"],
+  ["P6: PS4 with set -x", "PS4='$(sh) '\nset -x\necho '/usr/local/sbin/cockpit-borg-action repair' | cat"],
+  ["P8: PS4 through declare", "declare PS4='$(sh) '\nset -o xtrace\necho '/usr/local/sbin/cockpit-borg-action repair' | cat"],
+  ["PS4 through printf -v", "printf -v PS4 '%s' '$(sh) '\nset -x\necho '/usr/local/sbin/cockpit-borg-action repair' | cat"],
+  ["PS4 through read", "read -r PS4 <<< '$(sh) '\nset -x\necho '/usr/local/sbin/cockpit-borg-action repair' | cat"],
+  ["S1: arithmetic on a value built from parts", "x='a['\ny='$(sh)]'\nz=$x$y\necho '/usr/local/sbin/cockpit-borg-action repair' | echo $((z))"],
+  ["S2: arithmetic on a value from printf -v", "printf -v z '%s[%s]' a '$(sh)'\necho '/usr/local/sbin/cockpit-borg-action repair' | echo $((z))"],
+  ["S3: arithmetic on a value from tr", "z=$(echo 'a{$(sh)}' | tr '{}' '[]')\necho '/usr/local/sbin/cockpit-borg-action repair' | echo $((z))"],
+  ["S5: [[ z -eq 0 ]]", "x='a['\ny='$(sh)]'\nz=$x$y\necho '/usr/local/sbin/cockpit-borg-action repair' | [[ z -eq 0 ]]"],
+  ["S: $[z]", "x='a['\ny='$(sh)]'\nz=$x$y\necho '/usr/local/sbin/cockpit-borg-action repair' | echo $[z]"],
+  ["S: substring offset", "x='a['\ny='$(sh)]'\nz=$x$y\ns=abc\necho '/usr/local/sbin/cockpit-borg-action repair' | echo ${s:0:z}"],
+  ["S: array index from a name", "x='a['\ny='$(sh)]'\nz=$x$y\nread -ra b <<< '1 2'\necho '/usr/local/sbin/cockpit-borg-action repair' | echo ${b[z]}"],
+  ["S: compound array assignment", "x='a['\ny='$(sh)]'\nz=$x$y\necho '/usr/local/sbin/cockpit-borg-action repair' | { b=([z]=1); }"],
+  ["S: integer attribute", "x='a['\ny='$(sh)]'\nz=$x$y\ndeclare -i n\necho '/usr/local/sbin/cockpit-borg-action repair' | { n=$z; }"],
+  ["S: integer variable RANDOM", "x='a['\ny='$(sh)]'\nz=$x$y\necho '/usr/local/sbin/cockpit-borg-action repair' | RANDOM=$z"],
+  ["S: integer variable OPTIND through read", "x='a['\ny='$(sh)]'\nz=$x$y\necho '/usr/local/sbin/cockpit-borg-action repair' | { read -r -u 3 OPTIND 3<<< \"$z\"; }"],
+  ["S: test -v with a subscript from a name", "x='a['\ny='$(sh)]'\nz=$x$y\nread -ra b <<< '1 2'\necho '/usr/local/sbin/cockpit-borg-action repair' | test -v 'b[z]'"],
+  ["S: arithmetic in a heredoc", "x='a['\ny='$(sh)]'\nz=$x$y\necho '/usr/local/sbin/cockpit-borg-action repair' | cat <<EOF\n$((z))\nEOF"],
   ["price: the helper's checksum next to other work", "sha256sum /usr/local/sbin/cockpit-borg-action\napt-get update"],
   // Hinweis H1: ein Argument in Quotes ueber das Zeilenende.
   ["sources add with a quoted argument over two lines", "/usr/local/sbin/cockpit-borg-action sources add '/opt/stacks/x\n- /etc'"],
@@ -445,6 +475,13 @@ describe("backup bolt: needs the operator's approval", () => {
   it("counts a heredoc body line by its own line number", () => {
     const found = hits("cat > /tmp/x.sh <<'EOF'\necho start\nborg delete ::a\nEOF\nbash /tmp/x.sh");
     expect(found.some((hit) => hit.where === "S1:L3" && hit.kind === "backup")).toBe(true);
+  });
+
+  it("names the line where bash evaluates a value as code (t_2e391eba)", () => {
+    const run = "x='a['\ny='$(sh)]'\nz=$x$y\necho '/usr/local/sbin/cockpit-borg-action repair' | echo $((z))";
+    expect(hits(run)).toEqual([expect.objectContaining({ where: "S1:L4", kind: "backup", reason: expect.stringContaining("evaluate a value as code") })]);
+    const ps4 = hits("PS4='$(sh) '\nset -x\necho '/usr/local/sbin/cockpit-borg-action repair' | cat");
+    expect(ps4).toEqual([expect.objectContaining({ where: "S1:L1", reason: expect.stringContaining("PS4 decides which code runs") })]);
   });
 });
 

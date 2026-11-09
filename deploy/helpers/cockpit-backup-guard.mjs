@@ -583,6 +583,114 @@ function rebindBolt(line, segments, helperVars) {
   return null;
 }
 
+// Erweiterungen, die Bash als Code auswertet (Zweitprüfung t_f1b3ea8c, Karte
+// t_2e391eba). Die Allowlist urteilt über Befehlsnamen; Bash führt aber auch
+// einen Wert aus, der in einer solchen Erweiterung landet: ${x@P} macht aus
+// x='$(sh)' einen Befehl, PS4='$(sh)' läuft bei set -x vor jedem Befehl, und
+// Arithmetik rechnet einen Namen aus, dessen Wert a[$(sh)] ist — auch wenn
+// dieser Wert erst aus Teilen entsteht (z=$x$y). Im gekennzeichneten Plan ist
+// darum jede solche Stelle ein Treffer, außer sie rechnet nur mit Zahlen. In
+// echter Bash belegt (sonden/bash-real-arith-ctx.sh): $((…)), ((…)), $[…],
+// let, for ((…)), [[ … -eq … ]], ${s:off:len}, ein Index ${a[i]}/a[i]=, auch als
+// Name in unset, test -v, read, printf -v, declare; declare/local/typeset -i
+// und die Integer-Variablen RANDOM, SRANDOM, OPTIND, HISTCMD. Nicht: test/[ mit
+// -eq, printf %d, shift/exit/return, read -t/-n, ${A[$x]} bei assoziativen
+// Arrays (hier trotzdem ein Treffer, der Riegel kennt den Array-Typ nicht).
+const INTEGER_VARS = /^(?:RANDOM|SRANDOM|OPTIND|HISTCMD)$/;
+const DECLARERS = /^(?:export|local|declare|typeset|readonly)$/;
+const ARITH_COMPARE = /^-(?:eq|ne|lt|le|gt|ge)$/;
+const SAFE_PATH = /^PATH=(?:\/usr\/local\/sbin:\/usr\/local\/bin:\/usr\/sbin:\/usr\/bin:\/sbin:\/bin)?$/;
+// Nur Zahlen (auch 0x1f, 2#101) und Operatoren — kein Name, kein $.
+function arithLiteral(expr) {
+  return /^[\s\d+\-*/%()<>=!&|^~?:,"]*$/.test(String(expr).replace(/\b0[xX][0-9a-fA-F]+\b|\b\d+#[0-9A-Za-z@_]+/g, "0"));
+}
+function braceEnd(src, from) {
+  let depth = 1;
+  let i = from;
+  while (i < src.length && depth > 0) {
+    if (src[i] === "\\") { i += 2; continue; }
+    if (src[i] === "{") depth += 1;
+    else if (src[i] === "}") depth -= 1;
+    i += 1;
+  }
+  return i;
+}
+// Ein gebundener Name (Zuweisung, declare, read, printf -v, for …): bestimmt er,
+// welcher Code läuft, ist er eine Integer-Variable, oder rechnet sein Index?
+function boundNameCode(name) {
+  const base = name.replace(/\[[\s\S]*$/, "");
+  if (CODE_ENV.test(base)) return `${base} decides which code runs`;
+  if (INTEGER_VARS.test(base)) return `${base} is an integer variable: bash evaluates every value assigned to it as arithmetic`;
+  const index = name.match(/^[A-Za-z_]\w*\[([\s\S]*)\]$/);
+  if (index && !/^[@*]$/.test(index[1]) && !arithLiteral(index[1])) return `an array index (${clip(name, 60)}) that bash evaluates as arithmetic`;
+  return null;
+}
+// Text mit Erweiterungen (eine Zeile oder ein Heredoc-Körper, roh). Quotes
+// bleiben stehen: ein Treffer zu viel in '…' ist der Preis für einen Leser,
+// der keine Quote-Verschachtelung raten muss.
+function expansionCode(code) {
+  for (let i = code.indexOf("${"); i >= 0; i = code.indexOf("${", i + 2)) {
+    const body = code.slice(i + 2, braceEnd(code, i + 2) - 1);
+    if (/@P$/.test(body)) return "the prompt expansion ${…@P} runs a value as code";
+    const parts = body.match(/^([#!]?)([A-Za-z_]\w*|\d+|[@*])(\[[^\]]*\])?([\s\S]*)$/);
+    if (!parts) continue;
+    const [, , name, index, rest] = parts;
+    if (index) { const bound = boundNameCode(`${name}${index}`); if (bound) return bound; }
+    if (/^:?=/.test(rest)) { const bound = boundNameCode(name); if (bound) return `\${${name}:=…}: ${bound}`; }
+    if (/^:(?![-=?+])/.test(rest) && !rest.slice(1).split(":").every(arithLiteral)) return `the substring offset in \${${clip(body, 40)}} is arithmetic on a name or value`;
+  }
+  // Zusammengesetzte Zuweisung b=([i]=1): der Schlüssel rechnet wie ein Index.
+  for (const compound of code.matchAll(/([A-Za-z_]\w*)\+?=\(/g)) {
+    const inner = code.slice(compound.index + compound[0].length, parenEnd(code, compound.index + compound[0].length) - 1);
+    for (const key of inner.matchAll(/\[([^\]]*)\]\+?=/g)) { const bound = boundNameCode(`${compound[1]}[${key[1]}]`); if (bound) return bound; }
+  }
+  for (let i = code.indexOf("(("); i >= 0; i = code.indexOf("((", i + 2)) {
+    const end = parenEnd(code, i + 1);
+    const expr = code.slice(i + 2, Math.max(i + 2, end - 2));
+    if (!arithLiteral(expr)) return `arithmetic on a name or value ((${clip(expr, 40)})) — bash evaluates that value as code`;
+  }
+  for (let i = code.indexOf("$["); i >= 0; i = code.indexOf("$[", i + 2)) {
+    let depth = 1;
+    let j = i + 2;
+    for (; j < code.length && depth > 0; j += 1) { if (code[j] === "[") depth += 1; else if (code[j] === "]") depth -= 1; }
+    if (!arithLiteral(code.slice(i + 2, j - 1))) return "arithmetic on a name or value ($[…]) — bash evaluates that value as code";
+  }
+  for (const open of code.matchAll(/(?:^|[\s;&|(!{])\[\[(?=\s)/g)) {
+    const start = open.index + open[0].length;
+    const close = code.slice(start).search(/\s\]\](?=$|[\s;&|)])/);
+    const words = code.slice(start, close < 0 ? code.length : start + close).split(/\s+/).filter(Boolean);
+    for (let k = 0; k < words.length; k += 1) {
+      if (ARITH_COMPARE.test(words[k]) && !(arithLiteral(words[k - 1] ?? "x") && arithLiteral(words[k + 1] ?? "x"))) return `[[ … ${words[k]} … ]] compares arithmetically: bash evaluates a name or value there as code`;
+      if (words[k] === "-v") { const bound = boundNameCode((words[k + 1] ?? "").replace(/['"\\]/g, "")); if (bound) return bound; }
+    }
+  }
+  return null;
+}
+// Namen, die ein einfacher Befehl bindet, und das Integer-Attribut.
+function bindingCode(segment) {
+  const words = segment.words.map((word) => word.replace(/['"\\]/g, ""));
+  let i = 0;
+  while (i < words.length && KEYWORDS.test(words[i])) i += 1;
+  const head = words[i] ?? "";
+  const rest = words.slice(i + 1);
+  const names = segment.command.assignments.filter((assignment) => !SAFE_PATH.test(assignment)).map((assignment) => assignment.replace(/\+?=[\s\S]*$/, ""));
+  if (/^[A-Za-z_]\w*\[[\s\S]*\]\+?=/.test(head)) names.push(head.replace(/\]\+?=[\s\S]*$/, "]"));
+  if (DECLARERS.test(head)) {
+    if (rest.some((word) => /^-[A-Za-z]*i/.test(word))) return `${head} -i makes every assignment to the variable arithmetic`;
+    names.push(...rest.filter((word) => !/^[-+]/.test(word) && !SAFE_PATH.test(word)).map((word) => word.replace(/\+?=[\s\S]*$/, "")));
+  }
+  if (head === "let" && !rest.every(arithLiteral)) return "let evaluates a name or value as arithmetic";
+  if (/^(?:read|mapfile|readarray|unset)$/.test(head)) names.push(...rest.filter((word) => !word.startsWith("-")));
+  if (head === "for" || head === "select") names.push(rest[0] ?? "");
+  if (head === "getopts") names.push(rest[1] ?? "");
+  rest.forEach((word, index) => {
+    if (/^(?:printf|wait)$/.test(head) && /^-v|^-p$/.test(word)) names.push(word.length > 2 ? word.slice(2) : rest[index + 1] ?? "");
+    if (/^(?:test|\[)$/.test(head) && word === "-v") names.push(rest[index + 1] ?? "");
+  });
+  for (const name of names) { const bound = boundNameCode(name); if (bound) return bound; }
+  return null;
+}
+
 // Nennt der Plan den Helfer außerhalb seiner freien Formen? Frei sind nur die
 // Direktform (Befehlswort = Helfer, auch über die Shell-Form) und test/[/[[
 // (sie geben nichts aus). Alles andere — echo/printf mit dem Namen, ls,
@@ -614,6 +722,8 @@ function allowlistBolt(line, cwds, context, resolve, helperVars) {
   if (context.tainted) {
     const rebind = rebindBolt(line, segments, helperVars);
     if (rebind) return `a plan that names the backup helper outside its free forms may not rebind names or values; here: ${rebind}`;
+    const evaluated = expansionCode(line.code) || segments.map(bindingCode).find(Boolean);
+    if (evaluated) return `a plan that names the backup helper outside its free forms may not let bash evaluate a value as code; here: ${evaluated}`;
     for (const segment of segments) {
       const what = notAFilter(segment, cwds, context, resolve);
       if (what) return `a plan that names the backup helper outside its free forms (${context.tainted}) may only filter and store data on every line; here: ${what}`;
@@ -716,7 +826,7 @@ const BORGMATIC_VALUED = new Set(["-v", "--verbosity", "--syslog-verbosity", "--
 // Wertquellen, deren Ausgabe kein Ziel verstecken kann ($(date +%s), $(uname -r)).
 const BENIGN_PRODUCERS = new Set(["date", "uname", "nproc", "id", "whoami", "arch", "hostname", "lsb_release", "seq"]);
 // Umgebung, die bestimmt, welcher Code läuft.
-const CODE_ENV = /^(?:PATH|BASH_ENV|ENV|LD_PRELOAD|LD_LIBRARY_PATH|LD_AUDIT|PYTHONPATH|PYTHONSTARTUP|PYTHONHOME|PERL5LIB|PERL5OPT|PERLLIB|RUBYOPT|RUBYLIB|NODE_OPTIONS|NODE_PATH|PROMPT_COMMAND|SHELLOPTS|BASHOPTS|GLOBIGNORE|BASH_FUNC_\w*|BORG_\w+|BORGMATIC_\w+)$/;
+const CODE_ENV = /^(?:PATH|BASH_ENV|ENV|LD_PRELOAD|LD_LIBRARY_PATH|LD_AUDIT|PYTHONPATH|PYTHONSTARTUP|PYTHONHOME|PERL5LIB|PERL5OPT|PERLLIB|RUBYOPT|RUBYLIB|NODE_OPTIONS|NODE_PATH|PROMPT_COMMAND|PS[0-4]|SHELLOPTS|BASHOPTS|GLOBIGNORE|BASH_FUNC_\w*|BORG_\w+|BORGMATIC_\w+)$/;
 // Frei zu lesen (setzen nur Variablen).
 const SOURCE_OK = new Set(["/etc/os-release", "/usr/lib/os-release", "/etc/lsb-release"]);
 // Hier liegen installierte Programme; ein Pfad-Aufruf woandershin ist ein
@@ -788,7 +898,8 @@ function scanUnquoted(line) {
     if (char === "#" && (i === 0 || /[\s;&|()]/.test(line[i - 1]))) { commentAt = i; break; }
     if (arithmetic === 0 && char === "<" && line[i + 1] === "<" && line[i + 2] !== "<" && line[i - 1] !== "<") {
       const match = line.slice(i + 2).match(/^(-?)\s*(['"]?)\\?([A-Za-z_][\w.-]*)\2/);
-      if (match) { heredocs.push({ strip: match[1] === "-", word: match[3] }); i += 1 + match[0].length; }
+      // Ein Begrenzer in Quotes oder mit \ (<<'EOF', <<\EOF): Bash erweitert den Körper nicht.
+      if (match) { heredocs.push({ strip: match[1] === "-", word: match[3], quoted: match[2] !== "" || match[0].includes("\\") }); i += 1 + match[0].length; }
     }
   }
   return { heredocs, code: commentAt >= 0 ? line.slice(0, commentAt) : line };
@@ -843,7 +954,7 @@ function splitScript(prefix, text) {
         if ((doc.strip ? bodyLine.replace(/^\t+/, "") : bodyLine) === doc.word) { closed = true; break; }
         body.push({ id: bodyId, raw: bodyLine });
       }
-      const heredoc = { line, body, closed };
+      const heredoc = { line, body, closed, quoted: doc.quoted };
       line.heredocs.push(heredoc);
       heredocs.push(heredoc);
     }
@@ -1603,6 +1714,9 @@ function analyzeScript(prefix, text, context, hits, language = "shell") {
     const runnable = !printsOnly && (targets.length === 0 || Boolean(shebang) || targets.some((target) => runnableTarget(target, context)));
     for (const item of heredoc.body) {
       rawCheck(item.id, item.raw);
+      // Bash erweitert den Körper eines Heredocs ohne Quotes am Begrenzer wie eine Zeile.
+      const evaluated = context.tainted && !heredoc.quoted ? expansionCode(item.raw) : null;
+      if (evaluated) hit(item.id, "backup", `a plan that names the backup helper outside its free forms may not let bash evaluate a value as code; here (a here-document): ${evaluated}`, item.raw);
       const bolt = runnable ? codeBolt(item.raw) : (RETENTION_PHRASE.test(normalize(item.raw)) ? "changes the retention of the backups" : null);
       if (bolt) hit(item.id, "backup", `a file this run writes: ${bolt.replace(/^code that /, "")}`, item.raw);
       else if (TOKEN.test(normalize(item.raw)) || redirectOrPathTouches(normalize(item.raw))) hit(item.id, "mention", "a file this run writes names the backups", item.raw);

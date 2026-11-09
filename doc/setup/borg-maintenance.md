@@ -462,7 +462,8 @@ Grenzen:
   fallen F und A ohne eigene Regel: wer eine Datei, ein FIFO oder `tail -f` ausführt, braucht eine
   Shell, `xargs`, `less`, `ln`, `mkfifo` oder einen Befehlsnamen aus einem Wert — keiner davon ist ein
   Filter. Arithmetik: `$((…))`, `((…))` und Array-Indizes werden durchlaufen, jedes `$(…)`/`` `…` ``
-  darin wird ein eigener Befehl; ein Index mit `$(…)` in einem Argument (`printf -v`, `read`,
+  darin wird ein eigener Befehl (das allein reicht nicht: Bash rechnet auch den *Wert* eines Namens
+  aus — siehe Nachtrag t_2e391eba); ein Index mit `$(…)` in einem Argument (`printf -v`, `read`,
   `test -v`, `declare`) ist kein Filter, ebenso `mapfile -C`. `sed` wird positiv gelesen statt per
   Regex auf `/`: Optionen nur `-n -E -r -s -u -z -l`, `-e`/`--expression`, `--posix`, `--debug`,
   `--sandbox`; Programme nur Adressen (Zahl, `$`, `/re/`, `\cREc`, `first~step`, Bereiche, `!`),
@@ -486,6 +487,35 @@ Grenzen:
   Grenze, ehrlich: Ein Programm, das den Helfer weder nennt noch per Glob oder find-Filter trifft
   (Name aus Teilen zusammengesetzt, dekodiert, aus einer Datei gelesen), sieht der Riegel nicht;
   das bleibt Verschleierung und damit Sache des Türstehers (X4, `doc/setup/host-run.md` 2a).
+  **Nachtrag Zweitprüfung t_f1b3ea8c (Karte t_2e391eba, 09.11.2026): Erweiterungen, die Bash als
+  Code auswertet.** Die Plan-Allowlist urteilt über Befehlsnamen; Bash führt aber auch einen Wert
+  aus, der in bestimmten Erweiterungen landet. In echter Bash belegt, Riegel frei und Türsteher-Fokus
+  leer: (P) Prompt-Expansion `x='$(sh)'`⏎`echo '<helfer> repair' | echo "${x@P}"`, auch zerlegt
+  (`x='$'`, `y='(sh)'`, `z=$x$y`, `${z@P}`); (PS4) `PS4='$(sh) '`⏎`set -x`⏎`… | cat` — der Satz
+  „nichts bindet um“ stimmte damit nicht, PS4 fehlte in der Liste der Code-Variablen; (S) Arithmetik
+  auf einem Namen, dessen Wert `a[$(sh)]` erst aus Teilen entsteht (`z=$x$y`, `printf -v z …`, `tr`)
+  — „Arithmetik wird nach `$(…)` durchsucht“ galt nur für das wörtliche `$(…)`. Entscheidung: keine
+  Senkenliste, sondern **eine Regel** im gekennzeichneten Plan: jede Erweiterung, die Bash als Code
+  auswertet, ist kein Filter. Das sind `${…@P}`; die Zuweisung (auch `declare`, `export`, `read`,
+  `printf -v`, `for`, `${v:=…}`) an PS0–PS4 und die übrigen Code-Variablen sowie an die
+  Integer-Variablen RANDOM, SRANDOM, OPTIND, HISTCMD (Bash rechnet jeden Wert aus, belegt);
+  `declare`/`local`/`typeset -i`; und Arithmetik, die nicht nur Zahlen (auch `0x1f`, `2#101`) und
+  Operatoren enthält: `$((…))`, `((…))`, `$[…]`, `let`, `for ((…))`, `[[ … -eq|-ne|-lt|-le|-gt|-ge
+  … ]]`, `[[ -v a[i] ]]`, `${s:off:len}` (auch `${@:n}`), ein Index `${a[i]}`, `${#a[i]}`, `a[i]=`,
+  `b=([i]=…)` und als Name in `unset`, `test -v`, `read`, `printf -v`, `declare`/`local`. Ein Heredoc
+  ohne Quotes am Begrenzer wird wie eine Zeile gelesen; `<<'EOF'` erweitert nichts und bleibt frei.
+  Geprüft, was **nicht** rechnet (`sonden/bash-real-arith-ctx.sh`): `test`/`[` mit `-eq`, `printf
+  %d`, `shift`/`exit`/`return`/`break` mit Wert, `read -t/-n/-u`, `ulimit`, `mapfile -n/-s/-O`,
+  `${x@E}`/`@A`/`@Q`, SECONDS/LINENO und andere Sondervariablen — sie bleiben frei. Ein Index eines
+  assoziativen Arrays rechnet nicht; der Riegel kennt den Typ nicht und zählt ihn trotzdem. Der
+  Leser lässt Quotes stehen: `'$((x))'` in einem `awk`-Programm eines gekennzeichneten Plans ist ein
+  Treffer zu viel. **Preis (gemessen):** gegen bdd3c56 unverändert 5/15 (`probe-preis`), gegen
+  5c18e72 0/15 neu; frei bleiben im gekennzeichneten Plan `$((1 + 2))`, `[[ 3 -gt 2 ]]`, `[ "$n" -eq
+  0 ]`, `${s:-x}`, `${s: -1}`, `${a[@]}`, `${PIPESTATUS[0]}`, `${x@Q}`, `set -x` ohne eigenes PS4;
+  ein ungekennzeichneter Plan behält `for ((i=0; …))` und `${x@P}`. Sonden:
+  `/opt/data/out/t_2e391eba/sonden/probe-r5.mjs` (65 Fälle) und `bash-real-r5.mjs` (48 von 51
+  Treffer-Formen laufen in echter Bash; PS0, PS3 und `$((10#$z))` sind Treffer der Regel, ohne
+  dass sie hier liefen). Tests: `apps/api/test/backup-guard.test.ts` (P, PS4, S).
 * **Offene Entscheidung (05.11.2026, Karte t_5ce5f79f): Freigabe-Markierung im Helfer.** Erwogen:
   die schwächenden Verben (`sources connect|disconnect|restore`, `repair`) laufen in einer
   host-run-cgroup nur, wenn `cockpit-host-run` für genau diesen Job eine root-eigene Markierung

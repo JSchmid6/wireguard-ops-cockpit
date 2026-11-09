@@ -193,9 +193,16 @@ jedes `cd`-Ziel aufgelöst. Kommentare zählen nicht.
   freien Formen — frei sind nur die Direktform und `test`/`[`/`[[` auf ihn; `echo` seines Namens,
   `ls`/`stat`/`sha256sum` auf ihn, ein Glob, ein find-Filter, das Listen seines Verzeichnisses oder
   eine Variable mit seinem Namen sind es nicht —, muss **jede** Zeile filtern und Daten ablegen, und
-  nichts darf Namen oder Werte umbinden (Funktion, `alias`, `hash`, PATH/BASH_ENV/ENV, `${!…}`,
-  `declare -n`, `export` eines Helfer-Werts); Arithmetik `$((…))`/`((…))` und Array-Indizes werden
-  nach `$(…)` durchsucht, `sed` wird positiv gelesen (jeder Trenner, ohne `e`/`w`). Preis: ein Plan,
+  nichts darf Namen oder Werte umbinden (Funktion, `alias`, `hash`, PATH/BASH_ENV/ENV, PS0–PS4,
+  `${!…}`, `declare -n`, `export` eines Helfer-Werts); `sed` wird positiv gelesen (jeder Trenner,
+  ohne `e`/`w`). Seit Karte t_2e391eba (Zweitprüfung t_f1b3ea8c) lässt ein solcher Plan Bash auch
+  **keinen Wert als Code auswerten**: kein `${…@P}`, keine Zuweisung an PS0–PS4 (`set -x` führt PS4
+  aus) oder an die Integer-Variablen RANDOM/SRANDOM/OPTIND/HISTCMD, kein `declare`/`local`/`typeset
+  -i`, und Arithmetik — `$((…))`, `((…))`, `$[…]`, `let`, `for ((…))`, `[[ … -eq|-ne|-lt|-le|-gt|-ge
+  … ]]`, `${s:off:len}`, ein Index `${a[i]}`/`a[i]=`/`b=([i]=…)` auch in `unset`, `test -v`, `read`,
+  `printf -v`, `declare` — nur mit Zahlen; ein Name oder `$` darin ist ein Treffer, denn Bash rechnet
+  den Wert eines Namens aus und führt dabei ein `a[$(sh)]` darin aus, auch wenn der Wert erst aus
+  Teilen entsteht (`z=$x$y`). `test`/`[` mit `-eq` rechnen nicht und bleiben frei. Preis: ein Plan,
   der den Helfer so nennt und daneben fremde Arbeit tut (`sha256sum <helfer>` plus `apt-get
   upgrade`), geht an Jochen — dafür zwei Läufe (Einzelheiten `doc/setup/borg-maintenance.md`,
   „Riegel über Umwege“);
