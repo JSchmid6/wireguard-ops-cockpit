@@ -124,20 +124,52 @@ Routine: Paket-Updates aus den eingetragenen Quellen, Docker-Pulls, Kernel mit N
 GitLab-Stufen, Dienst-Neustarts.
 
 **Jedes ausgeführte Skript steht wörtlich im Plan** (05.11.2026, Befund X5 aus Job 26fb0860,
-Karte t_41cb8b49): Ein stündlicher root-Dienst führte ein Skript aus, das der Lauf nur per Hash
-festnagelte (`printf '<sha256>  /pfad' | sha256sum -c -`); die Unit-Datei stand per Heredoc
-wörtlich im Plan, das Skript nicht — der Türsteher sah einen Hash statt Code. Seitdem lehnt schon
-`parseHostRunManifest` (Planer-Stufe, also auch das Manifest aus dem Intent) einen Plan ab, in dem
-derselbe wörtliche Pfad per Prüfsumme festgenagelt (`sha*sum`, `b2sum`, `md5sum`, `shasum`,
-`cksum`, `openssl dgst` mit einem Hex-Digest im selben Schritt) **und** ausgeführt wird
-(`ExecStart=`-Zeile, Befehlswort, Shell/Interpreter/`source` mit dem Pfad, auch hinter `sudo`,
-`timeout`, `systemd-run` …), ohne dass ein Heredoc dieses Laufs ihn schreibt. Die Meldung nennt
-Pfad, Ausführungs- und Pin-Zeile; der Weg ist das Muster der Units: Inhalt per
-`cat > /pfad <<'EOF' … EOF` in den Lauf, eine Hash-Prüfung danach ist erlaubt. Bewusst eng: Ein
-geprüfter Download, der nur entpackt wird, und ein Skript ohne Hash bleiben frei; Code, den der
-Plan anders verbirgt (Pfad aus einer Variablen, Skript von anderswo), bleibt Fokus des Riegels
-(„content this plan does not show“) und X5 des Türstehers. Tests:
-`apps/api/test/host-run-visible-scripts.test.ts`.
+Karte t_41cb8b49; nachgeschärft 09.11.2026 nach Zweitprüfung t_740ac6ee, Karte t_11872429): Ein
+stündlicher root-Dienst führte ein Skript aus, das der Lauf nur per Hash festnagelte
+(`printf '<sha256>  /pfad' | sha256sum -c -`); die Unit-Datei stand per Heredoc wörtlich im Plan,
+das Skript nicht — der Türsteher sah einen Hash statt Code. Seitdem lehnt schon
+`parseHostRunManifest` (Planer-Stufe, also auch das Manifest aus dem Intent) einen Plan ab, der einen
+Pfad per Prüfsumme festnagelt und ausführt, ohne seinen Inhalt in diesem Lauf zu zeigen. Die Meldung
+nennt Pfad, Ausführungs- und Pin-Zeile (und ggf. die Zeile, die den Heredoc überschrieben hat); der
+Weg ist das Muster der Units: Inhalt per `cat > /pfad <<'EOF' … EOF` oder
+`install -m 0755 /dev/stdin /pfad <<'EOF' … EOF` in den Lauf, eine Hash-Prüfung danach ist erlaubt.
+Die Regel im Einzelnen (`hiddenPinnedScripts` in `apps/api/src/host-run.ts`):
+
+- **Pin** heißt echte Prüfung: ein Digest-Werkzeug (`sha*sum`, `b2sum`, `md5sum`, `shasum`,
+  `cksum`, `openssl dgst`) mit `-c`/`--check` (samt der Prüfsummenzeile, die der Lauf dafür schreibt,
+  auch relativ nach `cd`), oder ein Digest, der im selben Schritt mit einem Digest-Literal bzw. einer
+  Variablen verglichen wird (`[ "$(sha256sum /p | cut …)" = "$SOLL" ]`). Ein `sha256sum /pfad`, das
+  nur ausgibt, neben einem fremden Digest (`docker pull img@sha256:…`, Commit-ID) nagelt nichts fest.
+- **Ausgeführt** ist fail-safe (Entscheidung 09.11.2026): Ein festgenagelter Pfad gilt überall als
+  ausgeführt, wo er als Wort in einem Befehl steht — auch normalisiert (`/a//b`), relativ nach
+  `cd <abs>` (`./name`, `bash name`), in `ExecStart=`-Zeilen, in einer per `printf` geschriebenen Unit,
+  über eine Variable, als Kopie oder Symlink unter anderem Namen, in `$(…)`/`<(…)` oder in eine Shell
+  gepipt. Ausgenommen sind nur Befehle, die ihre Operanden nicht ausführen (`chmod`, `chown`, `stat`,
+  `test`/`[`, `ls`, `cat`, `rm`, `cp`, `mv`, `ln`, `install`, `curl`, `wget`, `tar`, `grep`, `cmp` …,
+  Liste `QUIET_COMMANDS`). Vor dem Befehl werden nur Schlüsselwörter und Wrapper ohne eigene
+  Argumente übersprungen; `sudo -u root /p`, `runuser -u x -- /p`, `su -c`, `flock`, `nsenter`,
+  `python3 -W ignore /p`, `awk -f`, `sh -c '/p'` gelten deshalb als Ausführung, weil das Wort nach dem
+  Wrapper kein stiller Befehl ist — nicht, weil jede Form einzeln erkannt würde. Preis: Ein Pfad in einer
+  `echo`-Meldung ohne Digest zählt auch; der Planer schreibt ihn dann anders.
+- **Geschrieben** zählt nur der letzte Schreibvorgang vor der Ausführung, und nur, wenn er den Inhalt
+  zeigt: `cat >`/`tee` mit Heredoc, `install … /dev/stdin <ziel>` mit Heredoc, `echo`/`printf` ohne
+  `$`/Backticks, eine Kopie eines so geschriebenen Skripts. Anhängen (`cat >>`, `tee -a`) an eine nicht
+  gezeigte Datei macht sie nicht sichtbar; ein späteres Überschreiben (`cp`, `mv`, `install`, `dd of=`,
+  `curl -o`, `wget -O`, `> /pfad`, `tar -x`/`unzip` in das Verzeichnis) hebt den Heredoc auf.
+- **Nicht unter der Regel** (Entscheidung 09.11.2026, sonst belohnt sie das Weglassen der Prüfung —
+  ohne Hash wäre der Plan frei): ein Programm, das dieser Lauf selbst lädt (`curl -o`, `wget -O`) und
+  prüft, sofern es kein Skript ist (Endung `.sh`, `.py` … oder Aufruf über Shell/Interpreter — ein
+  Skript lässt sich zeigen); und die vom Deploy installierten Cockpit-Helfer
+  (`/usr/local/sbin/cockpit-*`, `/usr/local/lib/wireguard-ops-cockpit/cockpit-*`), deren
+  Integritätsprüfung vor dem Aufruf erwünscht ist, solange der Lauf sie nicht überschreibt. Beide bleiben
+  wie vorher Fokus des Riegels und Sache des Türstehers.
+
+Ein geprüfter Download, der nur entpackt wird, und ein Skript ohne Hash bleiben frei; Code, den der
+Plan anders verbirgt (Skript von anderswo ohne Pin, Pfad aus nicht gezeigten Werten), bleibt Fokus des
+Riegels („content this plan does not show“) und X5 des Türstehers. Die Regel ist eine Planer-Hilfe, kein
+Schloss: Sie lehnt nur zusätzlich ab, der Türsteher liest jeden Lauf weiterhin selbst. Tests:
+`apps/api/test/host-run-visible-scripts.test.ts` (alle Fälle der Probe aus t_740ac6ee, plus die
+aufgezeichneten Pläne vom 10.10.2026 als Fehlalarm-Gegenprobe).
 
 ## 2a. Backup-Riegel: Backups löschen nur mit Freigabe
 

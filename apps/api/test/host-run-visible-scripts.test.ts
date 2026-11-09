@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -128,5 +130,136 @@ describe("hash-pinned scripts the run does not show", () => {
 
   it("tells the planner the rule", () => {
     expect(hostRunPlannerContract()).toMatch(/Every script the run executes .* must appear literally .*heredoc.*Pinning it only by hash .* is refused before review/);
+  });
+});
+
+// Befund t_740ac6ee (Zweitprüfung PR #72), Nacharbeit t_11872429: every case of
+// the probe /opt/data/out/t_740ac6ee/probe-run.ts. Step 1 pins the script,
+// step 2 runs it in the shown form.
+describe("hash-pinned scripts: fail safe recognition (Befund t_740ac6ee)", () => {
+  const P = "/opt/x/run.sh";
+  const pin = `echo "${HASH}  ${P}" | sha256sum -c -`;
+  const hidden = (...runs: string[]) => hiddenPinnedScripts(manifest(runs.map((run, index) => ({ name: `s${index + 1}`, run }))) as never);
+
+  const runForms: Record<string, string> = {
+    "sh -c": `sh -c '${P} --flag'`,
+    "ExecStart sh -c": `ExecStart=/bin/sh -c '${P}'`,
+    "sudo -u": `sudo -u root ${P}`,
+    "runuser -u --": `runuser -u nobody -- ${P}`,
+    "su -c": `su -c ${P}`,
+    "flock lock": `flock /run/x.lock ${P}`,
+    "python -W": `python3 -W ignore ${P}`,
+    "perl -I": `perl -I /opt/lib ${P}`,
+    "awk -f": `awk -f ${P} /etc/passwd`,
+    "fish": `fish ${P}`,
+    "relative after cd": `cd /opt/x && ./run.sh`,
+    "bare name after cd": `cd /opt/x\nbash run.sh`,
+    "double slash": `/opt/x//run.sh`,
+    "comment trick": `: '#' ; ${P}`,
+    "printf unit": `printf '[Service]\\nExecStart=${P}\\n' > /etc/systemd/system/x.service`,
+    "plain": `${P}`,
+    "env": `env -i FOO=1 ${P}`,
+    "nsenter": `nsenter -t 1 -m ${P}`,
+    "xargs": `echo a | xargs ${P}`,
+    "find -exec": `find /tmp -name x -exec ${P} {} \;`,
+    "piped into a shell": `cat ${P} | bash`,
+    "process substitution": `bash <(cat ${P})`,
+    "command substitution as command": `$(cat ${P})`,
+    "eval": `eval "$(cat ${P})"`,
+    "variable": `RUN=${P}\n"$RUN"`,
+    "copy under another name": `cp ${P} /usr/local/bin/x\n/usr/local/bin/x`,
+    "symlink": `ln -s ${P} /usr/local/bin/x\n/usr/local/bin/x`,
+    "cat into another file": `cat ${P} > /tmp/y\nbash /tmp/y`,
+    "exec": `exec ${P}`,
+    "dot": `. ${P}`,
+    "piped into sudo bash": `cat ${P} | sudo bash`,
+    "sh -c with substitution": `sh -c "$(cat ${P})"`,
+  };
+  for (const [label, run] of Object.entries(runForms)) {
+    it(`recognises the run form: ${label}`, () => {
+      expect(hidden(pin, run).map((item) => item.path)).toHaveLength(1);
+    });
+  }
+
+  it("refuses sudo -u in the planner stage (the doc's \"behind sudo\")", () => {
+    expect(() => parseHostRunManifest(plan(manifest([{ name: "pin", run: pin }, { name: "run", run: `sudo -u root ${P}` }])))).toThrow(/only pins by hash/);
+  });
+
+  it("does not count an append to an unseen file as written (cat >> … <<EOF)", () => {
+    expect(hidden(`cat >> ${P} <<'EOF'\n# x\nEOF\n${pin}\n${P}`)).toEqual([{ path: P, pinnedAt: "S1:L4", executedAt: "S1:L5" }]);
+  });
+
+  it("keeps an append to a script this run wrote literally", () => {
+    expect(hidden(`cat > ${P} <<'EOF'\necho hi\nEOF\ncat >> ${P} <<'EOF'\necho more\nEOF\n${pin}\n${P}`)).toEqual([]);
+  });
+
+  for (const overwrite of [`cp /srv/other.sh ${P}`, `mv /srv/other.sh ${P}`, `install -m 0755 /srv/other.sh ${P}`, `curl -fsSLo ${P} https://example.org/x.sh`, `wget -O ${P} https://example.org/x.sh`, `cat /srv/other.sh > ${P}`, `cp /srv/run.sh /opt/x/`, `tar -xzf /srv/x.tgz -C /opt/x`]) {
+    it(`takes the heredoc back when the run overwrites it afterwards: ${overwrite}`, () => {
+      expect(hidden(`cat > ${P} <<'EOF'\necho hi\nEOF\n${overwrite}\n${pin}\n${P}`)).toEqual([{ path: P, pinnedAt: "S1:L5", executedAt: "S1:L6", overwrittenAt: "S1:L4" }]);
+    });
+  }
+
+  it("names the overwrite in the planner stage", () => {
+    expect(() => parseHostRunManifest(plan(manifest([{ name: "s", run: `cat > ${P} <<'EOF'\necho hi\nEOF\ncp /srv/other.sh ${P}\n${pin}\n${P}` }])))).toThrow(/overwritten at S1:L4/);
+  });
+
+  it("counts install -m 0755 /dev/stdin <path> with a heredoc as written literally", () => {
+    expect(hidden(`install -m 0755 /dev/stdin ${P} <<'EOF'\necho hi\nEOF\n${pin}\n${P}`)).toEqual([]);
+    expect(hidden(`install -m 0755 -o root -g root /dev/stdin ${P} <<'EOF'\necho hi\nEOF\n${pin}\nsudo -u root ${P}`)).toEqual([]);
+  });
+
+  it("counts tee with a heredoc and a literal printf as written, a copy of a literal script as visible", () => {
+    expect(hidden(`tee ${P} >/dev/null <<'EOF'\necho hi\nEOF\n${pin}\n${P}`)).toEqual([]);
+    expect(hidden(`printf '#!/bin/sh\\necho hi\\n' > ${P}\n${pin}\n${P}`)).toEqual([]);
+    expect(hidden(`cat > /tmp/run.sh <<'EOF'\necho hi\nEOF\ninstall -m 0755 /tmp/run.sh ${P}\n${pin}\n${P}`)).toEqual([]);
+  });
+
+  it("does not take a printf with expansion as literal content", () => {
+    expect(hidden(`printf '%s\\n' "$BODY" > ${P}\n${pin}\n${P}`)).toHaveLength(1);
+  });
+
+  it("leaves commands that do not run the pinned file alone", () => {
+    expect(hidden(pin, `chmod 0755 ${P}\nchown root:root ${P}\nstat ${P}\ntest -x ${P}\n[ -f ${P} ] && ls -l ${P}\nrm -f ${P}\ncp ${P} /var/backups/run.sh.bak`)).toEqual([]);
+  });
+
+  it("does not count an informational sha256sum next to an unrelated digest as a pin (docker pull img@sha256)", () => {
+    expect(hidden(`docker pull img@sha256:${HASH}\nsha256sum /usr/local/bin/tool\n/usr/local/bin/tool --version`)).toEqual([]);
+  });
+
+  it("counts a checksum file the run writes and checks as a pin", () => {
+    expect(hidden(`cat > /tmp/sums <<'EOF'\n${HASH}  ${P}\nEOF\nsha256sum -c /tmp/sums`, P)).toEqual([{ path: P, pinnedAt: "S1:L2", executedAt: "S2:L1" }]);
+  });
+
+  it("counts a pin relative to cd", () => {
+    expect(hidden(`cd /opt/x && echo "${HASH}  run.sh" | sha256sum -c -`, P)).toEqual([{ path: P, pinnedAt: "S1:L1", executedAt: "S2:L1" }]);
+  });
+
+  it("does not refuse a release binary this run downloads and checks (no reason to drop the hash)", () => {
+    const run = `curl -fsSLo /usr/local/bin/restic https://example.org/restic\necho "${HASH}  /usr/local/bin/restic" | sha256sum -c -\nchmod +x /usr/local/bin/restic\n/usr/local/bin/restic version`;
+    expect(hidden(run)).toEqual([]);
+    expect(parseHostRunManifest(plan(manifest([{ name: "restic", run }])))?.steps).toHaveLength(1);
+    expect(hidden(`wget -qO /usr/local/bin/tool https://example.org/tool\necho "${HASH}  /usr/local/bin/tool" | sha256sum -c -\n/usr/local/bin/tool --version`)).toEqual([]);
+  });
+
+  it("still refuses a downloaded script: its code can be shown", () => {
+    expect(hidden(`curl -fsSLo /tmp/install.sh https://example.org/install.sh\necho "${HASH}  /tmp/install.sh" | sha256sum -c -\nbash /tmp/install.sh`)).toHaveLength(1);
+    expect(hidden(`curl -fsSLo /tmp/installer https://example.org/installer\necho "${HASH}  /tmp/installer" | sha256sum -c -\nsh /tmp/installer`)).toHaveLength(1);
+  });
+
+  it("does not refuse the integrity check of a Cockpit helper the deploy installed", () => {
+    const run = `echo "${HASH}  /usr/local/sbin/cockpit-borg-retention" | sha256sum -c -\n/usr/local/sbin/cockpit-borg-retention status`;
+    expect(hidden(run)).toEqual([]);
+    expect(parseHostRunManifest(plan(manifest([{ name: "helper", run }])))?.steps).toHaveLength(1);
+  });
+
+  it("leaves the recorded plans of 10.10.2026 alone (a git commit id on a git line is no checksum)", () => {
+    const recorded = JSON.parse(readFileSync(new URL("./fixtures/host-run-plans-2026-10-10.json", import.meta.url), "utf8")) as Record<string, { manifest: { steps: never[]; checks?: never[] } }>;
+    for (const [name, { manifest: value }] of Object.entries(recorded)) {
+      expect(hiddenPinnedScripts({ steps: value.steps, checks: value.checks || [] }), name).toEqual([]);
+    }
+  });
+
+  it("refuses a deployed helper's path once the run overwrites it with content it does not show", () => {
+    expect(hidden(`cp /tmp/x /usr/local/sbin/cockpit-borg-retention\necho "${HASH}  /usr/local/sbin/cockpit-borg-retention" | sha256sum -c -\n/usr/local/sbin/cockpit-borg-retention status`)).toHaveLength(1);
   });
 });

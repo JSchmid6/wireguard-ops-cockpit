@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { posix } from "node:path";
 
 import type { ExecutionReview } from "@wireguard-ops-cockpit/domain";
 
@@ -121,93 +122,372 @@ function script(value: unknown, where: string): string {
 // service ran a script whose source was not in the review material. The
 // planner stage refuses such a plan; the fix is the pattern the units already
 // use — write the script literally in a heredoc in this run, a hash check may
-// follow. Deterministic and narrow on purpose: it fires only where a hash pin
-// and an execution name the same literal path. Other code the plan does not
-// show (variables, a script from elsewhere) stays the guard's focus
-// ("content this plan does not show") and the doorkeeper's X5.
+// follow.
+//
+// Fail safe since t_11872429 (Befund t_740ac6ee): a pinned path counts as
+// executed wherever it appears as a word, unless the command of that segment
+// is on a short list of commands that do not run their operands (chmod, stat,
+// cp, ln, rm, curl -o …). Recognising every way to run a file (sh -c, sudo -u,
+// runuser --, flock, nsenter, python3 -W, awk -f, ./name after cd …) was the
+// gap. A pin is a real check only (-c/--check, or a digest compared with a
+// digest literal or variable), and "written" means: the run's last write of the
+// path shows its content (cat >, tee, install /dev/stdin with a heredoc, echo or
+// printf without expansion); appending to an unseen file or overwriting it
+// afterwards (cp, mv, install, curl -o, tar -x …) takes that back. Out of scope
+// on purpose, so the rule never rewards dropping a hash check: a program this
+// run downloads and checks (a binary, not a script), and the Cockpit helpers the
+// deploy installs (/usr/local/sbin/cockpit-*); calling them stays the
+// doorkeeper's focus as before. Code the plan hides otherwise (variables, a
+// script from elsewhere without a pin) stays the guard's focus ("content this
+// plan does not show") and the doorkeeper's X5. Decision: doc/setup/host-run.md.
 
-const DIGEST_TOOL = /\b(?:sha(?:1|224|256|384|512)sum|b2sum|md5sum|shasum|cksum)\b|\bopenssl\s+dgst\b/;
+const DIGEST_COMMAND = /^(?:sha(?:1|224|256|384|512)sum|b2sum|md5sum|shasum|cksum)$/;
 const DIGEST = /\b[0-9a-fA-F]{32,128}\b/;
+const CHECKSUM_ENTRY = /^\s*[0-9a-fA-F]{32,128}\s+\*?\S+\s*$/;
 const ABSOLUTE_PATH = /(?<![\w.~$-])\/[A-Za-z0-9._+@%/-]*[A-Za-z0-9_+@%-]/g;
-const SHELL_WORDS = /^(?:sh|bash|dash|zsh|ksh|ash|busybox|python[\d.]*|perl[\d.]*|ruby[\d.]*|node|nodejs|php[\d.]*|lua[\d.]*|Rscript|pwsh|source|\.)$/;
-const WRAPPERS = /^(?:if|elif|while|until|sudo|exec|env|nice|ionice|nohup|setsid|stdbuf|chrt|time|timeout|flock|systemd-run|systemd-cat|runuser|chroot|xargs)$/;
+const RELATIVE_PATH = /(?<![\w/.~$-])\.\.?\/[A-Za-z0-9._+@%/-]*[A-Za-z0-9_+@%-]/g;
+const SHELL_WORDS = /^(?:sh|bash|dash|zsh|ksh|mksh|ash|fish|csh|tcsh|busybox|python[\d.]*|perl[\d.]*|ruby[\d.]*|node|nodejs|php[\d.]*|lua[\d.]*|Rscript|pwsh|awk|gawk|mawk|nawk|source|\.)$/;
+const SCRIPT_FILE = /\.(?:sh|bash|zsh|ksh|fish|py|pl|rb|js|mjs|cjs|php|lua|ps1|awk|r)$/i;
+// Words in front of the command: keywords and wrappers that run what follows.
+// Their own option arguments (sudo -u root) are not skipped: "root" then is
+// the command, which is not on the quiet list, so the segment counts as running.
+const PREFIX_WORDS = /^(?:if|elif|while|until|then|do|else|!|\{|time|sudo|doas|exec|command|builtin|env|nice|ionice|nohup|setsid|stdbuf|chrt|timeout|systemd-run|systemd-cat|xargs)$/;
+// Commands that do not run their operands. Anything else, including an unknown
+// command, counts as running a pinned path it names.
+const QUIET_COMMANDS = /^(?:chmod|chown|chgrp|stat|test|\[|\[\[|ls|cat|rm|cp|mv|install|touch|file|du|readlink|realpath|ln|grep|egrep|fgrep|diff|cmp|head|tail|wc|cut|mkdir|rmdir|dirname|basename|cd|curl|wget|tar|unzip|gpg|gpgv|openssl|sha(?:1|224|256|384|512)sum|b2sum|md5sum|shasum|cksum)$/;
+const DEPLOYED_HELPER = /^\/usr\/local\/(?:sbin\/cockpit-[a-z0-9-]+|lib\/wireguard-ops-cockpit\/cockpit-[a-z0-9-]+(?:\.mjs)?)$/;
 
 export interface HiddenPinnedScript {
   path: string;
   pinnedAt: string;
   executedAt: string;
+  // Set when a heredoc wrote the script but a later step replaced or appended
+  // content the plan does not show.
+  overwrittenAt?: string;
 }
 
-function unquote(word: string): string {
-  return word.replace(/^['"]+|['"]+$/g, "");
+interface Segment {
+  text: string;
+  words: string[];
+  command: string;
+  // Command of the enclosing $( … ), <( … ) or ` … `: null at top level, "" for
+  // an assignment (VAR=$(…) only captures output).
+  enclosing: string | null;
+  pipedInto: string | null;
 }
 
-function pathsOn(line: string): string[] {
-  return (line.match(ABSOLUTE_PATH) || []).filter((path) => !DIGEST_TOOL.test(path.split("/").pop() || ""));
+function basename(word: string): string {
+  return word.split("/").pop() || word;
 }
 
-// The file a command line runs: the command word, the script of a shell or an
-// interpreter, the program behind a wrapper (sudo, env, timeout, systemd-run …).
-function executedPaths(line: string): string[] {
-  const exec = line.match(/^\s*Exec[A-Za-z]*\s*=\s*[-@:+!|]*(.*)$/);
-  const code = exec ? exec[1] : line.replace(/(^|\s)#.*$/, "");
-  const found: string[] = [];
-  for (const segment of code.split(/&&|\|\||[;&|`]|\$\(|\(|\)|\bthen\b|\bdo\b|\belse\b/)) {
-    const words = segment.trim().split(/\s+/).filter(Boolean).map(unquote);
-    let i = 0;
-    while (i < words.length) {
-      const word = words[i];
-      const base = word.split("/").pop() || word;
-      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word) || word.startsWith("-") || /^\d+[smhd]?$/.test(word) || word === "!") { i += 1; continue; }
-      if (WRAPPERS.test(base)) { i += 1; continue; }
-      if (SHELL_WORDS.test(base)) {
-        const script = words.slice(i + 1).find((arg) => !arg.startsWith("-"));
-        if (words.slice(i + 1).some((arg) => /^-[a-zA-Z]*c$|^-e$|^--eval$/.test(arg))) break;
-        if (script?.startsWith("/")) found.push(script);
-        break;
-      }
-      if (word.startsWith("/")) found.push(word);
-      break;
-    }
+function wordsOf(text: string): string[] {
+  return text.trim().split(/\s+/).map((word) => word.replace(/['"]/g, "")).filter(Boolean);
+}
+
+function commandOf(words: string[]): string {
+  for (const word of words) {
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word) || word.startsWith("-") || /^\d+[smhd]?$/.test(word) || PREFIX_WORDS.test(basename(word))) continue;
+    return basename(word);
   }
-  return found;
+  return "";
 }
 
-// Paths a heredoc in this run writes (cat > /p <<'EOF', cat <<EOF >/p, tee [-a] /p <<EOF).
-function heredocTargets(line: string): string[] {
-  if (!/<<-?\s*['"]?\w/.test(line)) return [];
-  const targets: string[] = [];
-  for (const match of line.matchAll(/>>?\s*['"]?(\/[^\s'";|&<>]+)/g)) targets.push(match[1]);
-  const tee = line.match(/\btee\b((?:\s+-\S+)*)((?:\s+['"]?\/[^\s'";|&<>]+['"]?)+)/);
-  if (tee) targets.push(...tee[2].trim().split(/\s+/).map(unquote));
-  return targets;
+// The command around a substitution: the segment's command, "" when the segment
+// only assigns (VAR=$(…)), "$(" when the substitution itself is the command.
+function enclosingOf(text: string): string {
+  const words = wordsOf(text);
+  return words.length ? commandOf(words) : "$(";
 }
 
-export function hiddenPinnedScripts(manifest: Pick<HostRunManifest, "steps" | "checks">): HiddenPinnedScript[] {
+// Simple commands of one line, split at ; & && || | ( ) $( <( >( and backticks.
+// Quotes are not parsed: a separator inside quotes only splits more, and every
+// piece still counts as running unless its own command is quiet.
+function segmentsOf(line: string): Segment[] {
+  const exec = line.match(/^\s*Exec[A-Za-z]*\s*=\s*[-@:+!|]*(.*)$/);
+  const code = exec ? exec[1] : line;
+  const raw: Array<{ text: string; enclosing: string | null; sep: string }> = [];
+  const stack: Array<string | null> = [];
+  let current = "";
+  let backtick = false;
+  const top = (): string | null => (stack.length ? stack[stack.length - 1] : null);
+  const close = (sep: string) => { raw.push({ text: current, enclosing: top(), sep }); current = ""; };
+  for (let i = 0; i < code.length; i += 1) {
+    const ch = code[i];
+    const two = code.slice(i, i + 2);
+    if (two === "&&" || two === "||") { close(two); i += 1; continue; }
+    if (two === "$(" || two === "<(" || two === ">(") {
+      const outer = enclosingOf(current);
+      close(two);
+      stack.push(outer);
+      i += 1;
+      continue;
+    }
+    if (ch === "`") {
+      if (backtick) { close(ch); stack.pop(); } else { const outer = enclosingOf(current); close(ch); stack.push(outer); }
+      backtick = !backtick;
+      continue;
+    }
+    if (ch === "(") { close(ch); stack.push(top()); continue; }
+    if (ch === ")") { close(ch); stack.pop(); continue; }
+    if (ch === "&" && (code[i - 1] === ">" || code[i - 1] === "<" || code[i + 1] === ">")) { current += ch; continue; }
+    if (ch === ";" || ch === "|" || ch === "&") { close(ch); continue; }
+    current += ch;
+  }
+  close("");
+  return raw.map((item, index) => {
+    const words = wordsOf(item.text);
+    const next = item.sep === "|" ? raw[index + 1] : undefined;
+    return { text: item.text, words, command: commandOf(words), enclosing: item.enclosing, pipedInto: next ? commandOf(wordsOf(next.text)) : null };
+  }).filter((segment) => segment.words.length);
+}
+
+function quiet(command: string, text: string): boolean {
+  return QUIET_COMMANDS.test(command) || (/^(?:echo|printf)$/.test(command) && DIGEST.test(text));
+}
+
+// A segment that names a pinned path runs it unless its command is quiet, its
+// output is not piped into a shell and it is not inside $( … ) of a command that
+// would run that output.
+function runs(segment: Segment): boolean {
+  if (segment.pipedInto !== null && SHELL_WORDS.test(segment.pipedInto)) return true;
+  if (segment.enclosing && !quiet(segment.enclosing, "")) return true;
+  return !quiet(segment.command, segment.text);
+}
+
+function resolve(path: string, cwd: string | null): string | null {
+  if (path.startsWith("/")) return posix.normalize(path);
+  return cwd ? posix.normalize(posix.join(cwd, path)) : null;
+}
+
+function pathsIn(text: string, cwd: string | null): string[] {
+  const found = (text.match(ABSOLUTE_PATH) || []).map((path) => posix.normalize(path));
+  if (cwd) {
+    for (const rel of text.match(RELATIVE_PATH) || []) found.push(posix.normalize(posix.join(cwd, rel)));
+    for (const word of text.split(/[\s'"=]+/)) if (/^[A-Za-z0-9_+@%][A-Za-z0-9._+@%-]*$/.test(word)) found.push(posix.join(cwd, word));
+  }
+  return found.filter((path) => !DIGEST_COMMAND.test(basename(path)));
+}
+
+// Non-option operands; options listed in withArgument take the next word.
+function operands(words: string[], withArgument: RegExp): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < words.length; i += 1) {
+    if (words[i] === "--") { out.push(...words.slice(i + 1)); break; }
+    if (words[i].startsWith("-")) { if (withArgument.test(words[i])) i += 1; continue; }
+    out.push(words[i]);
+  }
+  return out;
+}
+
+function optionValue(words: string[], short: RegExp, long: string): string | undefined {
+  for (let i = 0; i < words.length; i += 1) {
+    if (words[i].startsWith(`${long}=`)) return words[i].slice(long.length + 1);
+    if (words[i] === long || short.test(words[i])) return words[i + 1];
+  }
+  return undefined;
+}
+
+type Write = { path: string; kind: "visible" | "download" | "hidden" | "append" | "tree"; from?: string[] };
+
+// Words without redirections (>/dev/null, 2>&1, <<'EOF', "> /path").
+function plainWords(words: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < words.length; i += 1) {
+    if (/^\d*(?:>>?|<<?-?|&>|>\|)$/.test(words[i])) { i += 1; continue; }
+    if (/^\d*[<>&]/.test(words[i])) continue;
+    out.push(words[i]);
+  }
+  return out;
+}
+
+// What a top-level segment writes. heredoc: the line opens a heredoc, so the
+// written content is the literal body that follows.
+function writesOf(segment: Segment, heredoc: boolean, cwd: string | null): Write[] {
+  const out: Write[] = [];
+  const add = (path: string | undefined, kind: Write["kind"]) => {
+    const resolved = path ? resolve(path, cwd) : null;
+    if (resolved) out.push({ path: resolved, kind });
+  };
+  const command = segment.command;
+  const index = segment.words.findIndex((word) => basename(word) === command);
+  const args = index >= 0 ? plainWords(segment.words.slice(index + 1)) : [];
+  const literalText = /^(?:echo|printf)$/.test(command) && !/[$`]/.test(segment.text);
+  for (const match of segment.text.matchAll(/(?:^|[^<>&\d])\d*(>>|>\|?|&>)\s*['"]?([^\s'";|&<>()]+)/g)) {
+    const append = match[1] === ">>";
+    if (match[2] === "/dev/null") continue;
+    if ((heredoc && command === "cat") || literalText) add(match[2], append ? "append" : "visible");
+    else if (!append && /^(?:curl|wget)$/.test(command)) add(match[2], "download");
+    else if (command === "cat" && !append) {
+      // cat /pinned > /other copies the pinned file under another name.
+      const into = resolve(match[2], cwd);
+      if (into) out.push({ path: into, kind: "hidden", from: operands(args, /^$/).map((source) => resolve(source, cwd)).filter((source): source is string => Boolean(source)) });
+    } else add(match[2], "hidden");
+  }
+  if (command === "tee") {
+    const append = args.some((word) => /^-[A-Za-z]*a|^--append$/.test(word));
+    for (const path of operands(args, /^$/)) add(path, heredoc ? (append ? "append" : "visible") : "hidden");
+  } else if (/^(?:install|cp|mv|ln|rsync)$/.test(command)) {
+    if (command === "install" && args.some((word) => /^-[A-Za-z]*d|^--directory$/.test(word))) return out;
+    const files = operands(args, command === "install" ? /^-[A-Za-z]*[mogtS]$|^--(?:mode|owner|group|target-directory|suffix)$/ : /^-[A-Za-z]*[tS]$|^--(?:target-directory|suffix)$/);
+    const target = optionValue(args, /^-[A-Za-z]*t$/, "--target-directory");
+    const destination = target ?? files.pop();
+    if (!destination) return out;
+    if (command === "install" && heredoc && files.includes("/dev/stdin")) { add(destination, "visible"); return out; }
+    const sources = files.map((source) => resolve(source, cwd)).filter((source): source is string => Boolean(source));
+    const into = resolve(destination, cwd);
+    if (!into) return out;
+    out.push({ path: into, kind: "hidden", from: sources });
+    for (const source of sources) out.push({ path: posix.join(into, basename(source)), kind: "hidden", from: [source] });
+  } else if (command === "dd") {
+    for (const word of args) if (word.startsWith("of=")) add(word.slice(3), "hidden");
+  } else if (command === "curl") {
+    const output = optionValue(args, /^-[A-Za-z]*o$/, "--output") ?? args.map((word) => word.match(/^-[A-Za-z]*o(\/.+)$/)?.[1]).find(Boolean);
+    add(output, "download");
+  } else if (command === "wget") {
+    const output = optionValue(args, /^-[A-Za-z]*O$/, "--output-document") ?? args.map((word) => word.match(/^-[A-Za-z]*O(\/.+)$/)?.[1]).find(Boolean);
+    if (output !== "-") add(output, "download");
+  } else if (command === "tar" && args.some((word) => /^-?[A-Za-z]*x/.test(word) || word === "--extract" || word === "--get")) {
+    out.push({ path: resolve(optionValue(args, /^-[A-Za-z]*C$/, "--directory") ?? ".", cwd) ?? "/", kind: "tree" });
+  } else if (command === "unzip") {
+    const at = args.indexOf("-d");
+    out.push({ path: resolve(at >= 0 ? args[at + 1] ?? "." : ".", cwd) ?? "/", kind: "tree" });
+  }
+  return out;
+}
+
+interface ScriptLine {
+  where: string;
+  text: string;
+  body: boolean;
+  heredoc: boolean;
+  parts: Array<{ segment: Segment; cwd: string | null }>;
+}
+
+// Lines of all steps and checks in order; heredoc bodies are marked, whole-line
+// comments and heredoc terminators dropped, and each segment carries the working
+// directory a cd before it set (per step).
+function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): ScriptLine[] {
   const scripts = [
     ...manifest.steps.flatMap((step, index) => step.reboot ? [] : [{ prefix: `S${index + 1}`, text: step.run || "" }]),
     ...manifest.checks.map((check, index) => ({ prefix: `C${index + 1}`, text: check.run })),
   ];
-  const pinned = new Map<string, string>();
-  const written = new Set<string>();
-  const executed: Array<{ path: string; where: string }> = [];
-  for (const { prefix, text: body } of scripts) {
-    const lines = body.split("\n");
-    const hasDigest = DIGEST.test(body);
-    lines.forEach((line, index) => {
+  const out: ScriptLine[] = [];
+  for (const { prefix, text } of scripts) {
+    let cwd: string | null = null;
+    let delimiter: string | null = null;
+    text.split("\n").forEach((line, index) => {
       const where = `${prefix}:L${index + 1}`;
-      if (hasDigest && DIGEST_TOOL.test(line)) for (const path of pathsOn(line)) if (!pinned.has(path)) pinned.set(path, where);
-      for (const path of heredocTargets(line)) written.add(path);
-      for (const path of executedPaths(line)) executed.push({ path, where });
+      if (delimiter !== null) {
+        if (line.trim() === delimiter) { delimiter = null; return; }
+        if (/^\s*#/.test(line) || CHECKSUM_ENTRY.test(line)) { out.push({ where, text: line, body: true, heredoc: false, parts: [] }); return; }
+        out.push({ where, text: line, body: true, heredoc: false, parts: segmentsOf(line).map((segment) => ({ segment, cwd: null })) });
+        return;
+      }
+      if (/^\s*#/.test(line)) return;
+      const open = line.match(/(?<!<)<<-?\s*(['"]?)([A-Za-z_][\w-]*)\1/);
+      const parts = segmentsOf(line).map((segment) => {
+        const part = { segment, cwd };
+        if (segment.command === "cd") {
+          const target = operands(segment.words.slice(segment.words.indexOf("cd") + 1), /^$/)[0];
+          cwd = target ? resolve(target, cwd) : null;
+        }
+        return part;
+      });
+      out.push({ where, text: line, body: false, heredoc: Boolean(open), parts });
+      if (open) delimiter = open[2];
     });
   }
+  return out;
+}
+
+const CHECK_FLAG = /^-[A-Za-z]*c[A-Za-z]*$|^--check$/;
+const COMPARISON = /(?:^|\s)(?:!?=|==|-eq|-ne)(?:\s|$)|\b(?:grep|cmp|diff)\b/;
+
+function isDigestSegment(segment: Segment): boolean {
+  return DIGEST_COMMAND.test(segment.command) || (segment.command === "openssl" && segment.words.includes("dgst"));
+}
+
+// Paths the run checks against a known digest: a digest tool with -c/--check
+// (with the checksum line it reads in this run), or a digest compared with a
+// digest literal or a variable holding one. A bare "sha256sum /path" that only
+// prints, next to an unrelated digest (docker pull img@sha256:…), pins nothing.
+function pinnedPaths(lines: ScriptLine[]): Map<string, string> {
+  const pinned = new Map<string, string>();
+  const pin = (path: string, where: string) => { if (!pinned.has(path)) pinned.set(path, where); };
+  const checks = lines.some((line) => line.parts.some(({ segment }) => isDigestSegment(segment) && segment.words.some((word) => CHECK_FLAG.test(word))));
+  const stepOf = (where: string) => where.split(":")[0];
+  const digestSteps = new Set(lines.filter((line) => DIGEST.test(line.text)).map((line) => stepOf(line.where)));
+  const comparingSteps = new Set(lines.filter((line) => !line.body && COMPARISON.test(line.text)).map((line) => stepOf(line.where)));
+  for (const line of lines) {
+    const linePaths = () => line.body ? pathsIn(line.text, null) : line.parts.flatMap(({ segment, cwd: at }) => pathsIn(segment.text, at));
+    const cwd = line.parts[0]?.cwd ?? null;
+    const digests = line.parts.filter(({ segment }) => isDigestSegment(segment));
+    if (digests.some(({ segment }) => segment.words.some((word) => CHECK_FLAG.test(word)))) {
+      for (const path of linePaths()) pin(path, line.where);
+    } else if (checks && CHECKSUM_ENTRY.test(line.text)) {
+      for (const path of pathsIn(line.text.trim().split(/\s+/).pop()!.replace(/^\*/, ""), cwd)) pin(path, line.where);
+    } else if (checks && DIGEST.test(line.text)) {
+      // A checksum line the run writes for a later check (echo "<hash>  /p" > sums);
+      // a commit id on a git line is no checksum.
+      for (const { segment, cwd: at } of line.parts) if (/^(?:echo|printf)$/.test(segment.command) && DIGEST.test(segment.text)) for (const path of pathsIn(segment.text, at)) pin(path, line.where);
+    } else if (digests.length && digestSteps.has(stepOf(line.where)) && comparingSteps.has(stepOf(line.where))) {
+      for (const { segment, cwd: at } of digests) for (const path of pathsIn(segment.text, at)) pin(path, line.where);
+    }
+  }
+  return pinned;
+}
+
+export function hiddenPinnedScripts(manifest: Pick<HostRunManifest, "steps" | "checks">): HiddenPinnedScript[] {
+  const lines = manifestLines(manifest);
+  const pinned = pinnedPaths(lines);
+  if (!pinned.size) return [];
+  const state = new Map<string, { kind: "visible" | "download" | "hidden"; where: string; visibleBefore: boolean }>();
+  const found: HiddenPinnedScript[] = [];
   const seen = new Set<string>();
-  return executed.flatMap(({ path, where }) => {
-    const pinnedAt = pinned.get(path);
-    if (!pinnedAt || written.has(path) || seen.has(path)) return [];
-    seen.add(path);
-    return [{ path, pinnedAt, executedAt: where }];
-  });
+  for (const line of lines) {
+    if (!line.body) {
+      for (const { segment, cwd } of line.parts) {
+        for (const write of writesOf(segment, line.heredoc, cwd)) {
+          const before = state.get(write.path);
+          if (write.kind === "append") {
+            if (before?.kind === "visible") continue;
+            state.set(write.path, { kind: "hidden", where: line.where, visibleBefore: false });
+          } else if (write.kind === "tree") {
+            const prefix = write.path.endsWith("/") ? write.path : `${write.path}/`;
+            for (const path of new Set([...state.keys(), ...pinned.keys()])) {
+              if (path.startsWith(prefix)) state.set(path, { kind: "hidden", where: line.where, visibleBefore: state.get(path)?.kind === "visible" });
+            }
+          } else if (write.from) {
+            // A copy of a pinned file is pinned as well; its content is as visible as its sources'.
+            const pinnedSource = write.from.map((source) => pinned.get(source)).find(Boolean);
+            if (pinnedSource && !pinned.has(write.path)) pinned.set(write.path, pinnedSource);
+            const kinds = write.from.map((source) => state.get(source)?.kind);
+            const kind = kinds.length && kinds.every((item) => item === "visible") ? "visible" : kinds.length && kinds.every((item) => item === "download") ? "download" : "hidden";
+            state.set(write.path, { kind, where: line.where, visibleBefore: before?.kind === "visible" || Boolean(before?.visibleBefore) });
+          } else {
+            state.set(write.path, { kind: write.kind, where: line.where, visibleBefore: before?.kind === "visible" || Boolean(before?.visibleBefore) });
+          }
+        }
+      }
+    }
+    for (const { segment, cwd } of line.parts) {
+      if (!runs(segment)) continue;
+      for (const path of pathsIn(segment.text, cwd)) {
+        const pinnedAt = pinned.get(path);
+        if (!pinnedAt || seen.has(path)) continue;
+        const written = state.get(path);
+        if (written?.kind === "visible") continue;
+        const script = SCRIPT_FILE.test(path) || segment.words.some((word) => SHELL_WORDS.test(basename(word)));
+        if (written?.kind === "download" && !script) continue;
+        if (!written && DEPLOYED_HELPER.test(path)) continue;
+        seen.add(path);
+        found.push(written?.visibleBefore
+          ? { path, pinnedAt, executedAt: line.where, overwrittenAt: written.where }
+          : { path, pinnedAt, executedAt: line.where });
+      }
+    }
+  }
+  return found;
 }
 
 const HOST_RUN_FENCE = /```(?:json\s+)?host-run\s*\n([\s\S]*?)```/i;
@@ -294,7 +574,7 @@ export function parseHostRunManifest(plan: string): HostRunManifest | null {
   const risk = Array.isArray(value.risk) ? (value.risk as HostRunRisk[]) : [];
   const hidden = hiddenPinnedScripts({ steps, checks });
   if (hidden.length) {
-    fail(`host-run manifest runs a script it only pins by hash, so the doorkeeper never sees its code: ${hidden.map((item) => `${item.path} (runs at ${item.executedAt}, pinned at ${item.pinnedAt})`).join("; ")} — field steps[].run must write each such script literally in a heredoc in this run (cat > ${hidden[0].path} <<'EOF' … EOF, like the unit files); a hash check may follow`);
+    fail(`host-run manifest runs a script it only pins by hash, so the doorkeeper never sees its code: ${hidden.map((item) => `${item.path} (runs at ${item.executedAt}, pinned at ${item.pinnedAt}${item.overwrittenAt ? `, overwritten at ${item.overwrittenAt} after the heredoc` : ""})`).join("; ")} — field steps[].run must write each such script literally in a heredoc in this run (cat > ${hidden[0].path} <<'EOF' … EOF or install -m 0755 /dev/stdin ${hidden[0].path} <<'EOF' … EOF, like the unit files) and not replace it afterwards; a hash check may follow`);
   }
   return {
     version: HOST_RUN_VERSION, name, purpose, mutates, steps, checks, rollback,
@@ -822,7 +1102,7 @@ export function hostRunPlannerContract(): string {
     "Split big work into stages with a check each (for GitLab: the official upgrade stops, gitlab-backup before each stage, gitlab-ctl reconfigure and a health check after). Use apt-get with -y and noninteractive defaults; hold packages explicitly when a stage must not touch them (apt-mark hold).",
     "risk: [\"contained\"] unless the run opens or widens what is reachable (exposure: a new public hostname, port, vhost or firewall opening), can lose existing data (data_loss) or changes identities, keys or secrets (identity_or_secret). Any declared class other than contained always waits for the operator's approval, whatever the doorkeeper says; declare it honestly, the doorkeeper reads the steps as well.",
     "Deleting backups, changing their retention or switching them off always waits for the operator's approval, whatever the doorkeeper says: borg/borgmatic delete, prune, compact, recreate, break-lock, key changes, retention edits (/etc/borgmatic, keep_*, GitLab backup_keep_time), deleting, moving or overwriting in the repository path, /var/backups or /var/opt/gitlab/backups (also over ssh on Lab0, 10.0.0.5), stopping, disabling or masking borgmatic.timer or Lab0's retention service (cockpit-borg-retention set below its minimum or with --freigabe, freigeben, stopping/disabling its timer, editing its files), deleting a machine snapshot. Package updates, reading (borg list/info/check/create, docker ps/inspect/logs, systemctl status), plain borgmatic, cockpit-borg-action status|check, cockpit-borg-action sources status|add <directory below /opt/stacks, /srv or /var/lib/docker/volumes> (adding a backup source; connect, disconnect and restore wait for the operator), systemctl start borgmatic.service, new backup copies and on Lab0 /usr/local/sbin/cockpit-borg-retention status|run or set <keep_daily> <keep_weekly> <keep_monthly> <HH:MM> inside the fixed bounds (doc/setup/borg-retention.md) do not. Code the plan does not show (eval, decoding, piping into a shell, running a script the run did not write in a heredoc, commands or targets from values the plan does not show, ssh to another machine) makes the doorkeeper look hard: write the literal commands instead.",
-    "Every script the run executes (a unit's ExecStart=, python3 /path, bash /path, /path) must appear literally in the manifest: write it in a heredoc in this run (cat > /path <<'EOF' … EOF), as with unit files, even when it is already deployed. Pinning it only by hash (printf '<sha256>  /path' | sha256sum -c -) without writing it is refused before review; a hash check after the heredoc is fine.",
+    "Every script the run executes (a unit's ExecStart=, sh -c, sudo -u, python3 /path, bash /path, /path, ./name) must appear literally in the manifest: write it in a heredoc in this run (cat > /path <<'EOF' … EOF or install -m 0755 /dev/stdin /path <<'EOF' … EOF), as with unit files, even when it is already deployed, and do not replace or append to it afterwards. Pinning it only by hash (printf '<sha256>  /path' | sha256sum -c -) without writing it is refused before review; a hash check after the heredoc is fine. Keep hash checks of a binary this run downloads (curl -o, wget -O) and of the Cockpit helpers the deploy installed (/usr/local/sbin/cockpit-*): those are not refused.",
     "Never read, print or send secrets (Cockpit configuration in /etc/wireguard-ops-cockpit, agent credentials, private keys, /etc/shadow, borg keys, database passwords), never send host data off the host, and never change users, sudoers, SSH keys, firewall rules or the Cockpit's own code: the doorkeeper stops those for the operator.",
   ].join("\n");
 }
