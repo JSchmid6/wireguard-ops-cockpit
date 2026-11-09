@@ -23,6 +23,26 @@ eigenes Cockpit mit der allgemeinen Tür (`doc/setup/host-run.md`), kein SSH.
    danach James' Bearer (unten). Spätere Stände kommen per `self.update` — das installierte Skript liest
    die Rolle aus der installierten `instance-role.env`; ein Rollenwechsel per Deploy wird verweigert.
 
+## Entscheidung: ttyd auf Debian trixie (09.11.2026)
+
+Die ersten sechs Türläufe der Box scheiterten in Schritt „1) Pakete installieren“:
+`E: Unable to locate package ttyd`. Debian trixie hat kein Paket ttyd (gemessen am 09.11.2026 auf
+deb.debian.org: weder trixie main noch trixie-backports noch bookworm, nur forky 1.7.7-8). Alle übrigen
+Pakete des Schritts gibt es in trixie main. Gewählt: Hat apt keinen Kandidaten für ttyd, installiert das
+Deploy-Skript das statische Release-Binary von github.com/tsl0922/ttyd (1.7.7, `ttyd.x86_64`, sha256 fest
+im Skript, gleich dem `SHA256SUMS` des Releases) als root:root 0755 nach `/usr/local/bin/ttyd`. Eine
+Hash-Abweichung bricht ab, bevor etwas installiert ist. Die Unit `wireguard-ops-cockpit-ttyd.service`
+ruft `ttyd` ohne Pfad auf; systemd sucht fest in `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin`.
+VPS und Lab0 (Ubuntu universe) nehmen weiter das Paket. Kommt ttyd später als Paket, entfernt das
+Deploy-Skript das eigene Binary (nur bei passendem Hash). Verworfen:
+
+- Paket aus forky (testing) einbinden: das würde eine fremde Suite in die apt-Quellen des Hypervisors
+  bringen, und forky zieht neuere Bibliotheken nach.
+- ttyd selbst bauen: das bräuchte einen Compiler und Build-Abhängigkeiten auf dem Proxmox-Host und
+  braucht länger, ohne mehr Schutz als der gepinnte Hash.
+- Drop-in mit eigenem `ExecStart=` nur auf der Box: die Befehlszeile stünde dann doppelt und könnte
+  auseinanderlaufen.
+
 ## Entscheidung: der Planner-Schlüssel (DEEPSEEK_API_KEY)
 
 Das vpsdrop ist für jeden WireGuard-Peer lesbar, also nie Klartext dort. Gewählt: der Schlüssel steht in

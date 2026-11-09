@@ -82,6 +82,11 @@
 #         vom Erststart gelegt); Netz = Host-Snapshot + Proxmox-Snapshot jedes Gastes;
 #         James' Bearer: Konto hermes-automation, Label hermes-tresor, Hash aus
 #         /etc/box-bootstrap/cockpit-token.sha256 (cockpit-automation-token-seed).
+#         09.11.2026 (Kanban t_88f1e802): Debian trixie hat kein Paket ttyd (alle sechs
+#         Türläufe der Box brachen in Schritt 1 ab). Ohne apt-Kandidaten installiert das
+#         Skript das statische Release-Binary ttyd 1.7.7 (sha256 gepinnt) nach
+#         /usr/local/bin/ttyd; die Unit ruft ttyd ohne Pfad auf. Abgleich der übrigen
+#         Pakete gegen trixie main: alle vorhanden.
 #
 # Aufruf (als root AUF DER KISTE):
 #   bash homeserver-cockpit-deploy.sh                   # Lab0 bzw. die installierte Rolle
@@ -403,9 +408,56 @@ export DEBIAN_FRONTEND=noninteractive
 # Additiv bleiben: nginx-Zustand VOR der Installation merken
 NGINX_PREEXISTED="no"; command -v nginx >/dev/null 2>&1 && NGINX_PREEXISTED="yes"
 apt-get update -qq || die "apt-get update fehlgeschlagen (Netz/Mirror?)."
-apt-get install -y -qq --no-install-recommends \
-  ca-certificates curl git tmux ttyd nginx openssl python3 sudo \
-  || die "Paketinstallation fehlgeschlagen (ttyd/nginx verfügbar? Universe aktiv?)."
+# ttyd (09.11.2026, Kanban t_88f1e802): Debian trixie (Box) hat kein ttyd-Paket — weder
+# main noch backports. Ohne apt-Kandidaten kommt das statische Release-Binary von
+# github.com/tsl0922/ttyd, Version und sha256 fest gepinnt, nach /usr/local/bin/ttyd.
+# Die Unit ruft ttyd ohne Pfad auf (systemd sucht /usr/local/bin vor /usr/bin).
+# Der markierte Block wird vom Test (deploy-ttyd.test.ts) 1:1 ausgeführt.
+# >>> ttyd-logik
+TTYD_VERSION="1.7.7"
+TTYD_SHA256="8a217c968aba172e0dbf3f34447218dc015bc4d5e59bf51db2f2cd12b7be4f55"   # SHA256SUMS des Releases, x86_64
+TTYD_URL="https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/ttyd.x86_64"
+TTYD_LOCAL="${TTYD_LOCAL:-/usr/local/bin/ttyd}"
+
+# yes, wenn apt ein Paket ttyd installieren kann (Ubuntu universe: VPS, Lab0).
+ttyd_apt_candidate() {
+  local cand
+  cand="$(apt-cache policy ttyd 2>/dev/null | awk '/Candidate:/{print $2; exit}')"
+  if [ -n "$cand" ] && [ "$cand" != "(none)" ]; then echo yes; else echo no; fi
+}
+
+# Holt das gepinnte Binary; Hash-Abweichung bricht ab, bevor etwas installiert ist.
+ttyd_install_binary() {
+  local tmp
+  if [ -x "$TTYD_LOCAL" ] && echo "$TTYD_SHA256  $TTYD_LOCAL" | sha256sum -c - >/dev/null 2>&1; then
+    echo "ttyd: $TTYD_LOCAL ($TTYD_VERSION) schon vorhanden."
+    return 0
+  fi
+  tmp="$(mktemp)"
+  curl -fsSL --max-time 120 -o "$tmp" "$TTYD_URL" || { rm -f "$tmp"; die "ttyd-Download fehlgeschlagen ($TTYD_URL)."; }
+  echo "$TTYD_SHA256  $tmp" | sha256sum -c - >/dev/null 2>&1 \
+    || { rm -f "$tmp"; die "ttyd-Prüfsumme stimmt nicht ($TTYD_URL) — abgebrochen, nichts installiert."; }
+  install -D -m 0755 -o root -g root "$tmp" "$TTYD_LOCAL"
+  rm -f "$tmp"
+  echo "ttyd: Release-Binary $TTYD_VERSION nach $TTYD_LOCAL (sha256 geprüft)."
+}
+
+APT_PACKAGES=(ca-certificates curl git tmux nginx openssl python3 sudo)
+TTYD_FROM_APT="$(ttyd_apt_candidate)"
+if [ "$TTYD_FROM_APT" = "yes" ]; then APT_PACKAGES+=(ttyd); fi
+# <<< ttyd-logik
+apt-get install -y -qq --no-install-recommends "${APT_PACKAGES[@]}" \
+  || die "Paketinstallation fehlgeschlagen (${APT_PACKAGES[*]}; Universe aktiv?)."
+if [ "$TTYD_FROM_APT" = "yes" ]; then
+  # Ein früher gelegtes Release-Binary würde das Paket verdecken — nur unser eigenes entfernen.
+  if [ -f "$TTYD_LOCAL" ] && echo "$TTYD_SHA256  $TTYD_LOCAL" | sha256sum -c - >/dev/null 2>&1; then
+    rm -f "$TTYD_LOCAL"; echo "ttyd: Paket da — Release-Binary $TTYD_LOCAL entfernt."
+  fi
+else
+  echo "ttyd: kein apt-Paket (z. B. Debian trixie) — gepinntes Release-Binary."
+  ttyd_install_binary
+fi
+command -v ttyd >/dev/null 2>&1 || die "ttyd fehlt nach der Installation."
 if [ "$NGINX_PREEXISTED" = "no" ]; then
   systemctl disable --now nginx >/dev/null 2>&1 || true   # frisch installiert: erst nach Konfiguration aktivieren
 fi
@@ -963,6 +1015,7 @@ Rückbau (nur bei Bedarf, als root):
   # Benutzer (nur auf Wunsch): userdel -r wgops; userdel -r cockpit-agent; userdel -r cockpit-executor
   # Node/OpenCode (nur auf Wunsch, falls sonst ungenutzt):
   #   npm uninstall -g opencode-ai; rm -f /usr/local/bin/opencode
+  #   rm -f /usr/local/bin/ttyd   # nur das Release-Binary (Debian trixie); das apt-Paket bleibt
   #   rm -rf /opt/node-v22.23.4-linux-x64 /root/cockpit-deploy
   #   # /usr/bin/node-Symlink nur entfernen, wenn er von diesem Deploy stammt
 EOF
