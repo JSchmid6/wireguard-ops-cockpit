@@ -396,7 +396,17 @@ missing binding (`unavailable`), `dienste.update`, the safety review, the
 envelope binding of the reviewed hash and the runner's own checks are not
 touched. Honest limit: the marker is posted with the owner's token, the same
 the agent holds; it proves a review record for exactly this head, not a second
-principal. Way back: revert the change and self-update to the previous commit.
+principal. Spelled out (card t_e49f6254, 10.11.2026): the agent can write the
+marker line itself, without any second review having run, on every pull
+request it merged itself — and James merges directly. So for a self-update
+the agent can turn this review's `finding` or `incomplete` into a report and
+install the flagged code without the operator. Nothing in the Cockpit stops
+that; what is left is the public, immutable PR comment, the report in
+`GET /api/inbox` (`reviewFindings`, `reported: true`, seven days) and the audit
+`hermes.update_review.reported` — the operator learns of it afterwards, not
+before. The operator accepted this on 07.11.2026 and again on 10.11.2026 (job
+9bc909ed, whose own pre-install review flagged exactly this path, G1/G7, high).
+Way back: revert the change and self-update to the previous commit.
 
 **What the owner sees — only for a finding.** The job explanation's `reason`
 names why (the flagged findings; for `blocked_prerequisite` the agent reads the
@@ -458,7 +468,7 @@ finding names a concrete way **past** one of its guards, or a weakening of it:
 
 | Guarantee | holds |
 | --- | --- |
-| G1 Approval | only the admin session approves; a bearer token never approves or sets `operatorApproved`/`gatePassed`. A `host.run` start on the doorkeeper's pass is intended. A job that needed the operator (evidenced finding, bolt hit, a declared risk other than `contained`, a door without doorkeeper) never runs without the operator's approval. Exception by decision (07.11.2026): a self-update review finding whose commits carry a second review the Cockpit verified itself on GitHub is a report, not a stop ([Second review](#review-before-install)). |
+| G1 Approval | only the admin session approves; a bearer token never approves or sets `operatorApproved`/`gatePassed`. A `host.run` start on the doorkeeper's pass is intended. A job that needed the operator (evidenced finding, bolt hit, a declared risk other than `contained`, a door without doorkeeper) never runs without the operator's approval. Exception by decision (07.11.2026): a self-update review finding whose commits carry a second review the Cockpit verified itself on GitHub is a report, not a stop ([Second review](#review-before-install)); the marker can be posted by the agent's own token, so this exception rests on a public record, not on a second principal. |
 | G2 Lock | HMAC envelope (timing-safe, host secret), bound to plan and `manifestHash`, with expiry, capability and the job id (its form; the run directory is named by it); the root helper checks it at the start and on every resume; a blocked job's envelope never opens. |
 | G3 Doors | `host.run` is the one general door; every other action stays typed and narrow. No second general door, no way into `host.run` past G2, G9, G10. |
 | G4 Root helpers and sudoers | narrow, typed; the host-run helper keeps exactly `start` and `status <job>`. |
