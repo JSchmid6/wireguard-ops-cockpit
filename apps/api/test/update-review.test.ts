@@ -172,6 +172,58 @@ describe("self-update pre-install review", () => {
     expect(policy.evidence).toContain(`not fully reviewed (${SHA.slice(0, 12)}): apps/api/src/hermes-security.ts`);
   });
 
+  it("splits a file larger than a pass at hunk boundaries into named parts over several passes", () => {
+    const path = "apps/api/src/hermes-security.ts";
+    const hunk = (index: number) => [`@@ -${index * 100 + 1},40 +${index * 100 + 1},40 @@`, ...Array.from({ length: 40 }, (_, line) => `+h${index} l${line} ${"x".repeat(60)}`)];
+    const big = section(path, Array.from({ length: 6 }, (_, index) => hunk(index)).flat());
+    const { prompts, coverage } = buildUpdateReviewPrompt([diff({ excerpt: [big] })], { nonce: NONCE, limit: 22_000 });
+    expect(prompts.length).toBeGreaterThan(1);
+    expect(prompts.every((prompt) => Buffer.byteLength(prompt) <= 22_000)).toBe(true);
+    expect(coverage[0]).toMatchObject({ incomplete: [], cut: [], omitted: [] });
+    // Every hunk exactly once, whole, with the file header in every part.
+    for (let index = 0; index < 6; index += 1) {
+      const holders = prompts.filter((prompt) => prompt.includes(`@@ -${index * 100 + 1},40`));
+      expect(holders).toHaveLength(1);
+      expect(holders[0]).toContain(`+h${index} l0 `);
+      expect(holders[0]).toContain(`+h${index} l39 `);
+    }
+    expect(prompts.every((prompt) => prompt.includes(`diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@`))).toBe(true);
+    // Labelled part k/n with its hunk range; each pass names the other parts and their pass.
+    const n = prompts.length;
+    expect(prompts[0]).toMatch(new RegExp(`\\[part 1/${n} of ${path}: hunks 1–\\d of 6;`));
+    expect(prompts[n - 1]).toMatch(new RegExp(`\\[part ${n}/${n} of ${path}: hunks \\d–6 of 6;`));
+    expect(prompts[0]).toMatch(new RegExp(`The other passes of this update hold: [^\\n]*${path} \\(part 2/${n}, hunks \\d–\\d\\) in pass 2`));
+    expect(prompts[1]).toMatch(new RegExp(`This pass holds the[\\s\\S]*${path} \\(part 2/${n}, hunks`));
+    expect(coverage[0].passes?.flat().every((label) => label.startsWith(`${path} (part `))).toBe(true);
+    // Covered only when every part's pass approved.
+    const approve = parseUpdateReviewAnswer("VERDICT: approve");
+    expect(applyUpdateReviewPolicy(readyPolicy, outcome({ coverage, answer: mergeUpdateReviewAnswers(prompts.map(() => approve)) }))).toMatchObject({ allowed: true, status: "ready" });
+    const oneMissing = mergeUpdateReviewAnswers([approve, ...prompts.slice(1).map(() => null)]);
+    expect(applyUpdateReviewPolicy(readyPolicy, outcome({ coverage, answer: oneMissing ?? undefined, reviewerError: "pass 2: timeout" }))).toMatchObject({ allowed: false, status: "blocked_prerequisite" });
+  });
+
+  it("stays incomplete when parts exceed the pass limit or a single hunk is larger than a pass", () => {
+    const path = "apps/api/src/hermes-security.ts";
+    const hunk = (index: number, length = 40) => [`@@ -${index * 1000 + 1},${length} +${index * 1000 + 1},${length} @@`, ...Array.from({ length }, (_, line) => `+h${index} l${line} ${"x".repeat(60)}`)];
+    const big = section(path, Array.from({ length: 6 }, (_, index) => hunk(index)).flat());
+    const capped = buildUpdateReviewPrompt([diff({ excerpt: [big] })], { nonce: NONCE, limit: 22_000, maxPasses: 2 });
+    expect(capped.prompts).toHaveLength(2);
+    // Some parts were shown, not all: cut, and that stops.
+    expect(capped.coverage[0]).toMatchObject({ incomplete: [path], cut: [path], omitted: [] });
+    const giant = section(path, [...hunk(0), ...hunk(1, 400)]);
+    const single = buildUpdateReviewPrompt([diff({ excerpt: [giant] })], { nonce: NONCE, limit: 22_000 });
+    expect(single.coverage[0]).toMatchObject({ incomplete: [path], cut: [], omitted: [path] });
+    expect(single.prompts.join("\n")).not.toContain("+h0 l0 ");
+    for (const coverage of [capped.coverage, single.coverage]) {
+      expect(applyUpdateReviewPolicy(readyPolicy, outcome({ coverage, answer: parseUpdateReviewAnswer("VERDICT: approve") }))).toMatchObject({ allowed: false, status: "blocked_prerequisite" });
+    }
+    // A small diff stays one pass without parts.
+    const small = buildUpdateReviewPrompt([diff()], { nonce: NONCE });
+    expect(small.prompts).toHaveLength(1);
+    expect(small.prompt).not.toContain("[part ");
+    expect(small.coverage[0].passes).toEqual([["apps/api/src/hermes-security.ts", "README.md"]]);
+  });
+
   it("does not stop when only documentation is cut, and documentation never opens a pass", () => {
     const big = section("README.md", ["@@ -1 +1,400 @@", ...Array.from({ length: 400 }, (_, index) => `+docs ${index} ${"y".repeat(60)}`)]);
     const small = diff().excerpt[0];
