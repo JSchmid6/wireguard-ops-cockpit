@@ -167,7 +167,45 @@ jedes `cd`-Ziel aufgelöst. Kommentare zählen nicht.
   `sources connect|disconnect|restore` und `sources add` mit einem Pfad außerhalb der Wurzeln oder
   aus einer Variablen; auch als `bash|sh|source|. <helfer> …`; eine Kopie oder ein Link des Helfers per
   `cp|ln|install|rsync`) — auch als Text in `sh -c '…'`, in einem Skript,
-  das der Lauf schreibt, in einer Cron-Zeile oder in `echo/printf`;
+  das der Lauf schreibt, in einer Cron-Zeile oder in `echo/printf`; seit 05.11.2026 (Karte
+  t_5ce5f79f) allgemein jeder Befehl, der den Helfer nennt (Name, auch in Quotes; Glob auf seinen
+  Pfad; find-Filter `-name|-path|-regex`, der auf ihn passt) und weder die freie Direktform noch
+  reines Lesen oder Textausgabe ist: `find … -exec {} …`, `xargs` auf einer Zeile, die ihn nennt,
+  Inline-Code (`perl -e`, `python3 -c`, `ruby`, `node`, `php`, Heredoc für `python3 -`) mit seinem
+  Namen — gleich mit welchem Verb —, ein Argument in Quotes über das Zeilenende neben ihm, und
+  (seit 09.11.2026, Karte t_fd6dfaa4) eine Shell, ein Interpreter, `source` oder `at`, die Text
+  aus einer Pipe oder ein Skript, das der Plan nicht zeigt (`<(…)`), auf einer Zeile ausführen,
+  die ihn nennt (`ls <helfer> | sed 's/$/ repair/' | sh`, `bash <(echo '<helfer> repair')`); der
+  Wert von `xargs -I|-i|--replace` zählt dabei wie `{}` (`xargs -I@ /usr/local/sbin/@ repair`);
+  seit Karte t_3dce65e1 (09.11.2026) auch eine Gruppe `( … )`/`{ …; }` als Pipe-Ziel, eine über
+  `|`/`&&`/`||` am Zeilenende fortgesetzte Zeile (als eine logische Zeile gelesen), Pipe-Ausgabe,
+  deren Quelle den Helfer nennt, in eine Datei, die laufen kann (`> /etc/cron.d/x`, `| tee /tmp/r`),
+  `eval` auf einer Zeile, die ihn nennt, und ein `grep`-Filter auf seinen Namen über seinem
+  Verzeichnis; seit Karte t_6735af09 (09.11.2026) statt weiterer Senken eine **Zeilen-Allowlist**:
+  nennt eine logische Zeile den Helfer außerhalb der freien Formen (auch über eine Variable, deren
+  Wert ihn nennt, in einer späteren Zeile), dürfen alle übrigen Befehle der Zeile nur Filter oder
+  Datensenken sein (`grep`, `jq`, `head`, `tail`, `wc`, `sort`, `cut`, `tr`, `awk` ohne `system`/`|`,
+  `sed` ohne `e`/`w`/`-i`, Lesebefehle, `echo`, `tee` bzw. Umleitung nur in Datendateien); listet ein
+  Befehl sein Verzeichnis (`ls /usr/local/sbin`, `find` über einem Vorfahren ohne fremden
+  Namensfilter, `compgen -c`, `locate`), gilt dasselbe für die Befehle hinter ihm in der Pipe.
+  `|&` ist eine Pipe. Seit Karte t_d16c58d1 (09.11.2026, Zweitprüfung t_20ae3cda) gilt das für den
+  **ganzen Plan**: nennt irgendeine Zeile (Schritte und Prüfschritte) den Helfer außerhalb seiner
+  freien Formen — frei sind nur die Direktform und `test`/`[`/`[[` auf ihn; `echo` seines Namens,
+  `ls`/`stat`/`sha256sum` auf ihn, ein Glob, ein find-Filter, das Listen seines Verzeichnisses oder
+  eine Variable mit seinem Namen sind es nicht —, muss **jede** Zeile filtern und Daten ablegen, und
+  nichts darf Namen oder Werte umbinden (Funktion, `alias`, `hash`, PATH/BASH_ENV/ENV, PS0–PS4,
+  `${!…}`, `declare -n`, `export` eines Helfer-Werts); `sed` wird positiv gelesen (jeder Trenner,
+  ohne `e`/`w`). Seit Karte t_2e391eba (Zweitprüfung t_f1b3ea8c) lässt ein solcher Plan Bash auch
+  **keinen Wert als Code auswerten**: kein `${…@P}`, keine Zuweisung an PS0–PS4 (`set -x` führt PS4
+  aus) oder an die Integer-Variablen RANDOM/SRANDOM/OPTIND/HISTCMD, kein `declare`/`local`/`typeset
+  -i`, und Arithmetik — `$((…))`, `((…))`, `$[…]`, `let`, `for ((…))`, `[[ … -eq|-ne|-lt|-le|-gt|-ge
+  … ]]`, `${s:off:len}`, ein Index `${a[i]}`/`a[i]=`/`b=([i]=…)` auch in `unset`, `test -v`, `read`,
+  `printf -v`, `declare` — nur mit Zahlen; ein Name oder `$` darin ist ein Treffer, denn Bash rechnet
+  den Wert eines Namens aus und führt dabei ein `a[$(sh)]` darin aus, auch wenn der Wert erst aus
+  Teilen entsteht (`z=$x$y`). `test`/`[` mit `-eq` rechnen nicht und bleiben frei. Preis: ein Plan,
+  der den Helfer so nennt und daneben fremde Arbeit tut (`sha256sum <helfer>` plus `apt-get
+  upgrade`), geht an Jochen — dafür zwei Läufe (Einzelheiten `doc/setup/borg-maintenance.md`,
+  „Riegel über Umwege“);
 - jede Änderung der Aufbewahrung: `keep_*`/`--keep-*`, `keepDaily|Weekly|Monthly`,
   `backup_keep_time` (GitLab), außerhalb eines reinen Lesebefehls;
 - Schreiben in die Konfiguration: `/etc/borgmatic`, `/etc/borgmatic.d`, `/root/.config/borg`
@@ -256,8 +294,10 @@ jedes `cd`-Ziel aufgelöst. Kommentare zählen nicht.
 - `uncertain` — der Text, der läuft, ist nicht der Text im Plan: `ssh`/`scp`/`rsync` zu einem
   anderen Rechner, `eval`, Dekodieren, `$'\x..'`, Code aus einer Pipe, `alias`, `PATH`/
   `BASH_ENV`/`LD_PRELOAD`/`BORG_*`, ein Skript, das der Lauf nicht selbst schreibt, ein
-  Befehlsname oder Ziel aus einem unbekannten Wert (`$CMD`, `rm -rf "$X"`, `xargs`), Inline-Code
-  mit Prozessen oder Dateizugriffen.
+  Befehlsname oder Ziel aus einem unbekannten Wert (`$CMD`, `rm -rf "$X"`, `xargs`), ein
+  Platzhalter als Befehlswort (`find … -exec {} …`, `xargs -I{} {}`; nennt die Zeile den
+  Backup-Helfer, ist es ein Riegel-Treffer — ebenso für Code aus einer Pipe und ein ungezeigtes
+  Skript), Inline-Code mit Prozessen oder Dateizugriffen.
 
 **Frei** (weder Riegel noch Hinweis) bleiben die Routine und das Lesen: `systemctl start
 borgmatic.service`, ein nacktes `borgmatic` (konfigurierte Aufbewahrung),
@@ -305,8 +345,10 @@ sichtbare Routine (Dienst-Neustart, Status, Logs) bleibt trotzdem frei.
 
 Ehrliche Grenze: Programme, die schon auf dem Host liegen und über ihren Namen oder aus den
 System-Verzeichnissen (`/usr`, `/opt/gitlab`) aufgerufen werden, nimmt der Riegel für das, was ihr
-Name sagt; ihren Inhalt sieht er nicht. Ein Interpreter-Programm ohne Löschwort und ohne
-geschützten Pfad wird nicht weiter zerlegt. Dort bleibt der Türsteher (X4) die Sicherung.
+Name sagt; ihren Inhalt sieht er nicht. Ein Interpreter-Programm ohne Löschwort, ohne
+geschützten Pfad und ohne den Namen des Backup-Helfers wird nicht weiter zerlegt. Einen Helfer-Namen,
+der erst zur Laufzeit entsteht (zusammengesetzt, dekodiert, aus einer Datei), sieht der Riegel
+nicht. Dort bleibt der Türsteher (X4) die Sicherung.
 Auf box kennt der Riegel das `dump`-Verzeichnis eines Verzeichnis-Speichers außerhalb von
 `/var/lib/vz` und `/mnt/pve` nicht (es steht nur in `storage.cfg`); dort greifen die Dateinamen
 (`vzdump-*`, `*.vma*`), ein `rm -rf <anderer-speicher>/dump` ist Sache des Türstehers. Einen

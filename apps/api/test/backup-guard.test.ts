@@ -62,7 +62,82 @@ const free: Array<[string, string]> = [
   ["glob in another working directory", "cd /tmp/build && rm -f *.deb"],
   ["heredoc printed to stdout", "cat <<'EOF'\nHinweis: borg prune läuft nachts über borgmatic\nEOF"],
   ["find -exec rm outside the backups", "find /var/log/app -name '*.gz' -mtime +30 -exec rm -f {} \\;\nfind /tmp -name '*.tmp' | xargs -I{} rm -f {}"],
+  // t_5ce5f79f: den Helfer lesen, seinen Status und seine Units ansehen bleibt frei.
+  ["reading the backup helper", "ls -l /usr/local/sbin/cockpit-borg-action\nsha256sum /usr/local/sbin/cockpit-borg-action\ntest -x /usr/local/sbin/cockpit-borg-action\ncommand -v cockpit-borg-action"],
+  ["the helper's units by a glob", "journalctl -u 'cockpit-borg-*' -n 50\nsystemctl status 'cockpit-borg-*'"],
+  ["the helper named in text output", "echo 'cockpit-borg-action sources add /opt/stacks/neu folgt'"],
+  // t_fd6dfaa4: die freien Direktformen und eine Pipe in eine Shell ohne den Helfer.
+  ["the helper's free direct forms", "/usr/local/sbin/cockpit-borg-action status\n/usr/local/sbin/cockpit-borg-action check\n/usr/local/sbin/cockpit-borg-action db-access status\n/usr/local/sbin/cockpit-borg-action sources status\n/usr/local/sbin/cockpit-borg-action sources add /opt/stacks/wejos-wp"],
+  ["a pipe into sh -c without the helper", "journalctl -u borgmatic | grep x | sh -c cat"],
+  ["xargs -I@ with another command", "ls /tmp | xargs -I@ echo @"],
+  // t_3dce65e1: Fortsetzung nach | und &&, Gruppen und Helfer-Ausgabe in Datendateien bleiben frei.
+  ["pipes and lists continued on the next line", "/usr/local/sbin/cockpit-borg-action status |\n  jq .\napt-get update &&\n  apt-get -y upgrade"],
+  ["the helper's status into a data file", "/usr/local/sbin/cockpit-borg-action status | jq . > /tmp/borg-status.json"],
+  ["a subshell after a pipe without the helper", "journalctl -u borgmatic -n 20 | (grep -c x)"],
   ["notes and logs that mention the backups", "cat > /root/NOTIZ.md <<'EOF'\nAlte Dumps unter /var/backups nie per rm löschen\nEOF\necho \"borgmatic: create, dann prune\" | tee -a /var/log/cockpit.log"],
+  // t_6735af09: Filter und Datensenken auf einer Zeile, die den Helfer nennt, bleiben frei.
+  ["the helper's status with |& into a log", "/usr/local/sbin/cockpit-borg-action status |& tee /tmp/borg.log"],
+  ["the helper's status appended to a log", "/usr/local/sbin/cockpit-borg-action status | tee -a /var/log/cockpit-borg.log"],
+  ["the helper's status in a variable, filtered", "s=$(/usr/local/sbin/cockpit-borg-action status); echo \"$s\" | grep -i ok"],
+  ["the helper's sources read line by line", "/usr/local/sbin/cockpit-borg-action sources status | while read -r l; do echo \"$l\"; done"],
+  ["the helper's directory listed and filtered", "ls /usr/local/sbin | grep -v borg-action\nls -l /usr/local/sbin | awk '{print $9}' | sort | head -5"],
+  ["the helper's checksum filtered into a data file", "sha256sum /usr/local/sbin/cockpit-borg-action | cut -d' ' -f1 > /tmp/borg-helper.sha256.txt"],
+  ["t_d16c58d1: test -x on the helper next to other work", "test -x /usr/local/sbin/cockpit-borg-action && /usr/local/sbin/cockpit-borg-action status\ndocker compose -f /opt/stacks/x/compose.yml pull\napt-get update"],
+  ["t_d16c58d1: the helper's free forms next to other work", "/usr/local/sbin/cockpit-borg-action status | jq .\n/usr/local/sbin/cockpit-borg-action sources add /srv/foo\nsystemctl restart nginx\napt-get -y upgrade"],
+  ["t_d16c58d1: set -euo pipefail next to a filtered checksum", "set -euo pipefail\nsha256sum /usr/local/sbin/cockpit-borg-action | tee /tmp/h.txt"],
+  ["t_d16c58d1: sed with another delimiter, no e or w", "/usr/local/sbin/cockpit-borg-action status | sed -n 's|a|b|p;1,5p'\nls /usr/local/sbin/cockpit-borg-action | sed -E 's,x,y,g;$d;q'"],
+  ["t_d16c58d1: arithmetic without commands", "n=$(( 3 + 4 ))\n(( n > 2 )) && /usr/local/sbin/cockpit-borg-action status"],
+  // Karte t_2e391eba: im gekennzeichneten Plan bleibt Arithmetik mit Zahlen frei, ebenso test/[ mit -eq
+  // (Bash rechnet dort nicht), ${s:-x}, ${a[@]}, ${x@Q} und set -x ohne eigenes PS4.
+  ["t_2e391eba: arithmetic with numbers only", "ls -l /usr/local/sbin/cockpit-borg-action\necho $((1 + 2)) $((0x1f + 2#101))\n[[ 3 -gt 2 ]] && echo ok"],
+  ["t_2e391eba: test and [ with -eq on a value", "ls -l /usr/local/sbin/cockpit-borg-action\nn=$(wc -l < /etc/passwd)\n[ \"$n\" -eq 0 ] || test \"$n\" -gt 1"],
+  ["t_2e391eba: defaults, whole arrays, quoting, literal substrings", "ls -l /usr/local/sbin/cockpit-borg-action\ns=abc\necho \"${s:-x} ${t:+y} ${s: -1} ${s:1:2} ${a[@]} ${#a[@]} ${a[0]} ${PIPESTATUS[0]} ${s@Q}\""],
+  ["t_2e391eba: set -x without an own PS4", "ls -l /usr/local/sbin/cockpit-borg-action\nset -x\nsystemctl status borgmatic.timer"],
+  ["t_2e391eba: a quoted heredoc is not expanded", "ls -l /usr/local/sbin/cockpit-borg-action\ncat <<'EOF'\n$((z)) ${x@P}\nEOF"],
+  ["t_2e391eba: an unmarked plan keeps its arithmetic and prompt expansion", "for ((i=0; i<3; i++)); do echo $i; done\nx='\\u@\\h'\necho \"${x@P}\"\n/usr/local/sbin/cockpit-borg-action status"],
+  ["the helper's status through a variable", "h=/usr/local/sbin/cockpit-borg-action\n$h status"],
+  // Zweitpruefung t_ba8ceb38 (Karte t_8f78c1ac): ein Kommentar am Wortanfang bleibt Kommentar, wie in Bash.
+  // Seit Karte t_8334eec9 kostet der Helfer mit repair im Kommentar die Freigabe (Rohtext-Riegel, unten);
+  // der Leser selbst liest den Kommentar weiter richtig, geprueft mit borg delete statt des Helfers.
+  ["t_8f78c1ac: a comment right after a subshell", "(true)# ; borg delete ::a"],
+  ["t_8f78c1ac: a comment right after an arithmetic command", "(( 1 ))#; borg delete ::a"],
+  ["t_8f78c1ac: a comment after a blank", "hostname # borg delete ::a"],
+  ["t_8f78c1ac: a comment after a semicolon", "hostname;# borg delete ::a"],
+  ["t_8f78c1ac: a comment at the start of a command substitution", "x=$(# borg delete ::a\nhostname)\necho \"$x\""],
+  // Zweitpruefung t_a7b9a156 (Karte t_8334eec9): echte Kommentare bleiben frei, auch mit der freien Form darin.
+  ["t_8334eec9: a quote over two lines, then a real comment", "echo 'a\nb' # '; borg delete ::a"],
+  ["t_8334eec9: a comment ending in a backslash, the next line runs", "hostname # x \\\nuptime"],
+  ["t_8334eec9: status with a comment", "/usr/local/sbin/cockpit-borg-action status # Stand zeigen"],
+  ["t_8334eec9: a comment line before status", "# Stand der Sicherung\n/usr/local/sbin/cockpit-borg-action status"],
+  ["t_8334eec9: status | jq with a comment", "/usr/local/sbin/cockpit-borg-action status | jq .  # nur lesen"],
+  ["t_8334eec9: comments next to routine", "df -h /  # Platz\nuptime"],
+  ["t_8334eec9: case with a comment", "case \"$1\" in\n  a) echo a ;; # erster\n  *) echo b ;;\nesac"],
+  ["t_8334eec9: a note heredoc with a comment", "cat > /tmp/n.txt <<'EOF'\n# notiz\nEOF\n/usr/local/sbin/cockpit-borg-action status"],
+  ["t_8334eec9: a comment that names a free form, text after it", "# danach /usr/local/sbin/cockpit-borg-action status pruefen\napt-get -y upgrade"],
+  ["t_8334eec9: a comment that names db-access", "# siehe Doku: cockpit-borg-action db-access status\nuptime"],
+  ["t_8334eec9: logger text with a free form", "logger -t wartung \"cockpit-borg-action status ok\""],
+  ["t_8334eec9: a note heredoc with a free form", "cat > /tmp/notiz.txt <<'EOF'\nVorher cockpit-borg-action status laufen lassen\nEOF"],
+  ["t_8334eec9: checksum of two helpers", "sha256sum /usr/local/sbin/cockpit-borg-action /usr/local/sbin/cockpit-host-run"],
+  ["t_8334eec9: sources add over a continuation", "/usr/local/sbin/cockpit-borg-action sources add \\\n  /opt/stacks/app"],
+  ["t_8334eec9: status with a redirect", "/usr/local/sbin/cockpit-borg-action status 2>&1 | tail -n 5"],
+  ["t_8334eec9: a longer file name", "grep -c repair /var/log/cockpit-borg-action.log"],
+  ["t_8334eec9: an array with a comment", "pkgs=(nginx php-fpm) # Dienste\nsystemctl restart \"${pkgs[@]}\""],
+  ["t_8334eec9: a quoted heredoc delimiter that closes", "cat <<E\"OF\"\nborg delete ::a\nEOF"],
+  // Karte t_70e65772: echte Arithmetik bleibt Arithmetik; Umleitungen in Datensenken hinter der freien Form.
+  ["t_70e65772: arithmetic", "echo $(( 1 + 2 ))"],
+  ["t_70e65772: nested arithmetic", "echo $(( (2 + 3) * 4 ))\n(( 1 + 2 ))"],
+  ["t_70e65772: status to /dev/null", "/usr/local/sbin/cockpit-borg-action status >/dev/null"],
+  ["t_70e65772: status to /dev/null with a blank", "/usr/local/sbin/cockpit-borg-action status > /dev/null 2>&1"],
+  ["t_70e65772: a redirect before status", "/usr/local/sbin/cockpit-borg-action >/dev/null status"],
+  ["t_70e65772: status into a data file", "/usr/local/sbin/cockpit-borg-action check >/tmp/check.txt"],
+  ["t_70e65772: status 2>&1 | tee", "/usr/local/sbin/cockpit-borg-action status 2>&1 | tee x"],
+  ["t_70e65772: status with a redirect in a comment", "# /usr/local/sbin/cockpit-borg-action status >/dev/null\nuptime"],
+  // Karte t_ac8559f4: Befehlsersetzungen in einer Arithmetik sind eigene Befehle; Routine bleibt frei (preis-r8).
+  ["t_ac8559f4: date in arithmetic", "echo $(( $(date +%s) - 3600 ))"],
+  ["t_ac8559f4: wc in arithmetic", "n=$(( $(wc -l < /tmp/x.txt) + 1 ))"],
+  ["t_ac8559f4: helper status in arithmetic", "echo $(( $(/usr/local/sbin/cockpit-borg-action status) ))"],
+  ["t_ac8559f4: a comparison in arithmetic is no process substitution", "echo $(( 1<(2) ))"],
+  ["t_ac8559f4: status to /dev/null in backticks", "x=`/usr/local/sbin/cockpit-borg-action status >/dev/null`"],
 ];
 
 // Jede Form aus dem Auftrag, und Umwege, die der Text verdeckt.
@@ -107,6 +182,260 @@ const needsApproval: Array<[string, string]> = [
   ["the helper named by a glob after a separator inside sh -c", "sh -c 'true; /usr/local/sbin/cockpit-borg-actio? sources restore'"],
   ["the helper through source, named by a bracket glob", ". /usr/local/sbin/cockpit-borg-actio[n] sources disconnect"],
   ["the helper through bash under another path", "bash /usr/local/bin/cockpit-borg-action sources add /opt/stacks/x"],
+  // Zweitpruefung t_f65aa80e, Befund B1 (Karte t_5ce5f79f): der Helfer ueber find -exec,
+  // xargs oder Interpreter-Code - dort liest der Riegel sein Verb nicht.
+  ["the helper through find -exec, disconnect", "find /usr/local/sbin -name cockpit-borg-action -exec {} sources disconnect \;"],
+  ["the helper through find -exec, restore", "find /usr/local/sbin -name cockpit-borg-action -exec {} sources restore \;"],
+  ["the helper through find -exec, name glob", "find /usr/local/sbin -name 'cockpit-borg-*' -exec {} sources restore \;"],
+  ["the helper through xargs -I{}", "ls /usr/local/sbin/cockpit-borg-action | xargs -I{} {} sources restore"],
+  ["the helper through perl -e system()", "perl -e 'system(\"/usr/local/sbin/cockpit-borg-action repair\")'"],
+  ["the helper through python3 -c os.system()", "python3 -c 'import os; os.system(\"/usr/local/sbin/cockpit-borg-action sources restore\")'"],
+  ["the helper through find -execdir", "find /usr/local/sbin -name cockpit-borg-action -execdir {} sources disconnect \;"],
+  ["the helper through find -ok with a quoted terminator", "find /usr/local/sbin -name cockpit-borg-action -ok {} repair ';'"],
+  ["the helper through find -path", "find /usr/local -path '*/sbin/cockpit-borg-*' -exec {} repair \;"],
+  ["the helper through find -regex", "find /usr/local/sbin -regex '.*borg-act.*' -exec {} repair \;"],
+  ["the helper through find -exec sh -c", "find /usr/local/sbin -name cockpit-borg-action -exec sh -c '\"$1\" sources restore' _ {} \;"],
+  ["the helper in a second -exec of find", "find /usr/local/sbin -name x -exec true \; -o -name 'cockpit-borg-act*' -exec {} repair \;"],
+  ["the helper as the command of find -exec", "find /tmp -maxdepth 0 -exec /usr/local/sbin/cockpit-borg-action sources restore \;"],
+  ["the helper through xargs -I %", "echo /usr/local/sbin/cockpit-borg-action | xargs -I % % sources restore"],
+  ["the helper through xargs -i sh -c", "echo /usr/local/sbin/cockpit-borg-action | xargs -i sh -c '{} repair'"],
+  ["the helper through xargs with a placeholder in the path", "ls /usr/local/sbin | xargs -I{} /usr/local/sbin/{} sources restore"],
+  ["the helper found by find, run by xargs", "find /usr/local/sbin -name 'cockpit-borg-*' | xargs -I{} {} sources restore"],
+  ["the helper from a command substitution", "$(ls /usr/local/sbin/cockpit-borg-action) sources restore"],
+  ["the helper through perl -le exec", "perl -le 'exec qw[/usr/local/sbin/cockpit-borg-action repair]'"],
+  ["the helper through ruby -e", "ruby -e 'system(\"/usr/local/sbin/cockpit-borg-action sources disconnect\")'"],
+  ["the helper through node -e", "node -e 'require(\"child_process\").execSync(\"/usr/local/sbin/cockpit-borg-action repair\")'"],
+  ["the helper through php -r", "php -r 'system(\"/usr/local/sbin/cockpit-borg-action repair\");'"],
+  ["the helper through python by a glob", "python3 -c \"import glob,os; os.system(glob.glob('/usr/local/sbin/cockpit-borg-*')[0] + ' repair')\""],
+  ["the helper through a python heredoc", "python3 - <<'PY'\nimport subprocess\nsubprocess.run(['/usr/local/sbin/cockpit-borg-action', 'sources', 'restore'])\nPY"],
+  ["the helper as text piped into a shell", "echo '/usr/local/sbin/cockpit-borg-action repair' | sh"],
+  ["the helper in a cron line", "echo '0 3 * * * root /usr/local/sbin/cockpit-borg-action sources restore' > /etc/cron.d/x"],
+  // Zweitpruefung t_0b3f7290 (Karte t_fd6dfaa4): Text auf einer Zeile, die den Helfer nennt,
+  // ueber eine Pipe oder eine Prozess-Substitution in eine Shell.
+  ["the helper named by ls, sed into bash", "ls /usr/local/sbin/cockpit-borg-action | sed 's/$/ sources disconnect/' | bash"],
+  ["the helper named by ls, awk into sh", "ls /usr/local/sbin/cockpit-borg-action | awk '{print $1\" sources restore\"}' | sh"],
+  ["the helper found by find -printf into sh", "find /usr/local/sbin -name 'cockpit-borg*' -printf '%p repair\\n' | sh"],
+  ["the helper named by command -v, sed into sh", "command -v cockpit-borg-action | sed 's/$/ repair/' | sh"],
+  ["the helper through bash and a process substitution", "bash <(echo '/usr/local/sbin/cockpit-borg-action repair')"],
+  ["the helper through source and a process substitution", "source <(echo '/usr/local/sbin/cockpit-borg-action repair')"],
+  // Hinweis H-a: der Wert von xargs -I/-i/--replace zaehlt wie {}.
+  ["the helper through xargs -I@ in the path", "ls /usr/local/sbin | grep borg | xargs -I@ /usr/local/sbin/@ repair"],
+  ["the helper through xargs -I @ in the path", "ls /usr/local/sbin | grep borg | xargs -I @ /usr/local/sbin/@ repair"],
+  ["the helper through xargs --replace=XX in the path", "ls /usr/local/sbin | grep borg | xargs --replace=XX /usr/local/sbin/XX repair"],
+  // Zweitpruefung t_5dd27194 (Karte t_3dce65e1): B1 Gruppe als Pipe-Ziel, B2 | am Zeilenende,
+  // B3 Pipe-Ausgabe in eine Datei, die laufen kann, B4 tee und spaeter bash, B5 eval, H-1 grep-Filter.
+  ["B1: the helper as text piped into a subshell", "echo '/usr/local/sbin/cockpit-borg-action repair' | (bash)"],
+  ["B1: the helper as text piped into exec bash in a subshell", "echo '/usr/local/sbin/cockpit-borg-action repair' | (exec bash)"],
+  ["B1: the helper piped into a group that changes directory first", "echo '/usr/local/sbin/cockpit-borg-action repair' | { cd /; sh; }"],
+  ["B2: the helper named by ls, sed, | at the end of the line", "ls /usr/local/sbin/cockpit-borg-action | sed 's/$/ repair/' |\nsh"],
+  ["B2: the helper as text, | at the end of the line", "echo '/usr/local/sbin/cockpit-borg-action repair' |\nsh"],
+  ["B2: && at the end of the line", "true &&\n/usr/local/sbin/cockpit-borg-action repair"],
+  ["B2: || at the end of the line", "false ||\n/usr/local/sbin/cockpit-borg-action sources restore"],
+  ["B3: pipe output naming the helper into a cron file", "ls /usr/local/sbin/cockpit-borg-action | sed 's/$/ repair/' > /etc/cron.d/x"],
+  ["B3: pipe output naming the helper into root's crontab", "ls /usr/local/sbin/cockpit-borg-action | sed 's/$/ repair/' >> /var/spool/cron/crontabs/root"],
+  ["B4: pipe output naming the helper through tee, run on the next line", "ls /usr/local/sbin/cockpit-borg-action | sed 's/$/ repair/' | tee /tmp/r >/dev/null\nbash /tmp/r"],
+  ["B5: eval of a command substitution that names the helper", "eval \"$(echo '/usr/local/sbin/cockpit-borg-action repair')\""],
+  ["H-1: grep filter on the helper's directory into sh", "cd /usr/local/sbin && ls | grep borg-action | sed 's/$/ repair/' | sh"],
+  // Zweitpruefung t_605da75b (Karte t_6735af09): Zeilen-Allowlist statt Senken-Liste. Nennt eine
+  // Zeile den Helfer ausserhalb seiner freien Formen (oder listet sie sein Verzeichnis in eine Pipe),
+  // duerfen die uebrigen Befehle nur filtern und Daten ablegen.
+  ["N1: |& into bash", "echo '/usr/local/sbin/cockpit-borg-action repair' |& bash"],
+  ["N1: |& into a subshell", "echo '/usr/local/sbin/cockpit-borg-action repair' |& (bash)"],
+  ["N1: |& after ls and sed into sh", "ls /usr/local/sbin/cockpit-borg-action | sed 's/$/ repair/' |& sh"],
+  ["N1: |& at the end of the line", "ls /usr/local/sbin/cockpit-borg-action | sed 's/$/ repair/' |&\nsh"],
+  ["N2: if as the pipe target", "echo '/usr/local/sbin/cockpit-borg-action repair' | if true; then sh; fi"],
+  ["N2: while as the pipe target", "echo '/usr/local/sbin/cockpit-borg-action repair' | while true; do sh; break; done"],
+  ["N2: until as the pipe target", "echo '/usr/local/sbin/cockpit-borg-action repair' | until false; do bash; break; done"],
+  ["N2: for as the pipe target", "echo '/usr/local/sbin/cockpit-borg-action repair' | for i in 1; do sh; done"],
+  ["N2: case as the pipe target", "echo '/usr/local/sbin/cockpit-borg-action repair' | case x in x) sh;; esac"],
+  ["N2: select as the pipe target", "echo '/usr/local/sbin/cockpit-borg-action repair' | select i in 1; do sh; break; done"],
+  ["N3: dd into a cron file", "ls /usr/local/sbin/cockpit-borg-action | sed 's/$/ repair/' | dd of=/etc/cron.d/x"],
+  ["N3: cp from stdin into a cron file", "ls /usr/local/sbin/cockpit-borg-action | sed 's/$/ repair/' | cp /dev/stdin /etc/cron.d/x"],
+  ["N3: install from stdin as a program", "ls /usr/local/sbin/cockpit-borg-action | sed 's/$/ repair/' | install -m 755 /dev/stdin /usr/local/bin/r"],
+  ["N3: sponge into a cron file", "ls /usr/local/sbin/cockpit-borg-action | sed 's/$/ repair/' | sponge /etc/cron.d/x"],
+  ["N3: crontab -", "ls /usr/local/sbin/cockpit-borg-action | sed 's/^/* * * * * /;s/$/ repair/' | crontab -"],
+  ["N3: crontab without -", "ls /usr/local/sbin/cockpit-borg-action | sed 's/^/* * * * * /;s/$/ repair/' | crontab"],
+  ["N3: a unit file by redirect", "ls /usr/local/sbin/cockpit-borg-action | sed 's/^/ExecStart=/;s/$/ repair/' > /etc/systemd/system/x.service"],
+  ["N4: xargs -0 bash -c", "ls /usr/local/sbin/cockpit-borg-action | sed 's/$/ repair/' | xargs -0 bash -c"],
+  ["N4: xargs -d -n1 sh -c", "ls /usr/local/sbin/cockpit-borg-action | sed 's/$/ repair/' | xargs -d '\\n' -n1 sh -c"],
+  ["N5: awk system()", "ls /usr/local/sbin/cockpit-borg-action | sed 's/$/ repair/' | awk '{system($0)}'"],
+  ["N5: sed with the e flag", "ls /usr/local/sbin/cockpit-borg-action | sed 's/$/ repair/e'"],
+  ["N5: sed writes a cron file", "ls /usr/local/sbin/cockpit-borg-action | sed -n 's/$/ repair/w /etc/cron.d/x'"],
+  ["N6: eval of a variable from the line before", "x=\"$(ls /usr/local/sbin/cockpit-borg-action | sed 's/$/ repair/')\"\neval \"$x\""],
+  ["N6: a variable that names the helper, run as a command later", "c='/usr/local/sbin/cockpit-borg-action repair'\n$c"],
+  ["N6: a variable carried over another variable", "x=$(ls /usr/local/sbin/cockpit-borg-action)\ny=\"$x repair\"\nsh -c \"$y\""],
+  ["N6: read from the helper's listing, run later", "read -r c < <(ls /usr/local/sbin/cockpit-borg-action)\necho \"$c repair\" | sh"],
+  ["N7: awk filter over the helper's directory", "cd /usr/local/sbin && ls | awk '/borg-act/{print \"./\"$0\" repair\"}' | sh"],
+  ["N7: sed -n filter over the helper's directory", "cd /usr/local/sbin && ls | sed -n '/borg-act/s/$/ repair/p' | sh"],
+  ["N7: compgen -c", "compgen -c | grep borg-action | sed 's/$/ repair/' | sh"],
+  ["N7: find over an ancestor without a name filter", "find /usr/local -type f | awk '/borg-act/{print $0\" repair\"}' | bash"],
+  ["N8: coproc bash", "coproc bash; echo '/usr/local/sbin/cockpit-borg-action repair' >&${COPROC[1]}"],
+  ["N8: exec into a process substitution", "exec 3> >(bash); echo '/usr/local/sbin/cockpit-borg-action repair' >&3"],
+  // Zweitpruefung t_20ae3cda (Karte t_d16c58d1): Plan-Umfang. Nennt eine Zeile des Plans den Helfer
+  // ausserhalb seiner freien Formen, gilt die Allowlist fuer jede Zeile, und nichts darf Namen oder
+  // Werte umbinden (Funktion, alias, hash, PATH, ${!...}, declare -n, export); Arithmetik und
+  // Array-Index werden durchlaufen; sed ist positiv gelesen (jeder Trenner).
+  ["A1: cat rebound by a function on the line before", "cat(){ sh; }\necho '/usr/local/sbin/cockpit-borg-action repair' | cat"],
+  ["A2: grep rebound by a function", "grep(){ bash; }\necho '/usr/local/sbin/cockpit-borg-action repair' | grep x"],
+  ["A3: head rebound with the function keyword", "function head { sh; }\necho '/usr/local/sbin/cockpit-borg-action repair' | head"],
+  ["A4: tail rebound by an alias", "shopt -s expand_aliases\nalias tail=sh\necho '/usr/local/sbin/cockpit-borg-action repair' | tail"],
+  ["A5: cat rebound by hash -p", "hash -p /bin/sh cat\necho '/usr/local/sbin/cockpit-borg-action repair' | cat"],
+  ["A6: own cat through PATH", "mkdir -p /tmp/p && printf '#!/bin/sh\\nexec sh\\n' > /tmp/p/cat && chmod +x /tmp/p/cat\nexport PATH=/tmp/p:$PATH\necho '/usr/local/sbin/cockpit-borg-action repair' | cat"],
+  ["A7: echo rebound by a function", "echo(){ sh -c \"$*\"; }\necho '/usr/local/sbin/cockpit-borg-action repair'"],
+  ["C2: arithmetic runs a command substitution", "echo '/usr/local/sbin/cockpit-borg-action repair' | echo \"$(( $(sh) ))\""],
+  ["C3: arithmetic unquoted", "echo '/usr/local/sbin/cockpit-borg-action repair' | echo $(( $(sh) ))"],
+  ["C3: arithmetic command", "echo '/usr/local/sbin/cockpit-borg-action repair' | (( $(sh) ))"],
+  ["C5: test -v with a subscript over lines", "x=$(ls /usr/local/sbin/cockpit-borg-action)\ntest -v \"a[\\$($x repair)]\""],
+  ["C6: printf -v into a subscript", "echo '/usr/local/sbin/cockpit-borg-action repair' | printf -v 'a[$(sh)]' x"],
+  ["D1: mapfile with a callback", "mapfile -c 1 -C 'sh -c \"$2\" _' a < <(echo '/usr/local/sbin/cockpit-borg-action repair')"],
+  ["E1: sed s with | as delimiter and e flag", "ls /usr/local/sbin/cockpit-borg-action | sed 's|$| repair|e'"],
+  ["E2: sed s with , as delimiter and e flag", "ls /usr/local/sbin/cockpit-borg-action | sed 's,$, repair,e'"],
+  ["E7: sed s|..|..|w into a cron file", "ls /usr/local/sbin/cockpit-borg-action | sed 's/^/* * * * * root /;s/$/ repair/' | sed 's|$||w /etc/cron.d/x'"],
+  ["E: sed e command after an address", "echo '/usr/local/sbin/cockpit-borg-action repair' | sed '1e'"],
+  ["E: sed program from a variable", "x='s/$/ repair/e'\nls /usr/local/sbin/cockpit-borg-action | sed \"$x\""],
+  ["F1: tail -f into sh, fed by a data file", "touch /tmp/p.txt\ntail -n0 -f /tmp/p.txt | sh &\nls /usr/local/sbin/cockpit-borg-action | sed 's/$/ repair/' >> /tmp/p.txt\nsleep 2"],
+  ["F2: sh reads a data file", "ls /usr/local/sbin/cockpit-borg-action | sed 's/$/ repair/' > /tmp/r.txt\nsh < /tmp/r.txt"],
+  ["F3: bash -s reads a log file", "ls /usr/local/sbin/cockpit-borg-action | sed 's/$/ repair/' > /tmp/r.log\nbash -s < /tmp/r.log"],
+  ["F4: cat of a data file into sh", "ls /usr/local/sbin/cockpit-borg-action | sed 's/$/ repair/' > /tmp/r.txt\ncat /tmp/r.txt | sh"],
+  ["F5: a data file as a command substitution", "ls /usr/local/sbin/cockpit-borg-action | sed 's/$/ repair/' > /tmp/r.txt\n$(cat /tmp/r.txt)"],
+  ["F6: $(< file)", "ls /usr/local/sbin/cockpit-borg-action | sed 's/$/ repair/' > /tmp/r.txt\n$(< /tmp/r.txt)"],
+  ["F7: while read runs each line", "ls /usr/local/sbin/cockpit-borg-action | sed 's/$/ repair/' > /tmp/r.txt\nwhile read -r l; do $l; done < /tmp/r.txt"],
+  ["F8: a symlink from a data file to cron", "ln -sf /etc/cron.d/x /tmp/r.txt\nls /usr/local/sbin/cockpit-borg-action | sed 's/^/* * * * * root /;s/$/ repair/' > /tmp/r.txt"],
+  ["F9: a symlink from a log to cron, tee -a", "ln -sf /etc/cron.d/x /var/log/r.log\nls /usr/local/sbin/cockpit-borg-action | sed 's/^/* * * * * root /;s/$/ repair/' | tee -a /var/log/r.log"],
+  ["F10: xargs -a reads a data file into sh -c", "ls /usr/local/sbin/cockpit-borg-action | sed 's/$/ repair/' > /tmp/r.txt\nxargs -a /tmp/r.txt -d '\\n' -n1 sh -c"],
+  ["F13: LESSOPEN", "export LESSOPEN='|sh %s'\nls /usr/local/sbin/cockpit-borg-action | sed 's/$/ repair/' > /tmp/r.txt\nless /tmp/r.txt"],
+  ["F14: a FIFO with a data name read by sh", "mkfifo /tmp/f.log\nsh < /tmp/f.log &\nls /usr/local/sbin/cockpit-borg-action | sed 's/$/ repair/' > /tmp/f.log"],
+  ["I2: BASH_ENV points at a data file", "ls /usr/local/sbin/cockpit-borg-action | sed 's/$/ repair/' > /tmp/r.txt\nBASH_ENV=/tmp/r.txt bash -c true"],
+  ["G1: indirect variable", "x=/usr/local/sbin/cockpit-borg-action\ny=x\n${!y} repair"],
+  ["G2: name reference over lines", "x=/usr/local/sbin/cockpit-borg-action\ndeclare -n r=x\n$r repair"],
+  ["G3: export, then printenv into sh", "export X=/usr/local/sbin/cockpit-borg-action\nprintenv X | sed 's/$/ repair/' | sh"],
+  ["G4: export, then env into bash", "export X=/usr/local/sbin/cockpit-borg-action\nenv | sed -n 's/^X=//p' | sed 's/$/ repair/' | bash"],
+  ["G10: compgen -c into a variable", "x=$(compgen -c | grep borg-action)\n$x repair"],
+  // Zweitpruefung t_f1b3ea8c (Karte t_2e391eba): im gekennzeichneten Plan ist jede Erweiterung, die
+  // Bash als Code auswertet, kein Filter: ${x@P}, PS0-PS4, Arithmetik auf einem Namen oder Wert.
+  ["P3: prompt expansion of a value over lines", "x='$(sh)'\necho '/usr/local/sbin/cockpit-borg-action repair' | echo \"${x@P}\""],
+  ["S6: prompt expansion of a value built from parts", "x='$'\ny='(sh)'\nz=$x$y\necho '/usr/local/sbin/cockpit-borg-action repair' | echo \"${z@P}\""],
+  ["P: prompt expansion in a heredoc", "x='$(sh)'\necho '/usr/local/sbin/cockpit-borg-action repair' | cat <<EOF\n${x@P}\nEOF"],
+  ["P6: PS4 with set -x", "PS4='$(sh) '\nset -x\necho '/usr/local/sbin/cockpit-borg-action repair' | cat"],
+  ["P8: PS4 through declare", "declare PS4='$(sh) '\nset -o xtrace\necho '/usr/local/sbin/cockpit-borg-action repair' | cat"],
+  ["PS4 through printf -v", "printf -v PS4 '%s' '$(sh) '\nset -x\necho '/usr/local/sbin/cockpit-borg-action repair' | cat"],
+  ["PS4 through read", "read -r PS4 <<< '$(sh) '\nset -x\necho '/usr/local/sbin/cockpit-borg-action repair' | cat"],
+  ["S1: arithmetic on a value built from parts", "x='a['\ny='$(sh)]'\nz=$x$y\necho '/usr/local/sbin/cockpit-borg-action repair' | echo $((z))"],
+  ["S2: arithmetic on a value from printf -v", "printf -v z '%s[%s]' a '$(sh)'\necho '/usr/local/sbin/cockpit-borg-action repair' | echo $((z))"],
+  ["S3: arithmetic on a value from tr", "z=$(echo 'a{$(sh)}' | tr '{}' '[]')\necho '/usr/local/sbin/cockpit-borg-action repair' | echo $((z))"],
+  ["S5: [[ z -eq 0 ]]", "x='a['\ny='$(sh)]'\nz=$x$y\necho '/usr/local/sbin/cockpit-borg-action repair' | [[ z -eq 0 ]]"],
+  ["S: $[z]", "x='a['\ny='$(sh)]'\nz=$x$y\necho '/usr/local/sbin/cockpit-borg-action repair' | echo $[z]"],
+  ["S: substring offset", "x='a['\ny='$(sh)]'\nz=$x$y\ns=abc\necho '/usr/local/sbin/cockpit-borg-action repair' | echo ${s:0:z}"],
+  ["S: array index from a name", "x='a['\ny='$(sh)]'\nz=$x$y\nread -ra b <<< '1 2'\necho '/usr/local/sbin/cockpit-borg-action repair' | echo ${b[z]}"],
+  ["S: compound array assignment", "x='a['\ny='$(sh)]'\nz=$x$y\necho '/usr/local/sbin/cockpit-borg-action repair' | { b=([z]=1); }"],
+  ["S: integer attribute", "x='a['\ny='$(sh)]'\nz=$x$y\ndeclare -i n\necho '/usr/local/sbin/cockpit-borg-action repair' | { n=$z; }"],
+  ["S: integer variable RANDOM", "x='a['\ny='$(sh)]'\nz=$x$y\necho '/usr/local/sbin/cockpit-borg-action repair' | RANDOM=$z"],
+  ["S: integer variable OPTIND through read", "x='a['\ny='$(sh)]'\nz=$x$y\necho '/usr/local/sbin/cockpit-borg-action repair' | { read -r -u 3 OPTIND 3<<< \"$z\"; }"],
+  ["S: test -v with a subscript from a name", "x='a['\ny='$(sh)]'\nz=$x$y\nread -ra b <<< '1 2'\necho '/usr/local/sbin/cockpit-borg-action repair' | test -v 'b[z]'"],
+  // Zweitpruefung t_ba8ceb38 (Karte t_8f78c1ac): # mitten im Wort oder in ${…} ist kein Kommentar.
+  ["t_8f78c1ac: # right after $(…)", "echo $(true)#; /usr/local/sbin/cockpit-borg-action repair"],
+  ["t_8f78c1ac: # right after $((…))", "echo $((1))#; /usr/local/sbin/cockpit-borg-action repair"],
+  ["t_8f78c1ac: # right after <(…)", "cat <(true)#; /usr/local/sbin/cockpit-borg-action repair"],
+  ["t_8f78c1ac: # right after >(…)", "echo >(true)#; /usr/local/sbin/cockpit-borg-action repair"],
+  ["t_8f78c1ac: # right after $(…) before &&", "true $(true)#&& /usr/local/sbin/cockpit-borg-action repair"],
+  ["t_8f78c1ac: # inside ${x:- …}", "echo ${x:- #}; /usr/local/sbin/cockpit-borg-action repair"],
+  ["t_8f78c1ac: # inside ${x/ …/}", "x=a; echo ${x/ #/}; /usr/local/sbin/cockpit-borg-action repair"],
+  ["t_8f78c1ac: # inside backticks ends with them", "echo `true #`; /usr/local/sbin/cockpit-borg-action repair"],
+  ["t_8f78c1ac: # after a ) whose ( is on an earlier line", "x=$(\ntrue\n)#; /usr/local/sbin/cockpit-borg-action repair"],
+  // Zweitpruefung t_a7b9a156 (Karte t_8334eec9): was der Leser fuer Kommentar, Quote oder Heredoc-Koerper
+  // hielt, Bash aber ausfuehrt. Jede Form zweimal: mit dem Helfer (Rohtext-Riegel und Leser) und mit
+  // borg delete (nur der Leser, der Rohtext-Riegel kennt nur den Helfer).
+  ...([
+    ["a comment ending in a backslash", "true # x \\\nREST"],
+    ["a comment line ending in a backslash", "# notiz \\\nREST"],
+    ["line 2 of a '-quote starting with #", "echo 'a\n# '; REST"],
+    ["line 2 of a \"-quote starting with #", "echo \"a\n#\"; REST"],
+    ["ANSI-C quote with \\' then #", "echo $'a\\' #'; REST"],
+    ["ANSI-C quote with \\' without #", "echo $'a\\' x'; REST"],
+    ["extglob @(x)#", "shopt -s extglob\necho @(x)#; REST"],
+    ["extglob !(x)#", "shopt -s extglob\necho !(x)#; REST"],
+    ["extglob +(x)#", "shopt -s extglob\necho +(x)#; REST"],
+    ["extglob *(x)#", "shopt -s extglob\necho *(x)#; REST"],
+    ["extglob ?(x)#", "shopt -s extglob\necho ?(x)#; REST"],
+    ["[[ == @(a)# ]]", "[[ a == @(a)#x ]]; REST"],
+    ["array a=(x)#", "a=(x)#; REST"],
+    ["heredoc <<E\"OF\" closes at EOF", "cat <<E\"OF\"\nEOF\nREST\nE"],
+    ["heredoc <<E\\OF closes at EOF", "cat <<E\\OF\nEOF\nREST\nE"],
+    ["heredoc delimiter over a continuation E\\<NL>OF", "cat <<EOF\nE\\\nOF\nREST\nEOF"],
+  ] as Array<[string, string]>).flatMap(([label, run]): Array<[string, string]> => [
+    [`t_8334eec9: ${label}`, run.replace("REST", "/usr/local/sbin/cockpit-borg-action repair")],
+    [`t_8334eec9 (reader): ${label}`, run.replace("REST", "borg delete ::a")],
+  ]),
+  ["t_8334eec9: sources disconnect behind a comment backslash", "# x \\\n/usr/local/sbin/cockpit-borg-action sources disconnect"],
+  ["t_8334eec9: a variable set behind a comment backslash", "# x \\\nh=/usr/local/sbin/cockpit-borg-action\n$h repair"],
+  ["t_8334eec9: helper and verb split over a continuation", "/usr/local/sbin/cockpit-borg-action \\\nrepair"],
+  ["t_8334eec9: helper with a verb from a value", "/usr/local/sbin/cockpit-borg-action $'\\x72epair'"],
+  // Preis des Rohtext-Riegels (Karte t_8334eec9): der Helfer ohne freie Form in Kommentar oder Text.
+  ["price t_8334eec9: repair in a comment after a subshell", "(true)# ; /usr/local/sbin/cockpit-borg-action repair"],
+  ["price t_8334eec9: repair in a comment after an arithmetic command", "(( 1 ))#; /usr/local/sbin/cockpit-borg-action repair"],
+  ["price t_8334eec9: repair in a comment after a blank", "hostname # /usr/local/sbin/cockpit-borg-action repair"],
+  ["price t_8334eec9: repair in a comment at the start of a command substitution", "x=$(# /usr/local/sbin/cockpit-borg-action repair\nhostname)\necho \"$x\""],
+  ["price t_8334eec9: only the helper's path in a comment", "# Helfer liegt unter /usr/local/sbin/cockpit-borg-action\napt-get update"],
+  ["price t_8334eec9: echo text that names repair", "echo \"cockpit-borg-action repair braucht Freigabe\""],
+  ["price t_8334eec9: echo text with sources add but no path", "echo 'cockpit-borg-action sources add folgt'"],
+  ["price t_8334eec9: a note heredoc that names repair", "cat > /tmp/notiz.txt <<'EOF'\nrepair: cockpit-borg-action repair (nur mit Freigabe)\nEOF"],
+  ["price t_8334eec9: a note heredoc with only the path", "cat > /tmp/notiz.txt <<'EOF'\nHelfer: /usr/local/sbin/cockpit-borg-action\nEOF"],
+  // Zweitpruefung t_86917c5a (Karte t_70e65772): $((…)) ist nur Arithmetik, wenn das erste ) auf Tiefe 0
+  // von einem zweiten ) gefolgt wird, sonst Befehlsersetzung $( (…) …) wie in Bash 5.2; und eine
+  // Umleitung hinter dem Helfernamen beendet den Befehl nicht (R <&- repair startet repair).
+  // Jede Form mit dem Helfer (Rohtext-Riegel und Leser) und mit borg delete (nur der Leser).
+  ...([
+    ["$((cmd); …)", "echo $((echo x); REST)"],
+    ["$((cmd) | …)", "echo $((true) | REST)"],
+    ["x=$((cmd); …)", "x=$((cd /); REST)"],
+    ["\"$((cmd); …)\"", "echo \"$((:); REST)\""],
+    ["$((cmd)<NL>…)", "echo $((:)\nREST)"],
+    ["$((cmd) && …)", "echo $((:) && REST)"],
+    ["((cmd); …) as a subshell", "((echo x); REST)"],
+    ["$((a)+(b)) is a command substitution too", "echo $((a)+(b); REST)"],
+  ] as Array<[string, string]>).flatMap(([label, run]): Array<[string, string]> => [
+    [`t_70e65772: ${label} <&-`, run.replace("REST", "/usr/local/sbin/cockpit-borg-action <&- repair")],
+    [`t_70e65772: ${label} >/dev/null`, run.replace("REST", "/usr/local/sbin/cockpit-borg-action >/dev/null repair")],
+    [`t_70e65772: ${label} 2>&1`, run.replace("REST", "/usr/local/sbin/cockpit-borg-action 2>&1 repair")],
+    [`t_70e65772 (reader): ${label}`, run.replace("REST", "borg delete ::a")],
+  ]),
+  ["t_70e65772: $((cmd); sources <&- disconnect)", "echo $((:); /usr/local/sbin/cockpit-borg-action sources <&- disconnect x)"],
+  ["t_70e65772: $((cmd) && sources <&- restore)", "echo $((:) && /usr/local/sbin/cockpit-borg-action sources <&- restore x)"],
+  ["t_70e65772: a redirect before the verb", "/usr/local/sbin/cockpit-borg-action <&- repair"],
+  ["t_70e65772: a here-string before the verb", "/usr/local/sbin/cockpit-borg-action <<<x repair"],
+  ["t_70e65772: a process substitution as redirect target before the verb", "/usr/local/sbin/cockpit-borg-action > >(cat) repair"],
+  ["t_70e65772: a path, a redirect, then the verb", "/usr/local/sbin/cockpit-borg-action /x >/dev/null repair"],
+  ["t_70e65772: a redirect before the verb in a comment (raw text)", "(true)# ; /usr/local/sbin/cockpit-borg-action <&- repair"],
+  ["t_70e65772: status written into a file that can run", "/usr/local/sbin/cockpit-borg-action status >/etc/cron.d/x"],
+  // Zweitpruefung t_23d4dbd9 (Karte t_ac8559f4): Bash fuehrt jedes $(…)/`…` in einer Arithmetik aus; der Leser
+  // liest sie als eigene Befehle (Verb-, Unit- und Loeschpruefung). Je Arithmetik-Form mit dem Helfer hinter
+  // einer Umleitung, deren Ziel der Rohtext-Riegel frueher nur halb las, und mit borg delete bzw. systemctl stop
+  // (nur der Leser).
+  ...([
+    ["$(( $(…) ))", "echo $(( $(CMD) ))"],
+    ["$(( `…` ))", "echo $(( `CMD` ))"],
+    ["$(( 1 ? $(…) : 0 ))", "echo $(( 1 ? $(CMD >&2; echo 1) : 0 ))"],
+    ["x=$(( $(…) ))", "x=$(( $(CMD) ))"],
+    ["\"$(( $(…) ))\"", "echo \"$(( $(CMD) ))\""],
+    ["nested $(( $(( $(…) )) ))", "echo $(( $(( $(CMD) )) + 1 ))"],
+    ["(( $(…) ))", "(( $(CMD) ))"],
+    ["$[ $(…) ]", "echo $[ $(CMD) ]"],
+    ["let x=$(…)", "let x=$(CMD)"],
+    ["for (( $(…) ))", "for (( i=$(CMD); i<1; i++ )); do :; done"],
+    ["a[$(…)]=1", "a[$(CMD)]=1"],
+  ] as Array<[string, string]>).flatMap(([label, run]): Array<[string, string]> => [
+    [`t_ac8559f4: ${label} < <(:$(:)) repair`, run.replace("CMD", "/usr/local/sbin/cockpit-borg-action < <(:$(:)) repair")],
+    [`t_ac8559f4: ${label} >\`echo x\` repair`, run.replace("CMD", "/usr/local/sbin/cockpit-borg-action >`echo /tmp/r8x` repair")],
+    [`t_ac8559f4: ${label} sources disconnect`, run.replace("CMD", "/usr/local/sbin/cockpit-borg-action < <(:$(:)) sources disconnect x")],
+    [`t_ac8559f4 (reader): ${label} borg delete`, run.replace("CMD", "borg delete ::a")],
+    [`t_ac8559f4 (reader): ${label} systemctl stop`, run.replace("CMD", "systemctl stop borgmatic.timer")],
+  ]),
+  ["t_ac8559f4: a redirect target in $(…) before the verb", "/usr/local/sbin/cockpit-borg-action > $(echo /tmp/x) repair"],
+  ["t_ac8559f4: a redirect without a target", "/usr/local/sbin/cockpit-borg-action >"],
+  ["S: arithmetic in a heredoc", "x='a['\ny='$(sh)]'\nz=$x$y\necho '/usr/local/sbin/cockpit-borg-action repair' | cat <<EOF\n$((z))\nEOF"],
+  ["price: the helper's checksum next to other work", "sha256sum /usr/local/sbin/cockpit-borg-action\napt-get update"],
+  // Hinweis H1: ein Argument in Quotes ueber das Zeilenende.
+  ["sources add with a quoted argument over two lines", "/usr/local/sbin/cockpit-borg-action sources add '/opt/stacks/x\n- /etc'"],
   ["retention edit", "sed -i 's/keep_daily: 7/keep_daily: 1/' /etc/borgmatic/config.yaml"],
   ["retention written by heredoc", "cat > /etc/borgmatic/config.yaml <<'EOF'\nkeep_daily: 1\nEOF"],
   ["config moved away", "mv /etc/borgmatic /tmp/"],
@@ -257,6 +586,9 @@ const doorkeeperDecides: Array<[string, string]> = [
   ["docker run with a backup mount", "docker run --rm -v /var/backups:/b alpine ls /b"],
   ["rm with a variable target", "rm -rf \"$X\""],
   ["ssh to Lab0 that reads", "ssh borg@10.0.0.5 df -h /media/RAID"],
+  // t_5ce5f79f: ein Platzhalter als Befehlswort ohne den Helfer in der Zeile.
+  ["find runs what it finds", "find /opt/app/bin -name 'job-*' -exec {} --once \;"],
+  ["xargs runs what it reads", "ls /opt/app/bin | xargs -I{} /opt/app/bin/{} --once"],
 ];
 
 describe("backup bolt: the routine and ordinary host work stay free", () => {
@@ -282,9 +614,39 @@ describe("backup bolt: needs the operator's approval", () => {
     expect(focus(run).map((hit) => [hit.where, hit.kind])).toEqual([["S1:L3", "uncertain"]]);
   });
 
+  // Zweitpruefung t_23d4dbd9 (Karte t_ac8559f4): jede der beiden Ursachen allein.
+  it("reads a command substitution inside arithmetic as its own command (t_ac8559f4)", () => {
+    for (const run of ["echo $(( $(/usr/local/sbin/cockpit-borg-action repair) ))", "echo $(( `/usr/local/sbin/cockpit-borg-action repair` ))"]) {
+      expect(hits(run).some((hit) => hit.reason.includes("repair can delete archives"))).toBe(true);
+    }
+    expect(hits("echo $(( $(systemctl stop borgmatic.timer) ))")).toEqual([expect.objectContaining({ kind: "backup", reason: expect.stringContaining("systemctl stop") })]);
+  });
+
+  it("reads a redirect target it cannot read completely as a word, not as the end of the command (t_ac8559f4)", () => {
+    // Im Kommentar sieht nur der Rohtext-Riegel den Helfer: halb gelesen hiess das frueher „bare“.
+    for (const target of ["< <(:$(:))", ">`echo /tmp/x`", "> $(echo /tmp/x)"]) {
+      const found = hits(`hostname # /usr/local/sbin/cockpit-borg-action ${target} repair`);
+      expect(found.some((hit) => hit.reason.includes("with a word other than its free forms"))).toBe(true);
+    }
+    // Ein Ziel, das nicht schliesst, ist ein Wort; ein ganz gelesenes Ziel ohne Wort danach bleibt der blosse Name.
+    expect(hits("hostname # /usr/local/sbin/cockpit-borg-action < <(:$(:)")[0].reason).toContain("with a word other than its free forms");
+    expect(hits("hostname # /usr/local/sbin/cockpit-borg-action < <(:$(:))")[0].reason).toContain("where the bolt reads a comment");
+  });
+
   it("counts a heredoc body line by its own line number", () => {
     const found = hits("cat > /tmp/x.sh <<'EOF'\necho start\nborg delete ::a\nEOF\nbash /tmp/x.sh");
     expect(found.some((hit) => hit.where === "S1:L3" && hit.kind === "backup")).toBe(true);
+  });
+
+  it("names the line where bash evaluates a value as code (t_2e391eba)", () => {
+    const run = "x='a['\ny='$(sh)]'\nz=$x$y\necho '/usr/local/sbin/cockpit-borg-action repair' | echo $((z))";
+    // Dazu der Rohtext-Riegel (Karte t_8334eec9) auf derselben Zeile; der Grund des Lesers steht vorn.
+    const found = hits(run);
+    expect(found[0]).toEqual(expect.objectContaining({ where: "S1:L4", kind: "backup", reason: expect.stringContaining("evaluate a value as code") }));
+    expect(found.map((hit) => hit.where)).toEqual(["S1:L4", "S1:L4"]);
+    const ps4 = hits("PS4='$(sh) '\nset -x\necho '/usr/local/sbin/cockpit-borg-action repair' | cat");
+    expect(ps4[0]).toEqual(expect.objectContaining({ where: "S1:L1", reason: expect.stringContaining("PS4 decides which code runs") }));
+    expect(ps4.slice(1)).toEqual([expect.objectContaining({ where: "S1:L3", reason: expect.stringContaining("unabridged text") })]);
   });
 });
 

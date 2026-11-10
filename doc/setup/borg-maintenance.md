@@ -363,8 +363,279 @@ Grenzen:
   `/usr/local/sbin/cockpit-borg-action` aufgerufen wird und dort liegt — eine Kopie (`cat > …`),
   ein Link oder ein anderer Pfad endet mit rc=64. Offline nicht prüfbar (braucht die cgroup einer
   Lauf-Unit), die Bedingung steht vor der Grammatik.
+* **Allgemeine Regel seit der Zweitprüfung t_f65aa80e (Karte t_5ce5f79f, 05.11.2026):** `find -exec {}`,
+  `xargs -I{} {}`, `perl -e 'system(…)'` oder `python3 -c 'os.system(…)'` rufen genau den
+  installierten Pfad auf — der Selbstschutz greift dort nicht, und der Riegel las das Verb nicht.
+  Darum gilt jetzt: **nennt ein Befehl den Helfer und ist er weder die freie Direktform noch reines
+  Lesen, ist er ein Treffer.** „Nennen“ heißt: der Name `cockpit-borg-action` (Wortgrenze, auch in
+  Quotes), ein Glob, der auf `/usr/local/sbin/cockpit-borg-action` passt (`{}` zählt dabei wie `*`),
+  oder ein find-Filter (`-name`, `-path`, `-regex`, auch `-i…`), der auf ihn passt, unter einem
+  Startpfad, der ihn enthält. Frei bleiben nur: der Helfer als Befehlswort (oder die Shell-Form
+  oben) mit `status|check|db-access …|sources status|sources add <wörtlicher Pfad>`, Lesebefehle
+  (`ls`, `sha256sum`, `test`, `journalctl`, `systemctl status` …) und Textausgabe (`echo`,
+  `printf`, `logger`). Fließt Text, der den Helfer nennt, in eine Shell, in eine Datei, die laufen
+  kann (Cron, Skript), oder steht er in Code einer anderen Sprache (`python -c`, `perl -e`, `ruby`,
+  `node`, `php`, ein Heredoc für `python3 -`), ist auch das ein Treffer — gleich mit welchem Verb.
+  `xargs` und der Rest von `find` nach einem `\;` sind ein Treffer, wenn die Zeile den Helfer nennt
+  (`ls …/cockpit-borg-action | xargs -I{} {} …`). Ein Platzhalter als Befehlswort ohne den Helfer in
+  der Zeile (`find /opt/app -exec {} \;`, `xargs -I{} {}`) ist ein Hinweis für den Türsteher
+  (`uncertain`), kein Treffer. **Nachtrag Zweitprüfung t_0b3f7290 (Karte t_fd6dfaa4, 09.11.2026):**
+  Dieselbe Zeilenregel gilt für eine Shell, einen Interpreter, `source`/`.` oder `at|batch`, die
+  Text aus einer Pipe ausführen (`ls …/cockpit-borg-action | sed 's/$/ sources disconnect/' | bash`,
+  `find /usr/local/sbin -name 'cockpit-borg*' -printf '%p repair\n' | sh`,
+  `command -v cockpit-borg-action | sed 's/$/ repair/' | sh`), und für eine Shell oder `source`
+  mit einem Skript, das der Plan nicht zeigt (`bash <(echo '…/cockpit-borg-action repair')`):
+  nennt die Zeile den Helfer, ist es ein Treffer, sonst bleibt es `uncertain`
+  (`journalctl -u borgmatic | grep x | sh -c cat` bleibt frei). Der Wert von `xargs -I`, `-i` oder
+  `--replace` zählt wie `{}`, also nennt `ls /usr/local/sbin | grep borg | xargs -I@ /usr/local/sbin/@
+  repair` den Helfer per Glob (Hinweis H-a). Der Preis: auch `cockpit-borg-action status | python3 -c …`
+  geht an Jochen — wer die Status-Ausgabe auswerten will, nimmt `grep`, `awk` oder `jq`.
+  Ein Argument in Quotes, das über das Zeilenende reicht, neben dem Helfer ist ein Treffer (der Riegel liest jede Zeile für sich; Hinweis H1). Tests:
+  `apps/api/test/backup-guard.test.ts` (die sechs Fälle der Zweitprüfung und Varianten).
+  **Nachtrag Zweitprüfung t_5dd27194 (Karte t_3dce65e1, 09.11.2026):** (B1) Eine Gruppe hinter einer
+  Pipe liest die Pipe: jeder Befehl in `( … )` oder `{ …; }` gilt als „liest aus der Pipe“
+  (`echo '…/cockpit-borg-action repair' | (exec bash)`, `| { cd /; sh; }`). (B2) Endet eine Zeile
+  außerhalb von Quotes auf `|`, `|&`, `&&` oder `||`, setzt Bash sie fort; der Riegel fügt sie wie
+  die Backslash-Fortsetzung zu einer logischen Zeile zusammen (nicht, wenn die Zeile einen Heredoc
+  öffnet). (B3/B4) Pipe-Ausgabe, deren Quelle den Helfer nennt (ohne der Helfer selbst zu sein), in
+  eine Datei, die laufen kann (Umleitung oder `tee`; alles außer reinen Datendateien wie `.json`,
+  `.txt`, `.log`), ist ein Treffer — `ls <helfer> | sed 's/$/ repair/' > /etc/cron.d/x`,
+  `… | tee /tmp/r` vor `bash /tmp/r`. `<helfer> status | jq . > /tmp/s.json` bleibt frei. (B5) `eval`
+  auf einer Zeile, die den Helfer nennt (auch in `$(…)`), ist ein Treffer wie `sh -c "$(…)"`.
+  (H-1) Ein `grep`-Muster, das auf den Namen passt, nennt den Helfer, wenn dieselbe Zeile `ls`
+  über `/usr/local/sbin` (bzw. den Helfer) oder `find` über einen Vorfahren listet
+  (`cd /usr/local/sbin && ls | grep borg-action | sed 's/$/ repair/' | sh`); `grep -v` nicht.
+  **Nachtrag Zweitprüfung t_605da75b (Karte t_6735af09, 09.11.2026): Zeilen-Allowlist statt
+  Senken-Liste.** Die vierte Runde fand wieder neue Senken: `|&` galt nicht als Pipe (die Doku oben
+  behauptete es), `if/while/until/for/case/select` als Pipe-Ziel, Schreiber wie `dd of=`,
+  `cp|install /dev/stdin`, `sponge`, `crontab -`, `xargs … bash -c` (entgegen dem Satz oben),
+  `awk '{system($0)}'`, GNU-`sed …/e`, `eval "$x"` eine Zeile nach `x="$(ls <helfer> | sed …)"`,
+  `awk`/`sed -n`/`compgen -c` statt `grep` über dem Verzeichnis, `coproc bash` und
+  `exec 3> >(bash)` — alle in echter Bash als wirksam belegt. Entscheidung: nicht die fünfte Liste,
+  sondern eine Allowlist je logischer Zeile. **Nennt ein Befehl der Zeile den Helfer außerhalb seiner
+  freien Formen** (Direkt- und Shell-Form urteilt der Riegel weiter nach Verben), **dürfen alle
+  übrigen einfachen Befehle der Zeile** — auch in `$(…)`, `<(…)`, `>(…)`, Gruppen und
+  `if/while/for/case` — **nur Filter oder Datensenken sein**: `grep`, `jq`, `head`, `tail`, `wc`,
+  `sort` (ohne `-o`, `--compress-program`), `uniq`, `cut`, `tr`, `cat`, `awk` ohne `system()`,
+  `| getline`, `print … >|` und ohne `-f`, `sed` ohne `e`, `w`, `-i`, `-f`, Lesebefehle (`ls`,
+  `sha256sum`, `journalctl`, `systemctl status` …), `echo|printf|logger`, `read`, `test`, `cd`,
+  `tee` und Umleitung nur in Datendateien (`.json`, `.txt`, `.log`, `/var/log/…`, `/dev/null`);
+  Vorsätze nur `sudo`, `env`, `timeout`, `nice`, `ionice`, `command`. Alles andere — eine Shell, ein
+  Interpreter, `eval`, `source`, `xargs`, `exec`, `coproc`, `crontab`, `at`, `dd`, `cp`, `install`,
+  `sponge`, `ssh`, ein Befehlsname aus einer Variablen, eine Umleitung in einen Deskriptor (`>&3`) —
+  ist ein Treffer, gleich welche Senke es ist. Listet ein Befehl das Verzeichnis des Helfers
+  (`ls /usr/local/sbin` bzw. `-R` über einem Vorfahren, `find` über einem Vorfahren ohne fremden
+  Namensfilter, `du -a`, `tree`, `compgen -c`, `locate`), gilt dieselbe Regel für die Befehle hinter
+  ihm in der Pipe. Über Zeilen hinweg: eine Variable, deren Wert den Helfer nennt (`x="$(ls <helfer>)"`,
+  `c='<helfer> repair'`, `read -r c < <(ls <helfer>)`, auch weitergereicht `y="$x repair"`), nennt
+  ihn in jeder Zeile, in der sie vorkommt; frei bleibt der Wert der freien Direktform
+  (`s=$(<helfer> status); echo "$s" | grep ok`). `|&` ist jetzt eine Pipe. Für die Allowlist zerlegt
+  der Riegel die Zeile eigens mit Quotes und Ersetzungen, damit ein `sed`- oder `awk`-Programm in
+  Quotes nicht an `;`, `(` oder `|` zerfällt. Frei bleiben `<helfer> status |& tee /tmp/borg.log`,
+  `… status | tee -a /var/log/cockpit-borg.log`, `ls /usr/local/sbin | grep -v borg-action`. Der Preis:
+  eine Zeile, die den Helfer nennt und daneben etwas Fremdes tut (`ls -l <helfer> && systemctl
+  restart x`), geht an Jochen — wer beides will, schreibt zwei Zeilen. Tests: `apps/api/test/backup-guard.test.ts` (N1–N8).
+  **Nachtrag Zweitprüfung t_20ae3cda (Karte t_d16c58d1, 09.11.2026): Plan-Umfang statt Zeile.** Die
+  Zeilen-Allowlist urteilte über Namen und Syntax **einer** Zeile; die fünfte Runde fand Fluss über
+  Zeilen, in echter Bash belegt: (A) ein Filter-Name, umgebunden in einer Vorzeile (`cat(){ sh; }`⏎
+  `echo '<helfer> repair' | cat`, ebenso `function head {…}`, `alias tail=sh`, `hash -p /bin/sh cat`,
+  eigenes `cat` plus `export PATH=…`, `echo(){ sh -c "$*"; }`); (C) Arithmetik, die `$(…)` mit der
+  Pipe als Eingabe ausführt (`| echo "$(( $(sh) ))"`, `printf -v 'a[$(sh)]' x`,
+  `test -v "a[\$($x repair)]"`) — der Riegel hatte `$((…))` durch `0` ersetzt, ohne hineinzusehen;
+  (E) `sed` mit anderem Trenner (`s|$| repair|e`, `s,$, repair,e`, `s|$||w /etc/cron.d/x`); (F) eine
+  „Datensenke“, die eine andere Zeile ausführt (`tail -f /tmp/p.txt | sh &`, `sh < /tmp/r.txt`,
+  `bash -s < r.log`, `cat r.txt | sh`, `$(cat r.txt)`, `$(< r.txt)`, `while read -r l; do $l; done`,
+  `xargs -a r.txt … sh -c`, `BASH_ENV=r.txt bash -c true`, ein FIFO `f.log`, ein Symlink
+  `/tmp/r.txt → /etc/cron.d/x`); (G) Variablen ohne `$name` (`${!y}`, `declare -n r=x`, `export X=…`
+  plus `printenv X`/`env`, `x=$(compgen -c | grep borg-action)`). Entscheidung: keine sechste
+  Senken-Liste, sondern der Geltungsbereich wird **der ganze Plan**. Ein erster Durchgang über alle
+  Schritte und Prüfschritte (samt ausgeführter Heredocs) stellt fest, ob der Plan den Helfer
+  außerhalb seiner freien Formen nennt. Frei sind dabei nur die Direktform (bzw. Shell-Form) und
+  `test`/`[`/`[[` auf ihn, denn sie geben keinen Text aus, der anderswo laufen könnte; alles andere
+  macht seinen Namen zu Text (`echo`, `ls`, `stat`, `sha256sum`, ein Glob, ein find-Filter, ein
+  `grep` über seinem Verzeichnis, das Listen dieses Verzeichnisses, eine Variable mit seinem Namen).
+  Nennt der Plan ihn so, gilt im zweiten Durchgang für **jede** Zeile: jeder einfache Befehl ist
+  Filter oder Datensenke (Liste oben; dazu `set` mit Optionen, `exit`/`return` mit Zahl, `compgen`
+  ohne `-C`/`-F`, `locate`), und nichts bindet um — keine Funktionsdefinition, kein `alias`, `hash`,
+  `enable`, keine Zuweisung an PATH, BASH_ENV, ENV, LD_* & Co. (außer dem Standard-PATH), kein
+  `${!…}`, kein `declare -n`, kein `export` einer Variablen, deren Wert den Helfer nennt. Damit
+  fallen F und A ohne eigene Regel: wer eine Datei, ein FIFO oder `tail -f` ausführt, braucht eine
+  Shell, `xargs`, `less`, `ln`, `mkfifo` oder einen Befehlsnamen aus einem Wert — keiner davon ist ein
+  Filter. Arithmetik: `$((…))`, `((…))` und Array-Indizes werden durchlaufen, jedes `$(…)`/`` `…` ``
+  darin wird ein eigener Befehl (in der Verb-, Unit- und Löschprüfung für `$((…))` erst seit Karte
+  t_ac8559f4, siehe Nachtrag unten; das allein reicht nicht: Bash rechnet auch den *Wert* eines Namens
+  aus — siehe Nachtrag t_2e391eba); ein Index mit `$(…)` in einem Argument (`printf -v`, `read`,
+  `test -v`, `declare`) ist kein Filter, ebenso `mapfile -C`. `sed` wird positiv gelesen statt per
+  Regex auf `/`: Optionen nur `-n -E -r -s -u -z -l`, `-e`/`--expression`, `--posix`, `--debug`,
+  `--sandbox`; Programme nur Adressen (Zahl, `$`, `/re/`, `\cREc`, `first~step`, Bereiche, `!`),
+  `s` und `y` mit beliebigem Trenner, `s`-Flags nur `g p i I m M <Zahl>`, dazu `p P d D n N g G h H
+  x l z = F q Q`, `: b t T`, `a i c`, `{ }`; alles andere (`e`, `w`, `W`, `r`, `R`, `v`, das e-/w-Flag,
+  ein Programm aus einer Variablen oder `$(…)`) ist kein Filter. `awk` bleibt eine Wortprüfung,
+  zusätzlich ohne `-E`, `-i`, `-l`, `--include`, `--load` und ohne indirekten Aufruf `@f(…)`.
+  **Preis (gemessen, `/opt/data/out/t_d16c58d1/probe-preis.log`):** frei bleiben die Direktformen
+  neben fremder Arbeit (`<helfer> status | jq .` plus `apt-get -y upgrade`, `sources add` plus
+  `systemctl restart`, `db-access status` plus `a2dissite`), `test -x <helfer> && <helfer> status`
+  neben `docker compose pull`, und Pläne, die nur lesen und filtern (`stat <helfer>` plus
+  `docker compose ps`, `set -euo pipefail` plus `sha256sum <helfer> | tee /tmp/h.txt`). An Jochen geht
+  neu ein Plan, der den Helfer als Text nennt **und** daneben etwas ändert: `sha256sum <helfer>` oder
+  `ls -l <helfer>` plus `apt-get`/`systemctl restart`, `echo "<helfer>"` plus Arbeit,
+  `h=<helfer>; $h status` plus Arbeit. Ausweg: den Pfad wörtlich schreiben, `test -x` statt `ls`,
+  oder zwei Läufe (der Satz „schreibt zwei Zeilen“ im Nachtrag oben gilt damit nicht mehr). Tests:
+  `apps/api/test/backup-guard.test.ts` (A1–G10 und die freien Fälle `t_d16c58d1: …`), Sonden
+  `/opt/data/out/t_20ae3cda/sonden/probe-t20.mjs` (0 Abweichungen außer Z10, das schon auf main ein
+  Treffer ist). Auch der in Bash ungültige Plan „`|` am Anfang der Folgezeile“ ist jetzt ein Treffer
+  (er nennt den Helfer und hat ein `sh`); Bash würde ihn ohnehin nicht ausführen.
+  Grenze, ehrlich: Ein Programm, das den Helfer weder nennt noch per Glob oder find-Filter trifft
+  (Name aus Teilen zusammengesetzt, dekodiert, aus einer Datei gelesen), sieht der Riegel nicht;
+  das bleibt Verschleierung und damit Sache des Türstehers (X4, `doc/setup/host-run.md` 2a).
+  **Nachtrag Zweitprüfung t_f1b3ea8c (Karte t_2e391eba, 09.11.2026): Erweiterungen, die Bash als
+  Code auswertet.** Die Plan-Allowlist urteilt über Befehlsnamen; Bash führt aber auch einen Wert
+  aus, der in bestimmten Erweiterungen landet. In echter Bash belegt, Riegel frei und Türsteher-Fokus
+  leer: (P) Prompt-Expansion `x='$(sh)'`⏎`echo '<helfer> repair' | echo "${x@P}"`, auch zerlegt
+  (`x='$'`, `y='(sh)'`, `z=$x$y`, `${z@P}`); (PS4) `PS4='$(sh) '`⏎`set -x`⏎`… | cat` — der Satz
+  „nichts bindet um“ stimmte damit nicht, PS4 fehlte in der Liste der Code-Variablen; (S) Arithmetik
+  auf einem Namen, dessen Wert `a[$(sh)]` erst aus Teilen entsteht (`z=$x$y`, `printf -v z …`, `tr`)
+  — „Arithmetik wird nach `$(…)` durchsucht“ galt nur für das wörtliche `$(…)`. Entscheidung: keine
+  Senkenliste, sondern **eine Regel** im gekennzeichneten Plan: jede Erweiterung, die Bash als Code
+  auswertet, ist kein Filter. Das sind `${…@P}`; die Zuweisung (auch `declare`, `export`, `read`,
+  `printf -v`, `for`, `${v:=…}`) an PS0–PS4 und die übrigen Code-Variablen sowie an die
+  Integer-Variablen RANDOM, SRANDOM, OPTIND, HISTCMD (Bash rechnet jeden Wert aus, belegt);
+  `declare`/`local`/`typeset -i`; und Arithmetik, die nicht nur Zahlen (auch `0x1f`, `2#101`) und
+  Operatoren enthält: `$((…))`, `((…))`, `$[…]`, `let`, `for ((…))`, `[[ … -eq|-ne|-lt|-le|-gt|-ge
+  … ]]`, `[[ -v a[i] ]]`, `${s:off:len}` (auch `${@:n}`), ein Index `${a[i]}`, `${#a[i]}`, `a[i]=`,
+  `b=([i]=…)` und als Name in `unset`, `test -v`, `read`, `printf -v`, `declare`/`local`. Ein Heredoc
+  ohne Quotes am Begrenzer wird wie eine Zeile gelesen; `<<'EOF'` erweitert nichts und bleibt frei.
+  Geprüft, was **nicht** rechnet (`sonden/bash-real-arith-ctx.sh`): `test`/`[` mit `-eq`, `printf
+  %d`, `shift`/`exit`/`return`/`break` mit Wert, `read -t/-n/-u`, `ulimit`, `mapfile -n/-s/-O`,
+  `${x@E}`/`@A`/`@Q`, SECONDS/LINENO und andere Sondervariablen — sie bleiben frei. Ein Index eines
+  assoziativen Arrays rechnet nicht; der Riegel kennt den Typ nicht und zählt ihn trotzdem. Der
+  Leser lässt Quotes stehen: `'$((x))'` in einem `awk`-Programm eines gekennzeichneten Plans ist ein
+  Treffer zu viel. **Preis (gemessen):** gegen bdd3c56 unverändert 5/15 (`probe-preis`), gegen
+  5c18e72 0/15 neu; frei bleiben im gekennzeichneten Plan `$((1 + 2))`, `[[ 3 -gt 2 ]]`, `[ "$n" -eq
+  0 ]`, `${s:-x}`, `${s: -1}`, `${a[@]}`, `${PIPESTATUS[0]}`, `${x@Q}`, `set -x` ohne eigenes PS4;
+  ein ungekennzeichneter Plan behält `for ((i=0; …))` und `${x@P}`. Sonden:
+  `/opt/data/out/t_2e391eba/sonden/probe-r5.mjs` (65 Fälle) und `bash-real-r5.mjs` (48 von 51
+  Treffer-Formen laufen in echter Bash; PS0, PS3 und `$((10#$z))` sind Treffer der Regel, ohne
+  dass sie hier liefen). Tests: `apps/api/test/backup-guard.test.ts` (P, PS4, S).
+* **Kommentar wie in Bash (09.11.2026, Zweitprüfung t_ba8ceb38, Karte t_8f78c1ac).** Der Riegel
+  las `#` nach Leerraum, `;&|()` als Kommentarbeginn und sah den Rest der Zeile nicht — auch eine
+  direkte `repair`-Zeile: `echo $(true)#; …/cockpit-borg-action repair` lief in echter Bash, der Riegel
+  blieb frei (schon auf main). Bash beginnt einen Kommentar nur am Wortanfang. Jetzt liest **ein**
+  Leser (`scanShell`, für Kommentar, Heredoc und offenen Quote) die Zeile: Kommentar nach Leerraum,
+  `;&|(`, und nach dem `)` einer Gruppe `(…)` oder eines Befehls `((…))`; kein Kommentar ist `#`
+  direkt nach dem `)` von `$(…)`, `$((…))`, `<(…)`, `>(…)`, nach `$[…]`, in `${…}`, in Arithmetik und
+  in `` `…` `` (dort endet ein Kommentar am Backtick, belegt). Im Zweifel liest er zu viel: ein `)`,
+  dessen `(` nicht in der Zeile steht (`x=$(⏎…⏎)#; …`), macht `#` nicht zum Kommentar, und danach
+  öffnet die Zeile keinen Heredoc mehr; in `${…}` und `` `…` `` öffnet `<<` keinen Heredoc. Preis:
+  `case x in x)# …` ist in Bash ein Kommentar, der Riegel liest den Rest (ein Treffer zu viel).
+  Gemessen: alle Sonden der früheren Runden unverändert (`/opt/data/out/t_8f78c1ac/sonden-*`), die
+  Fälle aus t_ba8ceb38 (`faelle*.mjs`) sind alle Treffer, wo Bash `repair` startet. Tests:
+  `apps/api/test/backup-guard.test.ts` (t_8f78c1ac).
+* **Helfer-Riegel auf dem ungekürzten Text (09.11.2026, Zweitprüfung t_a7b9a156, Karte
+  t_8334eec9).** Runde 6 fand die sechste Leser-Lücke derselben Art (in echter Bash belegt, Riegel
+  frei, Fokus leer, alle schon auf main): `\⏎` am Ende eines Kommentars (`true # x \⏎…repair`;
+  Bash beendet den Kommentar an der Zeile), Zeile 2 eines mehrzeiligen Quotes (`echo 'a⏎# '; …
+  repair` — der Leser las jede Zeile ab „kein Quote offen“), `$'a\' #'` (`\'` schließt `$'…'`
+  nicht), extglob `@(x)#`/`!(x)#`/`+(x)#` und `a=(x)#` (das `)` schließt keine Gruppe), dazu
+  mit Hinweis `[[ a == @(a)#x ]]` und Heredoc-Begrenzer `<<E"OF"`, `<<E\OF` und `E\⏎OF` im Körper.
+  **Entscheidung (PO James): nicht nur Einzelformen nachziehen, sondern fail-closed** — der
+  Helfer-Riegel gilt zusätzlich auf dem ungekürzten Text, jede physische Zeile mit Kommentar und
+  Heredoc-Körper, egal was der Leser daraus macht (`helperMentions` in
+  `deploy/helpers/cockpit-backup-guard.mjs`, Zeilen an jedem `\⏎` blind verbunden): (1) folgt auf
+  den Namen des Helfers ein Wort, muss dort eine freie Form beginnen (`status`, `check`,
+  `db-access status|check|ensure|adopt|restore`, `sources status`, `sources add <Pfad unter den
+  Wurzeln>`), sonst Treffer — ein fester absoluter Pfad als Wort (`sha256sum …/cockpit-borg-action
+  /usr/…`) zählt nicht, ebenso ein längerer Dateiname (`…/cockpit-borg-action.log`); Text nach einer
+  vollständigen freien Form ist frei, weil der Helfer bei jedem Verb die genaue Zahl der Argumente
+  prüft und sonst mit 64 abbricht, bevor er etwas tut; (2) nennt eine logische Zeile den Helfer
+  ohne freie Form öfter, als der Leser in ihrem Code sieht (Kommentar), oder ein Heredoc-Körper, den
+  der Riegel nicht als Skript liest, ihn überhaupt ohne freie Form, ist das ebenfalls ein Treffer.
+  Zusätzlich liest der Leser die Formen jetzt wie Bash, damit Variablen und Plan-Umfang stimmen:
+  der offene Quote einer Zeile gilt am Anfang der nächsten, `\⏎` verbindet nur außerhalb von
+  Kommentar, `'…'` und `$'…'`, `$'…'` endet nicht an `\'`, `(` nach `@ ! + * ? =` öffnet ein Wort,
+  der Heredoc-Begrenzer ist das ganze Wort ohne Quotes und `\`, und im Körper ohne Quotes am
+  Begrenzer verbindet `\⏎` vor dem Vergleich. **Preis (gemessen, `/opt/data/out/t_8334eec9/`):**
+  Kommentar oder Text, der den Helfer mit einem anderen Wort als einer freien Form nennt
+  (`# … cockpit-borg-action repair`, `echo "cockpit-borg-action repair …"`,
+  `echo 'cockpit-borg-action sources add folgt'`) oder ihn in Kommentar/Notiz-Heredoc nur beim
+  Namen nennt, kostet die Freigabe des Operators — auch die bisherigen Kontrollen
+  `(true)# ; … repair`, `hostname # … repair`; der Leser selbst liest diese Kommentare weiter
+  richtig (geprüft mit `borg delete` statt des Helfers). Frei bleiben Kommentare und Text mit einer
+  freien Form (`# danach … status prüfen`, `logger "cockpit-borg-action status ok"`), `ls`/`sha256sum`
+  des Helfers, Fortsetzungen in `sources add \⏎ <pfad>`. `probe-preis` gegen bdd3c56 unverändert 5/15;
+  `preis-r7.mjs` (18 Routine-Pläne mit dem Helfer in Kommentar/Text): 6 Treffer, gegen bba18be 1 (5 neu,
+  alle Kommentar/Text mit `repair` oder nur dem Pfad). Echte Korrektur: `echo 'a⏎b' # '; borg delete …`
+  ist in Bash ein Kommentar und jetzt frei (vorher ein Treffer zu viel). Alle Sonden der früheren
+  Runden byteweise unverändert gegenüber bba18be; `faelle-r6.mjs` 26/26 Treffer, kein FREE+LÄUFT.
+  Tests: `apps/api/test/backup-guard.test.ts` (t_8334eec9, je Form mit Helfer und mit `borg delete`).
+* **Umleitung vor dem Verb, `$((` als Befehlsersetzung (10.11.2026, Zweitprüfung t_86917c5a, Karte
+  t_70e65772).** Runde 7 fand frei, Fokus leer, in echter Bash laufend (alt, auch auf main):
+  `echo $((echo x); …/cockpit-borg-action <&- repair)`, ebenso mit `>/dev/null` oder `2>&1` vor dem
+  Verb, `$((true) | …)`, `x=$((cd /); …)`, `"$((:); …)"`. Zwei Ursachen: (a) der Leser hielt `$((`
+  immer für Arithmetik; Bash liest `$((…))` bzw. `((…))` nur dann als Arithmetik, wenn das erste `)`
+  auf Tiefe 0 direkt von einem zweiten `)` gefolgt wird, sonst als `$( (…) …)` bzw. `( (…) …)`
+  (belegt in Bash 5.2.37, `/opt/data/out/t_70e65772/bash-arith-regel.sh`; auch `$((1)+(2))` ist dort
+  eine Befehlsersetzung). (b) Der Rohtext-Riegel las `Name <Umleitung>` als „nur der Name“, obwohl
+  Bash die Wörter hinter einer Umleitung weiter als Argumente nimmt. **Entscheidung:** der
+  Rohtext-Riegel überspringt hinter dem Namen jede Umleitung samt Ziel (`[n]<…`, `[n]>…`, `>>`,
+  `<&-`, `n>&m`, `&>`, `<<…`, `<<<…`, `{fd}>…`, Ziel auch `<(…)`/`>(…)`) und wertet das Wort danach,
+  als stünde es direkt hinter dem Namen — damit ist die Klasse zu, egal wie der Leser liest; eine
+  Prozessersetzung direkt hinter dem Namen ist ein Wort. Der Leser (`arithCloses` in
+  `deploy/helpers/cockpit-backup-guard.mjs`, an jeder Stelle in `rawSegments`, `scanShell` und
+  `extractSubstitutions`) liest `$((`/`((` nach derselben Bash-Regel; schließt der Ausdruck in der
+  Zeile nicht, ist es für ihn keine Arithmetik (er liest dann lieber zu viel). Dazu, damit die
+  Kontrollen der Karte frei sind: die Direktform urteilt über die Argumente des Helfers **ohne**
+  Umleitungen, die nur Ausgabe wegschreiben (`n>&m`, `n<&-`, `>`/`>>`/`&>` nach `/dev/null` oder in
+  eine Datendatei, also dieselbe Liste wie bei `tee`); jede andere Umleitung (Eingabe, Here-String,
+  eine Datei, die laufen kann, ein Ziel aus einer Variablen) bleibt ein Wort und macht die Form
+  unfrei. `<helfer> status > /tmp/s.json` kann nichts, was `<helfer> status | tee /tmp/s.json` nicht
+  schon frei konnte. **Preis (gemessen, `/opt/data/out/t_70e65772/sonden-neu/preis-r8.log`, 18
+  Routine-Pläne gegen bdd3c56 und ac919e6):** kein neuer Treffer; neu frei sind fünf Pläne mit dem
+  Helfer in freier Form und einer Umleitung (`status >/dev/null 2>&1`, `status > /tmp/s.json`,
+  `check > /tmp/c.log 2>&1`, `sources add <pfad> >/tmp/add.txt`, `apt-get …` plus `status
+  >/dev/null`) — darunter Z10 aus `probe-t20`, das seit t_20ae3cda als „schon auf main ein Treffer“
+  geführt war. Weiter Treffer: `status > /etc/cron.d/x`, `status <<<x`, `tail … cockpit-borg-action.log
+  > /tmp/x.txt` und `sha256sum <helfer> > /tmp/h.txt` (beide schon auf bdd3c56). Alle Sonden der
+  früheren Runden byteweise wie ac919e6 außer dieser Z10; `faelle-r7b.mjs` 72/72, `faelle-r7c.mjs`
+  10/10 Treffer (Kontrolle `$(( 1 + 2 ))` frei), `faelle-r7.mjs` unverändert (frei und laufend nur
+  die fünf Formen mit Türsteher-Fokus). Tests: `apps/api/test/backup-guard.test.ts` (t_70e65772, je
+  Form mit `<&-`, `>/dev/null`, `2>&1` und mit `borg delete` für den Leser).
+* **Befehlsersetzung in der Arithmetik, halb gelesenes Umleitungsziel (10.11.2026, Zweitprüfung
+  t_23d4dbd9, Karte t_ac8559f4).** Runde 8 fand frei, Fokus leer, in echter Bash laufend:
+  `echo $(( $(…/cockpit-borg-action < <(:$(:)) repair) ))`, ebenso mit `` >`echo /tmp/x` `` als Ziel,
+  `` $(( `…` )) ``, `$(( 1 ? $(…) : 0 ))`, `x=$(( $(…) ))`, `… sources disconnect x`; daneben
+  `echo $(( $(systemctl stop borgmatic.timer) ))`. Auf main war schon `$(( $(<helfer> repair) ))`
+  frei. Zwei Ursachen: (a) **Drift gegenüber dem Nachtrag t_d16c58d1 oben** („jedes `$(…)`/`` `…` ``
+  darin wird ein eigener Befehl“): das galt nur für die Zeilen-Allowlist (`rawSegments`); die
+  Verb-, Unit- und Löschprüfung (`extractSubstitutions`) ersetzte `$((…))` durch `0`, ohne
+  hineinzusehen. `((…))`, `$[…]`, `let`, `for ((…))` und Indizes las sie schon, weil sie dort Text
+  bleiben. (b) Der Rohtext-Riegel las ein Prozessersetzungs-Ziel nur bis zum ersten `)` und ein
+  Ziel, das er gar nicht lesen konnte (Backtick, `$(…)`), als Ende des Befehls („bare“).
+  **Entscheidung:** (a) ein Leser: `extractSubstitutions` liest den Ausdruck in `$((…))` mit sich
+  selbst (Modus Arithmetik: `<`/`>` sind dort Vergleiche, keine `<(…)`), jedes `$(…)`/`` `…` `` darin
+  wird ein eigener Befehl, der Ausdruck selbst bleibt `0` — damit stimmt der Satz oben jetzt für
+  beide Prüfungen. (b) Fail-closed: hinter einem Umleitungsoperator liest `redirectTargetEnd` das
+  ganze Ziel (einfache Zeichen, `$(…)`/`<(…)`/`>(…)` mit Klammerzählung, `${…}`, `` `…` `` mit
+  Partner); fehlt das Ziel oder schließt es nicht, ist das ein Wort („arg“), nie das Ende des
+  Befehls. „bare“ gibt es nur noch bei echtem Befehlsende (Zeilenende, `;`, `&`, `|`, `)`, `` ` ``,
+  `#`). Ein ganz gelesenes Ziel ohne Wort danach (`<helfer> < <(…)`, `<helfer> > repair`) bleibt der
+  bloße Name — so liest es auch Bash. **Preis (gemessen, `/opt/data/out/t_ac8559f4/preis-r8.log`):**
+  kein neuer Treffer gegenüber 3771b9b; frei bleiben `echo $(( $(date +%s) - 3600 ))`,
+  `n=$(( $(wc -l < /tmp/x.txt) + 1 ))`, `echo $(( $(<helfer> status) ))`, `<helfer> status
+  >/dev/null`. Tests: `apps/api/test/backup-guard.test.ts` (t_ac8559f4, je Arithmetik-Form mit dem
+  Helfer hinter `< <(:$(:))`, `` >`echo x` `` und mit `borg delete`/`systemctl stop` für den Leser;
+  dazu je Ursache allein).
+* **Offene Entscheidung (05.11.2026, Karte t_5ce5f79f): Freigabe-Markierung im Helfer.** Erwogen:
+  die schwächenden Verben (`sources connect|disconnect|restore`, `repair`) laufen in einer
+  host-run-cgroup nur, wenn `cockpit-host-run` für genau diesen Job eine root-eigene Markierung
+  „operatorApproved“ aus dem geprüften Envelope abgelegt hat. Nicht gebaut: die Schritte eines Laufs
+  laufen selbst als root und könnten die Markierung schreiben; gegen das Fälschen schützte wieder
+  nur der Riegel am Pfad (oder der Türsteher bei Verschleierung) — der Gewinn ist kleiner, als er
+  aussieht, und es ist eine Änderung an Schloss und Helfer zugleich (G2, G10). Entscheidet Jochen.
 * Mehr Quellen heißen mehr Platz auf der Kiste (RAID, `DF` in `status`): `add` nennt die Größe,
-  die Entscheidung bleibt „ergänzen ist frei“.
+  die Entscheidung bleibt „ergänzen ist frei“. **Offen (Hinweis H2, 05.11.2026):** `add` hat keine
+  Größengrenze; eine große Quelle kann das RAID auf Lab0 füllen, dann scheitern alle Nachtläufe.
+  Eine Grenze (fest oder gegen den freien Platz aus `status`) ist nicht gebaut.
 
 Ablauf für eine neue Quelle (ohne Jochen, sobald angeschlossen): ein host-run mit dem Schritt
 `/usr/local/sbin/cockpit-borg-action sources add <pfad>`, Prüfung `… sources status`, Rückweg
