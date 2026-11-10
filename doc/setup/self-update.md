@@ -301,7 +301,22 @@ Flow of a Hermes change job whose plan contains `self.update <sha>` lines:
    Dockerfiles, compose files, systemd units, sudoers, `package.json`), then
    the lockfile, then every other file, documentation last — so the material
    that runs as root or goes into the images lands in the first pass. So every
-   changed file reaches a reviewer completely in **exactly one** pass. The
+   changed file reaches a reviewer completely in **exactly one** pass — except
+   a file whose section alone is larger than a pass (since 10.11.2026, card
+   t_89b7bb76; case: `deploy/helpers/cockpit-backup-guard.mjs`, diff ~90 KB):
+   `splitAtHunks` cuts it at its hunk boundaries (`@@`) into parts that each
+   fit a pass, every part with the file header (`diff --git`/`---`/`+++`) and
+   a first line `[part k/n of <path>: hunks a–b of N; …]`; the parts go over
+   several passes, and every pass names the other parts and the pass that
+   holds them (`<path> (part 2/3, hunks 24–29) in pass 3`). No hunk is ever
+   cut. The file counts as covered only when every part reached a pass; some
+   parts in, the rest beyond the pass limit, is `cut` (incomplete). The merge
+   needs no file view: approve only when every pass approved, so no single
+   part's approve marks the file reviewed. Not given additionally: the full new
+   file of a focus file for context across hunks — at 152 KB it is larger than
+   a pass itself, and the hunks already carry their context lines; a reviewer
+   who cannot judge a hunk without more says so (`UNVERIFIABLE` of what it saw
+   is a stop, never a pass). The
    passes are asked one after the other (`runUpdateReviewPasses`); a failed
    pass does not keep the others from answering. Their answers are united
    (`mergeUpdateReviewAnswers`): the findings of all passes count; one
@@ -341,8 +356,9 @@ Flow of a Hermes change job whose plan contains `self.update <sha>` lines:
      whole: every focus-area file (a binary one counts as incomplete) and every
      other changed file except markdown and `package-lock.json` (summarized as
      the G8 package list) — tests included, for both repositories. Such a file
-     is never cut into pieces: one larger than a whole pass, or beyond the pass
-     limit, is left out and stops the review. Only documentation may be cut:
+     is never cut inside a hunk: one with a single hunk larger than a whole
+     pass, or (whole or in parts) beyond the pass limit, is left out (`cut`,
+     when some of its parts got in) and stops the review. Only documentation may be cut:
      it fills the room the other material leaves and never opens a pass of its
      own. A reviewer's `UNVERIFIABLE` is for what it saw and cannot judge, never
      for material the Cockpit failed to collect.
@@ -465,7 +481,7 @@ finding names a concrete way **past** one of its guards, or a weakening of it:
 | G5 Sandbox and safety net | the special doors' sandbox is not broader; `host.run` has none by design, but before every run with `mutates: true` the net of the instance role, otherwise no step runs: role `vps` a return path — the last successfully finished borg backup at most 30 h old (a later failed run does not take it away; without it only the two typed exceptions of `doc/setup/host-run.md` run, emergency shutdown and backup repair, recognized by fixed forms only) — and a machine snapshot; role `lab0` (the borg target, no hoster) a complete local host snapshot (`/etc`, packages, unit states) plus the data lock: the run unit mounts `/media` (borg repository), `/home`, `/mnt`, `/srv` read-only and the run confirms it in its mount table before the first step and after a reboot (Jochen, 17.10.2026: on Lab0 this replaces borg freshness and the machine snapshot); role `box` (Proxmox host, t_88f1e802) the same host snapshot plus a Proxmox snapshot of every guest (VM and container); a guest that cannot be snapshotted stops the run; no data lock (the guests' snapshots are their way back). The role comes only from the root-owned `instance-role.env` the deploy installs; missing, foreign-writable or unknown → no step runs (16.10.2026). Snapshot revert/delete stays the operator's decision (at the door through the doorkeeper's X4, not a rule). |
 | G6 Secrets | redaction of outputs, logs and prompts; the host-run log redacted line by line and 0600. The doorkeeper's unredacted material is intended. |
 | G7, G8 | unchanged (self-update path, dependencies). |
-| G9 Doorkeeper | isolated safety review; a pass only with complete material; incomplete or unreadable review and findings without evidence stop without a pass; its finding classes (secrets/egress, authority, exposure, loss of the way back, false read-only claim, hidden code, injection) do not narrow. |
+| G9 Doorkeeper | isolated safety review; a pass only with complete material (a file larger than one pass is complete only when all its hunk parts were reviewed); incomplete or unreadable review and findings without evidence stop without a pass; its finding classes (secrets/egress, authority, exposure, loss of the way back, false read-only claim, hidden code, injection) do not narrow. |
 | G10 Backup bolt | deleting backups, changing their retention or switching them off only with `operatorApproved`, even on a pass; one deterministic source asked at three places (API policy, `runHostRun`, root helper incl. resume); no deleting form becomes free. Reading the borg credentials or the repository contents is a bolt hit as well (13.10.2026). Unreadable text is the doorkeeper's focus (`backup-focus`), not a bolt hit (operator, 10.10.2026) — except on Lab0, the repository host: there unreadable code, text piped or redirected into `ssh`, and deleting after a quoted separator are bolt hits, while visible non-backup routine (service restarts, status, logs) stays free (13.10.2026). Risk bolt under the same guarantee (incident 23.10.2026): a manifest declaring `exposure`, `data_loss` or `identity_or_secret` starts only with `operatorApproved`, even on a pass, asked at the same three places (`hostRunRisksNeedingApproval`); an unknown risk class makes the manifest invalid. |
 
 The runner marks changes to the door's files as focus area `host-door`
