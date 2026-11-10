@@ -89,7 +89,7 @@
 
 import { classifyRetention, parseRetentionArgs } from "./cockpit-borg-retention-rules.mjs";
 
-export const BACKUP_GUARD_VERSION = "cockpit-backup-guard/v5";
+export const BACKUP_GUARD_VERSION = "cockpit-backup-guard/v6";
 
 // Was die Backups sind. TOKEN greift im normalisierten Text (ohne Quotes und
 // Backslashes), also auch in b"o"rg und bo\rg.
@@ -972,6 +972,52 @@ const READ_ONLY = new Set([
 const PVE_GUEST_READ = new Set(["list", "listsnapshot", "config", "status", "pending", "showcmd", "df", "help"]);
 const PVESM_READ = new Set(["status", "list", "path", "scan", "nfsscan", "cifsscan", "lvmscan", "lvmthinscan", "zfsscan", "iscsiscan", "glusterfsscan", "pbsscan", "apiinfo", "help"]);
 const PVESH_READ = new Set(["get", "ls", "usage", "help"]);
+// Die Proxmox-CLI nimmt eindeutige Präfixe ihrer Unterbefehle (pve-common
+// CLIHandler.pm, expand_command_name mit enforce_exact; Zweitprüfung t_eebb73c0,
+// Karte t_a5defddd): qm delsnap ist delsnapshot, pvesh del ist delete. Ein
+// exakter Name gilt vor jedem Präfix, ein Alias nur exakt; ein mehrdeutiges
+// Präfix lehnt Proxmox ab. Der Riegel löst genauso auf und wertet ein
+// mehrdeutiges Präfix, das ein gesperrtes Verb treffen kann, als dieses Verb
+// (fail-closed). Die Listen: git.proxmox.com HEAD (qm.pm, pct.pm, pvesm.pm,
+// pvesh.pm; help ergänzt CLIHandler), Stand 10.11.2026.
+const PVE_COMMANDS = {
+  qm: {
+    all: ["list", "create", "destroy", "clone", "migrate", "remote-migrate", "set", "config", "pending", "showcmd", "status", "snapshot", "delsnapshot", "listsnapshot", "rollback", "template", "start", "stop", "reset", "shutdown", "reboot", "suspend", "resume", "sendkey", "vncproxy", "wait", "unlock", "disk", "enroll-efi-keys", "monitor", "guest", "mtunnel", "nbdstop", "terminal", "importovf", "cleanup", "cloudinit", "import", "help"],
+    aliases: ["importdisk", "move-disk", "move_disk", "rescan", "resize", "unlink", "agent"],
+    bolted: ["delsnapshot", "rollback", "destroy"],
+  },
+  pct: {
+    all: ["list", "config", "pending", "set", "resize", "create", "restore", "destroy", "start", "suspend", "resume", "shutdown", "stop", "reboot", "clone", "migrate", "move-volume", "remote-migrate", "snapshot", "delsnapshot", "listsnapshot", "rollback", "template", "status", "console", "enter", "unlock", "exec", "fsck", "mount", "unmount", "push", "pull", "df", "rescan", "cpusets", "fstrim", "help"],
+    aliases: ["move_volume"],
+    bolted: ["delsnapshot", "rollback", "destroy", "restore"],
+  },
+  pvesm: {
+    all: ["add", "set", "remove", "status", "list", "alloc", "free", "scan", "path", "extractconfig", "export", "import", "apiinfo", "prune-backups", "help"],
+    aliases: ["nfsscan", "cifsscan", "iscsiscan", "lvmscan", "lvmthinscan", "zfsscan"],
+    bolted: ["free", "prune-backups", "set"],
+  },
+  pvesh: {
+    all: ["usage", "get", "ls", "set", "create", "delete", "help"],
+    aliases: [],
+    bolted: ["delete", "set", "create"],
+  },
+};
+// Das Verb, das Proxmox ausführt: { verb, unique }. Mehrdeutig (unique false):
+// das erste gesperrte Verb unter den Treffern, sonst das Wort unverändert.
+function pveVerb(tool, word) {
+  const def = PVE_COMMANDS[tool];
+  const lower = word.toLowerCase();
+  if (def.all.includes(lower) || def.aliases.includes(lower)) return { verb: lower, unique: true };
+  const hits = def.all.filter((name) => name.startsWith(lower));
+  if (hits.length === 1) return { verb: hits[0], unique: true };
+  return { verb: hits.find((name) => def.bolted.includes(name)) || word, unique: false };
+}
+// Im Text: jedes Verb hinter qm/pct/pvesm/pvesh durch das aufgelöste ersetzen.
+const pveVerbs = (text) => text.replace(/(\b(qm|pct|pvesm|pvesh)[\s,[\]()'"]+)([A-Za-z][\w-]*)/gi, (all, head, tool, word) => head + pveVerb(tool.toLowerCase(), word).verb);
+// Getopt::Long (JSONSchema.pm get_options: auto_abbrev, prefix_pattern (--|-)):
+// jede Option mit - oder -- und jedem Präfix ihres Namens (vzdump --rem 1).
+// Ein mehrdeutiges Präfix lehnt Proxmox ab; der Riegel zählt es mit (fail-closed).
+const optionPrefix = (name) => [...name].reduceRight((rest, char) => `${char === "-" ? "\\-" : char}${rest ? `(?:${rest})?` : ""}`, "");
 const DOCKER_READ = new Set(["ps", "images", "inspect", "logs", "stats", "version", "info", "top", "port", "diff", "history"]);
 const SYSTEMCTL_READ = new Set(["status", "is-active", "is-enabled", "is-failed", "show", "cat", "list-timers", "list-units", "list-unit-files", "list-dependencies", "help"]);
 const ROUTINE_UNITS = new Set(["borgmatic", "borgmatic.service", "borgmatic.timer", "cockpit-borg-retention", "cockpit-borg-retention.service", "cockpit-borg-retention.timer"]);
@@ -1014,16 +1060,25 @@ const RETENTION_PHRASE = /\bkeep[_-](?:within|secondly|minutely|hourly|daily|wee
 // /nodes/<n>/qemu|lxc/<id> (DELETE), …/storage/<s>/content/<vol> (DELETE, set),
 // …/storage/<s>/prunebackups (DELETE), /cluster/backup/<id> (DELETE, set).
 const PVE_GUEST = /\b(?:qm|pct)[\s,[\]()'"]+(?:delsnapshot|rollback|destroy)\b/i;
-const PVE_BACKUP = /\bvzdump\b[^\n;&|]*?\s--remove(?![\s=]+(?:0|false|no|off)\b)(?=[\s=;&|]|$)|\bpvesm[\s,[\]()]+(?:prune-backups\b|free\b[^\n;&|]*(?::backup\/|\sbackup\/|vzdump-))/i;
+const PVE_BACKUP = new RegExp(String.raw`\bvzdump\b[^\n;&|]*?\s--?${optionPrefix("remove")}(?![\s=]+(?:0|false|no|off)\b)(?=[\s=;&|]|$)|\bpvesm[\s,[\]()]+(?:prune-backups\b|free\b[^\n;&|]*(?::backup\/|\sbackup\/|vzdump-))`, "i");
+// Aufbewahrung als abgekürzte Option (pvesm set local --maxfi 1, vzdump --prune …).
+const PVE_RETENTION_OPTION = new RegExp(String.raw`\b(?:vzdump|pvesm|pvesh)\b[^\n;&|]*?\s--?(?:${optionPrefix("maxfiles")}|${optionPrefix("prune-backups")})(?=[\s=;&|]|$)`, "i");
+// Einen Gast aus einer Sicherung über den bestehenden legen (qmrestore/pct restore
+// --force) zerstört ihn samt Snapshots wie destroy.
+const PVE_RESTORE = new RegExp(String.raw`\b(?:qmrestore|pct[\s,[\]()'"]+restore)\b[^\n;&|]*?\s--?${optionPrefix("force")}(?![\s=]+(?:0|false|no|off)\b)(?=[\s=;&|]|$)`, "i");
+// Am qm/pct vorbei auf der Speicherebene (Box: LVM-thin; ZFS, qcow2): Gast-Volumes
+// und ihre Snapshots löschen oder zurückrollen. Andere Volume-Namen sind Fokus
+// des Türstehers.
+const PVE_STORAGE = /\blvremove\b[^\n;&|]*(?:\b(?:vm|base)-\d+-(?:disk|cloudinit|state)|\bsnap_|\bpve\/data\b)|\blvconvert\b[^\n;&|]*\s--merge\b[^\n;&|]*\bsnap_|\bzfs[\s,[\]()]+(?:destroy|rollback)\b[^\n;&|]*(?:@|\b(?:vm|base|subvol|basevol)-\d+-disk)|\bqemu-img[\s,[\]()]+snapshot\b[^\n;&|]*\s-[a-zA-Z]*[ad]\b/i;
 const PVE_API_PATH = String.raw`\/(?:snapshot\/[^\s/'"]+|(?:qemu|lxc)\/\d+|storage\/[^\s/'"]+\/(?:content\/[^\s/'"]+|prunebackups)|cluster\/backup\/[^\s/'"]+)`;
-const PVE_API_DELETE = new RegExp(String.raw`\bpvesh[\s,[\]()]+delete\s+(?:-\S+\s+)*\S*${PVE_API_PATH}(?:[\s/'"?]|$)|\bpvesh[\s,[\]()]+set\s+(?:-\S+\s+)*\S*\/(?:storage\/[^\s/'"]+\/content\/|cluster\/backup\/)|\/snapshot\/[^\s/'"]+\/rollback\b|(?:\s-[a-zA-Z]*X|--request|--method)[\s=]*DELETE\b[^\n]*\/api2\/\S*${PVE_API_PATH}(?:[\s/'"?]|$)|\/api2\/\S*${PVE_API_PATH}(?:[\s/'"?]|$)[^\n]*(?:\s-[a-zA-Z]*X|--request|--method)[\s=]*DELETE\b|(?:\s-[a-zA-Z]*X|--request|--method)[\s=]*(?:PUT|POST)\b[^\n]*\/api2\/\S*\/(?:cluster\/backup\/|storage\/[^\s/'"]+\/content\/)|\/api2\/\S*\/(?:cluster\/backup\/|storage\/[^\s/'"]+\/content\/)\S+[^\n]*(?:\s-[a-zA-Z]*X|--request|--method)[\s=]*(?:PUT|POST)\b`, "i");
+const PVE_API_DELETE = new RegExp(String.raw`\bpvesh[\s,[\]()]+delete\s+(?:-\S+\s+)*\S*${PVE_API_PATH}(?:[\s/'"?]|$)|\bpvesh[\s,[\]()]+set\s+(?:-\S+\s+)*\S*\/(?:storage\/[^\s/'"]+\/content\/|cluster\/backup\/)|\/snapshot\/[^\s/'"]+\/rollback\b|(?:\s-[a-zA-Z]*X|--request|--met(?:h(?:o(?:d)?)?)?)[\s=]*DELETE\b[^\n]*\/api2\/\S*${PVE_API_PATH}(?:[\s/'"?]|$)|\/api2\/\S*${PVE_API_PATH}(?:[\s/'"?]|$)[^\n]*(?:\s-[a-zA-Z]*X|--request|--met(?:h(?:o(?:d)?)?)?)[\s=]*DELETE\b|(?:\s-[a-zA-Z]*X|--request|--met(?:h(?:o(?:d)?)?)?)[\s=]*(?:PUT|POST)\b[^\n]*\/api2\/\S*\/(?:cluster\/backup\/|storage\/[^\s/'"]+\/content\/)|\/api2\/\S*\/(?:cluster\/backup\/|storage\/[^\s/'"]+\/content\/)\S+[^\n]*(?:\s-[a-zA-Z]*X|--request|--met(?:h(?:o(?:d)?)?)?)[\s=]*(?:PUT|POST)\b`, "i");
 // Proxmox wirft leere Pfadteile weg (/qemu//100), und pvesh nimmt Pfade auch ohne
 // führenden Schrägstrich (cluster/backup/x): beides vor dem Vergleich angleichen.
 function pveApiText(text) {
   return text.replace(/(?<!:)\/{2,}/g, "/")
     .replace(/(\bpvesh[\s,[\]()]+(?:get|ls|set|create|delete|usage)\s+(?:-\S+\s+)*)(?=[^\s/-])/g, "$1/");
 }
-const SNAPSHOT_DELETE = /\bcockpit-vps-snapshot\s+delete\b|(?:\s-[a-zA-Z]*X|--request|--method)[\s=]*DELETE\b[^\n]*\/snapshots\b|\/snapshots\b[^\n]*(?:\s-[a-zA-Z]*X|--request|--method)[\s=]*DELETE\b/i;
+const SNAPSHOT_DELETE = /\bcockpit-vps-snapshot\s+delete\b|(?:\s-[a-zA-Z]*X|--request|--met(?:h(?:o(?:d)?)?)?)[\s=]*DELETE\b[^\n]*\/snapshots\b|\/snapshots\b[^\n]*(?:\s-[a-zA-Z]*X|--request|--met(?:h(?:o(?:d)?)?)?)[\s=]*DELETE\b/i;
 const BORG_DELETE = new Set(["delete", "prune", "compact", "recreate", "break-lock", "rdelete", "repo-delete"]);
 const BORG_KEY_CHANGE = new Set(["change-passphrase", "import", "migrate-to-repokey", "change-location", "change-algorithm"]);
 const BORGMATIC_DELETE = new Set([...BORG_DELETE, "borg", "key"]);
@@ -1225,7 +1280,12 @@ function normalize(code) {
     if (quote === "'") { if (char === "'") quote = null; else if (!literal || char !== "$" && char !== "`") out += QUOTED_SEPARATOR.test(char) ? IN_QUOTES + char : char; continue; }
     // $'…' (ANSI-C): \' schließt nicht; das $ bleibt stehen (der Wert entsteht erst in Bash).
     if (quote === "$'") { if (char === "'") quote = null; else { if (char === "\\") { out += char; i += 1; } const next = code[i] ?? ""; out += QUOTED_SEPARATOR.test(next) ? IN_QUOTES + next : next; } continue; }
-    if (char === "$" && code[i + 1] === "'" && quote === null) { out += "$"; quote = "$'"; i += 1; continue; }
+    if (char === "$" && code[i + 1] === "'" && quote === null) {
+      // Ohne Backslash ist $'…' dasselbe wie '…' (qm del$'s'napshot).
+      const end = code.indexOf("'", i + 2);
+      if (end >= 0 && !code.slice(i + 2, end).includes("\\")) { quote = "'"; literal = OWN_LANGUAGE.test(code.slice(0, i)); i += 1; continue; }
+      out += "$"; quote = "$'"; i += 1; continue;
+    }
     if (char === "\\") { const next = code[i + 1] ?? ""; if (next !== "$" && next !== "`") out += next; i += 1; continue; }
     if (char === '"') { quote = quote === '"' ? null : '"'; continue; }
     if (char === "'" && quote === null) { quote = "'"; literal = OWN_LANGUAGE.test(code.slice(0, i)); continue; }
@@ -1548,6 +1608,12 @@ function leadingOptions(words, from) {
   return options;
 }
 
+// Ziele einer Umleitung, die die Datei kürzt (>, >|, n>, &>; nicht >>, >&n).
+function truncateTargets(text) {
+  return [...text.matchAll(/(?:^|[^<>])>\|?(?![>&(])\s*([^\s;&|<>]+)/g)].map((match) => match[1])
+    .filter((target) => !/^\/dev\//.test(target));
+}
+
 function redirectTargets(text) {
   const targets = [];
   const pattern = /(?:^|[^<>])>>?\s*([^\s;&|<>]+)/g;
@@ -1629,6 +1695,12 @@ function vzdumpTouches(path, bulk) {
 }
 const vzdumpAny = (path, bulk) => expandBraces(path).some((variant) => vzdumpTouches(resolvePath(variant, "/"), bulk));
 const touchesConfig = (path) => pathTouches(path, false, CONFIG, []);
+// Kürzen per Umleitung (: > f, > f, echo > f; Karte t_a5defddd, H1): ein Treffer
+// dort, wo nur das Backup-Werkzeug schreibt — Repo, GitLab-Sicherungen,
+// vzdump-Sicherungen. In /var/backups bleibt es Fokus des Türstehers: dort legt
+// ein Plan den eigenen Rückweg an (wp db export > /var/backups/…).
+const TRUNCATE_DATA = ["/media/RAID/backup_VServer", "/var/opt/gitlab/backups", "/var/lib/vz/dump"];
+const touchesTruncate = (path) => pathTouches(path, false, TRUNCATE_DATA, []) || vzdumpAny(path, false);
 const DATA_ANCESTORS = ancestorsOf(DATA);
 const touchesData = (path, bulk) => pathTouches(path, bulk, DATA, DATA_ANCESTORS) || vzdumpAny(path, bulk);
 const touchesBolted = (path) => pathTouches(path, true, BOLTED, BOLTED_ANCESTORS) || vzdumpAny(path, true);
@@ -1725,19 +1797,25 @@ function readOnlyForm(command, segmentText) {
     case "journalctl": return !/\s--(?:vacuum-\w+|rotate|flush|relinquish-var|setup-keys|sync)\b/.test(joined);
     case "find": return !/\s-(?:delete|exec|execdir|ok|okdir|fprint0?|fprintf|fls)\b/.test(joined);
     case "sort": return !/\s(?:-o|--output)\b/.test(joined);
-    case "curl": return !/\s(?:-[a-zA-Z]*[oODcKdFTXbu]|--(?:output|remote-name|dump-header|cookie-jar|config|data|json|form|upload-file|request|post|user))\b/.test(joined);
-    case "wget": return /\s(?:-q?O\s*-|--spider)(?:\s|$)/.test(joined) && !/\s--(?:post|method|body)/.test(joined);
+    // Eine Kurzoption nimmt ihren Wert auch angehängt (-XDELETE, -kXDELETE).
+    case "curl": return !/\s-[a-zA-Z]*[oODcKdFTXbu]|\s--(?:output|remote-name|dump-header|cookie-jar|config|data|json|form|upload-file|request|post|user)\b/.test(joined);
+    case "wget": return /\s(?:-q?O\s*-|--spider)(?:\s|$)/.test(joined) && !/\s--(?:post|met|body)/.test(joined);
     case "dpkg": return /^\s(?:-l|-s|-L|-S|--status|--list|--listfiles|--search|--print-architecture)\b/.test(joined);
     case "apt": return ["list", "show", "policy", "search"].includes(firstVerb(args).verb || "");
     case "apt-mark": return /^show/.test(firstVerb(args).verb || "");
     case "command": return args[0] === "-v" || args[0] === "-V";
-    case "qm": case "pct": return PVE_GUEST_READ.has(args[0] || "");
-    case "pvesh": return PVESH_READ.has(args[0] || "");
+    // Nur ein exaktes oder eindeutig aufgelöstes Leseverb (qm listsn = listsnapshot).
+    case "qm": case "pct": case "pvesh": {
+      const { verb, unique } = pveVerb(name, args[0] || "");
+      return unique && (name === "pvesh" ? PVESH_READ : PVE_GUEST_READ).has(verb);
+    }
     case "pvesm": {
-      if (PVESM_READ.has(args[0] || "")) return true;
+      const { verb, unique } = pveVerb(name, args[0] || "");
+      if (!unique) return false;
+      if (PVESM_READ.has(verb)) return true;
       // prune-backups --dry-run listet nur, was ginge. Jede Schreibweise der Option
       // (-dry-run, --dry, --dry-run=…; der letzte Wert gilt) muss wahr sein.
-      if (args[0] !== "prune-backups") return false;
+      if (verb !== "prune-backups") return false;
       const dries = args.map((arg, index) => ({ arg, index })).filter(({ arg }) => /^--?d(?:r(?:y(?:-(?:r(?:u(?:n)?)?)?)?)?)?(?:=|$)/.test(arg));
       return dries.length > 0 && dries.every(({ arg, index }) => {
         const value = arg.includes("=") ? arg.slice(arg.indexOf("=") + 1) : args[index + 1];
@@ -1784,12 +1862,16 @@ function toleratesOpaque(command, segmentText) {
 // ── Riegel ─────────────────────────────────────────────────────────────────
 
 // Im normalisierten Text: ein Löschbefehl, eine Aufbewahrung, ein Snapshot-Löschen.
-function phraseBolt(text) {
+function phraseBolt(raw) {
+  const text = pveVerbs(raw);
   if (DELETE_PHRASE.test(text)) return "deletes backups (borg/borgmatic delete, prune, compact, recreate, break-lock or a key change)";
   if (RETENTION_PHRASE.test(text)) return "changes the retention of the backups";
   if (SNAPSHOT_DELETE.test(text)) return "deletes a machine snapshot";
   if (PVE_GUEST.test(text)) return "deletes or rolls back a Proxmox guest snapshot or destroys a guest (qm/pct delsnapshot, rollback, destroy)";
   if (PVE_BACKUP.test(text)) return "deletes vzdump backups (vzdump --remove, pvesm prune-backups, pvesm free on a backup volume)";
+  if (PVE_RETENTION_OPTION.test(text)) return "changes the retention of the backups (an abbreviated maxfiles or prune-backups option)";
+  if (PVE_RESTORE.test(text)) return "restores over an existing Proxmox guest (qmrestore/pct restore --force), which destroys it with its snapshots";
+  if (PVE_STORAGE.test(text)) return "deletes or rolls back a Proxmox guest volume or snapshot on the storage layer (lvremove, lvconvert --merge, zfs destroy/rollback, qemu-img snapshot)";
   if (PVE_API_DELETE.test(pveApiText(text))) return "deletes or rolls back over the Proxmox API (guest snapshot, guest, storage content, pruning or a backup job)";
   return null;
 }
@@ -2192,6 +2274,7 @@ function segmentBolt(text, command, name, readOnly, cwds, context, line, piped) 
 
   if (deleted.some((path) => touchesBolted(path) || namesUnit(path))) return `${name} deletes or moves backups or their configuration`;
   if (overwritten.some((path) => touchesConfig(path) || touchesData(path, false) || namesUnit(path))) return `${name} overwrites backups or their configuration`;
+  if (resolveAll(truncateTargets(text)).some(touchesTruncate)) return `${name || "a redirect"} truncates backups`;
   if (written.some((path) => touchesConfig(path) || namesUnit(path))) return `${name} writes the backup configuration, retention, keys or timer`;
 
   // Auf Lab0, dem Rechner mit dem borg-Repo: jedes Löschen, und jeder Befehl,

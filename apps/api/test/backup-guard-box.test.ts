@@ -161,3 +161,74 @@ describe("backup bolt, box (t_5f5c89fe): vzdump backups and guest snapshots stay
     expect(hits("pvesm list local; pvesm free local:backup/vzdump-qemu-100.vma.zst").length).toBeGreaterThan(0);
   });
 });
+
+// Nacharbeit (Zweitprüfung t_eebb73c0, Karte t_a5defddd): die Proxmox-CLI führt
+// eindeutige Präfixe ihrer Unterbefehle aus (CLIHandler.pm expand_command_name),
+// Getopt::Long nimmt abgekürzte Optionen mit - oder --, curl einen angehängten
+// Wert (-XDELETE). Kürzen per Umleitung und die Speicherebene unter qm/pct.
+describe("backup bolt, box (t_a5defddd): abbreviations, attached values, truncation, storage layer", () => {
+  it.each([
+    ["qm delsnapshot abbreviated", "qm delsnap 100 s1"],
+    ["qm rollback abbreviated", "qm rollb 100 s1"],
+    ["pct destroy abbreviated", "pct destr 101"],
+    ["pct delsnapshot abbreviated", "pct dels 101 s1"],
+    ["an ambiguous prefix that can hit a gated verb", "qm de 100 s1"],
+    ["an abbreviation through a path and bash -c", "bash -c '/usr/sbin/qm delsn 100 s1'"],
+    ["pvesh delete abbreviated", "pvesh del /nodes/box/qemu/100/snapshot/s1"],
+    ["pvesh create abbreviated (rollback)", "pvesh cr /nodes/box/qemu/100/snapshot/s1/rollback"],
+    ["pvesh set abbreviated (backup job)", "pvesh s /cluster/backup/backup-abc --enabled 0"],
+    ["pvesm free abbreviated", "pvesm fre local:backup/vzdump-qemu-100.vma.zst"],
+    ["pvesm prune-backups abbreviated", "pvesm prune local --keep-last 1"],
+    ["pvesm prune-backups abbreviated with an abbreviated dry run of 0", "pvesm prune local --dry 0 --keep-last 1"],
+    ["vzdump --remove abbreviated", "vzdump 100 --rem 1"],
+    ["vzdump --remove abbreviated with =", "vzdump 100 --remov=1"],
+    ["vzdump -remove with one dash", "vzdump 100 -remove 1"],
+    ["vzdump --remove abbreviated without a value", "vzdump 100 --rem"],
+    ["vzdump over the API with an abbreviated --remove", "pvesh create /nodes/box/vzdump --vmid 100 --rem 1"],
+    ["pvesm set --maxfiles abbreviated", "pvesm set local --maxfi 1"],
+    ["pvesm set --prune-backups abbreviated", "pvesm se local --prune keep-last=1"],
+    ["vzdump -prune-backups abbreviated", "vzdump 100 -prune-b keep-last=1"],
+    ["curl -XDELETE on a guest snapshot", "curl -k -XDELETE https://localhost:8006/api2/json/nodes/box/qemu/100/snapshot/s1"],
+    ["curl -X'DELETE' on a guest snapshot", "curl -k -X'DELETE' https://localhost:8006/api2/json/nodes/box/qemu/100/snapshot/s1"],
+    ["curl -kXDELETE on a container snapshot", "curl -kXDELETE https://localhost:8006/api2/json/nodes/box/lxc/101/snapshot/s1"],
+    ["curl -XDELETE on a Contabo snapshot", "curl -sk -XDELETE -H 'Authorization: Bearer x' https://api.contabo.com/v1/compute/instances/1/snapshots/x"],
+    ["wget with an abbreviated --method", "wget -qO- --meth=DELETE https://localhost:8006/api2/json/nodes/box/qemu/100/snapshot/s1"],
+    ["truncate a vzdump backup with : >", ": > /var/lib/vz/dump/vzdump-qemu-100.vma.zst"],
+    ["truncate a vzdump backup with a bare >", "> /var/lib/vz/dump/vzdump-qemu-100.vma.zst"],
+    ["truncate a vzdump backup with echo >", "echo > /var/lib/vz/dump/vzdump-qemu-100.vma.zst"],
+    ["truncate a vzdump backup after cd", "cd /var/lib/vz/dump && : > vzdump-qemu-100.vma.zst"],
+    ["truncate a backup on a mounted storage", "true > /mnt/pve/nas/dump/vzdump-lxc-101.tar.zst"],
+    ["truncate a GitLab backup with >|", ": >| /var/opt/gitlab/backups/1_gitlab_backup.tar"],
+    ["lvremove of a guest snapshot", "lvremove -y pve/snap_vm-100-disk-0_s1"],
+    ["lvremove of a guest disk", "lvremove -f pve/vm-100-disk-0"],
+    ["lvconvert --merge of a guest snapshot", "lvconvert --merge pve/snap_vm-100-disk-0_s1"],
+    ["zfs destroy of a guest snapshot", "zfs destroy rpool/data/vm-100-disk-0@s1"],
+    ["zfs rollback of a container volume", "zfs rollback rpool/data/subvol-101-disk-0@s1"],
+    ["qemu-img snapshot -d", "qemu-img snapshot -d s1 /var/lib/vz/images/100/vm-100-disk-0.qcow2"],
+    ["qemu-img snapshot -a", "qemu-img snapshot -a s1 /var/lib/vz/images/100/vm-100-disk-0.qcow2"],
+    ["$'…' without escapes in the verb", "qm del$'s'napshot 100 s1"],
+    ["qmrestore --force over an existing guest", "qmrestore /var/lib/vz/dump/vzdump-qemu-100.vma.zst 100 --force 1"],
+    ["pct restore abbreviated with -f", "pct rest 101 /tmp/x.tar.zst -f"],
+  ])("gated: %s", (_label, run) => {
+    expect(hits(run).length).toBeGreaterThan(0);
+  });
+
+  it.each([
+    ["snapshots abbreviated", "qm snap 100 vor-update\npct snapshot 101 a; pct snapshot 101 b"],
+    ["read verbs resolved uniquely", "qm listsn 100\npvesh g /nodes\npvesm stat"],
+    ["an abbreviated dry run", "pvesm prune local --dry 1 --keep-last 1"],
+    ["vzdump options that only share a first letter", "vzdump --all --storage nas --mode snapshot --mailto a@example.org --mailnotification failure"],
+    ["a new dump in /var/backups (the plan's own return path)", "wp db export - > /var/backups/wordpress-vor-update.sql"],
+    ["qmrestore into a new guest", "qmrestore /var/lib/vz/dump/vzdump-qemu-100.vma.zst 120 --storage local-lvm"],
+    ["storage layer reads", "lvs\nzfs list -t snapshot\nqemu-img snapshot -l /var/lib/vz/images/100/vm-100-disk-0.qcow2"],
+    ["curl reads with short options", "curl -sSL https://example.org/x\ncurl -k https://localhost:8006/api2/json/nodes/box/qemu/100/snapshot"],
+    ["$'…' text into a note", "echo $'hallo welt' > /tmp/notiz.txt"],
+  ])("free: %s", (_label, run) => {
+    expect(hits(run)).toEqual([]);
+  });
+
+  it("truncating a file in /var/backups stays the doorkeeper's focus", () => {
+    expect(hits(": > /var/backups/dpkg.status.0")).toEqual([]);
+    expect(focus(": > /var/backups/dpkg.status.0").length).toBeGreaterThan(0);
+  });
+});
