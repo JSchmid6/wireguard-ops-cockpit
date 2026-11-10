@@ -164,7 +164,7 @@ jedes `cd`-Ziel aufgelöst. Kommentare zählen nicht.
   Schlüsseländerung (`key change-passphrase|import|migrate-to-repokey …`), `check --repair`,
   `borgmatic borg …`, ein `borgmatic`-Lauf mit anderer Konfiguration (`-c`) oder `--override`,
   `cockpit-borg-action` außer `status|check|db-access …|sources status|sources add <pfad>` (also auch
-  `sources connect|disconnect|restore` und `sources add` mit einem Pfad außerhalb der Wurzeln oder
+  `sources add-large|connect|disconnect|restore` und `sources add` mit einem Pfad außerhalb der Wurzeln oder
   aus einer Variablen; auch als `bash|sh|source|. <helfer> …`; eine Kopie oder ein Link des Helfers per
   `cp|ln|install|rsync`) — auch als Text in `sh -c '…'`, in einem Skript,
   das der Lauf schreibt, in einer Cron-Zeile oder in `echo/printf`; seit 05.11.2026 (Karte
@@ -264,7 +264,8 @@ borgmatic.service`, ein nacktes `borgmatic` (konfigurierte Aufbewahrung),
 Backups löscht kein Archiv und ändert keine Aufbewahrung, Karte t_30c9ea52),
 `cockpit-borg-action sources status|add <pfad>` mit einem wörtlichen Verzeichnis unter `/opt/stacks`,
 `/srv` oder `/var/lib/docker/volumes` (eine Backup-Quelle ergänzen stärkt den Rückweg; Jochen
-31.10.2026: „Ergänzen ja, Schwächen nein“, Karte t_2b394537, `doc/setup/borg-maintenance.md`),
+31.10.2026: „Ergänzen ja, Schwächen nein“, Karte t_2b394537, `doc/setup/borg-maintenance.md`;
+der Helfer selbst weist eine Quelle über ¼ des freien RAID-Platzes ab, dafür `add-large`, Karte t_0ea98639),
 `systemctl status|is-active|show|list-timers …`,
 `journalctl -u borgmatic`, lesende docker-Befehle (`ps`, `images`, `inspect`, `logs`, `stats`,
 `version`, `info`, `compose ps|config|logs`), Paket-Updates — auch wenn `borgbackup` oder
