@@ -617,7 +617,7 @@ Grenzen:
   beide Prüfungen. (b) Fail-closed: hinter einem Umleitungsoperator liest `redirectTargetEnd` das
   ganze Ziel (einfache Zeichen, `$(…)`/`<(…)`/`>(…)` mit Klammerzählung, `${…}`, `` `…` `` mit
   Partner); fehlt das Ziel oder schließt es nicht, ist das ein Wort („arg“), nie das Ende des
-  Befehls. „bare“ gibt es nur noch bei echtem Befehlsende (Zeilenende, `;`, `&`, `|`, `)`, `` ` ``,
+  Befehls (für Ziele mit Quote oder Escape erst seit Karte t_8939621f, siehe unten: Drift). „bare“ gibt es nur noch bei echtem Befehlsende (Zeilenende, `;`, `&`, `|`, `)`, `` ` ``,
   `#`). Ein ganz gelesenes Ziel ohne Wort danach (`<helfer> < <(…)`, `<helfer> > repair`) bleibt der
   bloße Name — so liest es auch Bash. **Preis (gemessen, `/opt/data/out/t_ac8559f4/preis-r8.log`):**
   kein neuer Treffer gegenüber 3771b9b; frei bleiben `echo $(( $(date +%s) - 3600 ))`,
@@ -625,6 +625,32 @@ Grenzen:
   >/dev/null`. Tests: `apps/api/test/backup-guard.test.ts` (t_ac8559f4, je Arithmetik-Form mit dem
   Helfer hinter `< <(:$(:))`, `` >`echo x` `` und mit `borg delete`/`systemctl stop` für den Leser;
   dazu je Ursache allein).
+* **Umleitungsziel mit Quote oder Escape im Rohtext (10.11.2026, Zweitprüfung t_b3b3773b, Karte
+  t_8939621f).** **Drift gegenüber dem Nachtrag t_ac8559f4 direkt darüber** („liest
+  `redirectTargetEnd` das ganze Ziel“): der Rohtext-Riegel las auf `normalize(text)` ohne Quotes und
+  Backslashes, das Ziel endete also an einem Trenner in Quotes oder hinter `\` (`<helfer>
+  >"/tmp/a;x" repair`, `>/tmp/a\;x`, `2>'/tmp/a|x'`, `>$'/tmp/a;x'`), an `\)` bzw. `")"` in
+  `$(…)`/`<(…)`, an einem `)` aus einem case-Muster in `$(…)` und an `}` in `${x:-$(echo })}`. Er
+  nannte das Folgende „bare“, Bash startet repair als Argument (gemessen 18 von 38 Formen aus
+  `faelle-r9a.mjs`, die Karte nannte 19; `/opt/data/out/t_8939621f/raw-r9a-vorher.log`). Dazu
+  ein `` ` `` hinter dem Namen: es galt immer als Befehlsende, auch wenn es eine Ersetzung öffnet
+  (`` <helfer> `echo repair` `` lief in Bash und hieß „bare“). Der Hauptleser fing jede dieser
+  Formen; die zweite Linie hatte die Lücke. **Entscheidung (fail-closed):** der Riegel liest auf
+  `normalize(text, true)`, dort trägt jedes Zeichen aus Quotes oder hinter `\` eine Markierung.
+  Name, freie Form und fester Pfad liest er wie bisher ohne Quotes; ein Umleitungsziel mit Quote
+  oder Escape (auch im Operator) ist ein Wort („arg“), ebenso eine Ersetzung im Ziel, in der Bash
+  eine Klammer anders zählen kann (case, `#`, Heredoc, `${…}`, `` ` ``, neue Zeile), und ein `${…}`
+  mit `$(`, `` ` ``, `{` oder Quote darin. Ein `` ` `` ist nur dann das Ende, wenn der Helfer selbst
+  in `` `…` `` steht (ungerade Zahl unmarkierter Backticks davor), sonst öffnet es eine Ersetzung,
+  die im selben Text schließen muss. Ein Trenner in Quotes als erstes Zeichen nach dem Namen bleibt
+  „bare“: das erste Argument des Helfers beginnt dann mit ihm, ein solches Verb gibt es nicht.
+  Damit stimmt der Satz „liest das ganze Ziel … sonst ein Wort“ jetzt auch für diese Ziele.
+  **Preis (gemessen):** `preis-r8` gegen f9899ee unverändert (`/opt/data/out/t_8939621f/preis-r8.log`),
+  `<helfer> status >/dev/null`, `<helfer> status > /tmp/s.json`, `<helfer> >$(mktemp) status`
+  bleiben frei. Neu „arg“ im Rohtext ist ein Ziel in Quotes vor dem Verb (`<helfer> >"$log"
+  status`); den Plan hielt der Leser schon vorher an, am Gesamturteil ändert sich nichts
+  (`/opt/data/out/t_8939621f/eigene-r10.log`). Tests: `apps/api/test/backup-guard.test.ts`
+  (t_8939621f, `helperMentions` allein und im Kommentar, den der Leser nicht liest; dazu Preis).
 * **Offene Entscheidung (05.11.2026, Karte t_5ce5f79f): Freigabe-Markierung im Helfer.** Erwogen:
   die schwächenden Verben (`sources connect|disconnect|restore`, `repair`) laufen in einer
   host-run-cgroup nur, wenn `cockpit-host-run` für genau diesen Job eine root-eigene Markierung

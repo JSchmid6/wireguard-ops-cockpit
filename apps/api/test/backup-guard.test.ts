@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { readFileSync } from "node:fs";
 
-import { backupGuardFocus, backupGuardHits } from "../../../deploy/helpers/cockpit-backup-guard.mjs";
+import { backupGuardFocus, backupGuardHits, helperMentions } from "../../../deploy/helpers/cockpit-backup-guard.mjs";
 import { buildHostRunReviewPrompt, hostRunManifestHash, hostRunPolicy, hostRunSafetyRecord, parseHostRunManifest, parseHostRunReviewAnswer, verifyHostRunFindings, type HostRunManifest } from "../src/host-run.js";
 
 // Backups löschen nur mit Jochens Freigabe (30.09.2026), und nur dafür
@@ -647,6 +647,55 @@ describe("backup bolt: needs the operator's approval", () => {
     const ps4 = hits("PS4='$(sh) '\nset -x\necho '/usr/local/sbin/cockpit-borg-action repair' | cat");
     expect(ps4[0]).toEqual(expect.objectContaining({ where: "S1:L1", reason: expect.stringContaining("PS4 decides which code runs") }));
     expect(ps4.slice(1)).toEqual([expect.objectContaining({ where: "S1:L3", reason: expect.stringContaining("unabridged text") })]);
+  });
+});
+
+// Zweitpruefung t_b3b3773b (Karte t_8939621f): der Rohtext-Riegel las ein Umleitungsziel mit einem Trenner in
+// Quotes oder hinter \ zu kurz und nannte das Folgende "bare", obwohl Bash repair als Argument startet. Getestet
+// wird der Rohtext-Riegel ALLEIN (helperMentions) und im Kommentar, den der Leser nicht liest.
+const rawRedirectForms: string[] = [
+  ">/tmp/a\\;x", ">/tmp/a\\|x", ">/tmp/a\\&x", ">/tmp/a\\)x",
+  ">\"/tmp/a;x\"", ">'/tmp/a)x'", ">$'/tmp/a;x'", ">$'/tmp/a\\';x'",
+  ">$(echo /tmp/a\\))", ">$(echo \"/tmp/a)\")", ">$(echo '/tmp/a)')", ">$(case a in a);; esac; echo /tmp/a)",
+  "< <(echo \\))", "< <(echo ')')", ">${x:-/tmp/a$(echo })}",
+  ">/tmp/a 2>/tmp/b\\;c", "2>&1 >/tmp/a\\|b", "<&- >&- 2>/tmp/a\\)b",
+  // ` hinter dem Namen oeffnet eine Ersetzung, wenn der Helfer nicht selbst in `...` steht.
+  ">/tmp/a`", ">/tmp/a`echo b`",
+];
+
+describe("backup bolt, raw text alone: a redirect target with quotes or escapes is a word (t_8939621f)", () => {
+  it.each(rawRedirectForms)("helperMentions: R %s repair", (target) => {
+    expect(helperMentions(`/usr/local/sbin/cockpit-borg-action ${target} repair`)).toEqual(["arg"]);
+  });
+
+  it.each(rawRedirectForms)("in a comment the reader does not read: R %s repair", (target) => {
+    const found = hits(`hostname # /usr/local/sbin/cockpit-borg-action ${target} repair`);
+    expect(found.some((hit) => hit.reason.includes("with a word other than its free forms"))).toBe(true);
+  });
+
+  it("a backtick after the name opens a substitution unless the helper stands in backticks itself", () => {
+    expect(helperMentions("/usr/local/sbin/cockpit-borg-action `echo repair`")).toEqual(["arg"]);
+    expect(helperMentions("echo '`'; /usr/local/sbin/cockpit-borg-action `echo repair`")).toEqual(["arg"]);
+    expect(helperMentions("x=`/usr/local/sbin/cockpit-borg-action >/dev/null`")).toEqual(["bare"]);
+    expect(helperMentions("echo 'Nutze `/usr/local/sbin/cockpit-borg-action` nie'")).toEqual(["bare"]);
+  });
+
+  it("keeps the price: free forms, plain targets and text around the name read as before", () => {
+    const R = "/usr/local/sbin/cockpit-borg-action";
+    expect(helperMentions(`${R} status >/dev/null`)).toEqual(["free"]);
+    expect(helperMentions(`${R} status > /tmp/s.json`)).toEqual(["free"]);
+    expect(helperMentions(`${R} >/dev/null status`)).toEqual(["free"]);
+    expect(helperMentions(`${R} 2>/dev/null >/tmp/x status`)).toEqual(["free"]);
+    expect(helperMentions(`${R} >$(mktemp) status`)).toEqual(["free"]);
+    expect(helperMentions(`${R} status >"$log"`)).toEqual(["free"]);
+    expect(helperMentions(`${R} sources add '/srv/daten'`)).toEqual(["free"]);
+    expect(helperMentions(`${R} >/dev/null`)).toEqual(["bare"]);
+    expect(helperMentions(`echo "(siehe ${R})"`)).toEqual(["bare"]);
+    expect(helperMentions(`cat /var/log/cockpit-borg-action".log"`)).toEqual(["bare"]);
+    // Ein Trenner in Quotes als erstes Argument: der Helfer kennt kein solches Verb.
+    expect(helperMentions(`${R} \\; repair`)).toEqual(["bare"]);
+    // Der Preis: ein Ziel in Quotes vor dem Verb ist ein Wort (der Leser haelt den Plan ohnehin an).
+    expect(helperMentions(`${R} >"$log" status`)).toEqual(["arg"]);
   });
 });
 
