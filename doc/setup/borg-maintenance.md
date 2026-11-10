@@ -9,8 +9,8 @@ typisierte Aktion mit Audit und Freigabe.
 | Aktion | Form im Plan | Wirkung | Freigabe |
 | --- | --- | --- | --- |
 | `borg.status` | `/usr/local/sbin/cockpit-borg-action status` | lesend: borgmatic-Timer, letzte Läufe (Journal), laufende Wartungs-Unit, jüngste Archive, Repo-Kennzahlen, Statusdatei der Kiste. Läuft in einer eigenen transienten Unit (`--wait --pipe --collect`) | autonom (keine) |
-| `borg.check` | `/usr/local/sbin/cockpit-borg-action check` | startet `borgmatic --verbosity 1 check --force` in der Unit `cockpit-borg-check-<stamp>` und kehrt sofort zurück | autonom (keine) |
-| `borg.repair` | `/usr/local/sbin/cockpit-borg-action repair` | startet `borgmatic --verbosity 1 check --repair --force` in der Unit `cockpit-borg-repair-<stamp>`; kann beschädigte Archive entfernen (siehe unten) | **Operator** (`blocked_user_approval`) |
+| `borg.check` | `/usr/local/sbin/cockpit-borg-action check` | startet `borgmatic --verbosity 1 check --force` in der Unit `cockpit-borg-check-<stamp>-<pid>` und kehrt sofort zurück | autonom (keine) |
+| `borg.repair` | `/usr/local/sbin/cockpit-borg-action repair` | startet `borgmatic --verbosity 1 check --repair --force` in der Unit `cockpit-borg-repair-<stamp>-<pid>`; kann beschädigte Archive entfernen (siehe unten) | **Operator** (`blocked_user_approval`) |
 
 Alles andere (`restore`, `delete`, zusätzliche Argumente, ein Pfad ausserhalb
 `/usr/local/sbin/`) ist kein `borg.manage`, sondern `shell.exception` — es läuft
@@ -40,7 +40,7 @@ transiente Unit — ausserhalb der Sandbox, im eigenen cgroup, mit eigenem Journ
 * `status`: `systemd-run --wait --pipe --collect`. Die Ausgabe kommt durch
   `--pipe` durch, der Rückgabecode des Laufs durch `--wait` — `rc=2` („Repo nicht
   erreichbar“) bleibt also erhalten.
-* `check`/`repair`: `systemd-run --collect --unit=cockpit-borg-<verb>-<stamp>` **ohne**
+* `check`/`repair`: `systemd-run --collect --unit=cockpit-borg-<verb>-<stamp>-<pid>` **ohne**
   `--wait`. Der Aufruf kehrt nach dem Start zurück (der Executor ist eine
   Anfrage/Antwort-Strecke und darf nicht Stunden warten), die Unit läuft weiter.
   `Type=exec` lässt einen Startfehler noch im Aufruf auffallen (rc=69),
