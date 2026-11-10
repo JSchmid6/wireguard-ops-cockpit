@@ -262,13 +262,13 @@ function redirectTargetEnd(text, from, ticked) {
   let i = from;
   while (i < text.length) {
     const char = text[i];
-    if (char === LITERAL) return -1;
+    if (MARK.test(char)) return -1;
     if (/[\s;&|)]/.test(char)) break;
     if (char === "$" && text[i + 1] === "(" || (char === "<" || char === ">") && text[i + 1] === "(") {
       let depth = 1;
       let j = i + 2;
       for (; j < text.length && depth > 0; j += 1) {
-        if (text[j] === LITERAL) return -1;
+        if (MARK.test(text[j])) return -1;
         if (text[j] === "(") depth += 1;
         else if (text[j] === ")") depth -= 1;
       }
@@ -278,7 +278,7 @@ function redirectTargetEnd(text, from, ticked) {
     if (char === "<" || char === ">" || char === "(") return i > from && char !== "(" ? i : -1;
     if (char === "$" && text[i + 1] === "{") {
       const end = text.indexOf("}", i + 2);
-      if (end < 0 || /[\u0003`{(]/.test(text.slice(i + 2, end))) return -1;
+      if (end < 0 || /[\u0003\u0004`{(]/.test(text.slice(i + 2, end))) return -1;
       i = end + 1; continue;
     }
     if (char === "`") {
@@ -286,18 +286,18 @@ function redirectTargetEnd(text, from, ticked) {
       // (`R >/dev/null`) — nur wenn er in `…` steht, sonst ist das Ziel ein Wort.
       const end = text.indexOf("`", i + 1);
       if (end < 0 && ticked) break;
-      if (end < 0 || text.slice(i + 1, end).includes(LITERAL)) return -1;
+      if (end < 0 || MARK.test(text.slice(i + 1, end))) return -1;
       i = end + 1; continue;
     }
     i += 1;
   }
   return i > from ? i : -1;
 }
-const unmark = (text) => text.replaceAll(LITERAL, "");
+const unmark = (text) => text.replace(/[\u0003\u0004]/g, "");
 // Stelle in text (mit mark) hinter count Zeichen von unmark(text).
 function markedOffset(text, count) {
   let i = 0;
-  for (let k = 0; k < count; k += 1) { while (text[i] === LITERAL) i += 1; i += 1; }
+  for (let k = 0; k < count; k += 1) { while (MARK.test(text[i] ?? "")) i += 1; i += 1; }
   return i;
 }
 // Jede Nennung des Helfers in einem Text: "free" (freie Form), "bare" (nur der
@@ -310,18 +310,18 @@ function markedOffset(text, count) {
 export function helperMentions(text) {
   const marked = normalize(text, true).replaceAll(IN_QUOTES, "");
   const at = [];
-  for (let i = 0; i < marked.length; i += 1) if (marked[i] !== LITERAL) at.push(i);
+  for (let i = 0; i < marked.length; i += 1) if (!MARK.test(marked[i])) at.push(i);
   const norm = at.map((i) => marked[i]).join("");
   return [...norm.matchAll(HELPER_MENTION)].map((match) => {
     const stop = match.index + match[0].length;
     let from = stop < at.length ? at[stop] : marked.length;
-    while (marked[from - 1] === LITERAL) from -= 1;
+    while (MARK.test(marked[from - 1] ?? "")) from -= 1;
     let ticks = 0;
     for (let i = 0; i < from; i += 1) if (marked[i] === "`" && marked[i - 1] !== LITERAL) ticks += 1;
     const after = marked.slice(from);
     // Ein längerer fester Name (…/cockpit-borg-action.log) ist ein anderes Wort;
     // was danach folgt, zählt wie hinter dem Helfer. $, ` und Globs bleiben Folge.
-    const rest = after.replace(/^(?:\u0003*[\w.,:@%+=/-])+/, "");
+    const rest = after.replace(/^(?:[\u0003\u0004]*[\w.,:@%+=/-])+/, "");
     return followerKind(rest, rest === after, ticks % 2 === 1);
   });
 }
@@ -329,9 +329,11 @@ export function helperMentions(text) {
 // freie Form (nur direkt hinter dem genauen Namen bzw. seinen Umleitungen),
 // Ende des Befehls ("bare"), ein fester absoluter Pfad (weiter lesen) oder
 // sonst ein Wort ("arg"). Eine Prozessersetzung <(…)/>(…) ist ein Wort.
-// Ein Trenner in Quotes oder hinter \ als erstes Zeichen bleibt "bare": das
+// Ein Trenner in '…' oder hinter \ als erstes Zeichen bleibt "bare": das
 // erste Argument des Helfers beginnt dann mit ihm, und der Helfer kennt kein
-// solches Verb. Ein ` ist nur das Ende, wenn der Helfer in `…` steht.
+// solches Verb. ` und $ in "…" sind kein Trenner, Bash wertet sie aus
+// ("`echo repair`" ist repair, Karte t_81f72a21). Ein ` ist nur das Ende,
+// wenn der Helfer in `…` steht (Backticks in "…" zählen mit).
 function followerKind(rest, exact, ticked) {
   let path = false;
   for (;;) {
@@ -340,17 +342,17 @@ function followerKind(rest, exact, ticked) {
     // <(…)/>(…) direkt hinter dem Namen ist ein Wort, keine Umleitung.
     if (operator && !/[<>]\($/.test(plain.slice(0, operator[0].length + 1).trimEnd())) {
       const from = markedOffset(rest, operator[0].length);
-      if (rest.slice(0, from).includes(LITERAL)) return "arg";
+      if (MARK.test(rest.slice(0, from))) return "arg";
       const end = redirectTargetEnd(rest, from, ticked);
       if (end < 0) return "arg";
       rest = rest.slice(end); continue;
     }
     const free = exact && !path ? plain.match(HELPER_FREE_FOLLOWER) : null;
     if (free && (free[1] === undefined || sourcesFree(["sources", "add", free[1]]))) return "free";
-    if (/^[ \t]*(?:$|[;&|)#])/.test(plain) || /^[ \t\u0003]*\u0003`/.test(rest) || ticked && /^[ \t]*`/.test(rest)) return "bare";
+    if (/^[ \t]*(?:$|[;&|)#])/.test(plain) || /^[ \t\u0003]*\u0003`/.test(rest) || ticked && /^[ \t]*\u0004?`/.test(rest)) return "bare";
     const word = plain.match(/^[ \t]+\/[^\s;&|)<>`$*?[\]{}\u0001]*(?=$|[\s;&|)<>`#])/);
     const next = word ? markedOffset(rest, word[0].length) : -1;
-    if (next < 0 || rest.slice(0, next).includes(LITERAL)) return "arg";
+    if (next < 0 || MARK.test(rest.slice(0, next))) return "arg";
     rest = rest.slice(next); path = true;
   }
 }
@@ -1056,6 +1058,12 @@ const OPAQUE = "\u0001";
 const IN_QUOTES = "\u0002";
 // Das nächste Zeichen stand in Quotes oder hinter \ (normalize mit mark).
 const LITERAL = "\u0003";
+// Das nächste Zeichen ist ` oder $ in "…" (normalize mit mark, Karte
+// t_81f72a21): Bash wertet es dort aus ("`echo repair`" ist eine Ersetzung).
+// Es zählt wie LITERAL als Quote (ein Ziel damit ist ein Wort), nur nicht als
+// literales ` (kein "bare") und beim Zählen der Backticks mit.
+const ACTIVE = "\u0004";
+const MARK = /[\u0003\u0004]/;
 const QUOTED_SEPARATOR = /[;&|\n]/;
 const GLOB = /[*?[\]{}]/;
 
@@ -1227,12 +1235,25 @@ function splitScript(prefix, text) {
 // stehen: sh -c '…' führt den Text als Shell aus.
 const OWN_LANGUAGE = /(?:^|[;&|(\n])\s*(?:sudo\s+)?(?:\S*\/)?(?:[gm]?awk|sed|jq)\s[^;&|(\n]*$/;
 // mark (nur der Rohtext-Riegel, Karte t_8939621f): jedes Zeichen aus Quotes
-// oder hinter \ trägt LITERAL davor, statt IN_QUOTES vor Trennern.
+// oder hinter \ trägt LITERAL davor, statt IN_QUOTES vor Trennern; ` und $ in
+// "…" tragen ACTIVE (Karte t_81f72a21), literal sind sie nur in '…' und als \` / \$.
+// Ein ` in "…" ohne Partner im selben "…" liest der Riegel nicht nach (Bash
+// würde die Ersetzung über das " hinaus suchen): es bleibt LITERAL.
 function normalize(code, mark = false) {
   let out = "";
   let quote = null;
   let literal = false;
-  const quoted = (char) => (mark ? LITERAL + char : QUOTED_SEPARATOR.test(char) ? IN_QUOTES + char : char);
+  let ticks = [];
+  const marker = (char) => (quote === '"' && (char === "`" || char === "$") ? ACTIVE : LITERAL);
+  const quoted = (char) => {
+    if (!mark) return QUOTED_SEPARATOR.test(char) ? IN_QUOTES + char : char;
+    if (quote === '"' && char === "`") ticks.push(out.length);
+    return marker(char) + char;
+  };
+  const closeDouble = () => {
+    if (ticks.length % 2 === 1) for (const at of ticks) out = out.slice(0, at) + LITERAL + out.slice(at + 1);
+    ticks = [];
+  };
   for (let i = 0; i < code.length; i += 1) {
     const char = code[i];
     if (quote === "'") { if (char === "'") quote = null; else if (!literal || char !== "$" && char !== "`") out += quoted(char); continue; }
@@ -1241,10 +1262,11 @@ function normalize(code, mark = false) {
     if (char === "$" && code[i + 1] === "'" && quote === null) { out += "$"; quote = "$'"; i += 1; continue; }
     // Mit mark bleibt \$ bzw. \` nur als LITERAL stehen: ohne Marken ist der Text derselbe.
     if (char === "\\") { const next = code[i + 1] ?? ""; if (mark) out += LITERAL; if (next !== "$" && next !== "`") out += next; i += 1; continue; }
-    if (char === '"') { quote = quote === '"' ? null : '"'; continue; }
+    if (char === '"') { if (quote === '"') closeDouble(); quote = quote === '"' ? null : '"'; continue; }
     if (char === "'" && quote === null) { quote = "'"; literal = OWN_LANGUAGE.test(code.slice(0, i)); continue; }
     out += quote ? quoted(char) : char;
   }
+  closeDouble();
   return out
     .replace(/\$\{IFS\}|\$IFS\b/g, " ")
     .replace(/\$\{HOME\}|\$HOME\b/g, "/root")
