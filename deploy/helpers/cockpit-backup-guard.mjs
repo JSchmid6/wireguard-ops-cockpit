@@ -234,10 +234,18 @@ const HELPER_MENTION = /\bcockpit-borg-action\b/g;
 // jedem Verb die genaue Zahl der Argumente und bricht sonst mit 64 ab, bevor er
 // etwas tut („status prüfen“ in einem Kommentar ruft nichts auf).
 const HELPER_FREE_FOLLOWER = /^[ \t]+(?:status|check|db-access[ \t]+(?:status|check|ensure|adopt|restore)|sources[ \t]+status|sources[ \t]+add[ \t]+([^\s;&|)<>`]+))(?=$|[\s;&|)<>`])/;
-const HELPER_BARE_FOLLOWER = /^(?:[ \t]*(?:$|[;&|)<>`#]|\d*[<>])|[ \t]+\/[^\s;&|)<>`$*?[\]{}\u0001]*(?=[ \t]*(?:$|[;&|)<>`#]|\d*[<>]|[ \t]\/)))/;
+// Eine Umleitung samt Ziel (Zweitprüfung t_86917c5a, Karte t_70e65772): Bash
+// nimmt sie an jeder Stelle des Befehls, die Wörter danach sind weiter
+// Argumente — `R <&- repair`, `R >/dev/null repair`, `R 2>&1 repair`,
+// `R <<<x repair` starten repair. [n] bzw. {name} vor dem Operator; das Ziel ist
+// ein Wort (auch -, &n, <(…), >(…)). Ein Operator ohne Ziel bleibt stehen
+// (followerKind liest ihn wie bisher als Ende des Befehls).
+const HELPER_REDIRECT = /^[ \t]*(?:\d+|\{\w+\})?(?:&>>|&>|>>|>\||>&|<&|<<<|<<-|<<|<>|>|<)[ \t]*(?:[<>]\([^)]*\)|[^\s;&|()<>`]+)/;
 // Jede Nennung des Helfers in einem Text: "free" (freie Form), "bare" (nur der
 // Name, ohne Argument oder mit einem festen absoluten Pfad) oder "arg" (ein
 // anderes Wort folgt: repair, sources restore, $v, $(…), ein Glob …).
+// Umleitungen hinter dem Namen überspringt der Riegel; das Wort danach zählt,
+// als stünde es direkt hinter dem Namen.
 function helperMentions(text) {
   const norm = normalize(text).replaceAll(IN_QUOTES, "");
   return [...norm.matchAll(HELPER_MENTION)].map((match) => {
@@ -245,10 +253,25 @@ function helperMentions(text) {
     // Ein längerer fester Name (…/cockpit-borg-action.log) ist ein anderes Wort;
     // was danach folgt, zählt wie hinter dem Helfer. $, ` und Globs bleiben Folge.
     const rest = after.replace(/^[\w.,:@%+=/-]+/, "");
-    const free = rest === after ? rest.match(HELPER_FREE_FOLLOWER) : null;
-    if (free && (free[1] === undefined || sourcesFree(["sources", "add", free[1]]))) return "free";
-    return HELPER_BARE_FOLLOWER.test(rest) ? "bare" : "arg";
+    return followerKind(rest, rest === after);
   });
+}
+// Was hinter dem Namen folgt, Wort für Wort: Umleitungen überspringen, dann
+// freie Form (nur direkt hinter dem genauen Namen bzw. seinen Umleitungen),
+// Ende des Befehls ("bare"), ein fester absoluter Pfad (weiter lesen) oder
+// sonst ein Wort ("arg"). Eine Prozessersetzung <(…)/>(…) ist ein Wort.
+function followerKind(rest, exact) {
+  let path = false;
+  for (;;) {
+    const redirect = rest.match(HELPER_REDIRECT);
+    if (redirect) { rest = rest.slice(redirect[0].length); continue; }
+    const free = exact && !path ? rest.match(HELPER_FREE_FOLLOWER) : null;
+    if (free && (free[1] === undefined || sourcesFree(["sources", "add", free[1]]))) return "free";
+    if (/^[ \t]*(?:$|[;&|)`#]|\d*[<>](?!\())/.test(rest)) return "bare";
+    const word = rest.match(/^[ \t]+\/[^\s;&|)<>`$*?[\]{}\u0001]*(?=$|[\s;&|)<>`#])/);
+    if (!word) return "arg";
+    rest = rest.slice(word[0].length); path = true;
+  }
 }
 // Physische Zeilen [from, to), blind an jedem \<NL> verbunden: wo Bash
 // verbindet, sieht der Riegel dasselbe, wo nicht (Kommentar, '…'), nur mehr.
@@ -437,6 +460,29 @@ function sedFilters(text) {
   return scripts.length > 0 && scripts.every((script) => !script.includes(OPAQUE) && sedScriptFilters(script));
 }
 
+// Bash liest $((…)) bzw. ((…)) nur als Arithmetik, wenn das erste ) auf Tiefe 0
+// (ab from, hinter den zwei Klammern) direkt von einem zweiten ) gefolgt wird;
+// sonst als Befehlsersetzung $( (…) …) bzw. Gruppe ( (…) …): echo $((echo x);
+// R repair) startet R (Zweitprüfung t_86917c5a, Karte t_70e65772; belegt in
+// Bash 5.2, auch $((1)+(2)) ist dort eine Befehlsersetzung). Schließt der Text
+// nicht, ist es für den Riegel keine Arithmetik — er liest dann lieber zu viel.
+function arithCloses(src, from) {
+  let depth = 0;
+  for (let i = from; i < src.length; i += 1) {
+    const char = src[i];
+    if (char === "\\") { i += 1; continue; }
+    if (char === "'" || char === '"') {
+      let j = i + 1;
+      while (j < src.length && src[j] !== char) j += char === '"' && src[j] === "\\" ? 2 : 1;
+      if (j >= src.length) return false;
+      i = j; continue;
+    }
+    if (char === "(") depth += 1;
+    else if (char === ")") { if (depth === 0) return src[i + 1] === ")"; depth -= 1; }
+  }
+  return false;
+}
+
 // Wo ein Ausdruck in Klammern endet (Index hinter der schließenden), Quotes beachtet.
 function parenEnd(src, from) {
   let depth = 1;
@@ -466,7 +512,7 @@ function rawSegments(code) {
     let j = 0;
     while (j < src.length) {
       if (src[j] === "\\") { j += 2; continue; }
-      if (src.startsWith("$((", j)) { const end = parenEnd(src, j + 2); arith(src.slice(j + 3, end - 2), depth); j = end; continue; }
+      if (src.startsWith("$((", j) && arithCloses(src, j + 3)) { const end = parenEnd(src, j + 2); arith(src.slice(j + 3, end - 2), depth); j = end; continue; }
       if (src.startsWith("$(", j)) { const end = parenEnd(src, j + 2); walk(src.slice(j + 2, end - 1), depth + 1); j = end; continue; }
       if (src[j] === "`") { const end = src.indexOf("`", j + 1); const stop = end < 0 ? src.length : end; walk(src.slice(j + 1, stop), depth + 1); j = stop + 1; continue; }
       j += 1;
@@ -491,15 +537,15 @@ function rawSegments(code) {
         let text = '"';
         while (j < src.length && src[j] !== '"') {
           if (src[j] === "\\") { text += src.slice(j, j + 2); j += 2; continue; }
-          if (src.startsWith("$((", j)) { const end = parenEnd(src, j + 2); arith(src.slice(j + 3, end - 2), depth); text += "0"; j = end; continue; }
+          if (src.startsWith("$((", j) && arithCloses(src, j + 3)) { const end = parenEnd(src, j + 2); arith(src.slice(j + 3, end - 2), depth); text += "0"; j = end; continue; }
           if (src.startsWith("$(", j)) { const end = parenEnd(src, j + 2); walk(src.slice(j + 2, end - 1), depth + 1); text += OPAQUE; j = end; continue; }
           if (src[j] === "`") { const end = src.indexOf("`", j + 1); const stop = end < 0 ? src.length : end; walk(src.slice(j + 1, stop), depth + 1); text += OPAQUE; j = stop + 1; continue; }
           text += src[j]; j += 1;
         }
         current += `${text}"`; i = j + 1; continue;
       }
-      if (src.startsWith("$((", i)) { const end = parenEnd(src, i + 2); arith(src.slice(i + 3, end - 2), depth); current += "0"; i = end; continue; }
-      if (src.startsWith("((", i) && !current.trim()) { const end = parenEnd(src, i + 1); arith(src.slice(i + 2, end - 2), depth); current += "true"; i = end; continue; }
+      if (src.startsWith("$((", i) && arithCloses(src, i + 3)) { const end = parenEnd(src, i + 2); arith(src.slice(i + 3, end - 2), depth); current += "0"; i = end; continue; }
+      if (src.startsWith("((", i) && !current.trim() && arithCloses(src, i + 2)) { const end = parenEnd(src, i + 1); arith(src.slice(i + 2, end - 2), depth); current += "true"; i = end; continue; }
       if ((char === "$" || char === "<" || char === ">") && src[i + 1] === "(") {
         const end = parenEnd(src, i + 2);
         walk(src.slice(i + 2, end - 1), depth + 1);
@@ -973,11 +1019,11 @@ function scanShell(line, quote = null) {
     if (char === "'" || char === '"') { quote = char; continue; }
     if (char === "`") { backtick = !backtick; continue; }
     if (char === "(" && i > 0 && /[@!+*?=]/.test(line[i - 1])) { open.push("word"); continue; }
-    if (char === "$" && line[i + 1] === "(" && line[i + 2] === "(") { open.push("warith"); i += 2; continue; }
+    if (char === "$" && line[i + 1] === "(" && line[i + 2] === "(" && arithCloses(line, i + 3)) { open.push("warith"); i += 2; continue; }
     if (char === "$" && line[i + 1] === "[") { open.push("square"); i += 1; continue; }
     if (char === "$" && line[i + 1] === "(" || (char === "<" || char === ">") && line[i + 1] === "(") { open.push("word"); i += 1; continue; }
     if (char === "$" && line[i + 1] === "{") { open.push("brace"); i += 1; continue; }
-    if (char === "(" && line[i + 1] === "(") { open.push("arith"); i += 1; continue; }
+    if (char === "(" && line[i + 1] === "(" && arithCloses(line, i + 2)) { open.push("arith"); i += 1; continue; }
     if (char === "(") { open.push("group"); continue; }
     if (char === ")") {
       const top = open.at(-1);
@@ -1124,7 +1170,7 @@ function extractSubstitutions(text, inner) {
   let out = "";
   let i = 0;
   while (i < text.length) {
-    if (text.startsWith("$((", i)) {
+    if (text.startsWith("$((", i) && arithCloses(text, i + 3)) {
       const end = closing(text, i + 3, "(", ")", 2);
       out += "0"; i = end; continue;
     }
@@ -1953,8 +1999,7 @@ function segmentBolt(text, command, name, readOnly, cwds, context, line, piped) 
   }
   // db-access (Karte t_30c9ea52) richtet nur den DB-Zugang des Backups ein bzw.
   // spielt dessen alte Optionsdatei zurück: es löscht kein Archiv, ändert keine
-  // Aufbewahrung und schaltet nichts ab — frei wie status und check.
-  const dbAccess = args.length === 2 && args[0] === "db-access" && ["status", "check", "ensure", "adopt", "restore"].includes(args[1]);
+  // Aufbewahrung und schaltet nichts ab — frei wie status und check (helperVerbBolt).
   // sources (Karte t_2b394537): eine Quelle hinzufügen stärkt den Rückweg und ist
   // frei; den Verweis in config.yaml setzen oder lösen und Quellen zurücknehmen
   // (connect, disconnect, restore) bleibt beim Riegel.
@@ -1976,8 +2021,7 @@ function segmentBolt(text, command, name, readOnly, cwds, context, line, piped) 
       return "the backup helper through a shell outside status, check, db-access, sources status and sources add <path below the roots>";
     }
   }
-  if (name === "cockpit-borg-action" && args[0] === "sources" && !sourcesFree(args)) return "the backup helper's sources outside status and add <path below /opt/stacks, /srv or /var/lib/docker/volumes> (connect, disconnect and restore change the configuration or drop sources)";
-  if (name === "cockpit-borg-action" && args[0] !== "sources" && !dbAccess && !(args.length === 1 && (args[0] === "status" || args[0] === "check"))) return "the backup helper outside status, check, db-access and sources (repair can delete archives)";
+  if (name === "cockpit-borg-action") { const verb = helperVerbBolt(helperArgs(args, cwds, context)); if (verb) return verb; }
 
   // Die Units der Sicherung und des Aufräum-Dienstes anhalten, abschalten, maskieren.
   if (/^(?:systemctl|service|invoke-rc\.d|deb-systemd-invoke|update-rc\.d)$/.test(name)) {
@@ -2043,6 +2087,34 @@ function segmentBolt(text, command, name, readOnly, cwds, context, line, piped) 
     const unclear = remote.lab0 && sub.find((item) => item.kind === "uncertain");
     if (unclear) return `on Lab0 (${remote.host}), the machine that holds the borg repository: ${unclear.reason}`;
   }
+  return null;
+}
+
+// Die Argumente des Helfers ohne Umleitungen, die nur Ausgabe wegschreiben
+// (Karte t_70e65772): `R status >/dev/null`, `R check 2>&1`, `R status >
+// /tmp/s.txt` sind die freie Form. Ein Deskriptor (n>&m, n<&-) oder eine
+// Ausgabe in eine Datendatei bzw. /dev/null fällt weg; jede andere Umleitung
+// (Eingabe, Here-String, Datei, die laufen kann, Ziel aus einer Variablen)
+// bleibt ein Wort und macht die Form unfrei.
+const REDIRECT_WORD = /^(?:\d+|\{\w+\})?(&>>|&>|>>|>\||>&|<&|>|<)(.*)$/;
+function helperArgs(args, cwds, context) {
+  const out = [];
+  for (let k = 0; k < args.length; k += 1) {
+    const redirect = args[k].match(REDIRECT_WORD);
+    if (!redirect) { out.push(args[k]); continue; }
+    const separate = redirect[2] === "" && k + 1 < args.length;
+    const target = separate ? args[k + 1] : redirect[2];
+    const dup = (redirect[1] === ">&" || redirect[1] === "<&") && /^(?:\d+|-)$/.test(target);
+    const sink = /^(?:&>>|&>|>>|>\||>)$/.test(redirect[1]) && target !== "" && (DATA_DEVICES.test(target) || ![...cwds].some((cwd) => runnableTarget(resolvePath(target, cwd), context)));
+    if (!dup && !sink) { out.push(args[k]); continue; }
+    if (separate) k += 1;
+  }
+  return out;
+}
+function helperVerbBolt(args) {
+  const dbAccess = args.length === 2 && args[0] === "db-access" && ["status", "check", "ensure", "adopt", "restore"].includes(args[1]);
+  if (args[0] === "sources" && !sourcesFree(args)) return "the backup helper's sources outside status and add <path below /opt/stacks, /srv or /var/lib/docker/volumes> (connect, disconnect and restore change the configuration or drop sources)";
+  if (args[0] !== "sources" && !dbAccess && !(args.length === 1 && (args[0] === "status" || args[0] === "check"))) return "the backup helper outside status, check, db-access and sources (repair can delete archives)";
   return null;
 }
 

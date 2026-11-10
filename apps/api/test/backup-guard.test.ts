@@ -123,6 +123,15 @@ const free: Array<[string, string]> = [
   ["t_8334eec9: a longer file name", "grep -c repair /var/log/cockpit-borg-action.log"],
   ["t_8334eec9: an array with a comment", "pkgs=(nginx php-fpm) # Dienste\nsystemctl restart \"${pkgs[@]}\""],
   ["t_8334eec9: a quoted heredoc delimiter that closes", "cat <<E\"OF\"\nborg delete ::a\nEOF"],
+  // Karte t_70e65772: echte Arithmetik bleibt Arithmetik; Umleitungen in Datensenken hinter der freien Form.
+  ["t_70e65772: arithmetic", "echo $(( 1 + 2 ))"],
+  ["t_70e65772: nested arithmetic", "echo $(( (2 + 3) * 4 ))\n(( 1 + 2 ))"],
+  ["t_70e65772: status to /dev/null", "/usr/local/sbin/cockpit-borg-action status >/dev/null"],
+  ["t_70e65772: status to /dev/null with a blank", "/usr/local/sbin/cockpit-borg-action status > /dev/null 2>&1"],
+  ["t_70e65772: a redirect before status", "/usr/local/sbin/cockpit-borg-action >/dev/null status"],
+  ["t_70e65772: status into a data file", "/usr/local/sbin/cockpit-borg-action check >/tmp/check.txt"],
+  ["t_70e65772: status 2>&1 | tee", "/usr/local/sbin/cockpit-borg-action status 2>&1 | tee x"],
+  ["t_70e65772: status with a redirect in a comment", "# /usr/local/sbin/cockpit-borg-action status >/dev/null\nuptime"],
 ];
 
 // Jede Form aus dem Auftrag, und Umwege, die der Text verdeckt.
@@ -365,6 +374,33 @@ const needsApproval: Array<[string, string]> = [
   ["price t_8334eec9: echo text with sources add but no path", "echo 'cockpit-borg-action sources add folgt'"],
   ["price t_8334eec9: a note heredoc that names repair", "cat > /tmp/notiz.txt <<'EOF'\nrepair: cockpit-borg-action repair (nur mit Freigabe)\nEOF"],
   ["price t_8334eec9: a note heredoc with only the path", "cat > /tmp/notiz.txt <<'EOF'\nHelfer: /usr/local/sbin/cockpit-borg-action\nEOF"],
+  // Zweitpruefung t_86917c5a (Karte t_70e65772): $((…)) ist nur Arithmetik, wenn das erste ) auf Tiefe 0
+  // von einem zweiten ) gefolgt wird, sonst Befehlsersetzung $( (…) …) wie in Bash 5.2; und eine
+  // Umleitung hinter dem Helfernamen beendet den Befehl nicht (R <&- repair startet repair).
+  // Jede Form mit dem Helfer (Rohtext-Riegel und Leser) und mit borg delete (nur der Leser).
+  ...([
+    ["$((cmd); …)", "echo $((echo x); REST)"],
+    ["$((cmd) | …)", "echo $((true) | REST)"],
+    ["x=$((cmd); …)", "x=$((cd /); REST)"],
+    ["\"$((cmd); …)\"", "echo \"$((:); REST)\""],
+    ["$((cmd)<NL>…)", "echo $((:)\nREST)"],
+    ["$((cmd) && …)", "echo $((:) && REST)"],
+    ["((cmd); …) as a subshell", "((echo x); REST)"],
+    ["$((a)+(b)) is a command substitution too", "echo $((a)+(b); REST)"],
+  ] as Array<[string, string]>).flatMap(([label, run]): Array<[string, string]> => [
+    [`t_70e65772: ${label} <&-`, run.replace("REST", "/usr/local/sbin/cockpit-borg-action <&- repair")],
+    [`t_70e65772: ${label} >/dev/null`, run.replace("REST", "/usr/local/sbin/cockpit-borg-action >/dev/null repair")],
+    [`t_70e65772: ${label} 2>&1`, run.replace("REST", "/usr/local/sbin/cockpit-borg-action 2>&1 repair")],
+    [`t_70e65772 (reader): ${label}`, run.replace("REST", "borg delete ::a")],
+  ]),
+  ["t_70e65772: $((cmd); sources <&- disconnect)", "echo $((:); /usr/local/sbin/cockpit-borg-action sources <&- disconnect x)"],
+  ["t_70e65772: $((cmd) && sources <&- restore)", "echo $((:) && /usr/local/sbin/cockpit-borg-action sources <&- restore x)"],
+  ["t_70e65772: a redirect before the verb", "/usr/local/sbin/cockpit-borg-action <&- repair"],
+  ["t_70e65772: a here-string before the verb", "/usr/local/sbin/cockpit-borg-action <<<x repair"],
+  ["t_70e65772: a process substitution as redirect target before the verb", "/usr/local/sbin/cockpit-borg-action > >(cat) repair"],
+  ["t_70e65772: a path, a redirect, then the verb", "/usr/local/sbin/cockpit-borg-action /x >/dev/null repair"],
+  ["t_70e65772: a redirect before the verb in a comment (raw text)", "(true)# ; /usr/local/sbin/cockpit-borg-action <&- repair"],
+  ["t_70e65772: status written into a file that can run", "/usr/local/sbin/cockpit-borg-action status >/etc/cron.d/x"],
   ["S: arithmetic in a heredoc", "x='a['\ny='$(sh)]'\nz=$x$y\necho '/usr/local/sbin/cockpit-borg-action repair' | cat <<EOF\n$((z))\nEOF"],
   ["price: the helper's checksum next to other work", "sha256sum /usr/local/sbin/cockpit-borg-action\napt-get update"],
   // Hinweis H1: ein Argument in Quotes ueber das Zeilenende.

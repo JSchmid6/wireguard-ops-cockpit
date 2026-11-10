@@ -567,6 +567,38 @@ Grenzen:
   ist in Bash ein Kommentar und jetzt frei (vorher ein Treffer zu viel). Alle Sonden der früheren
   Runden byteweise unverändert gegenüber bba18be; `faelle-r6.mjs` 26/26 Treffer, kein FREE+LÄUFT.
   Tests: `apps/api/test/backup-guard.test.ts` (t_8334eec9, je Form mit Helfer und mit `borg delete`).
+* **Umleitung vor dem Verb, `$((` als Befehlsersetzung (10.11.2026, Zweitprüfung t_86917c5a, Karte
+  t_70e65772).** Runde 7 fand frei, Fokus leer, in echter Bash laufend (alt, auch auf main):
+  `echo $((echo x); …/cockpit-borg-action <&- repair)`, ebenso mit `>/dev/null` oder `2>&1` vor dem
+  Verb, `$((true) | …)`, `x=$((cd /); …)`, `"$((:); …)"`. Zwei Ursachen: (a) der Leser hielt `$((`
+  immer für Arithmetik; Bash liest `$((…))` bzw. `((…))` nur dann als Arithmetik, wenn das erste `)`
+  auf Tiefe 0 direkt von einem zweiten `)` gefolgt wird, sonst als `$( (…) …)` bzw. `( (…) …)`
+  (belegt in Bash 5.2.37, `/opt/data/out/t_70e65772/bash-arith-regel.sh`; auch `$((1)+(2))` ist dort
+  eine Befehlsersetzung). (b) Der Rohtext-Riegel las `Name <Umleitung>` als „nur der Name“, obwohl
+  Bash die Wörter hinter einer Umleitung weiter als Argumente nimmt. **Entscheidung:** der
+  Rohtext-Riegel überspringt hinter dem Namen jede Umleitung samt Ziel (`[n]<…`, `[n]>…`, `>>`,
+  `<&-`, `n>&m`, `&>`, `<<…`, `<<<…`, `{fd}>…`, Ziel auch `<(…)`/`>(…)`) und wertet das Wort danach,
+  als stünde es direkt hinter dem Namen — damit ist die Klasse zu, egal wie der Leser liest; eine
+  Prozessersetzung direkt hinter dem Namen ist ein Wort. Der Leser (`arithCloses` in
+  `deploy/helpers/cockpit-backup-guard.mjs`, an jeder Stelle in `rawSegments`, `scanShell` und
+  `extractSubstitutions`) liest `$((`/`((` nach derselben Bash-Regel; schließt der Ausdruck in der
+  Zeile nicht, ist es für ihn keine Arithmetik (er liest dann lieber zu viel). Dazu, damit die
+  Kontrollen der Karte frei sind: die Direktform urteilt über die Argumente des Helfers **ohne**
+  Umleitungen, die nur Ausgabe wegschreiben (`n>&m`, `n<&-`, `>`/`>>`/`&>` nach `/dev/null` oder in
+  eine Datendatei, also dieselbe Liste wie bei `tee`); jede andere Umleitung (Eingabe, Here-String,
+  eine Datei, die laufen kann, ein Ziel aus einer Variablen) bleibt ein Wort und macht die Form
+  unfrei. `<helfer> status > /tmp/s.json` kann nichts, was `<helfer> status | tee /tmp/s.json` nicht
+  schon frei konnte. **Preis (gemessen, `/opt/data/out/t_70e65772/sonden-neu/preis-r8.log`, 18
+  Routine-Pläne gegen bdd3c56 und ac919e6):** kein neuer Treffer; neu frei sind fünf Pläne mit dem
+  Helfer in freier Form und einer Umleitung (`status >/dev/null 2>&1`, `status > /tmp/s.json`,
+  `check > /tmp/c.log 2>&1`, `sources add <pfad> >/tmp/add.txt`, `apt-get …` plus `status
+  >/dev/null`) — darunter Z10 aus `probe-t20`, das seit t_20ae3cda als „schon auf main ein Treffer“
+  geführt war. Weiter Treffer: `status > /etc/cron.d/x`, `status <<<x`, `tail … cockpit-borg-action.log
+  > /tmp/x.txt` und `sha256sum <helfer> > /tmp/h.txt` (beide schon auf bdd3c56). Alle Sonden der
+  früheren Runden byteweise wie ac919e6 außer dieser Z10; `faelle-r7b.mjs` 72/72, `faelle-r7c.mjs`
+  10/10 Treffer (Kontrolle `$(( 1 + 2 ))` frei), `faelle-r7.mjs` unverändert (frei und laufend nur
+  die fünf Formen mit Türsteher-Fokus). Tests: `apps/api/test/backup-guard.test.ts` (t_70e65772, je
+  Form mit `<&-`, `>/dev/null`, `2>&1` und mit `borg delete` für den Leser).
 * **Offene Entscheidung (05.11.2026, Karte t_5ce5f79f): Freigabe-Markierung im Helfer.** Erwogen:
   die schwächenden Verben (`sources connect|disconnect|restore`, `repair`) laufen in einer
   host-run-cgroup nur, wenn `cockpit-host-run` für genau diesen Job eine root-eigene Markierung
