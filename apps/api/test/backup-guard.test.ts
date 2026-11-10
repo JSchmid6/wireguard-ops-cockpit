@@ -132,6 +132,12 @@ const free: Array<[string, string]> = [
   ["t_70e65772: status into a data file", "/usr/local/sbin/cockpit-borg-action check >/tmp/check.txt"],
   ["t_70e65772: status 2>&1 | tee", "/usr/local/sbin/cockpit-borg-action status 2>&1 | tee x"],
   ["t_70e65772: status with a redirect in a comment", "# /usr/local/sbin/cockpit-borg-action status >/dev/null\nuptime"],
+  // Karte t_ac8559f4: Befehlsersetzungen in einer Arithmetik sind eigene Befehle; Routine bleibt frei (preis-r8).
+  ["t_ac8559f4: date in arithmetic", "echo $(( $(date +%s) - 3600 ))"],
+  ["t_ac8559f4: wc in arithmetic", "n=$(( $(wc -l < /tmp/x.txt) + 1 ))"],
+  ["t_ac8559f4: helper status in arithmetic", "echo $(( $(/usr/local/sbin/cockpit-borg-action status) ))"],
+  ["t_ac8559f4: a comparison in arithmetic is no process substitution", "echo $(( 1<(2) ))"],
+  ["t_ac8559f4: status to /dev/null in backticks", "x=`/usr/local/sbin/cockpit-borg-action status >/dev/null`"],
 ];
 
 // Jede Form aus dem Auftrag, und Umwege, die der Text verdeckt.
@@ -401,6 +407,31 @@ const needsApproval: Array<[string, string]> = [
   ["t_70e65772: a path, a redirect, then the verb", "/usr/local/sbin/cockpit-borg-action /x >/dev/null repair"],
   ["t_70e65772: a redirect before the verb in a comment (raw text)", "(true)# ; /usr/local/sbin/cockpit-borg-action <&- repair"],
   ["t_70e65772: status written into a file that can run", "/usr/local/sbin/cockpit-borg-action status >/etc/cron.d/x"],
+  // Zweitpruefung t_23d4dbd9 (Karte t_ac8559f4): Bash fuehrt jedes $(…)/`…` in einer Arithmetik aus; der Leser
+  // liest sie als eigene Befehle (Verb-, Unit- und Loeschpruefung). Je Arithmetik-Form mit dem Helfer hinter
+  // einer Umleitung, deren Ziel der Rohtext-Riegel frueher nur halb las, und mit borg delete bzw. systemctl stop
+  // (nur der Leser).
+  ...([
+    ["$(( $(…) ))", "echo $(( $(CMD) ))"],
+    ["$(( `…` ))", "echo $(( `CMD` ))"],
+    ["$(( 1 ? $(…) : 0 ))", "echo $(( 1 ? $(CMD >&2; echo 1) : 0 ))"],
+    ["x=$(( $(…) ))", "x=$(( $(CMD) ))"],
+    ["\"$(( $(…) ))\"", "echo \"$(( $(CMD) ))\""],
+    ["nested $(( $(( $(…) )) ))", "echo $(( $(( $(CMD) )) + 1 ))"],
+    ["(( $(…) ))", "(( $(CMD) ))"],
+    ["$[ $(…) ]", "echo $[ $(CMD) ]"],
+    ["let x=$(…)", "let x=$(CMD)"],
+    ["for (( $(…) ))", "for (( i=$(CMD); i<1; i++ )); do :; done"],
+    ["a[$(…)]=1", "a[$(CMD)]=1"],
+  ] as Array<[string, string]>).flatMap(([label, run]): Array<[string, string]> => [
+    [`t_ac8559f4: ${label} < <(:$(:)) repair`, run.replace("CMD", "/usr/local/sbin/cockpit-borg-action < <(:$(:)) repair")],
+    [`t_ac8559f4: ${label} >\`echo x\` repair`, run.replace("CMD", "/usr/local/sbin/cockpit-borg-action >`echo /tmp/r8x` repair")],
+    [`t_ac8559f4: ${label} sources disconnect`, run.replace("CMD", "/usr/local/sbin/cockpit-borg-action < <(:$(:)) sources disconnect x")],
+    [`t_ac8559f4 (reader): ${label} borg delete`, run.replace("CMD", "borg delete ::a")],
+    [`t_ac8559f4 (reader): ${label} systemctl stop`, run.replace("CMD", "systemctl stop borgmatic.timer")],
+  ]),
+  ["t_ac8559f4: a redirect target in $(…) before the verb", "/usr/local/sbin/cockpit-borg-action > $(echo /tmp/x) repair"],
+  ["t_ac8559f4: a redirect without a target", "/usr/local/sbin/cockpit-borg-action >"],
   ["S: arithmetic in a heredoc", "x='a['\ny='$(sh)]'\nz=$x$y\necho '/usr/local/sbin/cockpit-borg-action repair' | cat <<EOF\n$((z))\nEOF"],
   ["price: the helper's checksum next to other work", "sha256sum /usr/local/sbin/cockpit-borg-action\napt-get update"],
   // Hinweis H1: ein Argument in Quotes ueber das Zeilenende.
@@ -581,6 +612,25 @@ describe("backup bolt: needs the operator's approval", () => {
     expect(found.map((hit) => [hit.where, hit.kind])).toEqual([["S1:L2", "backup"]]);
     expect(found[0].code).toBe("borgmatic prune");
     expect(focus(run).map((hit) => [hit.where, hit.kind])).toEqual([["S1:L3", "uncertain"]]);
+  });
+
+  // Zweitpruefung t_23d4dbd9 (Karte t_ac8559f4): jede der beiden Ursachen allein.
+  it("reads a command substitution inside arithmetic as its own command (t_ac8559f4)", () => {
+    for (const run of ["echo $(( $(/usr/local/sbin/cockpit-borg-action repair) ))", "echo $(( `/usr/local/sbin/cockpit-borg-action repair` ))"]) {
+      expect(hits(run).some((hit) => hit.reason.includes("repair can delete archives"))).toBe(true);
+    }
+    expect(hits("echo $(( $(systemctl stop borgmatic.timer) ))")).toEqual([expect.objectContaining({ kind: "backup", reason: expect.stringContaining("systemctl stop") })]);
+  });
+
+  it("reads a redirect target it cannot read completely as a word, not as the end of the command (t_ac8559f4)", () => {
+    // Im Kommentar sieht nur der Rohtext-Riegel den Helfer: halb gelesen hiess das frueher „bare“.
+    for (const target of ["< <(:$(:))", ">`echo /tmp/x`", "> $(echo /tmp/x)"]) {
+      const found = hits(`hostname # /usr/local/sbin/cockpit-borg-action ${target} repair`);
+      expect(found.some((hit) => hit.reason.includes("with a word other than its free forms"))).toBe(true);
+    }
+    // Ein Ziel, das nicht schliesst, ist ein Wort; ein ganz gelesenes Ziel ohne Wort danach bleibt der blosse Name.
+    expect(hits("hostname # /usr/local/sbin/cockpit-borg-action < <(:$(:)")[0].reason).toContain("with a word other than its free forms");
+    expect(hits("hostname # /usr/local/sbin/cockpit-borg-action < <(:$(:))")[0].reason).toContain("where the bolt reads a comment");
   });
 
   it("counts a heredoc body line by its own line number", () => {

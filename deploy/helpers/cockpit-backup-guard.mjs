@@ -238,9 +238,39 @@ const HELPER_FREE_FOLLOWER = /^[ \t]+(?:status|check|db-access[ \t]+(?:status|ch
 // nimmt sie an jeder Stelle des Befehls, die Wörter danach sind weiter
 // Argumente — `R <&- repair`, `R >/dev/null repair`, `R 2>&1 repair`,
 // `R <<<x repair` starten repair. [n] bzw. {name} vor dem Operator; das Ziel ist
-// ein Wort (auch -, &n, <(…), >(…)). Ein Operator ohne Ziel bleibt stehen
-// (followerKind liest ihn wie bisher als Ende des Befehls).
-const HELPER_REDIRECT = /^[ \t]*(?:\d+|\{\w+\})?(?:&>>|&>|>>|>\||>&|<&|<<<|<<-|<<|<>|>|<)[ \t]*(?:[<>]\([^)]*\)|[^\s;&|()<>`]+)/;
+// ein Wort (auch -, &n, <(…), >(…)). Das Ziel liest redirectTargetEnd.
+// Fail-closed (Zweitprüfung t_23d4dbd9, Karte t_ac8559f4): ein Operator, dessen
+// Ziel nicht vollständig gelesen wird (fehlt, schließt nicht), ist ein Wort
+// ("arg"), nie das Ende des Befehls — `R < <(:$(:)) repair` und
+// `R >\`echo x\` repair` starten repair.
+const HELPER_REDIRECT_OP = /^[ \t]*(?:\d+|\{\w+\})?(?:&>>|&>|>>|>\||>&|<&|<<<|<<-|<<|<>|>|<)[ \t]*/;
+// Wo ein Wort endet, das bei from beginnt (Text nach normalize, Quotes weg):
+// einfache Zeichen, $(…), <(…)/>(…) mit Klammerzählung, ${…}, `…`. -1: das
+// Wort fehlt oder schließt nicht, oder es enthält etwas, das der Riegel nicht
+// liest (eine nackte Klammer).
+function redirectTargetEnd(text, from) {
+  let i = from;
+  while (i < text.length) {
+    const char = text[i];
+    if (/[\s;&|)]/.test(char)) break;
+    if (char === "$" && text[i + 1] === "(" || (char === "<" || char === ">") && text[i + 1] === "(") {
+      let depth = 1;
+      let j = i + 2;
+      for (; j < text.length && depth > 0; j += 1) {
+        if (text[j] === "(") depth += 1;
+        else if (text[j] === ")") depth -= 1;
+      }
+      if (depth > 0) return -1;
+      i = j; continue;
+    }
+    if (char === "<" || char === ">" || char === "(") return i > from && char !== "(" ? i : -1;
+    if (char === "$" && text[i + 1] === "{") { const end = text.indexOf("}", i + 2); if (end < 0) return -1; i = end + 1; continue; }
+    // Ein ` ohne Partner schließt die Ersetzung, in der der Helfer steht (`R >/dev/null`).
+    if (char === "`") { const end = text.indexOf("`", i + 1); if (end < 0) break; i = end + 1; continue; }
+    i += 1;
+  }
+  return i > from ? i : -1;
+}
 // Jede Nennung des Helfers in einem Text: "free" (freie Form), "bare" (nur der
 // Name, ohne Argument oder mit einem festen absoluten Pfad) oder "arg" (ein
 // anderes Wort folgt: repair, sources restore, $v, $(…), ein Glob …).
@@ -263,11 +293,16 @@ function helperMentions(text) {
 function followerKind(rest, exact) {
   let path = false;
   for (;;) {
-    const redirect = rest.match(HELPER_REDIRECT);
-    if (redirect) { rest = rest.slice(redirect[0].length); continue; }
+    const operator = rest.match(HELPER_REDIRECT_OP);
+    // <(…)/>(…) direkt hinter dem Namen ist ein Wort, keine Umleitung.
+    if (operator && !/[<>]\($/.test(rest.slice(0, operator[0].length + 1).trimEnd())) {
+      const end = redirectTargetEnd(rest, operator[0].length);
+      if (end < 0) return "arg";
+      rest = rest.slice(end); continue;
+    }
     const free = exact && !path ? rest.match(HELPER_FREE_FOLLOWER) : null;
     if (free && (free[1] === undefined || sourcesFree(["sources", "add", free[1]]))) return "free";
-    if (/^[ \t]*(?:$|[;&|)`#]|\d*[<>](?!\())/.test(rest)) return "bare";
+    if (/^[ \t]*(?:$|[;&|)`#])/.test(rest)) return "bare";
     const word = rest.match(/^[ \t]+\/[^\s;&|)<>`$*?[\]{}\u0001]*(?=$|[\s;&|)<>`#])/);
     if (!word) return "arg";
     rest = rest.slice(word[0].length); path = true;
@@ -1166,15 +1201,22 @@ function normalize(code) {
 
 // $(…), `…`, <(…), >(…) und $((…)) werden zu Platzhaltern; ihr Inhalt wird als
 // eigene Zeile geprüft. Das Ergebnis ist OPAQUE, außer bei harmlosen Quellen.
-function extractSubstitutions(text, inner) {
+// Arithmetik (Zweitprüfung t_23d4dbd9, Karte t_ac8559f4): Bash führt jedes $(…)
+// und `…` in $((…)) aus (echo $(( $(R repair) )) startet R). Der Ausdruck wird
+// zu 0, seine Ersetzungen werden wie überall eigene Befehle in inner — derselbe
+// Leser, rekursiv im Modus arith (dort ist < bzw. > ein Vergleich, kein <(…)).
+// ((…)), $[…], let, for ((…)) und ein Index bleiben Text; ihr $(…)/`…` findet
+// dieser Leser ohnehin.
+function extractSubstitutions(text, inner, arith = false) {
   let out = "";
   let i = 0;
   while (i < text.length) {
     if (text.startsWith("$((", i) && arithCloses(text, i + 3)) {
       const end = closing(text, i + 3, "(", ")", 2);
+      extractSubstitutions(text.slice(i + 3, Math.max(i + 3, end - 2)), inner, true);
       out += "0"; i = end; continue;
     }
-    const opener = text.startsWith("$(", i) ? 2 : (text[i] === "<" || text[i] === ">") && text[i + 1] === "(" ? 2 : 0;
+    const opener = text.startsWith("$(", i) ? 2 : !arith && (text[i] === "<" || text[i] === ">") && text[i + 1] === "(" ? 2 : 0;
     if (opener) {
       const end = closing(text, i + opener, "(", ")", 1);
       const body = text.slice(i + opener, end - 1);

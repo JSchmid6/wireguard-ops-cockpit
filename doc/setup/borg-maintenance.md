@@ -462,7 +462,8 @@ Grenzen:
   fallen F und A ohne eigene Regel: wer eine Datei, ein FIFO oder `tail -f` ausführt, braucht eine
   Shell, `xargs`, `less`, `ln`, `mkfifo` oder einen Befehlsnamen aus einem Wert — keiner davon ist ein
   Filter. Arithmetik: `$((…))`, `((…))` und Array-Indizes werden durchlaufen, jedes `$(…)`/`` `…` ``
-  darin wird ein eigener Befehl (das allein reicht nicht: Bash rechnet auch den *Wert* eines Namens
+  darin wird ein eigener Befehl (in der Verb-, Unit- und Löschprüfung für `$((…))` erst seit Karte
+  t_ac8559f4, siehe Nachtrag unten; das allein reicht nicht: Bash rechnet auch den *Wert* eines Namens
   aus — siehe Nachtrag t_2e391eba); ein Index mit `$(…)` in einem Argument (`printf -v`, `read`,
   `test -v`, `declare`) ist kein Filter, ebenso `mapfile -C`. `sed` wird positiv gelesen statt per
   Regex auf `/`: Optionen nur `-n -E -r -s -u -z -l`, `-e`/`--expression`, `--posix`, `--debug`,
@@ -599,6 +600,31 @@ Grenzen:
   10/10 Treffer (Kontrolle `$(( 1 + 2 ))` frei), `faelle-r7.mjs` unverändert (frei und laufend nur
   die fünf Formen mit Türsteher-Fokus). Tests: `apps/api/test/backup-guard.test.ts` (t_70e65772, je
   Form mit `<&-`, `>/dev/null`, `2>&1` und mit `borg delete` für den Leser).
+* **Befehlsersetzung in der Arithmetik, halb gelesenes Umleitungsziel (10.11.2026, Zweitprüfung
+  t_23d4dbd9, Karte t_ac8559f4).** Runde 8 fand frei, Fokus leer, in echter Bash laufend:
+  `echo $(( $(…/cockpit-borg-action < <(:$(:)) repair) ))`, ebenso mit `` >`echo /tmp/x` `` als Ziel,
+  `` $(( `…` )) ``, `$(( 1 ? $(…) : 0 ))`, `x=$(( $(…) ))`, `… sources disconnect x`; daneben
+  `echo $(( $(systemctl stop borgmatic.timer) ))`. Auf main war schon `$(( $(<helfer> repair) ))`
+  frei. Zwei Ursachen: (a) **Drift gegenüber dem Nachtrag t_d16c58d1 oben** („jedes `$(…)`/`` `…` ``
+  darin wird ein eigener Befehl“): das galt nur für die Zeilen-Allowlist (`rawSegments`); die
+  Verb-, Unit- und Löschprüfung (`extractSubstitutions`) ersetzte `$((…))` durch `0`, ohne
+  hineinzusehen. `((…))`, `$[…]`, `let`, `for ((…))` und Indizes las sie schon, weil sie dort Text
+  bleiben. (b) Der Rohtext-Riegel las ein Prozessersetzungs-Ziel nur bis zum ersten `)` und ein
+  Ziel, das er gar nicht lesen konnte (Backtick, `$(…)`), als Ende des Befehls („bare“).
+  **Entscheidung:** (a) ein Leser: `extractSubstitutions` liest den Ausdruck in `$((…))` mit sich
+  selbst (Modus Arithmetik: `<`/`>` sind dort Vergleiche, keine `<(…)`), jedes `$(…)`/`` `…` `` darin
+  wird ein eigener Befehl, der Ausdruck selbst bleibt `0` — damit stimmt der Satz oben jetzt für
+  beide Prüfungen. (b) Fail-closed: hinter einem Umleitungsoperator liest `redirectTargetEnd` das
+  ganze Ziel (einfache Zeichen, `$(…)`/`<(…)`/`>(…)` mit Klammerzählung, `${…}`, `` `…` `` mit
+  Partner); fehlt das Ziel oder schließt es nicht, ist das ein Wort („arg“), nie das Ende des
+  Befehls. „bare“ gibt es nur noch bei echtem Befehlsende (Zeilenende, `;`, `&`, `|`, `)`, `` ` ``,
+  `#`). Ein ganz gelesenes Ziel ohne Wort danach (`<helfer> < <(…)`, `<helfer> > repair`) bleibt der
+  bloße Name — so liest es auch Bash. **Preis (gemessen, `/opt/data/out/t_ac8559f4/preis-r8.log`):**
+  kein neuer Treffer gegenüber 3771b9b; frei bleiben `echo $(( $(date +%s) - 3600 ))`,
+  `n=$(( $(wc -l < /tmp/x.txt) + 1 ))`, `echo $(( $(<helfer> status) ))`, `<helfer> status
+  >/dev/null`. Tests: `apps/api/test/backup-guard.test.ts` (t_ac8559f4, je Arithmetik-Form mit dem
+  Helfer hinter `< <(:$(:))`, `` >`echo x` `` und mit `borg delete`/`systemctl stop` für den Leser;
+  dazu je Ursache allein).
 * **Offene Entscheidung (05.11.2026, Karte t_5ce5f79f): Freigabe-Markierung im Helfer.** Erwogen:
   die schwächenden Verben (`sources connect|disconnect|restore`, `repair`) laufen in einer
   host-run-cgroup nur, wenn `cockpit-host-run` für genau diesen Job eine root-eigene Markierung
