@@ -787,19 +787,29 @@ export function updateReviewFindings(outcome: UpdateReviewOutcome): {
 //   (secondReviewCovers) keeps the plan's own status. The review still ran and
 //   is recorded; the job and GET /api/inbox carry it as a report. A plan block
 //   stays, and so does every other stop outside this review.
+// - severity cut (operator decision 10.11.2026, variant C): a finding that is
+//   high, on G1/G2/G7/G10, an INJECTION or without a readable severity
+//   (secondReviewStops) keeps the finding's stop although the proof holds; the
+//   verified proof is still recorded in the evidence.
 export function applyUpdateReviewPolicy<P extends ReviewedPolicy>(policy: P, outcome: UpdateReviewOutcome): P {
-  const { result, findings, gaps, evidence, needed } = updateReviewFindings(outcome);
-  const merged = { ...policy, evidence: [...policy.evidence, ...evidence] };
-  if (result === "pass") return merged;
-  if (secondReviewCovers(outcome)) {
-    const checks = outcome.secondReview ?? [];
+  const { result, findings, gaps, evidence: reviewEvidence, needed } = updateReviewFindings(outcome);
+  const checks = secondReviewCovers(outcome) ? outcome.secondReview ?? [] : [];
+  const verified = checks.map((check) => `second review verified for ${check.sha.slice(0, 12)}: ${check.reason}`);
+  const evidence = [...reviewEvidence];
+  if (result === "pass") return { ...policy, evidence: [...policy.evidence, ...evidence] };
+  if (secondReviewReports(outcome)) {
     return {
-      ...merged,
-      evidence: [...merged.evidence, ...checks.map((check) => `second review verified for ${check.sha.slice(0, 12)}: ${check.reason}`),
+      ...policy,
+      evidence: [...policy.evidence, ...evidence, ...verified,
         `pre-install review ${result} reported, not a stop: ${[...findings, ...gaps].join("; ").slice(0, 600)}`],
       neededToContinue: [...policy.neededToContinue, "Tell the operator about the reported pre-install review (GET /api/inbox lists it under reviewFindings)."],
     };
   }
+  if (checks.length > 0) {
+    const severe = secondReviewStops(outcome).map((finding) => `${finding.title || "(untitled)"} [${finding.guarantee || "?"}, ${finding.severity || "?"}]`);
+    evidence.push(...verified, `second review does not lift the stop: finding(s) high, on G1/G2/G7/G10, INJECTION or without severity: ${severe.join("; ").slice(0, 600)}`);
+  }
+  const merged = { ...policy, evidence: [...policy.evidence, ...evidence] };
   const subject = UPDATE_KINDS[kindOf(outcome.kind)].subject;
   const stillBlocked = (reason: string, status: P["status"]): P => policy.allowed
     ? { ...merged, zone: "red", allowed: false, status, reason, neededToContinue: needed }
@@ -879,7 +889,7 @@ export function summarizeUpdateReview(diffs: UpdateDiff[], outcome: UpdateReview
     notes: outcome.answer?.notes ?? "",
     secondReview: outcome.secondReview ?? [],
     // A finding or gap that did not stop the job because of the second review.
-    reported: updateReviewFindings(outcome).result !== "pass" && secondReviewCovers(outcome),
+    reported: secondReviewReports(outcome),
   };
 }
 
@@ -905,7 +915,9 @@ export function summarizeUpdateReview(diffs: UpdateDiff[], outcome: UpdateReview
 // Honest limit: the marker proves that the review record exists for exactly
 // this head, not who wrote it beyond the account's write access — the agent
 // posts it with the owner's token. Its worth is the binding to the sha and the
-// public, immutable record, not a second principal.
+// public, immutable record, not a second principal. Therefore it carries only
+// light findings (secondReviewStops, operator decision 10.11.2026): a high
+// finding, one on G1/G2/G7/G10 or an INJECTION stays the operator's stop.
 export const SECOND_REVIEW_REPOSITORY = "JSchmid6/wireguard-ops-cockpit";
 export const SECOND_REVIEW_MARKER = /^Cockpit-Zweitpruefung: FREIGABE ([a-f0-9]{40}) opus[ \t]*$/m;
 const SECOND_REVIEW_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
@@ -917,6 +929,33 @@ export function secondReviewCovers(outcome: UpdateReviewOutcome): boolean {
   if (kindOf(outcome.kind) !== "self" || outcome.unavailable || outcome.bindings.length === 0) return false;
   const checks = outcome.secondReview ?? [];
   return outcome.bindings.every((binding) => checks.some((check) => check.sha === binding.sha && check.verified));
+}
+
+// Severity cut (operator decision 10.11.2026, card t_e49f6254, variant C): the
+// marker can be posted by the agent's own token, so it carries only light
+// findings. A finding stays a stop for the operator, marker or not, when it is
+// high, names G1, G2, G7 or G10 (approval, lock, self-update path, backup bolt),
+// is an INJECTION, or carries no severity the cut can read (fail closed: only a
+// severity starting with medium or low is light). UNVERIFIABLE points are gaps,
+// not findings, and an incomplete review stays reportable.
+export const SECOND_REVIEW_STOP_GUARANTEES = new Set([1, 2, 7, 10]);
+
+function stopsDespiteSecondReview(finding: UpdateReviewFinding): boolean {
+  if (unverifiable(finding)) return false;
+  if (/\bINJECTION\b/.test(finding.guarantee)) return true;
+  if ([...finding.guarantee.matchAll(/\bG(\d+)\b/g)].some((match) => SECOND_REVIEW_STOP_GUARANTEES.has(Number(match[1])))) return true;
+  return !/^(?:medium|low)\b/.test(finding.severity);
+}
+
+// The findings the second review cannot turn into a report.
+export function secondReviewStops(outcome: UpdateReviewOutcome): UpdateReviewFinding[] {
+  return outcome.answer?.verdict === "flag" ? outcome.answer.findings.filter(stopsDespiteSecondReview) : [];
+}
+
+// A review that is not a pass becomes a report instead of a stop: the proof
+// covers every installed commit and no finding is beyond the severity cut.
+export function secondReviewReports(outcome: UpdateReviewOutcome): boolean {
+  return updateReviewFindings(outcome).result !== "pass" && secondReviewCovers(outcome) && secondReviewStops(outcome).length === 0;
 }
 
 function record(value: unknown): Record<string, unknown> {

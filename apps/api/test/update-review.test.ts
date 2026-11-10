@@ -987,8 +987,13 @@ describe("second review: the pre-install review reports instead of stopping (4b)
   }
   const binding = { base: BASE, sha: SHA, diffSha256: HASH };
   const flagged = parseUpdateReviewAnswer([
-    "VERDICT: flag", "FINDING: safety net skipped", "GUARANTEE: G5", "SEVERITY: high",
+    "VERDICT: flag", "FINDING: safety net skipped", "GUARANTEE: G5", "SEVERITY: medium",
     "FILE: deploy/helpers/cockpit-host-run", "CODE: skip_net=1", "REASON: the net is skipped",
+  ].join("\n"));
+  const flag = (guarantee: string, severity: string | null) => parseUpdateReviewAnswer([
+    "VERDICT: flag", "FINDING: light point", "GUARANTEE: G5", "SEVERITY: medium", "FILE: a.ts", "CODE: x", "REASON: r",
+    "FINDING: the point under test", `GUARANTEE: ${guarantee}`, ...(severity === null ? [] : [`SEVERITY: ${severity}`]),
+    "FILE: apps/api/src/update-review.ts", "CODE: y", "REASON: r",
   ].join("\n"));
 
   it("verifies the merge of a reviewed PR head and turns a finding into a report", async () => {
@@ -1000,6 +1005,35 @@ describe("second review: the pre-install review reports instead of stopping (4b)
     expect(policy.evidence).toContain("pre-install review result: finding");
     expect(policy.evidence.some((line) => line.startsWith("pre-install review finding reported, not a stop"))).toBe(true);
     expect(summarizeUpdateReview([diff()], reviewed, null)).toMatchObject({ result: "finding", reported: true, secondReview: [check] });
+  });
+
+  it("keeps the stop for a high finding, one on G1/G2/G7/G10, an INJECTION or no severity (severity cut, 10.11.2026)", async () => {
+    const check = await verifySecondReview(binding, github());
+    const cases: Array<[string, string | null]> = [
+      ["G5", "high"], ["G1", "medium"], ["G2", "medium"], ["G7", "medium"], ["G10", "medium"],
+      ["G3 (also weakens G1)", "medium"], ["INJECTION", "medium"], ["G5", null], ["G5", "critical"],
+    ];
+    for (const [guarantee, severity] of cases) {
+      const name = `${guarantee}/${severity}`;
+      const reviewed = outcome({ answer: flag(guarantee, severity), secondReview: [check] });
+      const policy = applyUpdateReviewPolicy(readyPolicy, reviewed);
+      expect(policy, name).toMatchObject({ status: "blocked_user_approval", allowed: false, zone: "red" });
+      expect(policy.evidence.some((line) => line.startsWith(`second review verified for ${SHA.slice(0, 12)}`)), name).toBe(true);
+      expect(policy.evidence.some((line) => line.startsWith("second review does not lift the stop") && line.includes("the point under test")), name).toBe(true);
+      expect(policy.evidence.some((line) => line.includes("reported, not a stop")), name).toBe(false);
+      expect(summarizeUpdateReview([diff()], reviewed, null), name).toMatchObject({ result: "finding", reported: false });
+    }
+    // G1x is not G1, and medium/low outside the four guarantees stay reportable.
+    for (const [guarantee, severity] of [["G11", "medium"], ["G9", "low"], ["G4, G6", "medium"]] as const) {
+      expect(applyUpdateReviewPolicy(readyPolicy, outcome({ answer: flag(guarantee, severity), secondReview: [check] })).status, guarantee).toBe("ready");
+    }
+    // Only UNVERIFIABLE points (incomplete) stay reportable even when one names G1.
+    const open = parseUpdateReviewAnswer(["VERDICT: flag", "FINDING: cut", "GUARANTEE: UNVERIFIABLE (G1)", "SEVERITY: high", "FILE: a.ts", "CODE: x", "REASON: r"].join("\n"));
+    expect(applyUpdateReviewPolicy(readyPolicy, outcome({ answer: open, secondReview: [check] })).status).toBe("ready");
+    // Without the proof the cut changes nothing: the plain stop, no second-review evidence.
+    const plain = applyUpdateReviewPolicy(readyPolicy, outcome({ answer: flag("G1", "high") }));
+    expect(plain.status).toBe("blocked_user_approval");
+    expect(plain.evidence.some((line) => line.startsWith("second review"))).toBe(false);
   });
 
   it("also reports an incomplete review, but never without the reviewed binding", async () => {

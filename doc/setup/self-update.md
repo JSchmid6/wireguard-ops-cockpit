@@ -385,7 +385,8 @@ request):
    longer counts. The line never goes into a commit message (the reviewer
    would read it as an injection, see the cockpit skill).
 
-With that proof the review stays recorded but keeps the plan's own status:
+With that proof — and only for light findings, see the severity cut below — the
+review stays recorded but keeps the plan's own status:
 evidence `second review verified for <sha>` and `pre-install review <result>
 reported, not a stop`, `output.updateReview.secondReview` and `reported: true`,
 audit `hermes.update_review.reported`, and `GET /api/inbox` lists it under
@@ -400,13 +401,35 @@ principal. Spelled out (card t_e49f6254, 10.11.2026): the agent can write the
 marker line itself, without any second review having run, on every pull
 request it merged itself — and James merges directly. So for a self-update
 the agent can turn this review's `finding` or `incomplete` into a report and
-install the flagged code without the operator. Nothing in the Cockpit stops
-that; what is left is the public, immutable PR comment, the report in
-`GET /api/inbox` (`reviewFindings`, `reported: true`, seven days) and the audit
-`hermes.update_review.reported` — the operator learns of it afterwards, not
-before. The operator accepted this on 07.11.2026 and again on 10.11.2026 (job
-9bc909ed, whose own pre-install review flagged exactly this path, G1/G7, high).
-Way back: revert the change and self-update to the previous commit.
+install the flagged code without the operator. What is left is the public,
+immutable PR comment, the report in `GET /api/inbox` (`reviewFindings`,
+`reported: true`, seven days) and the audit `hermes.update_review.reported` —
+the operator learns of it afterwards, not before. Job 9bc909ed's own pre-install
+review flagged exactly this path (G1/G7, high); the operator kept the second
+review and narrowed it instead (10.11.2026, variant C):
+
+**Severity cut** (`secondReviewStops`, `secondReviewReports`). Because the
+marker is no second principal, it carries only light findings. A finding stays
+the operator's stop (`blocked_user_approval`) despite a verified proof when it
+is `high`, names G1, G2, G7 or G10 anywhere in its `GUARANTEE` line (approval,
+lock, self-update path, backup bolt — the guarantees a self-posted marker could
+be used to get past), is an `INJECTION`, or has a severity that does not start
+with `medium` or `low` (fail closed). The verified proof is still recorded
+(`second review verified for <sha>`, then `second review does not lift the stop:
+…` with the findings beyond the cut), and `reported` stays `false`. Light
+findings (`medium`/`low` on the other guarantees) and `incomplete` (tool-chain
+gaps, `UNVERIFIABLE` only) stay reports as above, so a fault of the review chain
+still does not block the agent. Effect: a severe finding behind a
+self-posted marker no longer installs without the operator. What is left open:
+the reviewer sets the severity itself — a severe point it rates `medium` on a
+guarantee outside the four still becomes a report. Staying able to act
+(operator, 10.11.2026): a stop here is one approval click in "Wartet auf dich";
+host runs, repairs and rollbacks through `host.run` never pass this review; a
+revert is a new merge with its own, usually unflagged diff. If such stops pile
+up, the operator wants to talk again (no silent loosening).
+Way back: revert this change (one commit in `update-review.ts`,
+`update-review-prompt.ts`, tests and docs) and self-update to the previous
+commit.
 
 **What the owner sees — only for a finding.** The job explanation's `reason`
 names why (the flagged findings; for `blocked_prerequisite` the agent reads the
@@ -468,7 +491,7 @@ finding names a concrete way **past** one of its guards, or a weakening of it:
 
 | Guarantee | holds |
 | --- | --- |
-| G1 Approval | only the admin session approves; a bearer token never approves or sets `operatorApproved`/`gatePassed`. A `host.run` start on the doorkeeper's pass is intended. A job that needed the operator (evidenced finding, bolt hit, a declared risk other than `contained`, a door without doorkeeper) never runs without the operator's approval. Exception by decision (07.11.2026): a self-update review finding whose commits carry a second review the Cockpit verified itself on GitHub is a report, not a stop ([Second review](#review-before-install)); the marker can be posted by the agent's own token, so this exception rests on a public record, not on a second principal. |
+| G1 Approval | only the admin session approves; a bearer token never approves or sets `operatorApproved`/`gatePassed`. A `host.run` start on the doorkeeper's pass is intended. A job that needed the operator (evidenced finding, bolt hit, a declared risk other than `contained`, a door without doorkeeper) never runs without the operator's approval. Exception by decision (07.11.2026): a self-update review finding whose commits carry a second review the Cockpit verified itself on GitHub is a report, not a stop ([Second review](#review-before-install)); the marker can be posted by the agent's own token, so this exception rests on a public record, not on a second principal, and it holds only for light findings: a `high` finding, one on G1/G2/G7/G10 or an `INJECTION` stays a stop (severity cut, 10.11.2026). |
 | G2 Lock | HMAC envelope (timing-safe, host secret), bound to plan and `manifestHash`, with expiry, capability and the job id (its form; the run directory is named by it); the root helper checks it at the start and on every resume; a blocked job's envelope never opens. |
 | G3 Doors | `host.run` is the one general door; every other action stays typed and narrow. No second general door, no way into `host.run` past G2, G9, G10. |
 | G4 Root helpers and sudoers | narrow, typed; the host-run helper keeps exactly `start` and `status <job>`. |
