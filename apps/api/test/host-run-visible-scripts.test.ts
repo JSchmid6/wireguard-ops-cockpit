@@ -263,3 +263,65 @@ describe("hash-pinned scripts: fail safe recognition (Befund t_740ac6ee)", () =>
     expect(hidden(`cp /tmp/x /usr/local/sbin/cockpit-borg-retention\necho "${HASH}  /usr/local/sbin/cockpit-borg-retention" | sha256sum -c -\n/usr/local/sbin/cockpit-borg-retention status`)).toHaveLength(1);
   });
 });
+
+// Befund t_af29564c (Zweitprüfung Runde 2), Nacharbeit 2 t_0e05c213: the cases of
+// /opt/data/out/t_af29564c/gegen2.ts and the comment of t_ae973907.
+describe("hash-pinned scripts: PATH names, continued lines, sed -i (Befund t_af29564c)", () => {
+  const P = "/opt/x/run.sh";
+  const W = "/usr/local/sbin/wartung";
+  const pin = `echo "${HASH}  ${P}" | sha256sum -c -`;
+  const hidden = (...runs: string[]) => hiddenPinnedScripts(manifest(runs.map((run, index) => ({ name: `s${index + 1}`, run }))) as never);
+
+  it("N1: recognises a pinned program in a PATH directory run by its bare name", () => {
+    expect(hidden(`echo "${HASH}  ${W}" | sha256sum -c - && wartung`)).toEqual([{ path: W, pinnedAt: "S1:L1", executedAt: "S1:L1" }]);
+  });
+
+  it("N1: recognises the bare name behind sudo, runuser and su", () => {
+    for (const run of ["sudo wartung --jetzt", "sudo -u root wartung", "runuser -u nobody -- wartung", "su -c wartung"]) {
+      expect(hidden(`echo "${HASH}  ${W}" | sha256sum -c -`, run), run).toEqual([{ path: W, pinnedAt: "S1:L1", executedAt: "S2:L1" }]);
+    }
+  });
+
+  it("N1: recognises ExecStart=name in a unit written by heredoc", () => {
+    expect(hidden(`echo "${HASH}  /usr/local/bin/wartung" | sha256sum -c -`, `cat > /etc/systemd/system/w.service <<'EOF'\n[Service]\nExecStart=wartung\nEOF`))
+      .toEqual([{ path: "/usr/local/bin/wartung", pinnedAt: "S1:L1", executedAt: "S2:L3" }]);
+  });
+
+  it("N1: recognises a symlink into a PATH directory run by its name", () => {
+    expect(hidden(pin, `ln -s ${P} /usr/local/bin/runit`, "runit")).toEqual([{ path: "/usr/local/bin/runit", pinnedAt: "S1:L1", executedAt: "S3:L1" }]);
+  });
+
+  it("N1: recognises a copy into a PATH directory run by its name", () => {
+    expect(hidden(pin, `cp ${P} /usr/local/bin/`, "run.sh")).toEqual([{ path: "/usr/local/bin/run.sh", pinnedAt: "S1:L1", executedAt: "S3:L1" }]);
+  });
+
+  it("N1: refuses the bare name in the planner stage", () => {
+    expect(() => parseHostRunManifest(plan(manifest([{ name: "pin", run: `echo "${HASH}  ${W}" | sha256sum -c -` }, { name: "run", run: "sudo wartung --jetzt" }])))).toThrow(/only pins by hash/);
+  });
+
+  it("N1: keeps the bare name of a deployed Cockpit helper free and leaves names outside PATH directories alone", () => {
+    expect(hidden(`echo "${HASH}  /usr/local/sbin/cockpit-borg-retention" | sha256sum -c -\ncockpit-borg-retention status`)).toEqual([]);
+    expect(hidden(pin, "run.sh")).toEqual([]);
+  });
+
+  it("N2: sees an overwrite after the heredoc that a continued line splits", () => {
+    expect(hidden(`cat > ${P} <<'EOF'\necho hi\nEOF\ninstall -m 0755 -o root -g root \\\n  /srv/repo/run.sh ${P}`, pin, P))
+      .toEqual([{ path: P, pinnedAt: "S2:L1", executedAt: "S3:L1", overwrittenAt: "S1:L4" }]);
+  });
+
+  it("N2: recognises a pinned script piped into a shell on a continued line", () => {
+    expect(hidden(pin, `cat ${P} \\\n  | bash`)).toEqual([{ path: P, pinnedAt: "S1:L1", executedAt: "S2:L1" }]);
+  });
+
+  it("N2: does not join an escaped backslash or a heredoc body line", () => {
+    expect(hidden(pin, `echo done \\\\\ncat ${P}`)).toEqual([]);
+    expect(hidden(`cat > ${P} <<'EOF'\necho a \\\nEOF\n${pin}\n${P}`)).toEqual([]);
+  });
+
+  it("takes the heredoc back when sed -i edits it afterwards", () => {
+    // sed is no quiet command, so its own line already counts as running the path; the overwrite is named.
+    for (const edit of [`sed -i "s/hi/$(cat /srv/x)/" ${P}`, `sed -i 's/hi/ho/' ${P}`, `sed -i -e '1r /srv/other.sh' ${P}`]) {
+      expect(hidden(`cat > ${P} <<'EOF'\necho hi\nEOF\n${edit}\n${pin}\n${P}`), edit).toEqual([{ path: P, pinnedAt: "S1:L5", executedAt: "S1:L4", overwrittenAt: "S1:L4" }]);
+    }
+  });
+});
