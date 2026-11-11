@@ -141,9 +141,10 @@ Bare-metal Ubuntu VPS (161.97.86.86) running:
   adding yes, weakening no): extra sources live in `/etc/borgmatic/cockpit-sources.patterns` (`R <path>`
   lines, no secrets), referenced once from `config.yaml` via `patterns_from`.
   `cockpit-borg-action sources add <dir below /opt/stacks|/srv|/var/lib/docker/volumes>` from a host run
-  is free under the backup bolt up to a quarter of the free space on Lab0's RAID (`du -sxb` against `DF`
-  from the status file; above that, or unreadable, it changes nothing and says „Braucht Jochen“, card
-  t_0ea98639); `sources add-large|connect|disconnect|restore` go to the operator. Which paths are
+  is free under the backup bolt while it and all sources already listed together stay within a quarter of
+  the free space on Lab0's RAID (`du -sbc` across mount points, du rc ≠ 0 = unmeasurable, against `DF`
+  from a status file at most 24 h old; above that, or unreadable, it changes nothing and says „Braucht
+  Jochen“, cards t_0ea98639, t_b6cbeb86); `sources add-large|connect|disconnect|restore` go to the operator. Which paths are
   backed up is readable without the config: `Command line:` in `borgmatic info --last 1`.
 - Retention lives on Lab0, not here (`doc/setup/borg-retention.md`): the VPS key is
   append-only there and borgmatic here only creates and checks. Lab0's

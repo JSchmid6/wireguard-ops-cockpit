@@ -1048,8 +1048,10 @@ readonly SOURCES_CONFIG_FIXED="/etc/borgmatic/config.yaml"
 readonly SOURCES_LOCK_FIXED="/run/lock/cockpit-borg.lock"
 readonly SOURCES_KISTE_URL_FIXED="http://10.0.0.5:8088/status.txt"
 # Größengrenze (Hinweis H2, Karte t_0ea98639): eine neue Quelle darf höchstens
-# 1/SOURCES_SIZE_SHARE des freien Platzes auf /media/RAID der Kiste belegen
-# (gemessen: `du -sxb`, gegen `DF` aus der Statusdatei, die auch status zeigt).
+# 1/SOURCES_SIZE_SHARE des freien Platzes auf /media/RAID der Kiste belegen —
+# zusammen mit allen schon eingetragenen Cockpit-Quellen (gemessen: `du -sbc`,
+# über Mountpunkte hinweg, gegen `DF` aus der höchstens 24 h alten Statusdatei,
+# die auch status zeigt).
 # Begründung des Faktors 4: das erste Archiv der Quelle wächst das Repo um bis
 # zu ihre Grösse (Kompression und Deduplizierung machen es nur kleiner), jede
 # Änderung an ihr bleibt bis zum Ende der Aufbewahrung zusätzlich liegen, und
@@ -1058,7 +1060,9 @@ readonly SOURCES_KISTE_URL_FIXED="http://10.0.0.5:8088/status.txt"
 # wenn Grösse oder Platz nicht lesbar sind, verändert add nichts (rc=1,
 # „braucht Jochen“); den Weg mit seiner Freigabe geht add-large.
 readonly SOURCES_SIZE_SHARE=4
-readonly SOURCES_DU_TIMEOUT=120 # s; länger heisst: sehr viele Dateien → Jochen
+readonly SOURCES_DU_TIMEOUT=120 # s; länger heisst: sehr viele Dateien oder ein hängender Mount → Jochen
+readonly SOURCES_STATUS_MAX_AGE=86400 # s; ein älterer freier Platz gilt als nicht lesbar (H1)
+readonly SOURCES_STATUS_MAX_SKEW=600  # s; DATE weiter in der Zukunft ebenso
 SOURCES_FILE=""; SOURCES_ROOTS=""; SOURCES_CONFIG=""; SOURCES_LOCK=""; SOURCES_SERVICE=""; SOURCES_KISTE_URL=""
 
 sources_context() {
@@ -1156,10 +1160,23 @@ sources_covered() { # sources_covered <pfad>: Meldung auf stdout und rc=0, wenn 
   return 1
 }
 
+kiste_status_fresh() { # kiste_status_fresh <statustext>: rc=0, wenn DATE höchstens SOURCES_STATUS_MAX_AGE s alt ist
+  local d t now
+  d="$(printf '%s\n' "$1" | awk '$1 == "DATE:" { n++; v = $2 } END { if (n == 1) print v }')"
+  [ -n "$d" ] || return 1
+  t="$(date -d "$d" +%s 2>/dev/null)" || return 1
+  now="$(date -u +%s)"
+  [[ "$t" =~ ^[0-9]+$ && "$now" =~ ^[0-9]+$ ]] || return 1
+  [ $(( now - t )) -le "$SOURCES_STATUS_MAX_AGE" ] && [ $(( t - now )) -le "$SOURCES_STATUS_MAX_SKEW" ]
+}
+
 kiste_free_bytes() { # freier Platz auf /media/RAID aus der Statusdatei (Spalte Avail von `df -h`), in Byte
   local body
   have curl || return 1
   body="$(curl -fsS --max-time 10 "$SOURCES_KISTE_URL" 2>/dev/null)" || return 1
+  # H1 (Zweitprüfung PR #83): ein alter Wert ist kein freier Platz — DATE fehlt,
+  # ist unlesbar, älter als 24 h oder liegt in der Zukunft → nicht lesbar.
+  kiste_status_fresh "$body" || return 1
   # „DF: /dev/md126 5,5T 4,8T 697G 88% /media/RAID“ — df -h rundet auf, mit
   # Komma oder Punkt; die Einheiten sind Potenzen von 1024. Genau eine solche
   # Zeile, sonst unbekannt.
@@ -1175,14 +1192,27 @@ kiste_free_bytes() { # freier Platz auf /media/RAID aus der Statusdatei (Spalte 
 }
 
 sources_size_ok() { # sources_size_ok <pfad>: Größe gegen den freien Platz; Grund auf stdout und rc=1 darüber
-  local p="$1" size free limit
-  size="$(timeout "$SOURCES_DU_TIMEOUT" du -sxb -- "$p" 2>/dev/null | awk 'NR == 1 && $1 ~ /^[0-9]+$/ { print $1 }')"
-  [ -n "$size" ] || { printf 'Größe nicht messbar (du -sxb scheitert oder braucht länger als %s s)' "$SOURCES_DU_TIMEOUT"; return 1; }
+  # Gemessen wird die neue Quelle ZUSAMMEN mit allen schon eingetragenen
+  # Cockpit-Quellen (B3, Zweitprüfung PR #83): welche davon der freie Platz schon
+  # enthält, lässt sich aus Statusdatei, Backup- und Eintragszeit nicht sicher
+  # sagen — so zählt keine Quelle zu wenig, nur eine schon gesicherte doppelt.
+  # Ohne -x (B1): borgmatic geht standardmässig über Mountpunkte (one_file_system
+  # false), also zählt du auch, was hinter ihnen liegt. du-rc≠0 (B2) heisst
+  # „nicht messbar“ — eine Teilsumme ist keine Grösse.
+  local p="$1" out size free limit existing n=0 paths=("$1")
+  while read -r existing; do
+    [ -n "$existing" ] || continue
+    paths+=("$existing"); n=$((n + 1))
+  done < <(sources_list)
+  out="$(timeout -k 10 "$SOURCES_DU_TIMEOUT" du -sbc -- "${paths[@]}" 2>/dev/null)" \
+    || { printf 'Größe nicht messbar (du -sbc scheitert, liest nicht alles oder braucht länger als %s s)' "$SOURCES_DU_TIMEOUT"; return 1; }
+  size="$(printf '%s\n' "$out" | awk 'END { if ($1 ~ /^[0-9]+$/ && $2 == "total") print $1 }')"
+  [ -n "$size" ] || { printf 'Größe nicht messbar (du -sbc ohne Summenzeile)'; return 1; }
   free="$(kiste_free_bytes)" || free=""
-  [ -n "$free" ] || { printf 'Quelle %s Byte, freier Platz auf der Kiste nicht lesbar (%s, Zeile DF … /media/RAID)' "$size" "$SOURCES_KISTE_URL"; return 1; }
+  [ -n "$free" ] || { printf 'Quellen zusammen %s Byte (neu + %s vorhandene), freier Platz auf der Kiste nicht lesbar (%s: Zeile DF … /media/RAID, DATE höchstens 24 h alt)' "$size" "$n" "$SOURCES_KISTE_URL"; return 1; }
   limit=$(( free / SOURCES_SIZE_SHARE ))
-  [ "$size" -le "$limit" ] || { printf 'Quelle %s Byte, frei auf der Kiste %s Byte, Grenze 1/%s davon = %s Byte' "$size" "$free" "$SOURCES_SIZE_SHARE" "$limit"; return 1; }
-  printf 'Quelle %s Byte ≤ 1/%s von %s Byte frei auf der Kiste' "$size" "$SOURCES_SIZE_SHARE" "$free"
+  [ "$size" -le "$limit" ] || { printf 'Quellen zusammen %s Byte (neu + %s vorhandene), frei auf der Kiste %s Byte, Grenze 1/%s davon = %s Byte' "$size" "$n" "$free" "$SOURCES_SIZE_SHARE" "$limit"; return 1; }
+  printf 'Quellen zusammen %s Byte (neu + %s vorhandene) ≤ 1/%s von %s Byte frei auf der Kiste' "$size" "$n" "$SOURCES_SIZE_SHARE" "$free"
 }
 
 sources_add() { # sources_add <pfad> [large]
@@ -1227,7 +1257,7 @@ sources_add() { # sources_add <pfad> [large]
     if [ -f "$SOURCES_FILE.vor-$stamp" ]; then cp -a "$SOURCES_FILE.vor-$stamp" "$SOURCES_FILE" && rm -f "$SOURCES_FILE.vor-$stamp"; else rm -f "$SOURCES_FILE"; fi
     die "borgmatic config validate lehnt ab — alte Musterdatei zurück, nichts verändert." 1
   fi
-  size="$(timeout 120 du -shx -- "$p" 2>/dev/null | awk '{ print $1 }')"
+  size="$(timeout -k 10 120 du -sh -- "$p" 2>/dev/null | awk '{ print $1 }')"
   printf 'hinzugefügt: %s (Größe %s)\n' "$p" "${size:-unbekannt}"
   printf 'größenprüfung: %s\n' "$sizecheck"
   printf 'konfiguration: gültig (borgmatic config validate)\n'
