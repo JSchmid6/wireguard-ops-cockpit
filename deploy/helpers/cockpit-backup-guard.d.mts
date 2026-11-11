@@ -11,3 +11,5 @@ export declare const BACKUP_GUARD_VERSION: "cockpit-backup-guard/v6";
 export declare function backupGuardHits(manifest: GuardManifest): BackupGuardHit[];
 // Hinweise für den Türsteher ("mention", "uncertain"); halten den Lauf nicht an.
 export declare function backupGuardFocus(manifest: GuardManifest): BackupGuardHit[];
+// Der Rohtext-Riegel allein: je Nennung des Helfers im Text "free", "bare" oder "arg" (für Tests).
+export declare function helperMentions(text: string): Array<"free" | "bare" | "arg">;

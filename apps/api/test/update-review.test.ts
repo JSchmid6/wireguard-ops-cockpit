@@ -172,6 +172,58 @@ describe("self-update pre-install review", () => {
     expect(policy.evidence).toContain(`not fully reviewed (${SHA.slice(0, 12)}): apps/api/src/hermes-security.ts`);
   });
 
+  it("splits a file larger than a pass at hunk boundaries into named parts over several passes", () => {
+    const path = "apps/api/src/hermes-security.ts";
+    const hunk = (index: number) => [`@@ -${index * 100 + 1},40 +${index * 100 + 1},40 @@`, ...Array.from({ length: 40 }, (_, line) => `+h${index} l${line} ${"x".repeat(60)}`)];
+    const big = section(path, Array.from({ length: 6 }, (_, index) => hunk(index)).flat());
+    const { prompts, coverage } = buildUpdateReviewPrompt([diff({ excerpt: [big] })], { nonce: NONCE, limit: 22_000 });
+    expect(prompts.length).toBeGreaterThan(1);
+    expect(prompts.every((prompt) => Buffer.byteLength(prompt) <= 22_000)).toBe(true);
+    expect(coverage[0]).toMatchObject({ incomplete: [], cut: [], omitted: [] });
+    // Every hunk exactly once, whole, with the file header in every part.
+    for (let index = 0; index < 6; index += 1) {
+      const holders = prompts.filter((prompt) => prompt.includes(`@@ -${index * 100 + 1},40`));
+      expect(holders).toHaveLength(1);
+      expect(holders[0]).toContain(`+h${index} l0 `);
+      expect(holders[0]).toContain(`+h${index} l39 `);
+    }
+    expect(prompts.every((prompt) => prompt.includes(`diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@`))).toBe(true);
+    // Labelled part k/n with its hunk range; each pass names the other parts and their pass.
+    const n = prompts.length;
+    expect(prompts[0]).toMatch(new RegExp(`\\[part 1/${n} of ${path}: hunks 1–\\d of 6;`));
+    expect(prompts[n - 1]).toMatch(new RegExp(`\\[part ${n}/${n} of ${path}: hunks \\d–6 of 6;`));
+    expect(prompts[0]).toMatch(new RegExp(`The other passes of this update hold: [^\\n]*${path} \\(part 2/${n}, hunks \\d–\\d\\) in pass 2`));
+    expect(prompts[1]).toMatch(new RegExp(`This pass holds the[\\s\\S]*${path} \\(part 2/${n}, hunks`));
+    expect(coverage[0].passes?.flat().every((label) => label.startsWith(`${path} (part `))).toBe(true);
+    // Covered only when every part's pass approved.
+    const approve = parseUpdateReviewAnswer("VERDICT: approve");
+    expect(applyUpdateReviewPolicy(readyPolicy, outcome({ coverage, answer: mergeUpdateReviewAnswers(prompts.map(() => approve)) }))).toMatchObject({ allowed: true, status: "ready" });
+    const oneMissing = mergeUpdateReviewAnswers([approve, ...prompts.slice(1).map(() => null)]);
+    expect(applyUpdateReviewPolicy(readyPolicy, outcome({ coverage, answer: oneMissing ?? undefined, reviewerError: "pass 2: timeout" }))).toMatchObject({ allowed: false, status: "blocked_prerequisite" });
+  });
+
+  it("stays incomplete when parts exceed the pass limit or a single hunk is larger than a pass", () => {
+    const path = "apps/api/src/hermes-security.ts";
+    const hunk = (index: number, length = 40) => [`@@ -${index * 1000 + 1},${length} +${index * 1000 + 1},${length} @@`, ...Array.from({ length }, (_, line) => `+h${index} l${line} ${"x".repeat(60)}`)];
+    const big = section(path, Array.from({ length: 6 }, (_, index) => hunk(index)).flat());
+    const capped = buildUpdateReviewPrompt([diff({ excerpt: [big] })], { nonce: NONCE, limit: 22_000, maxPasses: 2 });
+    expect(capped.prompts).toHaveLength(2);
+    // Some parts were shown, not all: cut, and that stops.
+    expect(capped.coverage[0]).toMatchObject({ incomplete: [path], cut: [path], omitted: [] });
+    const giant = section(path, [...hunk(0), ...hunk(1, 400)]);
+    const single = buildUpdateReviewPrompt([diff({ excerpt: [giant] })], { nonce: NONCE, limit: 22_000 });
+    expect(single.coverage[0]).toMatchObject({ incomplete: [path], cut: [], omitted: [path] });
+    expect(single.prompts.join("\n")).not.toContain("+h0 l0 ");
+    for (const coverage of [capped.coverage, single.coverage]) {
+      expect(applyUpdateReviewPolicy(readyPolicy, outcome({ coverage, answer: parseUpdateReviewAnswer("VERDICT: approve") }))).toMatchObject({ allowed: false, status: "blocked_prerequisite" });
+    }
+    // A small diff stays one pass without parts.
+    const small = buildUpdateReviewPrompt([diff()], { nonce: NONCE });
+    expect(small.prompts).toHaveLength(1);
+    expect(small.prompt).not.toContain("[part ");
+    expect(small.coverage[0].passes).toEqual([["apps/api/src/hermes-security.ts", "README.md"]]);
+  });
+
   it("does not stop when only documentation is cut, and documentation never opens a pass", () => {
     const big = section("README.md", ["@@ -1 +1,400 @@", ...Array.from({ length: 400 }, (_, index) => `+docs ${index} ${"y".repeat(60)}`)]);
     const small = diff().excerpt[0];
@@ -987,8 +1039,13 @@ describe("second review: the pre-install review reports instead of stopping (4b)
   }
   const binding = { base: BASE, sha: SHA, diffSha256: HASH };
   const flagged = parseUpdateReviewAnswer([
-    "VERDICT: flag", "FINDING: safety net skipped", "GUARANTEE: G5", "SEVERITY: high",
+    "VERDICT: flag", "FINDING: safety net skipped", "GUARANTEE: G5", "SEVERITY: medium",
     "FILE: deploy/helpers/cockpit-host-run", "CODE: skip_net=1", "REASON: the net is skipped",
+  ].join("\n"));
+  const flag = (guarantee: string, severity: string | null) => parseUpdateReviewAnswer([
+    "VERDICT: flag", "FINDING: light point", "GUARANTEE: G5", "SEVERITY: medium", "FILE: a.ts", "CODE: x", "REASON: r",
+    "FINDING: the point under test", `GUARANTEE: ${guarantee}`, ...(severity === null ? [] : [`SEVERITY: ${severity}`]),
+    "FILE: apps/api/src/update-review.ts", "CODE: y", "REASON: r",
   ].join("\n"));
 
   it("verifies the merge of a reviewed PR head and turns a finding into a report", async () => {
@@ -1000,6 +1057,35 @@ describe("second review: the pre-install review reports instead of stopping (4b)
     expect(policy.evidence).toContain("pre-install review result: finding");
     expect(policy.evidence.some((line) => line.startsWith("pre-install review finding reported, not a stop"))).toBe(true);
     expect(summarizeUpdateReview([diff()], reviewed, null)).toMatchObject({ result: "finding", reported: true, secondReview: [check] });
+  });
+
+  it("keeps the stop for a high finding, one on G1/G2/G7/G10, an INJECTION or no severity (severity cut, 10.11.2026)", async () => {
+    const check = await verifySecondReview(binding, github());
+    const cases: Array<[string, string | null]> = [
+      ["G5", "high"], ["G1", "medium"], ["G2", "medium"], ["G7", "medium"], ["G10", "medium"],
+      ["G3 (also weakens G1)", "medium"], ["INJECTION", "medium"], ["G5", null], ["G5", "critical"],
+    ];
+    for (const [guarantee, severity] of cases) {
+      const name = `${guarantee}/${severity}`;
+      const reviewed = outcome({ answer: flag(guarantee, severity), secondReview: [check] });
+      const policy = applyUpdateReviewPolicy(readyPolicy, reviewed);
+      expect(policy, name).toMatchObject({ status: "blocked_user_approval", allowed: false, zone: "red" });
+      expect(policy.evidence.some((line) => line.startsWith(`second review verified for ${SHA.slice(0, 12)}`)), name).toBe(true);
+      expect(policy.evidence.some((line) => line.startsWith("second review does not lift the stop") && line.includes("the point under test")), name).toBe(true);
+      expect(policy.evidence.some((line) => line.includes("reported, not a stop")), name).toBe(false);
+      expect(summarizeUpdateReview([diff()], reviewed, null), name).toMatchObject({ result: "finding", reported: false });
+    }
+    // G1x is not G1, and medium/low outside the four guarantees stay reportable.
+    for (const [guarantee, severity] of [["G11", "medium"], ["G9", "low"], ["G4, G6", "medium"]] as const) {
+      expect(applyUpdateReviewPolicy(readyPolicy, outcome({ answer: flag(guarantee, severity), secondReview: [check] })).status, guarantee).toBe("ready");
+    }
+    // Only UNVERIFIABLE points (incomplete) stay reportable even when one names G1.
+    const open = parseUpdateReviewAnswer(["VERDICT: flag", "FINDING: cut", "GUARANTEE: UNVERIFIABLE (G1)", "SEVERITY: high", "FILE: a.ts", "CODE: x", "REASON: r"].join("\n"));
+    expect(applyUpdateReviewPolicy(readyPolicy, outcome({ answer: open, secondReview: [check] })).status).toBe("ready");
+    // Without the proof the cut changes nothing: the plain stop, no second-review evidence.
+    const plain = applyUpdateReviewPolicy(readyPolicy, outcome({ answer: flag("G1", "high") }));
+    expect(plain.status).toBe("blocked_user_approval");
+    expect(plain.evidence.some((line) => line.startsWith("second review"))).toBe(false);
   });
 
   it("also reports an incomplete review, but never without the reviewed binding", async () => {

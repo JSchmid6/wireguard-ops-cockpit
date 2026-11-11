@@ -260,68 +260,116 @@ const HELPER_FREE_FOLLOWER = /^[ \t]+(?:status|check|db-access[ \t]+(?:status|ch
 // ("arg"), nie das Ende des Befehls — `R < <(:$(:)) repair` und
 // `R >\`echo x\` repair` starten repair.
 const HELPER_REDIRECT_OP = /^[ \t]*(?:\d+|\{\w+\})?(?:&>>|&>|>>|>\||>&|<&|<<<|<<-|<<|<>|>|<)[ \t]*/;
-// Wo ein Wort endet, das bei from beginnt (Text nach normalize, Quotes weg):
+// Quote- und Escape-Kenntnis (Zweitprüfung t_b3b3773b, Karte t_8939621f):
+// der Riegel liest auf normalize(text, true), dort trägt jedes Zeichen aus
+// Quotes oder hinter \ LITERAL davor. Ein Ziel mit Quote oder Escape
+// (`>"/tmp/a;x"`, `>/tmp/a\;x`, `>$'…'`, `<(echo ')')`) baut der Riegel nicht
+// nach, es ist ein Wort ("arg"): Bash nimmt den Trenner dort ins Ziel, und
+// repair danach ist ein Argument.
+// In einer Ersetzung im Ziel zählt Bash eine Klammer anders bei case-Mustern,
+// Kommentaren, Heredocs, ${…} und `…`; dann liest der Riegel sie nicht.
+const TARGET_UNREAD = /[`{}#\n]|<<|(?:^|[\s;&|(])case(?=[\s;&|)]|$)/;
+// Wo ein Wort endet, das bei from beginnt (Text nach normalize mit mark):
 // einfache Zeichen, $(…), <(…)/>(…) mit Klammerzählung, ${…}, `…`. -1: das
 // Wort fehlt oder schließt nicht, oder es enthält etwas, das der Riegel nicht
-// liest (eine nackte Klammer).
-function redirectTargetEnd(text, from) {
+// liest (Quote, Escape, eine nackte Klammer, TARGET_UNREAD in einer Ersetzung).
+// ticked: der Helfer steht selbst in `…`, das nächste ` schließt das.
+function redirectTargetEnd(text, from, ticked) {
   let i = from;
   while (i < text.length) {
     const char = text[i];
+    if (MARK.test(char)) return -1;
     if (/[\s;&|)]/.test(char)) break;
     if (char === "$" && text[i + 1] === "(" || (char === "<" || char === ">") && text[i + 1] === "(") {
       let depth = 1;
       let j = i + 2;
       for (; j < text.length && depth > 0; j += 1) {
+        if (MARK.test(text[j])) return -1;
         if (text[j] === "(") depth += 1;
         else if (text[j] === ")") depth -= 1;
       }
-      if (depth > 0) return -1;
+      if (depth > 0 || TARGET_UNREAD.test(text.slice(i + 2, j - 1))) return -1;
       i = j; continue;
     }
     if (char === "<" || char === ">" || char === "(") return i > from && char !== "(" ? i : -1;
-    if (char === "$" && text[i + 1] === "{") { const end = text.indexOf("}", i + 2); if (end < 0) return -1; i = end + 1; continue; }
-    // Ein ` ohne Partner schließt die Ersetzung, in der der Helfer steht (`R >/dev/null`).
-    if (char === "`") { const end = text.indexOf("`", i + 1); if (end < 0) break; i = end + 1; continue; }
+    if (char === "$" && text[i + 1] === "{") {
+      const end = text.indexOf("}", i + 2);
+      if (end < 0 || /[\u0003\u0004`{(]/.test(text.slice(i + 2, end))) return -1;
+      i = end + 1; continue;
+    }
+    if (char === "`") {
+      // Ein ` ohne Partner schließt die Ersetzung, in der der Helfer steht
+      // (`R >/dev/null`) — nur wenn er in `…` steht, sonst ist das Ziel ein Wort.
+      const end = text.indexOf("`", i + 1);
+      if (end < 0 && ticked) break;
+      if (end < 0 || MARK.test(text.slice(i + 1, end))) return -1;
+      i = end + 1; continue;
+    }
     i += 1;
   }
   return i > from ? i : -1;
+}
+const unmark = (text) => text.replace(/[\u0003\u0004]/g, "");
+// Stelle in text (mit mark) hinter count Zeichen von unmark(text).
+function markedOffset(text, count) {
+  let i = 0;
+  for (let k = 0; k < count; k += 1) { while (MARK.test(text[i] ?? "")) i += 1; i += 1; }
+  return i;
 }
 // Jede Nennung des Helfers in einem Text: "free" (freie Form), "bare" (nur der
 // Name, ohne Argument oder mit einem festen absoluten Pfad) oder "arg" (ein
 // anderes Wort folgt: repair, sources restore, $v, $(…), ein Glob …).
 // Umleitungen hinter dem Namen überspringt der Riegel; das Wort danach zählt,
-// als stünde es direkt hinter dem Namen.
-function helperMentions(text) {
-  const norm = normalize(text).replaceAll(IN_QUOTES, "");
+// als stünde es direkt hinter dem Namen. Name, freie Form und Pfad liest er
+// ohne Quotes (b"o"rg → borg), das Umleitungsziel mit (redirectTargetEnd).
+// Exportiert für die Tests des Rohtext-Riegels allein (ohne den Leser).
+export function helperMentions(text) {
+  const marked = normalize(text, true).replaceAll(IN_QUOTES, "");
+  const at = [];
+  for (let i = 0; i < marked.length; i += 1) if (!MARK.test(marked[i])) at.push(i);
+  const norm = at.map((i) => marked[i]).join("");
   return [...norm.matchAll(HELPER_MENTION)].map((match) => {
-    const after = norm.slice(match.index + match[0].length);
+    const stop = match.index + match[0].length;
+    let from = stop < at.length ? at[stop] : marked.length;
+    while (MARK.test(marked[from - 1] ?? "")) from -= 1;
+    let ticks = 0;
+    for (let i = 0; i < from; i += 1) if (marked[i] === "`" && marked[i - 1] !== LITERAL) ticks += 1;
+    const after = marked.slice(from);
     // Ein längerer fester Name (…/cockpit-borg-action.log) ist ein anderes Wort;
     // was danach folgt, zählt wie hinter dem Helfer. $, ` und Globs bleiben Folge.
-    const rest = after.replace(/^[\w.,:@%+=/-]+/, "");
-    return followerKind(rest, rest === after);
+    const rest = after.replace(/^(?:[\u0003\u0004]*[\w.,:@%+=/-])+/, "");
+    return followerKind(rest, rest === after, ticks % 2 === 1);
   });
 }
 // Was hinter dem Namen folgt, Wort für Wort: Umleitungen überspringen, dann
 // freie Form (nur direkt hinter dem genauen Namen bzw. seinen Umleitungen),
 // Ende des Befehls ("bare"), ein fester absoluter Pfad (weiter lesen) oder
 // sonst ein Wort ("arg"). Eine Prozessersetzung <(…)/>(…) ist ein Wort.
-function followerKind(rest, exact) {
+// Ein Trenner in '…' oder hinter \ als erstes Zeichen bleibt "bare": das
+// erste Argument des Helfers beginnt dann mit ihm, und der Helfer kennt kein
+// solches Verb. ` und $ in "…" sind kein Trenner, Bash wertet sie aus
+// ("`echo repair`" ist repair, Karte t_81f72a21). Ein ` ist nur das Ende,
+// wenn der Helfer in `…` steht (Backticks in "…" zählen mit).
+function followerKind(rest, exact, ticked) {
   let path = false;
   for (;;) {
-    const operator = rest.match(HELPER_REDIRECT_OP);
+    const plain = unmark(rest);
+    const operator = plain.match(HELPER_REDIRECT_OP);
     // <(…)/>(…) direkt hinter dem Namen ist ein Wort, keine Umleitung.
-    if (operator && !/[<>]\($/.test(rest.slice(0, operator[0].length + 1).trimEnd())) {
-      const end = redirectTargetEnd(rest, operator[0].length);
+    if (operator && !/[<>]\($/.test(plain.slice(0, operator[0].length + 1).trimEnd())) {
+      const from = markedOffset(rest, operator[0].length);
+      if (MARK.test(rest.slice(0, from))) return "arg";
+      const end = redirectTargetEnd(rest, from, ticked);
       if (end < 0) return "arg";
       rest = rest.slice(end); continue;
     }
-    const free = exact && !path ? rest.match(HELPER_FREE_FOLLOWER) : null;
+    const free = exact && !path ? plain.match(HELPER_FREE_FOLLOWER) : null;
     if (free && (free[1] === undefined || sourcesFree(["sources", "add", free[1]]))) return "free";
-    if (/^[ \t]*(?:$|[;&|)`#])/.test(rest)) return "bare";
-    const word = rest.match(/^[ \t]+\/[^\s;&|)<>`$*?[\]{}\u0001]*(?=$|[\s;&|)<>`#])/);
-    if (!word) return "arg";
-    rest = rest.slice(word[0].length); path = true;
+    if (/^[ \t]*(?:$|[;&|)#])/.test(plain) || /^[ \t\u0003]*\u0003`/.test(rest) || ticked && /^[ \t]*\u0004?`/.test(rest)) return "bare";
+    const word = plain.match(/^[ \t]+\/[^\s;&|)<>`$*?[\]{}\u0001]*(?=$|[\s;&|)<>`#])/);
+    const next = word ? markedOffset(rest, word[0].length) : -1;
+    if (next < 0 || MARK.test(rest.slice(0, next))) return "arg";
+    rest = rest.slice(next); path = true;
   }
 }
 // Physische Zeilen [from, to), blind an jedem \<NL> verbunden: wo Bash
@@ -1101,6 +1149,14 @@ const OPAQUE = "\u0001";
 // führt ihn aus), aber was danach kommt, ist womöglich nur Text. Klammern
 // bleiben, wie sie sind: "$(…)" ist auch in Quotes eine Ersetzung.
 const IN_QUOTES = "\u0002";
+// Das nächste Zeichen stand in Quotes oder hinter \ (normalize mit mark).
+const LITERAL = "\u0003";
+// Das nächste Zeichen ist ` oder $ in "…" (normalize mit mark, Karte
+// t_81f72a21): Bash wertet es dort aus ("`echo repair`" ist eine Ersetzung).
+// Es zählt wie LITERAL als Quote (ein Ziel damit ist ein Wort), nur nicht als
+// literales ` (kein "bare") und beim Zählen der Backticks mit.
+const ACTIVE = "\u0004";
+const MARK = /[\u0003\u0004]/;
 const QUOTED_SEPARATOR = /[;&|\n]/;
 const GLOB = /[*?[\]{}]/;
 
@@ -1271,26 +1327,44 @@ function splitScript(prefix, text) {
 // in '…' für awk, sed und jq auch nicht (awk '{print $1}'). Sonst bleibt es
 // stehen: sh -c '…' führt den Text als Shell aus.
 const OWN_LANGUAGE = /(?:^|[;&|(\n])\s*(?:sudo\s+)?(?:\S*\/)?(?:[gm]?awk|sed|jq)\s[^;&|(\n]*$/;
-function normalize(code) {
+// mark (nur der Rohtext-Riegel, Karte t_8939621f): jedes Zeichen aus Quotes
+// oder hinter \ trägt LITERAL davor, statt IN_QUOTES vor Trennern; ` und $ in
+// "…" tragen ACTIVE (Karte t_81f72a21), literal sind sie nur in '…' und als \` / \$.
+// Ein ` in "…" ohne Partner im selben "…" liest der Riegel nicht nach (Bash
+// würde die Ersetzung über das " hinaus suchen): es bleibt LITERAL.
+function normalize(code, mark = false) {
   let out = "";
   let quote = null;
   let literal = false;
+  let ticks = [];
+  const marker = (char) => (quote === '"' && (char === "`" || char === "$") ? ACTIVE : LITERAL);
+  const quoted = (char) => {
+    if (!mark) return QUOTED_SEPARATOR.test(char) ? IN_QUOTES + char : char;
+    if (quote === '"' && char === "`") ticks.push(out.length);
+    return marker(char) + char;
+  };
+  const closeDouble = () => {
+    if (ticks.length % 2 === 1) for (const at of ticks) out = out.slice(0, at) + LITERAL + out.slice(at + 1);
+    ticks = [];
+  };
   for (let i = 0; i < code.length; i += 1) {
     const char = code[i];
-    if (quote === "'") { if (char === "'") quote = null; else if (!literal || char !== "$" && char !== "`") out += QUOTED_SEPARATOR.test(char) ? IN_QUOTES + char : char; continue; }
+    if (quote === "'") { if (char === "'") quote = null; else if (!literal || char !== "$" && char !== "`") out += quoted(char); continue; }
     // $'…' (ANSI-C): \' schließt nicht; das $ bleibt stehen (der Wert entsteht erst in Bash).
-    if (quote === "$'") { if (char === "'") quote = null; else { if (char === "\\") { out += char; i += 1; } const next = code[i] ?? ""; out += QUOTED_SEPARATOR.test(next) ? IN_QUOTES + next : next; } continue; }
+    if (quote === "$'") { if (char === "'") quote = null; else { if (char === "\\") { out += mark ? LITERAL + char : char; i += 1; } out += quoted(code[i] ?? ""); } continue; }
     if (char === "$" && code[i + 1] === "'" && quote === null) {
       // Ohne Backslash ist $'…' dasselbe wie '…' (qm del$'s'napshot).
       const end = code.indexOf("'", i + 2);
       if (end >= 0 && !code.slice(i + 2, end).includes("\\")) { quote = "'"; literal = OWN_LANGUAGE.test(code.slice(0, i)); i += 1; continue; }
       out += "$"; quote = "$'"; i += 1; continue;
     }
-    if (char === "\\") { const next = code[i + 1] ?? ""; if (next !== "$" && next !== "`") out += next; i += 1; continue; }
-    if (char === '"') { quote = quote === '"' ? null : '"'; continue; }
+    // Mit mark bleibt \$ bzw. \` nur als LITERAL stehen: ohne Marken ist der Text derselbe.
+    if (char === "\\") { const next = code[i + 1] ?? ""; if (mark) out += LITERAL; if (next !== "$" && next !== "`") out += next; i += 1; continue; }
+    if (char === '"') { if (quote === '"') closeDouble(); quote = quote === '"' ? null : '"'; continue; }
     if (char === "'" && quote === null) { quote = "'"; literal = OWN_LANGUAGE.test(code.slice(0, i)); continue; }
-    out += quote && QUOTED_SEPARATOR.test(char) ? IN_QUOTES + char : char;
+    out += quote ? quoted(char) : char;
   }
+  closeDouble();
   return out
     .replace(/\$\{IFS\}|\$IFS\b/g, " ")
     .replace(/\$\{HOME\}|\$HOME\b/g, "/root")

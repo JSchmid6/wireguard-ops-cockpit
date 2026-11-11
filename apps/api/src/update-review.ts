@@ -409,9 +409,47 @@ const PASS_FRAME = 1200 + 4 * NAME_LIST_BUDGET;
 interface ReviewPass {
   update: number;
   paths: string[];
+  // The entries of paths that are parts of a split file (splitAtHunks).
+  parts: Set<string>;
   texts: string[];
   used: number;
   fenceLength: number;
+}
+
+// A file section larger than a whole pass, split at its hunk boundaries (`@@`)
+// into parts that each fit a pass alone (fitsAlone). Every part carries the
+// file header (diff --git, ---, +++) and a first line naming part and hunks;
+// a hunk is never cut. null when the section has fewer than two hunks or a
+// single hunk does not fit: then the file stays left out (G9).
+export function splitAtHunks(path: string, text: string, fitsAlone: (text: string) => boolean): Array<{ label: string; text: string }> | null {
+  const lines = text.split(/(?<=\n)/);
+  const start = lines.findIndex((line) => line.startsWith("@@"));
+  if (start < 0) return null;
+  const header = lines.slice(0, start).join("");
+  const hunks: string[] = [];
+  for (const line of lines.slice(start)) {
+    if (line.startsWith("@@")) hunks.push(line);
+    else hunks[hunks.length - 1] += line;
+  }
+  if (hunks.length < 2) return null;
+  const total = hunks.length;
+  const render = (k: number | string, n: number | string, first: number, last: number) =>
+    `[part ${k}/${n} of ${path}: hunks ${first + 1}–${last + 1} of ${total}; the other parts are in other review passes]\n${header}${hunks.slice(first, last + 1).join("")}`;
+  // Sized with the widest label, so the final (shorter) one fits as well.
+  const groups: Array<[number, number]> = [];
+  let first = 0;
+  for (let index = 0; index < total; index += 1) {
+    if (fitsAlone(render(total, total, first, index))) continue;
+    if (index === first) return null;
+    groups.push([first, index - 1]);
+    first = index;
+    if (!fitsAlone(render(total, total, first, index))) return null;
+  }
+  groups.push([first, total - 1]);
+  return groups.map(([from, to], number) => ({
+    label: `${path} (part ${number + 1}/${groups.length}, hunks ${from + 1}–${to + 1})`,
+    text: render(number + 1, groups.length, from, to),
+  }));
 }
 
 // The reviewer prompts of one review: one or more passes, each inside the
@@ -420,13 +458,15 @@ interface ReviewPass {
 // files, inside nonce-marked data markers. Sections are placed whole in review
 // order (root and build material first) into the first pass with room; a
 // section that fits no open pass opens the next one. So every changed file
-// reaches the reviewer completely in exactly one pass, and the answers of all
-// passes are united (mergeUpdateReviewAnswers).
+// reaches the reviewer completely in exactly one pass — except a file larger
+// than a whole pass, whose complete hunks go in parts over several passes
+// (splitAtHunks) — and the answers of all passes are united
+// (mergeUpdateReviewAnswers: approve only when every pass approved).
 //
 // Only the kind's supplementary files (documentation) may be cut: they fill the
 // room the other material leaves and never open a pass of their own. Every
 // other file (and every focus-area file) that does not reach a pass completely
-// — larger than a whole pass, beyond the pass limit, cut or left out by the
+// — a single hunk larger than a whole pass, beyond the pass limit, cut or left out by the
 // runner, or not listed at all — is incomplete coverage: a deterministic stop
 // before any reviewer's answer counts, never a gap the reviewer has to guess at.
 export function buildUpdateReviewPasses(diffs: UpdateDiff[], options: { nonce?: string; limit?: number; maxPasses?: number } = {}): { prompts: string[]; coverage: UpdateReviewCoverage[] } {
@@ -464,15 +504,16 @@ export function buildUpdateReviewPasses(diffs: UpdateDiff[], options: { nonce?: 
     const fits = (pass: ReviewPass, text: string) => pass.used + bytes(text) + fenceCost(pass.fenceLength, text) <= capacity;
     const open = (): ReviewPass | null => {
       if (passes.length + own.length >= maxPasses) return null;
-      const pass: ReviewPass = { update: index, paths: [], texts: [], used: 0, fenceLength: 3 };
+      const pass: ReviewPass = { update: index, paths: [], parts: new Set(), texts: [], used: 0, fenceLength: 3 };
       own.push(pass);
       return pass;
     };
-    const place = (pass: ReviewPass, path: string, text: string) => {
+    const place = (pass: ReviewPass, path: string, text: string, part?: string) => {
       pass.used += bytes(text) + fenceCost(pass.fenceLength, text);
       pass.fenceLength = Math.max(pass.fenceLength, backtickRun(text) + 1);
       pass.texts.push(text);
-      pass.paths.push(path);
+      pass.paths.push(part ?? path);
+      if (part) pass.parts.add(part);
       shown.add(path);
     };
     for (const section of materialOrder(diff.excerpt, supplementary)) {
@@ -488,6 +529,21 @@ export function buildUpdateReviewPasses(diffs: UpdateDiff[], options: { nonce?: 
         // git shows a binary file only by name: complete for an ordinary file,
         // never for a focus-area file.
         if (!focus.has(section.path) || !/^Binary files /m.test(text)) complete.add(section.path);
+        continue;
+      }
+      const parts = optional || alone ? null : splitAtHunks(section.path, text, (part) => bytes(part) + fenceCost(3, part) <= capacity);
+      if (parts) {
+        // Larger than a whole pass: its complete hunks in parts over several
+        // passes. Complete only when every part reached a pass.
+        let placed = 0;
+        for (const part of parts) {
+          const target = own.find((item) => fits(item, part.text)) ?? open();
+          if (!target) break;
+          place(target, section.path, part.text, part.label);
+          placed += 1;
+        }
+        if (placed < parts.length) (placed ? cut : omitted).push(section.path);
+        else if (!diff.partialFiles.includes(section.path)) complete.add(section.path);
         continue;
       }
       if (!optional) {
@@ -541,7 +597,8 @@ export function buildUpdateReviewPasses(diffs: UpdateDiff[], options: { nonce?: 
     const state = item.cut.length || item.omitted.length
       ? `The excerpt is INCOMPLETE. Cut: ${nameList(item.cut)}. Left out: ${nameList(named)}.`
       : "The excerpt is complete (every changed file's diff section is included; lockfiles are summarized above).";
-    const elsewhere = passes.filter((other) => other.update === pass.update && other !== pass).flatMap((other) => other.paths);
+    const elsewhere = passes.filter((other) => other.update === pass.update && other !== pass)
+      .flatMap((other) => other.paths.map((path) => other.parts.has(path) ? `${path} in pass ${passes.indexOf(other) + 1}` : path));
     const notice = passes.length > 1
       ? ["", "## Review pass", updateReviewPassNotice(number + 1, passes.length, nameList(pass.paths), nameList(elsewhere))]
       : [];
@@ -787,19 +844,29 @@ export function updateReviewFindings(outcome: UpdateReviewOutcome): {
 //   (secondReviewCovers) keeps the plan's own status. The review still ran and
 //   is recorded; the job and GET /api/inbox carry it as a report. A plan block
 //   stays, and so does every other stop outside this review.
+// - severity cut (operator decision 10.11.2026, variant C): a finding that is
+//   high, on G1/G2/G7/G10, an INJECTION or without a readable severity
+//   (secondReviewStops) keeps the finding's stop although the proof holds; the
+//   verified proof is still recorded in the evidence.
 export function applyUpdateReviewPolicy<P extends ReviewedPolicy>(policy: P, outcome: UpdateReviewOutcome): P {
-  const { result, findings, gaps, evidence, needed } = updateReviewFindings(outcome);
-  const merged = { ...policy, evidence: [...policy.evidence, ...evidence] };
-  if (result === "pass") return merged;
-  if (secondReviewCovers(outcome)) {
-    const checks = outcome.secondReview ?? [];
+  const { result, findings, gaps, evidence: reviewEvidence, needed } = updateReviewFindings(outcome);
+  const checks = secondReviewCovers(outcome) ? outcome.secondReview ?? [] : [];
+  const verified = checks.map((check) => `second review verified for ${check.sha.slice(0, 12)}: ${check.reason}`);
+  const evidence = [...reviewEvidence];
+  if (result === "pass") return { ...policy, evidence: [...policy.evidence, ...evidence] };
+  if (secondReviewReports(outcome)) {
     return {
-      ...merged,
-      evidence: [...merged.evidence, ...checks.map((check) => `second review verified for ${check.sha.slice(0, 12)}: ${check.reason}`),
+      ...policy,
+      evidence: [...policy.evidence, ...evidence, ...verified,
         `pre-install review ${result} reported, not a stop: ${[...findings, ...gaps].join("; ").slice(0, 600)}`],
       neededToContinue: [...policy.neededToContinue, "Tell the operator about the reported pre-install review (GET /api/inbox lists it under reviewFindings)."],
     };
   }
+  if (checks.length > 0) {
+    const severe = secondReviewStops(outcome).map((finding) => `${finding.title || "(untitled)"} [${finding.guarantee || "?"}, ${finding.severity || "?"}]`);
+    evidence.push(...verified, `second review does not lift the stop: finding(s) high, on G1/G2/G7/G10, INJECTION or without severity: ${severe.join("; ").slice(0, 600)}`);
+  }
+  const merged = { ...policy, evidence: [...policy.evidence, ...evidence] };
   const subject = UPDATE_KINDS[kindOf(outcome.kind)].subject;
   const stillBlocked = (reason: string, status: P["status"]): P => policy.allowed
     ? { ...merged, zone: "red", allowed: false, status, reason, neededToContinue: needed }
@@ -879,7 +946,7 @@ export function summarizeUpdateReview(diffs: UpdateDiff[], outcome: UpdateReview
     notes: outcome.answer?.notes ?? "",
     secondReview: outcome.secondReview ?? [],
     // A finding or gap that did not stop the job because of the second review.
-    reported: updateReviewFindings(outcome).result !== "pass" && secondReviewCovers(outcome),
+    reported: secondReviewReports(outcome),
   };
 }
 
@@ -905,7 +972,9 @@ export function summarizeUpdateReview(diffs: UpdateDiff[], outcome: UpdateReview
 // Honest limit: the marker proves that the review record exists for exactly
 // this head, not who wrote it beyond the account's write access — the agent
 // posts it with the owner's token. Its worth is the binding to the sha and the
-// public, immutable record, not a second principal.
+// public, immutable record, not a second principal. Therefore it carries only
+// light findings (secondReviewStops, operator decision 10.11.2026): a high
+// finding, one on G1/G2/G7/G10 or an INJECTION stays the operator's stop.
 export const SECOND_REVIEW_REPOSITORY = "JSchmid6/wireguard-ops-cockpit";
 export const SECOND_REVIEW_MARKER = /^Cockpit-Zweitpruefung: FREIGABE ([a-f0-9]{40}) opus[ \t]*$/m;
 const SECOND_REVIEW_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
@@ -917,6 +986,33 @@ export function secondReviewCovers(outcome: UpdateReviewOutcome): boolean {
   if (kindOf(outcome.kind) !== "self" || outcome.unavailable || outcome.bindings.length === 0) return false;
   const checks = outcome.secondReview ?? [];
   return outcome.bindings.every((binding) => checks.some((check) => check.sha === binding.sha && check.verified));
+}
+
+// Severity cut (operator decision 10.11.2026, card t_e49f6254, variant C): the
+// marker can be posted by the agent's own token, so it carries only light
+// findings. A finding stays a stop for the operator, marker or not, when it is
+// high, names G1, G2, G7 or G10 (approval, lock, self-update path, backup bolt),
+// is an INJECTION, or carries no severity the cut can read (fail closed: only a
+// severity starting with medium or low is light). UNVERIFIABLE points are gaps,
+// not findings, and an incomplete review stays reportable.
+export const SECOND_REVIEW_STOP_GUARANTEES = new Set([1, 2, 7, 10]);
+
+function stopsDespiteSecondReview(finding: UpdateReviewFinding): boolean {
+  if (unverifiable(finding)) return false;
+  if (/\bINJECTION\b/.test(finding.guarantee)) return true;
+  if ([...finding.guarantee.matchAll(/\bG(\d+)\b/g)].some((match) => SECOND_REVIEW_STOP_GUARANTEES.has(Number(match[1])))) return true;
+  return !/^(?:medium|low)\b/.test(finding.severity);
+}
+
+// The findings the second review cannot turn into a report.
+export function secondReviewStops(outcome: UpdateReviewOutcome): UpdateReviewFinding[] {
+  return outcome.answer?.verdict === "flag" ? outcome.answer.findings.filter(stopsDespiteSecondReview) : [];
+}
+
+// A review that is not a pass becomes a report instead of a stop: the proof
+// covers every installed commit and no finding is beyond the severity cut.
+export function secondReviewReports(outcome: UpdateReviewOutcome): boolean {
+  return updateReviewFindings(outcome).result !== "pass" && secondReviewCovers(outcome) && secondReviewStops(outcome).length === 0;
 }
 
 function record(value: unknown): Record<string, unknown> {
