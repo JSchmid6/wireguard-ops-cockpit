@@ -93,13 +93,15 @@ export function updateReviewDataNotice(nonce: string): string {
 }
 
 // Only when the review runs in more than one pass (update-review.ts,
-// buildUpdateReviewPasses): every changed file is in exactly one pass, so the
-// absence of the others here is not material missing from the review.
+// buildUpdateReviewPasses): every changed file is in exactly one pass (a file
+// larger than a pass in hunk parts, each named), so the absence of the others
+// here is not material missing from the review.
 export function updateReviewPassNotice(pass: number, total: number, here: string, elsewhere: string): string {
   return [
     `This is review pass ${pass} of ${total}. The update is too large for one prompt, so its diff is split into passes; every changed file's`,
-    `diff section is in exactly one pass, and each pass is judged by a reviewer with these same instructions. This pass holds the`,
-    `complete diff sections of: ${here}.`,
+    `diff section is in exactly one pass, and each pass is judged by a reviewer with these same instructions. A file larger than one`,
+    `pass is split at hunk boundaries into parts marked "part k/n" (no hunk is cut), each in its own pass. This pass holds the`,
+    `complete diff sections (or the named parts) of: ${here}.`,
     `The other passes of this update hold: ${elsewhere}.`,
     "Judge the files of this pass against the guarantees. The focus areas and the file list above describe the whole update for",
     "context. That the diff sections of the other passes are not shown here is not UNVERIFIABLE; a truncated or left-out file named",
