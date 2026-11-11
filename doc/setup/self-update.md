@@ -301,7 +301,22 @@ Flow of a Hermes change job whose plan contains `self.update <sha>` lines:
    Dockerfiles, compose files, systemd units, sudoers, `package.json`), then
    the lockfile, then every other file, documentation last — so the material
    that runs as root or goes into the images lands in the first pass. So every
-   changed file reaches a reviewer completely in **exactly one** pass. The
+   changed file reaches a reviewer completely in **exactly one** pass — except
+   a file whose section alone is larger than a pass (since 10.11.2026, card
+   t_89b7bb76; case: `deploy/helpers/cockpit-backup-guard.mjs`, diff ~90 KB):
+   `splitAtHunks` cuts it at its hunk boundaries (`@@`) into parts that each
+   fit a pass, every part with the file header (`diff --git`/`---`/`+++`) and
+   a first line `[part k/n of <path>: hunks a–b of N; …]`; the parts go over
+   several passes, and every pass names the other parts and the pass that
+   holds them (`<path> (part 2/3, hunks 24–29) in pass 3`). No hunk is ever
+   cut. The file counts as covered only when every part reached a pass; some
+   parts in, the rest beyond the pass limit, is `cut` (incomplete). The merge
+   needs no file view: approve only when every pass approved, so no single
+   part's approve marks the file reviewed. Not given additionally: the full new
+   file of a focus file for context across hunks — at 152 KB it is larger than
+   a pass itself, and the hunks already carry their context lines; a reviewer
+   who cannot judge a hunk without more says so (`UNVERIFIABLE` of what it saw
+   is a stop, never a pass). The
    passes are asked one after the other (`runUpdateReviewPasses`); a failed
    pass does not keep the others from answering. Their answers are united
    (`mergeUpdateReviewAnswers`): the findings of all passes count; one
@@ -341,8 +356,9 @@ Flow of a Hermes change job whose plan contains `self.update <sha>` lines:
      whole: every focus-area file (a binary one counts as incomplete) and every
      other changed file except markdown and `package-lock.json` (summarized as
      the G8 package list) — tests included, for both repositories. Such a file
-     is never cut into pieces: one larger than a whole pass, or beyond the pass
-     limit, is left out and stops the review. Only documentation may be cut:
+     is never cut inside a hunk: one with a single hunk larger than a whole
+     pass, or (whole or in parts) beyond the pass limit, is left out (`cut`,
+     when some of its parts got in) and stops the review. Only documentation may be cut:
      it fills the room the other material leaves and never opens a pass of its
      own. A reviewer's `UNVERIFIABLE` is for what it saw and cannot judge, never
      for material the Cockpit failed to collect.
@@ -385,7 +401,8 @@ request):
    longer counts. The line never goes into a commit message (the reviewer
    would read it as an injection, see the cockpit skill).
 
-With that proof the review stays recorded but keeps the plan's own status:
+With that proof — and only for light findings, see the severity cut below — the
+review stays recorded but keeps the plan's own status:
 evidence `second review verified for <sha>` and `pre-install review <result>
 reported, not a stop`, `output.updateReview.secondReview` and `reported: true`,
 audit `hermes.update_review.reported`, and `GET /api/inbox` lists it under
@@ -396,7 +413,39 @@ missing binding (`unavailable`), `dienste.update`, the safety review, the
 envelope binding of the reviewed hash and the runner's own checks are not
 touched. Honest limit: the marker is posted with the owner's token, the same
 the agent holds; it proves a review record for exactly this head, not a second
-principal. Way back: revert the change and self-update to the previous commit.
+principal. Spelled out (card t_e49f6254, 10.11.2026): the agent can write the
+marker line itself, without any second review having run, on every pull
+request it merged itself — and James merges directly. So for a self-update
+the agent can turn this review's `finding` or `incomplete` into a report and
+install the flagged code without the operator. What is left is the public,
+immutable PR comment, the report in `GET /api/inbox` (`reviewFindings`,
+`reported: true`, seven days) and the audit `hermes.update_review.reported` —
+the operator learns of it afterwards, not before. Job 9bc909ed's own pre-install
+review flagged exactly this path (G1/G7, high); the operator kept the second
+review and narrowed it instead (10.11.2026, variant C):
+
+**Severity cut** (`secondReviewStops`, `secondReviewReports`). Because the
+marker is no second principal, it carries only light findings. A finding stays
+the operator's stop (`blocked_user_approval`) despite a verified proof when it
+is `high`, names G1, G2, G7 or G10 anywhere in its `GUARANTEE` line (approval,
+lock, self-update path, backup bolt — the guarantees a self-posted marker could
+be used to get past), is an `INJECTION`, or has a severity that does not start
+with `medium` or `low` (fail closed). The verified proof is still recorded
+(`second review verified for <sha>`, then `second review does not lift the stop:
+…` with the findings beyond the cut), and `reported` stays `false`. Light
+findings (`medium`/`low` on the other guarantees) and `incomplete` (tool-chain
+gaps, `UNVERIFIABLE` only) stay reports as above, so a fault of the review chain
+still does not block the agent. Effect: a severe finding behind a
+self-posted marker no longer installs without the operator. What is left open:
+the reviewer sets the severity itself — a severe point it rates `medium` on a
+guarantee outside the four still becomes a report. Staying able to act
+(operator, 10.11.2026): a stop here is one approval click in "Wartet auf dich";
+host runs, repairs and rollbacks through `host.run` never pass this review; a
+revert is a new merge with its own, usually unflagged diff. If such stops pile
+up, the operator wants to talk again (no silent loosening).
+Way back: revert this change (one commit in `update-review.ts`,
+`update-review-prompt.ts`, tests and docs) and self-update to the previous
+commit.
 
 **What the owner sees — only for a finding.** The job explanation's `reason`
 names why (the flagged findings; for `blocked_prerequisite` the agent reads the
@@ -458,14 +507,14 @@ finding names a concrete way **past** one of its guards, or a weakening of it:
 
 | Guarantee | holds |
 | --- | --- |
-| G1 Approval | only the admin session approves; a bearer token never approves or sets `operatorApproved`/`gatePassed`. A `host.run` start on the doorkeeper's pass is intended. A job that needed the operator (evidenced finding, bolt hit, a declared risk other than `contained`, a door without doorkeeper) never runs without the operator's approval. Exception by decision (07.11.2026): a self-update review finding whose commits carry a second review the Cockpit verified itself on GitHub is a report, not a stop ([Second review](#review-before-install)). |
+| G1 Approval | only the admin session approves; a bearer token never approves or sets `operatorApproved`/`gatePassed`. A `host.run` start on the doorkeeper's pass is intended. A job that needed the operator (evidenced finding, bolt hit, a declared risk other than `contained`, a door without doorkeeper) never runs without the operator's approval. Exception by decision (07.11.2026): a self-update review finding whose commits carry a second review the Cockpit verified itself on GitHub is a report, not a stop ([Second review](#review-before-install)); the marker can be posted by the agent's own token, so this exception rests on a public record, not on a second principal, and it holds only for light findings: a `high` finding, one on G1/G2/G7/G10 or an `INJECTION` stays a stop (severity cut, 10.11.2026). |
 | G2 Lock | HMAC envelope (timing-safe, host secret), bound to plan and `manifestHash`, with expiry, capability and the job id (its form; the run directory is named by it); the root helper checks it at the start and on every resume; a blocked job's envelope never opens. |
 | G3 Doors | `host.run` is the one general door; every other action stays typed and narrow. No second general door, no way into `host.run` past G2, G9, G10. |
 | G4 Root helpers and sudoers | narrow, typed; the host-run helper keeps exactly `start` and `status <job>`. |
 | G5 Sandbox and safety net | the special doors' sandbox is not broader; `host.run` has none by design, but before every run with `mutates: true` the net of the instance role, otherwise no step runs: role `vps` a return path — the last successfully finished borg backup at most 30 h old (a later failed run does not take it away; without it only the two typed exceptions of `doc/setup/host-run.md` run, emergency shutdown and backup repair, recognized by fixed forms only) — and a machine snapshot; role `lab0` (the borg target, no hoster) a complete local host snapshot (`/etc`, packages, unit states) plus the data lock: the run unit mounts `/media` (borg repository), `/home`, `/mnt`, `/srv` read-only and the run confirms it in its mount table before the first step and after a reboot (Jochen, 17.10.2026: on Lab0 this replaces borg freshness and the machine snapshot); role `box` (Proxmox host, t_88f1e802) the same host snapshot plus a Proxmox snapshot of every guest (VM and container); a guest that cannot be snapshotted stops the run; no data lock (the guests' snapshots are their way back). The role comes only from the root-owned `instance-role.env` the deploy installs; missing, foreign-writable or unknown → no step runs (16.10.2026). Snapshot revert/delete stays the operator's decision (at the door through the doorkeeper's X4, not a rule). |
 | G6 Secrets | redaction of outputs, logs and prompts; the host-run log redacted line by line and 0600. The doorkeeper's unredacted material is intended. |
 | G7, G8 | unchanged (self-update path, dependencies). |
-| G9 Doorkeeper | isolated safety review; a pass only with complete material; incomplete or unreadable review and findings without evidence stop without a pass; its finding classes (secrets/egress, authority, exposure, loss of the way back, false read-only claim, hidden code, injection) do not narrow. |
+| G9 Doorkeeper | isolated safety review; a pass only with complete material (a file larger than one pass is complete only when all its hunk parts were reviewed); incomplete or unreadable review and findings without evidence stop without a pass; its finding classes (secrets/egress, authority, exposure, loss of the way back, false read-only claim, hidden code, injection) do not narrow. |
 | G10 Backup bolt | deleting backups, changing their retention or switching them off only with `operatorApproved`, even on a pass; one deterministic source asked at three places (API policy, `runHostRun`, root helper incl. resume); no deleting form becomes free. Reading the borg credentials or the repository contents is a bolt hit as well (13.10.2026). Unreadable text is the doorkeeper's focus (`backup-focus`), not a bolt hit (operator, 10.10.2026) — except on Lab0, the repository host: there unreadable code, text piped or redirected into `ssh`, and deleting after a quoted separator are bolt hits, while visible non-backup routine (service restarts, status, logs) stays free (13.10.2026). The backup helper is the second exception: a line that names `cockpit-borg-action` (name, glob on its path, find filter) outside its free direct forms is a bolt hit even where its text is unreadable — `find -exec`, `xargs` (its `-I`/`-i` value counts as `{}`), interpreter code, text piped into a shell, interpreter, `source` or `at`, or a script the plan does not show such as `<(…)`, a subshell or brace group as the pipe target, a pipeline continued after `|`/`&&`/`||` at the end of a line, pipe output naming the helper written into a file that can run (redirect or `tee`), `eval` on such a line, and a `grep` filter matching its name over its directory (05. and 09.11.2026); since 09.11.2026 (card t_6735af09) this is a per-line allowlist instead of a list of sinks: on a logical line that names the helper outside its free forms every other simple command (also inside `$(…)`, `<(…)`, `>(…)`, groups and `if/while/for/case`) must be a pure filter or data sink (`grep`, `jq`, `head`, `tail`, `wc`, `sort`, `cut`, `tr`, `awk` without `system`/pipes, `sed` without `e`/`w`/`-i`, reading commands, `echo`, `tee` or redirects into data files only), anything else is a hit; the same holds for the commands piped behind a listing of its directory (`ls /usr/local/sbin`, `find` over an ancestor without another name filter, `compgen -c`, `locate`); `|&` is a pipe; a variable whose value names the helper names it on every line that uses it (`x="$(ls …)"` then `eval "$x"`); since card t_d16c58d1 (09.11.2026, second review t_20ae3cda) the scope is the whole plan, not the line: if any line of the steps or checks names the helper outside its free forms (free are only the direct form and `test`/`[`/`[[` on it; `echo` of its name, `ls`/`stat`/`sha256sum` on it, a glob, a find filter, a listing of its directory or a variable holding its name are not), every line of the plan must be filters and data sinks, and no line may rebind a name or value (function definitions, `alias`, `hash`, `enable`, PATH/BASH_ENV/ENV, PS0–PS4 and other code-selecting variables, `${!…}`, `declare -n`, `export` of a value naming the helper) — so a data file, FIFO or `tail -f` that another line feeds into a shell, and a filter name rebound on an earlier line, are hits; command substitutions inside `$((…))`, `((…))` and array subscripts are read as commands; since card t_2e391eba (09.11.2026, second review t_f1b3ea8c) no line of such a plan may let bash evaluate a value as code either: `${…@P}`, assigning PS0–PS4 or the integer variables RANDOM/SRANDOM/OPTIND/HISTCMD, `declare -i`, and arithmetic (`$((…))`, `((…))`, `$[…]`, `let`, `for ((…))`, `[[ … -eq … ]]`, `${s:off:len}`, array indices) with anything but numbers and operators, also in an unquoted here-document; `test`/`[` with `-eq` do not evaluate and stay free; `sed` is parsed positively (any delimiter; only `s`/`y` with flags `g p i I m M <n>`, addresses, print/delete/quit/buffer/branch/text commands). The price: a plan that names the helper as text and also changes something else goes to the operator. Without the helper's name these stay the doorkeeper's focus; a name assembled from parts, decoded or read from a file is not seen (honest limit, `doc/setup/borg-maintenance.md`). Risk bolt under the same guarantee (incident 23.10.2026): a manifest declaring `exposure`, `data_loss` or `identity_or_secret` starts only with `operatorApproved`, even on a pass, asked at the same three places (`hostRunRisksNeedingApproval`); an unknown risk class makes the manifest invalid. |
 
 The runner marks changes to the door's files as focus area `host-door`

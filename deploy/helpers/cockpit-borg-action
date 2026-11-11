@@ -713,7 +713,9 @@ start_maintenance() { # verb (check|repair)
 
   local stamp unit rc=0 shown
   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-  unit="$BORG_ACTION_UNIT_PREFIX-$verb-$stamp"
+  # Die PID macht den Namen je Aufruf eindeutig: zwei Läufe in derselben Sekunde
+  # (check, fertig, gleich wieder check) teilten sich sonst eine Unit-Kennung.
+  unit="$BORG_ACTION_UNIT_PREFIX-$verb-$stamp-$$"
   shown="--verbosity 1 check --force"
   [ "$verb" = "repair" ] && shown="--verbosity 1 check --repair --force"
 

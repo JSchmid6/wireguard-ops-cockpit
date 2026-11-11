@@ -9,8 +9,8 @@ typisierte Aktion mit Audit und Freigabe.
 | Aktion | Form im Plan | Wirkung | Freigabe |
 | --- | --- | --- | --- |
 | `borg.status` | `/usr/local/sbin/cockpit-borg-action status` | lesend: borgmatic-Timer, letzte Läufe (Journal), laufende Wartungs-Unit, jüngste Archive, Repo-Kennzahlen, Statusdatei der Kiste. Läuft in einer eigenen transienten Unit (`--wait --pipe --collect`) | autonom (keine) |
-| `borg.check` | `/usr/local/sbin/cockpit-borg-action check` | startet `borgmatic --verbosity 1 check --force` in der Unit `cockpit-borg-check-<stamp>` und kehrt sofort zurück | autonom (keine) |
-| `borg.repair` | `/usr/local/sbin/cockpit-borg-action repair` | startet `borgmatic --verbosity 1 check --repair --force` in der Unit `cockpit-borg-repair-<stamp>`; kann beschädigte Archive entfernen (siehe unten) | **Operator** (`blocked_user_approval`) |
+| `borg.check` | `/usr/local/sbin/cockpit-borg-action check` | startet `borgmatic --verbosity 1 check --force` in der Unit `cockpit-borg-check-<stamp>-<pid>` und kehrt sofort zurück | autonom (keine) |
+| `borg.repair` | `/usr/local/sbin/cockpit-borg-action repair` | startet `borgmatic --verbosity 1 check --repair --force` in der Unit `cockpit-borg-repair-<stamp>-<pid>`; kann beschädigte Archive entfernen (siehe unten) | **Operator** (`blocked_user_approval`) |
 
 Alles andere (`restore`, `delete`, zusätzliche Argumente, ein Pfad ausserhalb
 `/usr/local/sbin/`) ist kein `borg.manage`, sondern `shell.exception` — es läuft
@@ -40,7 +40,7 @@ transiente Unit — ausserhalb der Sandbox, im eigenen cgroup, mit eigenem Journ
 * `status`: `systemd-run --wait --pipe --collect`. Die Ausgabe kommt durch
   `--pipe` durch, der Rückgabecode des Laufs durch `--wait` — `rc=2` („Repo nicht
   erreichbar“) bleibt also erhalten.
-* `check`/`repair`: `systemd-run --collect --unit=cockpit-borg-<verb>-<stamp>` **ohne**
+* `check`/`repair`: `systemd-run --collect --unit=cockpit-borg-<verb>-<stamp>-<pid>` **ohne**
   `--wait`. Der Aufruf kehrt nach dem Start zurück (der Executor ist eine
   Anfrage/Antwort-Strecke und darf nicht Stunden warten), die Unit läuft weiter.
   `Type=exec` lässt einen Startfehler noch im Aufruf auffallen (rc=69),
@@ -643,8 +643,10 @@ Grenzen:
   eine Klammer anders zählen kann (case, `#`, Heredoc, `${…}`, `` ` ``, neue Zeile), und ein `${…}`
   mit `$(`, `` ` ``, `{` oder Quote darin. Ein `` ` `` ist nur dann das Ende, wenn der Helfer selbst
   in `` `…` `` steht (ungerade Zahl unmarkierter Backticks davor), sonst öffnet es eine Ersetzung,
-  die im selben Text schließen muss. Ein Trenner in Quotes als erstes Zeichen nach dem Namen bleibt
-  „bare“: das erste Argument des Helfers beginnt dann mit ihm, ein solches Verb gibt es nicht.
+  die im selben Text schließen muss. Ein Trenner in `'…'` oder hinter `\` als erstes Zeichen nach dem
+  Namen bleibt „bare“: das erste Argument des Helfers beginnt dann mit ihm, ein solches Verb gibt es
+  nicht. `` ` `` und `$` in `"…"` sind kein solcher Trenner — Bash wertet sie dort aus (seit Karte
+  t_81f72a21, siehe unten: Drift).
   Damit stimmt der Satz „liest das ganze Ziel … sonst ein Wort“ jetzt auch für diese Ziele.
   **Preis (gemessen):** `preis-r8` gegen f9899ee unverändert (`/opt/data/out/t_8939621f/preis-r8.log`),
   `<helfer> status >/dev/null`, `<helfer> status > /tmp/s.json`, `<helfer> >$(mktemp) status`
@@ -652,6 +654,31 @@ Grenzen:
   status`); den Plan hielt der Leser schon vorher an, am Gesamturteil ändert sich nichts
   (`/opt/data/out/t_8939621f/eigene-r10.log`). Tests: `apps/api/test/backup-guard.test.ts`
   (t_8939621f, `helperMentions` allein und im Kommentar, den der Leser nicht liest; dazu Preis).
+* **`` ` `` und `$` in Doppelquotes sind aktiv (10.11.2026, Zweitprüfung t_03e2d8c8, Karte
+  t_81f72a21).** **Drift gegenüber dem Nachtrag t_8939621f direkt darüber** („Ein Trenner in Quotes
+  als erstes Zeichen … bleibt bare“): `normalize(text, true)` markierte in `"…"` jedes Zeichen als
+  literal, auch `` ` `` und `$`, die Bash dort auswertet. `` <helfer> "`echo repair`" ``,
+  `` <helfer> >/dev/null "`echo repair`" ``, `` "`echo re`pair" `` und `` "`echo ''`repair" `` hießen „bare“,
+  Bash startet den Helfer mit `repair` (`/opt/data/out/t_03e2d8c8/rohtext-r11.log`). Die Backtick-
+  Zählung („steht der Helfer in `` `…` ``?“) ließ Backticks in `"…"` aus. Der Hauptleser hielt jede
+  dieser Formen an (hit, Fokus uncertain); die Lücke lag in der zweiten Linie. **Entscheidung:**
+  `` ` `` und `$` in `"…"` tragen die Marke `ACTIVE` statt `LITERAL`; literal sind sie nur in `'…'`
+  und als `` \` `` / `\$`. `ACTIVE` zählt überall wie `LITERAL` als Quote (ein Umleitungsziel damit
+  bleibt ein Wort, `<helfer> >"$$" status` bleibt „arg“), nur nicht als literales `` ` `` (kein
+  „bare“) und beim Zählen der Backticks mit. Ein `` ` `` in `"…"` ohne Partner im selben `"…"` bleibt
+  `LITERAL` (Bash sucht die Ersetzung dann über das `"` hinaus; der Riegel baut das nicht nach) —
+  der erprobte einfachere Vorschlag (`` ` ``/`$` ganz ohne Marke) machte sonst Ziele wie `>"$$"` frei
+  und über einen ungepaarten `` ` `` davor `` <helfer> `echo repair` `` „bare“ (gemessen lockerer als
+  2a35c56: 2 Texte im Korpus aus t_8939621f, 3450 im erweiterten Korpus;
+  `/opt/data/out/t_81f72a21/vorschlag-differenz*.log`). Weiter „bare“ (gewollt, Bash startet den Helfer ohne Verb):
+  `` echo "Nutze `<helfer>` nie" ``, `` echo "`<helfer>`" ``, `` <helfer> '`echo repair`' `` (argv[0] ist der
+  Text samt Backticks, der Helfer bricht mit 64 ab). **Preis (gemessen):** `preis-r8` gegen 2a35c56
+  unverändert (`/opt/data/out/t_81f72a21/preis-r8.log`); neu „arg“ statt „bare“ nur ``` <helfer> "``" status ```
+  und `` <helfer> "`" `` (argv[0] wäre leer; `` "`" `` allein ist in Bash nicht abgeschlossen). `` x="`<helfer> >/dev/null`" ``
+  war schon auf 2a35c56 „arg“ (`/dev/null` steht in `"…"`, das Ziel hat ein Quote), daran ändert
+  sich nichts. Differenztest alt/neu 0 lockerer (`/opt/data/out/t_81f72a21/differenz*.log`). Tests:
+  `apps/api/test/backup-guard.test.ts` (t_81f72a21, `helperMentions` allein und im Kommentar, den
+  der Leser nicht liest; dazu Kontrollen und Preis).
 * **Offene Entscheidung (05.11.2026, Karte t_5ce5f79f): Freigabe-Markierung im Helfer.** Erwogen:
   die schwächenden Verben (`sources connect|disconnect|restore`, `repair`) laufen in einer
   host-run-cgroup nur, wenn `cockpit-host-run` für genau diesen Job eine root-eigene Markierung

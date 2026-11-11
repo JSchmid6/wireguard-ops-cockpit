@@ -235,7 +235,8 @@ case "\$*" in
   *"check"*"--repair"*) printf 'REPAIR args=%s env=%s\n' "\$*" "\${BORG_CHECK_I_KNOW_WHAT_I_AM_DOING:-unset}" >> "$WORK/repo/data/repair.run" ;;
   *"check"*) printf 'CHECK args=%s env=%s\n' "\$*" "\${BORG_CHECK_I_KNOW_WHAT_I_AM_DOING:-unset}" >> "$WORK/repo/data/check.run" ;;
 esac
-[ -e "$WORK/hold-check" ] && sleep 6
+# Halten, bis der Test den Marker löst (statt fester Frist: unter Last reichten 6 s nicht).
+hold=0; while [ -e "$WORK/hold-check" ] && [ "\$hold" -lt 1200 ]; do sleep 0.1; hold=\$((hold + 1)); done
 exit 0
 EOF
 
@@ -307,8 +308,8 @@ case "\$cmd" in
     for a in "\$@"; do case "\$a" in --quiet|-q) quiet=1 ;; -*) ;; *) unit="\$a" ;; esac; done
     case "\$unit" in
       borgmatic.service)
-        # W1: wie echtes systemd — nur `active` gibt rc=0; `activating` (oneshot
-        # während des ganzen Laufs) und `deactivating` geben rc=3 wie `inactive`.
+        # W1: wie echtes systemd — nur active gibt rc=0; activating (oneshot
+        # während des ganzen Laufs) und deactivating geben rc=3 wie inactive.
         if [ -e "$WORK/borgmatic-busy" ]; then state=active; rc=0
         elif [ -e "$WORK/borgmatic-activating" ]; then state=activating; rc=3
         elif [ -e "$WORK/borgmatic-deactivating" ]; then state=deactivating; rc=3
@@ -330,9 +331,9 @@ case "\$cmd" in
     [ "\$quiet" -eq 1 ] || echo "\$state"
     exit "\$rc" ;;
   list-timers)
-    # Der Weg der Fristprüfung (R1) ist `--output=json`; der Aufruf wird
+    # Der Weg der Fristprüfung (R1) ist --output=json; der Aufruf wird
     # protokolliert, damit die Prüfung ihn belegen kann. Ohne --output=json bleibt
-    # die menschliche Tabelle für `status`.
+    # die menschliche Tabelle für status.
     case " \$* " in
       *" --output=json "*)
         printf '%s\n' "list-timers \$*" >> "$WORK/list-timers.log"
@@ -342,7 +343,7 @@ case "\$cmd" in
     printf '%s\n' "NEXT                         LEFT     LAST                         PASSED UNIT            ACTIVATES" "Mon 2026-09-28 02:26:08 CEST 3h 10min Sun 2026-09-27 02:39:04 CEST 20h ago borgmatic.timer borgmatic.service"
     exit 0 ;;
   show)
-    # `systemctl show <unit> -p Result -p ExecMainStatus`: genau die zwei Werte,
+    # systemctl show <unit> -p Result -p ExecMainStatus: genau die zwei Werte,
     # die der Datenblock für den letzten Backup-Lauf übernimmt. Über
     # \$WORK/borgmatic-failed lässt sich ein fehlgeschlagener Lauf nachstellen.
     unit=""

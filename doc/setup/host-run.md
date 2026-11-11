@@ -750,6 +750,11 @@ hebt. Der Normalfall ist Durchlaufen. Das gilt für beide Prüfungen: den Türst
   (`reported: true`); James meldet sie Jochen. Ohne prüfbaren Nachweis bleibt alles wie oben.
   Fehlt die Bindung des geprüften Diffs (Eingabe nicht verfügbar), bleibt es `blocked_prerequisite`.
   Plan-Policy, Safety review, Backup- und Risiko-Riegel und `dienste.update` sind davon nicht berührt.
+  **Schweregrad-Schnitt (Jochen, 10.11.2026, Variante C, Karte t_e49f6254):** Den Marker kann der
+  Agent mit dem Owner-Token selbst setzen. Deshalb macht er nur leichte Befunde zur Meldung: ein
+  Befund mit `high`, einer auf G1/G2/G7/G10, eine `INJECTION` oder einer ohne lesbaren Schweregrad
+  bleibt trotz Nachweis `blocked_user_approval` (ein Klick für Jochen im Cockpit). INCOMPLETE bleibt
+  meldbar.
 
 ## Tests
 

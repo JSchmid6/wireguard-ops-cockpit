@@ -701,6 +701,52 @@ describe("backup bolt, raw text alone: a redirect target with quotes or escapes 
   });
 });
 
+// Zweitpruefung t_03e2d8c8 (Karte t_81f72a21): normalize(..., true) markierte in "..." jedes Zeichen als literal,
+// auch ` und $, die Bash dort auswertet. R "`echo repair`" hiess "bare" (Regel: Trenner in Quotes als erstes
+// Zeichen), Bash startet den Helfer mit repair. Getestet wird der Rohtext-Riegel ALLEIN und im Kommentar.
+const rawDoubleQuotedForms: string[] = [
+  "\"`echo repair`\"", ">/dev/null \"`echo repair`\"", "\"`echo re`pair\"", "\"`echo ''`repair\"",
+  "2>&1 \"`echo repair`\"", "<&- \"`echo repair`\"", "\"$(echo repair)\"", "\"`echo re`\"pair",
+];
+
+describe("backup bolt, raw text alone: ` and $ in double quotes are active (t_81f72a21)", () => {
+  it.each(rawDoubleQuotedForms)("helperMentions: R %s", (follower) => {
+    expect(helperMentions(`/usr/local/sbin/cockpit-borg-action ${follower}`)).toEqual(["arg"]);
+  });
+
+  it.each(rawDoubleQuotedForms)("in a comment the reader does not read: R %s", (follower) => {
+    const found = hits(`hostname # /usr/local/sbin/cockpit-borg-action ${follower}`);
+    expect(found.some((hit) => hit.reason.includes("with a word other than its free forms"))).toBe(true);
+  });
+
+  it("inside a substitution and next to text in double quotes", () => {
+    const R = "/usr/local/sbin/cockpit-borg-action";
+    expect(helperMentions(`echo $(${R} "\`echo repair\`")`)).toEqual(["arg"]);
+    expect(helperMentions(`echo "\`echo\`"; ${R} \`echo repair\``)).toEqual(["arg"]);
+  });
+
+  it("keeps what is literal and what Bash only runs bare", () => {
+    const R = "/usr/local/sbin/cockpit-borg-action";
+    // In "..." fuehrt Bash R aus, ohne Argument; die Backticks dort zaehlen mit.
+    expect(helperMentions(`echo "Nutze \`${R}\` nie"`)).toEqual(["bare"]);
+    expect(helperMentions(`echo "\`${R}\`"`)).toEqual(["bare"]);
+    expect(helperMentions(`x="\`${R} status\`"`)).toEqual(["free"]);
+    expect(helperMentions(`x="$(${R} status)"`)).toEqual(["free"]);
+    expect(helperMentions(`echo 'Nutze \`${R}\` nie'`)).toEqual(["bare"]);
+    // '...' und \` sind literal: das erste Argument beginnt mit `, ein solches Verb gibt es nicht.
+    expect(helperMentions(`${R} '\`echo repair\`'`)).toEqual(["bare"]);
+    expect(helperMentions(`${R} status >"$log"`)).toEqual(["free"]);
+    // Ein Ziel mit Quote bleibt ein Wort, auch wenn darin nur $ oder ` steht.
+    expect(helperMentions(`${R} >"$$" status`)).toEqual(["arg"]);
+    expect(helperMentions(`${R} >"\`\`" status`)).toEqual(["arg"]);
+    // Ein ` ohne Partner im selben "..." liest der Riegel nicht nach: es zaehlt nicht als Ersetzung.
+    expect(helperMentions(`echo "\`"; ${R} \`echo repair\``)).toEqual(["arg"]);
+    // Der Preis: ein leeres "``" vor dem Verb ist ein Wort (argv[0] waere leer, der Helfer bricht ab).
+    expect(helperMentions(`${R} "\`\`" status`)).toEqual(["arg"]);
+    expect(helperMentions(`x="\`${R} >/dev/null\`"`)).toEqual(["arg"]);
+  });
+});
+
 describe("backup bolt: what is unclear goes to the doorkeeper, not to the operator", () => {
   it.each(doorkeeperDecides)("%s", (_label, run) => {
     expect(hits(run)).toEqual([]);
