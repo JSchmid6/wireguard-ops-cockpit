@@ -741,6 +741,8 @@ describe("backup bolt, raw text alone: ` and $ in double quotes are active (t_81
     expect(helperMentions(`echo "\`"; ${R} \`echo repair\``)).toEqual(["arg"]);
     // Der Preis: ein leeres "``" vor dem Verb ist ein Wort (argv[0] waere leer, der Helfer bricht ab).
     expect(helperMentions(`${R} "\`\`" status`)).toEqual(["arg"]);
+    // Ein einzelnes ` in "..." bleibt literal und "`" allein ist nicht abgeschlossen: weiter "bare" (alt wie neu).
+    expect(helperMentions(`${R} "\`"`)).toEqual(["bare"]);
     expect(helperMentions(`x="\`${R} >/dev/null\`"`)).toEqual(["arg"]);
   });
 });

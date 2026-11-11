@@ -673,7 +673,9 @@ Grenzen:
   `` echo "Nutze `<helfer>` nie" ``, `` echo "`<helfer>`" ``, `` <helfer> '`echo repair`' `` (argv[0] ist der
   Text samt Backticks, der Helfer bricht mit 64 ab). **Preis (gemessen):** `preis-r8` gegen 2a35c56
   unverändert (`/opt/data/out/t_81f72a21/preis-r8.log`); neu „arg“ statt „bare“ nur ``` <helfer> "``" status ```
-  und `` <helfer> "`" `` (argv[0] wäre leer; `` "`" `` allein ist in Bash nicht abgeschlossen). `` x="`<helfer> >/dev/null`" ``
+  (argv[0] wäre leer). `` <helfer> "`" `` bleibt „bare“ (alt und neu gemessen, Korrektur t_27df1354: ein einzelnes
+  `` ` `` in `"…"` bleibt literal, und `` "`" `` allein ist in Bash nicht abgeschlossen;
+  `/opt/data/out/t_8e46af7d/doku-aussagen.log`). `` x="`<helfer> >/dev/null`" ``
   war schon auf 2a35c56 „arg“ (`/dev/null` steht in `"…"`, das Ziel hat ein Quote), daran ändert
   sich nichts. Differenztest alt/neu 0 lockerer (`/opt/data/out/t_81f72a21/differenz*.log`). Tests:
   `apps/api/test/backup-guard.test.ts` (t_81f72a21, `helperMentions` allein und im Kommentar, den
