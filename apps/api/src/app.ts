@@ -76,6 +76,7 @@ import {
 } from "./hermes-security.js";
 import {
   applyUpdateReviewPolicy,
+  selfUpdateBackupBolt,
   buildUpdateReviewPasses,
   githubApiFetch,
   normalizeUpdateBindings,
@@ -2364,6 +2365,8 @@ export async function createApp(options: AppOptions = {}) {
       : prompts.map((prompt, index) => `<!-- review pass ${index + 1}/${prompts.length} -->\n${prompt}`).join("\n\n");
     await writeFile(reviewPath, record, { encoding: "utf-8", mode: 0o600 });
     const outcome: UpdateReviewOutcome = { kind, bindings: updateBindings(diffs), coverage };
+    // Backup bolt in the update (backup-bolt.ts, decision 12.11.2026).
+    if (kind === "self") outcome.backupBolt = selfUpdateBackupBolt(diffs);
     Object.assign(outcome, await runUpdateReviewPasses(prompts, updateReviewRunner));
     // A self-update review that would stop looks for a second review of
     // exactly these commits, which the Cockpit verifies itself (4b).

@@ -21,6 +21,7 @@ import {
   redactSecrets,
   reviewedDiffFor,
   runUpdateReviewPasses,
+  selfUpdateBackupBolt,
   selfUpdateTargets,
   summarizeUpdateReview,
   updateBindings,
@@ -91,7 +92,10 @@ const readyPolicy = evaluatePlanPolicy([
 ].join("\n"), "passed");
 
 function outcome(partial: Partial<UpdateReviewOutcome> = {}): UpdateReviewOutcome {
-  return { bindings: [{ base: BASE, sha: SHA, diffSha256: HASH }], coverage: [{ sha: SHA, incomplete: [], cut: [], omitted: [] }], ...partial };
+  return {
+    bindings: [{ base: BASE, sha: SHA, diffSha256: HASH }], coverage: [{ sha: SHA, incomplete: [], cut: [], omitted: [] }],
+    backupBolt: { changes: [], unreadable: [] }, ...partial,
+  };
 }
 
 describe("self-update pre-install review", () => {
@@ -727,10 +731,16 @@ describe("review in passes (ad82dbf..cba7628)", () => {
     expect(update.files.map((file) => file.path).filter((path) => path.startsWith("deploy/")).every((path) => first.includes(path))).toBe(true);
     expect(prompts[0]).toContain("+COPY --from=build /workspace/deploy/helpers/cockpit-state-steps.mjs");
     const result = await runUpdateReviewPasses(prompts, approve);
-    const policy = applyUpdateReviewPolicy(readyPolicy, { bindings: updateBindings([update]), coverage, ...result });
+    // The review alone passes; the bolt is judged on its own (below).
+    const policy = applyUpdateReviewPolicy(readyPolicy, { bindings: updateBindings([update]), coverage, ...result, backupBolt: { changes: [], unreadable: [] } });
     expect(policy).toMatchObject({ allowed: true, status: "ready" });
     expect(policy.evidence).toContain("pre-install review result: pass");
     expect(policy.reason).not.toContain("incomplete");
+    // This update changes the root helper deploy/helpers/cockpit-host-run, which
+    // asks the backup bolt: since 12.11.2026 (t_fcb051fa) it waits for the operator.
+    const bolted = applyUpdateReviewPolicy(readyPolicy, { bindings: updateBindings([update]), coverage, ...result, backupBolt: selfUpdateBackupBolt([update]) });
+    expect(bolted).toMatchObject({ allowed: false, status: "blocked_user_approval" });
+    expect(bolted.reason).toContain("Backup-Riegel geändert (G10), Jochens Ja nötig");
   });
 
   it("finds a deliberately risky hunk in Dockerfile.api: the flagging pass reaches the operator", async () => {
@@ -1234,5 +1244,73 @@ describe("unchanged context of the backup bolt (b9372e1..0d0edf42)", () => {
       expect(fs.existsSync(new URL(`../../../${entry.helper}`, import.meta.url))).toBe(true);
     }
     expect(installedBackupGuard()).toBe(guard);
+  });
+});
+
+// Backup bolt in the update (operator decision 12.11.2026, card t_fcb051fa):
+// a self-update whose diff changes the bolt waits for the operator, whatever
+// the review said. Written against applyUpdateReviewPolicy and the outcome
+// field only, so the same cases run red against the stand before the rule.
+describe("backup bolt in the update: a bolt change waits for the operator (12.11.2026)", () => {
+  const HEAD = "fedcba9876543210fedcba9876543210fedcba98";
+  const pass = parseUpdateReviewAnswer("VERDICT: approve");
+  const bolt = { changes: ["deploy/helpers/cockpit-backup-guard.mjs"], unreadable: [] };
+  const verified = [{ sha: SHA, verified: true, reason: "merge of PR #87, marker on the head", pr: 87, headSha: HEAD }];
+  const light = parseUpdateReviewAnswer([
+    "VERDICT: flag", "FINDING: light point", "GUARANTEE: G5", "SEVERITY: medium", "FILE: a.ts", "CODE: x", "REASON: r",
+  ].join("\n"));
+
+  it("pass with a bolt file in the diff -> blocked_user_approval with the operator's reason", () => {
+    const policy = applyUpdateReviewPolicy(readyPolicy, outcome({ answer: pass, backupBolt: bolt }));
+    expect(policy).toMatchObject({ allowed: false, status: "blocked_user_approval", zone: "red" });
+    expect(policy.reason).toContain("Backup-Riegel geändert (G10), Jochens Ja nötig");
+    expect(policy.reason).toContain("deploy/helpers/cockpit-backup-guard.mjs");
+    expect(policy.evidence).toContain("pre-install review result: pass");
+  });
+
+  it("pass without a bolt file -> ready, unchanged", () => {
+    expect(applyUpdateReviewPolicy(readyPolicy, outcome({ answer: pass }))).toMatchObject({ allowed: true, status: "ready" });
+    expect(applyUpdateReviewPolicy(readyPolicy, outcome({ answer: pass, backupBolt: { changes: [], unreadable: [] } })).reason).toBe(readyPolicy.reason);
+  });
+
+  it("a verified second review does not lift the bolt: no report, the operator decides", () => {
+    // Without the bolt the light finding is a report (secondReviewReports).
+    expect(applyUpdateReviewPolicy(readyPolicy, outcome({ answer: light, secondReview: verified }))).toMatchObject({ allowed: true, status: "ready" });
+    const reviewed = outcome({ answer: light, secondReview: verified, backupBolt: bolt });
+    const policy = applyUpdateReviewPolicy(readyPolicy, reviewed);
+    expect(policy).toMatchObject({ allowed: false, status: "blocked_user_approval" });
+    expect(policy.reason).toContain("Backup-Riegel geändert (G10), Jochens Ja nötig");
+    expect(summarizeUpdateReview([diff()], reviewed, null)).toMatchObject({ reported: false, backupBolt: bolt });
+    // Also an incomplete review with a verified second review (otherwise reportable).
+    const incomplete = applyUpdateReviewPolicy(readyPolicy, outcome({ reviewerError: "timeout", secondReview: verified, backupBolt: bolt }));
+    expect(incomplete.status).not.toBe("ready");
+    expect(incomplete.reason).toContain("Backup-Riegel geändert (G10)");
+  });
+
+  it("a block an approval cannot lift stays, and gains the reason", () => {
+    const prerequisite = applyUpdateReviewPolicy(readyPolicy, outcome({ reviewerError: "timeout", backupBolt: bolt }));
+    expect(prerequisite).toMatchObject({ status: "blocked_prerequisite" });
+    expect(prerequisite.reason).toContain("Backup-Riegel geändert (G10)");
+    const policyBlock = { ...readyPolicy, allowed: false, status: "blocked_policy" as const, zone: "red" as const, reason: "plan blocked." };
+    expect(applyUpdateReviewPolicy(policyBlock, outcome({ answer: pass, backupBolt: bolt }))).toMatchObject({ status: "blocked_policy" });
+  });
+
+  it("an unreadable bolt check stops for the agent, also with a verified second review", () => {
+    const unreadable = { changes: [], unreadable: ["apps/api/src/app.ts"] };
+    const policy = applyUpdateReviewPolicy(readyPolicy, outcome({ answer: pass, backupBolt: unreadable }));
+    expect(policy).toMatchObject({ allowed: false, status: "blocked_prerequisite" });
+    const reviewed = outcome({ reviewerError: "timeout", secondReview: verified, backupBolt: unreadable });
+    expect(applyUpdateReviewPolicy(readyPolicy, reviewed)).toMatchObject({ allowed: false, status: "blocked_prerequisite" });
+    expect(summarizeUpdateReview([diff()], reviewed, null)).toMatchObject({ reported: false });
+  });
+
+  it("fails closed: a self-update outcome without the bolt part does not run", () => {
+    const { backupBolt: _dropped, ...rest } = outcome({ answer: pass });
+    expect(applyUpdateReviewPolicy(readyPolicy, rest)).toMatchObject({ allowed: false, status: "blocked_prerequisite" });
+  });
+
+  it("dienste.update is not touched (server-dienste holds no bolt file)", () => {
+    const dienste = { ...outcome({ answer: pass, kind: "dienste" }), backupBolt: undefined };
+    expect(applyUpdateReviewPolicy(readyPolicy, dienste)).toMatchObject({ allowed: true, status: "ready" });
   });
 });

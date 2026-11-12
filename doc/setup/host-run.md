@@ -897,6 +897,12 @@ hebt. Der Normalfall ist Durchlaufen. Das gilt für beide Prüfungen: den Türst
   nur `host.run`); Risiko-Riegel (Abschnitt 2b, erklärtes `exposure`/`data_loss`/
   `identity_or_secret`, nur `host.run`); für die typisierten Türen die Plan-Policy (`evaluatePlanPolicy`: geschützte
   Grenze, Risikozone rot, nicht autorisierte Capability, `shell.exception`, `borg.repair`).
+- Riegel im Selbstupdate (Jochen, 12.11.2026, Karte t_fcb051fa): Ändert der installierte Diff eines
+  `self.update` den Backup-Riegel selbst (Riegel-Dateien und die Stellen, die ihn abfragen; Liste in
+  `apps/api/src/backup-bolt.ts`, `doc/setup/self-update.md` „Backup bolt in the update“), entscheidet
+  Jochen (`blocked_user_approval`, „Backup-Riegel geändert (G10), Jochens Ja nötig“) — auch bei PASS
+  und auch mit verifizierter Zweitprüfung. Kann die Prüfung den Diff nicht ganz lesen, stoppt das
+  Update für James (`blocked_prerequisite`). `dienste.update` betrifft das nicht.
 - Die Sicherungskette vor einem verändernden Lauf (borg-Prüfung, Snapshot) hängt nicht an dieser
   Matrix und bleibt unverändert.
 - **Zweitprüfung (Jochen, 07.11.2026, „ja alles“, Punkt 4b), nur Selbstupdate:** Prüft das Cockpit

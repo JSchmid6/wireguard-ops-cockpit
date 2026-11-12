@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { agentPromptLimit } from "./agent-broker.js";
+import { backupBoltChanges, type BackupBoltChange } from "./backup-bolt.js";
 import {
   hashCanonical,
   parseTypedDiensteUpdates,
@@ -191,6 +192,9 @@ export interface UpdateReviewOutcome {
   // What the Cockpit itself found on GitHub about a second review of exactly
   // the installed commits (verifySecondReview). Only a self-update has one.
   secondReview?: SecondReviewCheck[];
+  // What the installed diff changes of the backup bolt (backup-bolt.ts), set
+  // for every self-update whose diff was read (selfUpdateBackupBolt).
+  backupBolt?: BackupBoltChange;
 }
 
 // One installed commit's second review, as the Cockpit verified it.
@@ -975,7 +979,69 @@ export function updateReviewFindings(outcome: UpdateReviewOutcome): {
 //   high, on G1/G2/G7/G10, an INJECTION or without a readable severity
 //   (secondReviewStops) keeps the finding's stop although the proof holds; the
 //   verified proof is still recorded in the evidence.
+// - backup bolt (operator decision 12.11.2026, card t_fcb051fa): a self-update
+//   whose diff changes the bolt (backupBoltChanges) waits for the operator
+//   whatever the review said, also with a verified second review
+//   (applyBackupBolt, after everything above).
 export function applyUpdateReviewPolicy<P extends ReviewedPolicy>(policy: P, outcome: UpdateReviewOutcome): P {
+  return applyBackupBolt(reviewPolicy(policy, outcome), outcome);
+}
+
+// The bolt part of a self-update (backup-bolt.ts) for the outcome; a
+// dienste.update installs server-dienste, which holds no bolt file.
+export function selfUpdateBackupBolt(diffs: UpdateDiff[]): BackupBoltChange {
+  return backupBoltChanges(diffs, UPDATE_KINDS.self.supplementary);
+}
+
+export const BACKUP_BOLT_REASON = "Backup-Riegel geändert (G10), Jochens Ja nötig";
+
+// A self-update whose binding exists but whose bolt part is missing counts as
+// unreadable: the rule never silently drops out.
+function backupBoltOf(outcome: UpdateReviewOutcome): BackupBoltChange | null {
+  if (kindOf(outcome.kind) !== "self" || outcome.bindings.length === 0) return null;
+  return outcome.backupBolt ?? { changes: [], unreadable: ["the backup-bolt check did not run"] };
+}
+
+// True when the bolt keeps the update from a report (secondReviewReports) or a
+// silent install: it changes the bolt or could not be read.
+function backupBoltHolds(outcome: UpdateReviewOutcome): boolean {
+  const bolt = backupBoltOf(outcome);
+  return !!bolt && (bolt.changes.length > 0 || bolt.unreadable.length > 0);
+}
+
+// After the review's decision: a bolt change turns every status an approval
+// can lift (ready, reported, blocked_user_approval) into
+// blocked_user_approval; blocked_prerequisite and blocked_policy stay (an
+// approval never lifts them) and gain the reason. An unreadable bolt check
+// stops a plan that would run (blocked_prerequisite, for the agent: split the
+// update); a plan that waits anyway gains the reason.
+function applyBackupBolt<P extends ReviewedPolicy>(policy: P, outcome: UpdateReviewOutcome): P {
+  const bolt = backupBoltOf(outcome);
+  if (!bolt) return policy;
+  if (bolt.changes.length > 0) {
+    const reason = `${BACKUP_BOLT_REASON}: the update changes the backup bolt (${bolt.changes.slice(0, 12).join("; ")}${bolt.changes.length > 12 ? "; ..." : ""}).`;
+    const evidence = [...policy.evidence, `backup bolt changed by the update: ${bolt.changes.slice(0, 30).join("; ")}`];
+    const needed = "Ask the operator: the update changes the backup bolt (G10, decision 12.11.2026); only the operator approves it.";
+    if (policy.status === "blocked_prerequisite" || policy.status === "blocked_policy") {
+      return { ...policy, evidence, reason: `${policy.reason} ${reason}`, neededToContinue: [...policy.neededToContinue, needed] };
+    }
+    return {
+      ...policy, evidence, zone: "red", allowed: false, status: "blocked_user_approval",
+      reason: policy.allowed ? reason : `${policy.reason} ${reason}`,
+      neededToContinue: policy.allowed ? [needed] : [...policy.neededToContinue, needed],
+    };
+  }
+  if (bolt.unreadable.length > 0) {
+    const reason = `The backup-bolt check could not read the whole update (${bolt.unreadable.slice(0, 12).join(", ")}), so nothing is installed: a bolt change must not slip through unseen.`;
+    const evidence = [...policy.evidence, `backup bolt check unreadable: ${bolt.unreadable.slice(0, 30).join(", ")}`];
+    const needed = "Split the update so that every changed code file reaches the review completely, then submit it again.";
+    if (policy.allowed) return { ...policy, evidence, zone: "red", allowed: false, status: "blocked_prerequisite", reason, neededToContinue: [needed] };
+    return { ...policy, evidence, reason: `${policy.reason} ${reason}`, neededToContinue: [...policy.neededToContinue, needed] };
+  }
+  return policy;
+}
+
+function reviewPolicy<P extends ReviewedPolicy>(policy: P, outcome: UpdateReviewOutcome): P {
   const { result, findings, gaps, evidence: reviewEvidence, needed } = updateReviewFindings(outcome);
   const checks = secondReviewCovers(outcome) ? outcome.secondReview ?? [] : [];
   const verified = checks.map((check) => `second review verified for ${check.sha.slice(0, 12)}: ${check.reason}`);
@@ -1072,6 +1138,7 @@ export function summarizeUpdateReview(diffs: UpdateDiff[], outcome: UpdateReview
     findings: outcome.answer?.findings ?? [],
     notes: outcome.answer?.notes ?? "",
     secondReview: outcome.secondReview ?? [],
+    backupBolt: backupBoltOf(outcome),
     // A finding or gap that did not stop the job because of the second review.
     reported: secondReviewReports(outcome),
   };
@@ -1137,9 +1204,11 @@ export function secondReviewStops(outcome: UpdateReviewOutcome): UpdateReviewFin
 }
 
 // A review that is not a pass becomes a report instead of a stop: the proof
-// covers every installed commit and no finding is beyond the severity cut.
+// covers every installed commit, no finding is beyond the severity cut, and the
+// update neither changes the backup bolt nor hides it (applyBackupBolt).
 export function secondReviewReports(outcome: UpdateReviewOutcome): boolean {
-  return updateReviewFindings(outcome).result !== "pass" && secondReviewCovers(outcome) && secondReviewStops(outcome).length === 0;
+  return updateReviewFindings(outcome).result !== "pass" && secondReviewCovers(outcome) && secondReviewStops(outcome).length === 0
+    && !backupBoltHolds(outcome);
 }
 
 function record(value: unknown): Record<string, unknown> {
