@@ -17,8 +17,8 @@
 //    app.ts and update-review.ts also hold code outside the bolt (a hash pin,
 //    the plan policy), so a path rule would be too wide there. A changed line
 //    (+/-) or the function context of a hunk (`@@ … @@ <context>`) naming one
-//    of these code names is a bolt change. Tests and documentation are not
-//    code at the door and are not read for names.
+//    of these code names is a bolt change. Documentation and lockfiles are not
+//    read for names, and tests only where they cannot ship (TEST_ROOT).
 // 3. Fail closed: a file the names rule must read and cannot (the runner cut
 //    or left out its section, or clipped the file list) is reported as
 //    unreadable; the update then stops for the agent and no second review lifts
@@ -50,6 +50,11 @@ export const BACKUP_BOLT_FILES: RegExp[] = [
   /^deploy\/helpers\/cockpit-borg-action$/,
   // The instance role decides which snapshot a mutating run takes first.
   /^deploy\/[^/]+\/instance-role\.env$/,
+  // The units that run them (finding B3, card t_834fb98c): the prune/compact
+  // run and its start time, and the lock drop-in that makes the nightly backup
+  // wait for a running check instead of failing.
+  /^deploy\/systemd\/cockpit-borg-retention\.(?:service|timer)$/,
+  /^deploy\/systemd\/borgmatic-cockpit-borg-lock\.conf$/,
   // This list and the names below.
   /^apps\/api\/src\/backup-bolt\.ts$/,
 ];
@@ -68,7 +73,13 @@ export const BACKUP_BOLT_SYMBOLS: string[] = [
 ];
 
 const SYMBOL = new RegExp(`\\b(?:${BACKUP_BOLT_SYMBOLS.join("|")})\\b`);
-const TEST_PATH = /(?:^|\/)tests?\/|\.test\.[^/]+$/;
+// Tests that cannot ship (finding B1, card t_834fb98c): the root harnesses and
+// the test folders of packages that build only src/ (rootDir "src", so shipped
+// code cannot import from there). A test/ folder or *.test.* file anywhere else
+// — under src/, deploy/ or ops/ — is built or installed and is read like code:
+// a shim there could redefine backupGuardHits while app.ts changes only its
+// `from` line.
+const TEST_ROOT = /^(?:test|apps\/api\/test|packages\/[^/]+\/test)\//;
 
 export interface BackupBoltDiff {
   files: Array<{ path: string }>;
@@ -121,7 +132,7 @@ export function backupBoltChanges(diffs: BackupBoltDiff[], supplementary: (path:
         changes.push(path);
         continue;
       }
-      if (supplementary(path) || TEST_PATH.test(path)) continue;
+      if (supplementary(path) || TEST_ROOT.test(path)) continue;
       const sections = diff.excerpt.filter((section) => section.path === path);
       if (sections.length === 0 || diff.partialFiles.includes(path) || diff.omittedFiles.includes(path)) {
         unreadable.push(path);

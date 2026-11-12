@@ -31,12 +31,16 @@ describe("backup bolt: which files and names are the bolt", () => {
       "deploy/helpers/cockpit-host-snapshot", "deploy/helpers/cockpit-self-update-snapshot", "ops/cockpit-vps-snapshot",
       "deploy/helpers/cockpit-borg-action",
       "deploy/vps/instance-role.env", "deploy/lab0/instance-role.env", "deploy/box/instance-role.env",
+      // The units that run them (finding B3, t_834fb98c).
+      "deploy/systemd/cockpit-borg-retention.service", "deploy/systemd/cockpit-borg-retention.timer",
+      "deploy/systemd/borgmatic-cockpit-borg-lock.conf",
     ]) expect(isBackupBoltFile(path), path).toBe(true);
     for (const path of [
       "apps/api/src/host-run.ts", "apps/api/src/app.ts", "apps/api/src/update-review.ts",
       "deploy/helpers/cockpit-state-steps.mjs", "deploy/helpers/cockpit-self-update-run",
       "doc/setup/borg-retention.md", "apps/api/test/backup-guard.test.ts", "deploy/helpers/cockpit-borg-retention-x",
       "deploy/helpers/cockpit-borg-action-x", "deploy/helpers/cockpit-host-snapshot.bak", "deploy/instance-role.env",
+      "deploy/systemd/cockpit-borg-retention.service.bak", "deploy/systemd/borgmatic.service",
     ]) expect(isBackupBoltFile(path), path).toBe(false);
   });
 
@@ -46,7 +50,9 @@ describe("backup bolt: which files and names are the bolt", () => {
       "deploy/helpers/cockpit-host-run", "apps/api/src/backup-bolt.ts",
       "deploy/helpers/cockpit-host-snapshot", "deploy/helpers/cockpit-self-update-snapshot", "ops/cockpit-vps-snapshot",
       "deploy/helpers/cockpit-borg-action",
-      "deploy/vps/instance-role.env", "deploy/lab0/instance-role.env", "deploy/box/instance-role.env"]) {
+      "deploy/vps/instance-role.env", "deploy/lab0/instance-role.env", "deploy/box/instance-role.env",
+      "deploy/systemd/cockpit-borg-retention.service", "deploy/systemd/cockpit-borg-retention.timer",
+      "deploy/systemd/borgmatic-cockpit-borg-lock.conf"]) {
       expect(fs.existsSync(new URL(`../../../${path}`, import.meta.url)), path).toBe(true);
     }
   });
@@ -106,12 +112,45 @@ describe("backup bolt: changes in a diff", () => {
     expect(check([pin, context])).toEqual({ changes: [], unreadable: [] });
   });
 
-  it("tests and documentation are not read for names", () => {
+  it("tests that cannot ship and documentation are not read for names", () => {
     expect(check([
       section("apps/api/test/host-run.test.ts", ["@@ -1 +1 @@", "-backupGuardHits(a)", "+backupGuardHits(b)"]),
       section("doc/setup/self-update.md", ["@@ -1 +1 @@", "-hostRunRisksNeedingApproval", "+x"]),
       section("test/cockpit-host-run.test.sh", ["@@ -1 +1 @@", "-backupGuardHits", "+x"]),
+      section("packages/domain/test/x.test.ts", ["@@ -1 +1 @@", "-backupGuardHits", "+x"]),
     ])).toEqual({ changes: [], unreadable: [] });
+  });
+
+  // Finding B1 (second review t_f7369424, probe /opt/data/out/t_f7369424/):
+  // apps/api builds src/**, so a shim under src/test/ ships. It redefined
+  // backupGuardHits as a no-op, and app.ts changed only its `from` line; the old
+  // test exemption (any test/ segment or .test. name) saw neither.
+  it("a test-like file that ships (src/test/, src/*.test.*, deploy/, ops/) is read like code", () => {
+    const appFrom = section("apps/api/src/app.ts", [
+      "@@ -117,7 +117,7 @@ import {",
+      "   verifyHostRunFindings,",
+      "   type HostRunManifest,",
+      "   type HostRunReviewOutcome,",
+      "-} from \"./host-run.js\";",
+      "+} from \"./test/host-run-shim.js\";",
+    ]);
+    const shim = (path: string) => section(path, [
+      "new file mode 100644",
+      "@@ -0,0 +1,3 @@",
+      "+import type { BackupGuardHit } from \"../host-run.js\";",
+      "+export * from \"../host-run.js\";",
+      "+export function backupGuardHits(_m: unknown): BackupGuardHit[] { return []; }",
+    ]);
+    expect(check([appFrom, shim("apps/api/src/test/host-run-shim.ts")]))
+      .toEqual({ changes: ["apps/api/src/test/host-run-shim.ts: backupGuardHits"], unreadable: [] });
+    expect(check([shim("apps/api/src/host-run-shim.test.ts")]).changes).toEqual(["apps/api/src/host-run-shim.test.ts: backupGuardHits"]);
+    for (const path of ["apps/api/src/tests/shim.ts", "apps/web/test/shim.ts", "apps/agent-broker/test/shim.mjs",
+      "deploy/helpers/test/shim.mjs", "ops/x.test.mjs", "packages/domain/src/test/shim.ts"]) {
+      expect(check([shim(path)]).changes, path).toEqual([`${path}: backupGuardHits`]);
+    }
+    // Fail closed there too: a shipping test file without its section is unreadable.
+    expect(check([], { files: [{ path: "apps/api/src/test/host-run-shim.ts" }], filesTotal: 1 }).unreadable)
+      .toEqual(["apps/api/src/test/host-run-shim.ts"]);
   });
 
   it("a header line is not a changed line, a changed line beginning with -- is", () => {
