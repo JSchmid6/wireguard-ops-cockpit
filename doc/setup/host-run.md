@@ -123,6 +123,66 @@ Datenbank-Passwörter ist dort immer ein Befund, egal wohin die Ausgabe geht. Ro
 Routine: Paket-Updates aus den eingetragenen Quellen, Docker-Pulls, Kernel mit Neustart,
 GitLab-Stufen, Dienst-Neustarts.
 
+**Jedes ausgeführte Skript steht wörtlich im Plan** (05.11.2026, Befund X5 aus Job 26fb0860,
+Karte t_41cb8b49; nachgeschärft 09.11.2026 nach Zweitprüfung t_740ac6ee, Karte t_11872429, und
+11.11.2026 nach Zweitprüfung t_af29564c, Karte t_0e05c213): Ein
+stündlicher root-Dienst führte ein Skript aus, das der Lauf nur per Hash festnagelte
+(`printf '<sha256>  /pfad' | sha256sum -c -`); die Unit-Datei stand per Heredoc wörtlich im Plan,
+das Skript nicht — der Türsteher sah einen Hash statt Code. Seitdem lehnt schon
+`parseHostRunManifest` (Planer-Stufe, also auch das Manifest aus dem Intent) einen Plan ab, der einen
+Pfad per Prüfsumme festnagelt und ausführt, ohne seinen Inhalt in diesem Lauf zu zeigen. Die Meldung
+nennt Pfad, Ausführungs- und Pin-Zeile (und ggf. die Zeile, die den Heredoc überschrieben hat); der
+Weg ist das Muster der Units: Inhalt per `cat > /pfad <<'EOF' … EOF` oder
+`install -m 0755 /dev/stdin /pfad <<'EOF' … EOF` in den Lauf, eine Hash-Prüfung danach ist erlaubt.
+Die Regel im Einzelnen (`hiddenPinnedScripts` in `apps/api/src/host-run.ts`):
+
+- **Pin** heißt echte Prüfung: ein Digest-Werkzeug (`sha*sum`, `b2sum`, `md5sum`, `shasum`,
+  `cksum`, `openssl dgst`) mit `-c`/`--check` (samt der Prüfsummenzeile, die der Lauf dafür schreibt,
+  auch relativ nach `cd`), oder ein Digest, der im selben Schritt mit einem Digest-Literal bzw. einer
+  Variablen verglichen wird (`[ "$(sha256sum /p | cut …)" = "$SOLL" ]`). Ein `sha256sum /pfad`, das
+  nur ausgibt, neben einem fremden Digest (`docker pull img@sha256:…`, Commit-ID) nagelt nichts fest.
+- **Ausgeführt** ist fail-safe (Entscheidung 09.11.2026): Ein festgenagelter Pfad gilt überall als
+  ausgeführt, wo er als Wort in einem Befehl steht — auch normalisiert (`/a//b`), relativ nach
+  `cd <abs>` (`./name`, `bash name`), in `ExecStart=`-Zeilen, in einer per `printf` geschriebenen Unit,
+  über eine Variable, als Kopie oder Symlink unter anderem Namen, in `$(…)`/`<(…)` oder in eine Shell
+  gepipt. Liegt der Pfad in einem PATH-Verzeichnis (`/usr/local/sbin`, `/usr/local/bin`, `/usr/sbin`,
+  `/usr/bin`, `/sbin`, `/bin`) — auch als Ziel einer Kopie oder eines Symlinks (`ln -s /opt/x/run.sh
+  /usr/local/bin/runit`, `cp /opt/x/run.sh /usr/local/bin/`) —, zählt auch sein **Basisname** als Wort
+  (`… sha256sum -c - && wartung`, `sudo wartung --jetzt`, `runuser -u x -- wartung`, `ExecStart=wartung`);
+  fail-safe jedes Wort, nicht nur das Befehlswort (Entscheidung 11.11.2026). Eine Zeile mit `\` am Ende
+  wird außerhalb von Heredoc-Körpern vor dem Zerlegen mit der Folgezeile verbunden; die Fundstelle ist die
+  erste Zeile (`install -m 0755 \` + `/srv/run.sh /opt/x/run.sh`, `cat /p \` + `| bash`).
+  Ausgenommen sind nur Befehle, die ihre Operanden nicht ausführen (`chmod`, `chown`, `stat`,
+  `test`/`[`, `ls`, `cat`, `rm`, `cp`, `mv`, `ln`, `install`, `curl`, `wget`, `tar`, `grep`, `cmp` …,
+  Liste `QUIET_COMMANDS`; `sed` steht nicht darauf). Vor dem Befehl werden nur Schlüsselwörter und
+  Wrapper ohne eigene Argumente übersprungen; `sudo -u root /p`, `runuser -u x -- /p`, `su -c`, `flock`, `nsenter`,
+  `python3 -W ignore /p`, `awk -f`, `sh -c '/p'` gelten deshalb als Ausführung, weil das Wort nach dem
+  Wrapper kein stiller Befehl ist — nicht, weil jede Form einzeln erkannt würde. Preis: Ein Pfad in einer
+  `echo`-Meldung ohne Digest zählt auch, beim Basisnamen ebenso ein gleichlautendes Wort (`apt-get install
+  wartung`, `command -v wartung`); der Planer schreibt ihn dann anders.
+- **Geschrieben** zählt nur der letzte Schreibvorgang vor der Ausführung, und nur, wenn er den Inhalt
+  zeigt: `cat >`/`tee` mit Heredoc, `install … /dev/stdin <ziel>` mit Heredoc, `echo`/`printf` ohne
+  `$`/Backticks, eine Kopie eines so geschriebenen Skripts. Anhängen (`cat >>`, `tee -a`) an eine nicht
+  gezeigte Datei macht sie nicht sichtbar; ein späteres Überschreiben (`cp`, `mv`, `install`, `dd of=`,
+  `curl -o`, `wget -O`, `> /pfad`, `tar -x`/`unzip` in das Verzeichnis) hebt den Heredoc auf. Ebenso
+  jedes `sed -i`/`--in-place` auf den Pfad (Entscheidung 11.11.2026, Hinweis aus t_af29564c): Mit `$(…)`,
+  Backticks oder `r /datei` ist die Änderung nicht sichtbar, und eine literale Ersetzung gehört gleich in
+  den Heredoc — eine Unterscheidung nach dem sed-Skript wäre nur eine weitere Lücke.
+- **Nicht unter der Regel** (Entscheidung 09.11.2026, sonst belohnt sie das Weglassen der Prüfung —
+  ohne Hash wäre der Plan frei): ein Programm, das dieser Lauf selbst lädt (`curl -o`, `wget -O`) und
+  prüft, sofern es kein Skript ist (Endung `.sh`, `.py` … oder Aufruf über Shell/Interpreter — ein
+  Skript lässt sich zeigen); und die vom Deploy installierten Cockpit-Helfer
+  (`/usr/local/sbin/cockpit-*`, `/usr/local/lib/wireguard-ops-cockpit/cockpit-*`), deren
+  Integritätsprüfung vor dem Aufruf erwünscht ist, solange der Lauf sie nicht überschreibt. Beide bleiben
+  wie vorher Fokus des Riegels und Sache des Türstehers.
+
+Ein geprüfter Download, der nur entpackt wird, und ein Skript ohne Hash bleiben frei; Code, den der
+Plan anders verbirgt (Skript von anderswo ohne Pin, Pfad aus nicht gezeigten Werten), bleibt Fokus des
+Riegels („content this plan does not show“) und X5 des Türstehers. Die Regel ist eine Planer-Hilfe, kein
+Schloss: Sie lehnt nur zusätzlich ab, der Türsteher liest jeden Lauf weiterhin selbst. Tests:
+`apps/api/test/host-run-visible-scripts.test.ts` (alle Fälle der Probe aus t_740ac6ee und der Gegenprobe
+aus t_af29564c, plus die aufgezeichneten Pläne vom 10.10.2026 als Fehlalarm-Gegenprobe).
+
 ## 2a. Backup-Riegel: Backups löschen nur mit Freigabe
 
 Jochen, 30.09.2026: „Ein Admin muss auch die Backups löschen können. Aber halt mit Freigabe.“
@@ -749,6 +809,11 @@ hebt. Der Normalfall ist Durchlaufen. Das gilt für beide Prüfungen: den Türst
   (`reported: true`); James meldet sie Jochen. Ohne prüfbaren Nachweis bleibt alles wie oben.
   Fehlt die Bindung des geprüften Diffs (Eingabe nicht verfügbar), bleibt es `blocked_prerequisite`.
   Plan-Policy, Safety review, Backup- und Risiko-Riegel und `dienste.update` sind davon nicht berührt.
+  **Schweregrad-Schnitt (Jochen, 10.11.2026, Variante C, Karte t_e49f6254):** Den Marker kann der
+  Agent mit dem Owner-Token selbst setzen. Deshalb macht er nur leichte Befunde zur Meldung: ein
+  Befund mit `high`, einer auf G1/G2/G7/G10, eine `INJECTION` oder einer ohne lesbaren Schweregrad
+  bleibt trotz Nachweis `blocked_user_approval` (ein Klick für Jochen im Cockpit). INCOMPLETE bleibt
+  meldbar.
 
 ## Tests
 
