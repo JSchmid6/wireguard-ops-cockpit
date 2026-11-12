@@ -39,6 +39,17 @@ export const BACKUP_BOLT_FILES: RegExp[] = [
   /^apps\/api\/src\/borg-retention\.ts$/,
   // The root helper asks the bolt at the start and on every resume.
   /^deploy\/helpers\/cockpit-host-run$/,
+  // Code that creates, rotates or deletes backups or snapshots, with its bounds
+  // (finding B1, card t_1621fa3e): the host snapshot (KEEP, removal in its
+  // store, qm/pct delsnapshot of its name form), Lab0's self-update snapshot
+  // (KEEP, removal loop), the hoster snapshot (rotation, delete), the backup
+  // helper (also the quarter bound of `sources add`).
+  /^deploy\/helpers\/cockpit-host-snapshot$/,
+  /^deploy\/helpers\/cockpit-self-update-snapshot$/,
+  /^ops\/cockpit-vps-snapshot$/,
+  /^deploy\/helpers\/cockpit-borg-action$/,
+  // The instance role decides which snapshot a mutating run takes first.
+  /^deploy\/[^/]+\/instance-role\.env$/,
   // This list and the names below.
   /^apps\/api\/src\/backup-bolt\.ts$/,
 ];

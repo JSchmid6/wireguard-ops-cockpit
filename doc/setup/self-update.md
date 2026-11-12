@@ -517,7 +517,13 @@ enforces it (`applyBackupBolt` in `update-review.ts`, last step of
      entry `deploy/helpers/cockpit-borg-retention` and
      `apps/api/src/borg-retention.ts`, the root helper
      `deploy/helpers/cockpit-host-run` (it asks the bolt at the start and on
-     every resume), and `apps/api/src/backup-bolt.ts` itself — changing the list
+     every resume), code that creates, rotates or deletes backups or snapshots
+     together with its bounds (finding B1, card t_1621fa3e:
+     `deploy/helpers/cockpit-host-snapshot`, `cockpit-self-update-snapshot`,
+     `ops/cockpit-vps-snapshot`, `deploy/helpers/cockpit-borg-action` with the
+     quarter bound of `sources add`, and the role files
+     `deploy/*/instance-role.env`, which pick the snapshot before a mutating
+     run), and `apps/api/src/backup-bolt.ts` itself — changing the list
      is a bolt change. The runner diffs with `--no-renames`, so moving a bolt
      file names its old path too.
   2. *Places that ask the bolt* (`BACKUP_BOLT_SYMBOLS`): `host-run.ts`, `app.ts`

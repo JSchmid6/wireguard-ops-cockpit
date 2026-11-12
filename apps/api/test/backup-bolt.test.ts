@@ -27,18 +27,26 @@ describe("backup bolt: which files and names are the bolt", () => {
       "deploy/helpers/cockpit-borg-retention.mjs", "deploy/helpers/cockpit-borg-retention",
       "apps/api/src/borg-retention.ts", "deploy/helpers/cockpit-host-run", "apps/api/src/backup-bolt.ts",
       "ops/cockpit-backup-guard.mjs", "ops/cockpit-borg-retention-rules.mjs",
+      // Code that creates, rotates or deletes backups or snapshots (finding B1, t_1621fa3e).
+      "deploy/helpers/cockpit-host-snapshot", "deploy/helpers/cockpit-self-update-snapshot", "ops/cockpit-vps-snapshot",
+      "deploy/helpers/cockpit-borg-action",
+      "deploy/vps/instance-role.env", "deploy/lab0/instance-role.env", "deploy/box/instance-role.env",
     ]) expect(isBackupBoltFile(path), path).toBe(true);
     for (const path of [
       "apps/api/src/host-run.ts", "apps/api/src/app.ts", "apps/api/src/update-review.ts",
-      "deploy/helpers/cockpit-borg-action", "deploy/helpers/cockpit-state-steps.mjs", "deploy/helpers/cockpit-host-snapshot",
+      "deploy/helpers/cockpit-state-steps.mjs", "deploy/helpers/cockpit-self-update-run",
       "doc/setup/borg-retention.md", "apps/api/test/backup-guard.test.ts", "deploy/helpers/cockpit-borg-retention-x",
+      "deploy/helpers/cockpit-borg-action-x", "deploy/helpers/cockpit-host-snapshot.bak", "deploy/instance-role.env",
     ]) expect(isBackupBoltFile(path), path).toBe(false);
   });
 
   it("every bolt file the list names exists in this stand (no stale entry by typo)", () => {
     for (const path of ["deploy/helpers/cockpit-backup-guard.mjs", "deploy/helpers/cockpit-borg-retention-rules.mjs",
       "deploy/helpers/cockpit-borg-retention.mjs", "deploy/helpers/cockpit-borg-retention", "apps/api/src/borg-retention.ts",
-      "deploy/helpers/cockpit-host-run", "apps/api/src/backup-bolt.ts"]) {
+      "deploy/helpers/cockpit-host-run", "apps/api/src/backup-bolt.ts",
+      "deploy/helpers/cockpit-host-snapshot", "deploy/helpers/cockpit-self-update-snapshot", "ops/cockpit-vps-snapshot",
+      "deploy/helpers/cockpit-borg-action",
+      "deploy/vps/instance-role.env", "deploy/lab0/instance-role.env", "deploy/box/instance-role.env"]) {
       expect(fs.existsSync(new URL(`../../../${path}`, import.meta.url)), path).toBe(true);
     }
   });
@@ -121,12 +129,14 @@ describe("backup bolt: changes in a diff", () => {
     expect(check([], { files: [{ path: "README.md" }], filesTotal: 1 }).unreadable).toEqual([]);
   });
 
-  it("real diffs: PR #83 (helper verb, guard unchanged) stays free, ad82dbf..cba7628 (root helper) is a bolt change", () => {
+  // PR #83 added `sources add-large` to the backup helper with the guard
+  // unchanged; since finding B1 (t_1621fa3e) the backup helper is a bolt file.
+  it("real diffs: PR #83 (backup helper) and ad82dbf..cba7628 (root helper) are bolt changes", () => {
     const real = (name: string) => {
       const raw = fs.readFileSync(new URL(`./fixtures/${name}`, import.meta.url), "utf8");
       return parseUpdateDiff(raw, (JSON.parse(raw) as { sha: string }).sha);
     };
-    expect(selfUpdateBackupBolt([real("self-diff-b9372e1-0d0edf42.json")])).toEqual({ changes: [], unreadable: [] });
+    expect(selfUpdateBackupBolt([real("self-diff-b9372e1-0d0edf42.json")])).toEqual({ changes: ["deploy/helpers/cockpit-borg-action"], unreadable: [] });
     expect(selfUpdateBackupBolt([real("self-diff-ad82dbf-cba7628.json")])).toEqual({ changes: ["deploy/helpers/cockpit-host-run"], unreadable: [] });
   });
 });
