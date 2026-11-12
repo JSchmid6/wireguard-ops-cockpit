@@ -30,7 +30,9 @@
 //                       truncate, dd, find -delete, rsync --delete, git clean)
 //                       in Backup-Zielen: borg-Repo, /var/backups,
 //                       /var/opt/gitlab/backups — auch über einen Vorfahren
-//                       (rm -rf /var) und per ssh auf Lab0;
+//                       (rm -rf /var) und per ssh auf Lab0; cp, install, ln -f,
+//                       rsync, tee auf eine Datei im Repo, in den GitLab- oder
+//                       vzdump-Sicherungen (Karte t_cef59949);
 //                     - Abschalten, Stoppen oder Maskieren der borgmatic- und
 //                       Retention-Units (auch per Glob oder Zielwechsel), dem
 //                       Entfernen der borg-Pakete, dem Streichen ihres Cron-
@@ -89,7 +91,7 @@
 
 import { classifyRetention, parseRetentionArgs } from "./cockpit-borg-retention-rules.mjs";
 
-export const BACKUP_GUARD_VERSION = "cockpit-backup-guard/v6";
+export const BACKUP_GUARD_VERSION = "cockpit-backup-guard/v7";
 
 // Was die Backups sind. TOKEN greift im normalisierten Text (ohne Quotes und
 // Backslashes), also auch in b"o"rg und bo\rg.
@@ -1775,6 +1777,23 @@ const touchesConfig = (path) => pathTouches(path, false, CONFIG, []);
 // ein Plan den eigenen Rückweg an (wp db export > /var/backups/…).
 const TRUNCATE_DATA = ["/media/RAID/backup_VServer", "/var/opt/gitlab/backups", "/var/lib/vz/dump"];
 const touchesTruncate = (path) => pathTouches(path, false, TRUNCATE_DATA, []) || vzdumpAny(path, false);
+// Überschreiben per cp, install, ln -f, rsync, tee (Karte t_cef59949, host-run.md 2a):
+// ein Ziel, das eine Datei an denselben Orten nennt, ist ein Treffer — ob sie
+// schon da ist, sieht der Riegel nicht. Ein Verzeichnis als Ziel legt eine neue
+// Sicherung dazu und bleibt Fokus des Türstehers, ebenso ein vzdump-Name an
+// einem fremden Ort: eine Kopie weg vom Backup trägt denselben Namen.
+const backupDir = (path) => TRUNCATE_DATA.includes(path) || path.split("/").filter(Boolean).length === 4 && vzdumpTouches(path, false);
+const copiedOntoBackup = (path) => !backupDir(path) && (pathTouches(path, false, TRUNCATE_DATA, []) || vzdumpTouches(path.replace(/[^/]*$/, "_"), false));
+// Die Operanden von cp, install, ln, rsync ohne die Werte ihrer Optionen
+// (install -m 600 a b, cp -S .alt a b).
+function copyOperands(args) {
+  const out = [];
+  for (let k = 0; k < args.length; k += 1) {
+    if (/^-(?:m|o|g|S|t)$|^--(?:mode|owner|group|suffix|target-directory)$/.test(args[k])) { k += 1; continue; }
+    if (!args[k].startsWith("-")) out.push(args[k]);
+  }
+  return out;
+}
 const DATA_ANCESTORS = ancestorsOf(DATA);
 const touchesData = (path, bulk) => pathTouches(path, bulk, DATA, DATA_ANCESTORS) || vzdumpAny(path, bulk);
 const touchesBolted = (path) => pathTouches(path, true, BOLTED, BOLTED_ANCESTORS) || vzdumpAny(path, true);
@@ -2316,7 +2335,15 @@ function segmentBolt(text, command, name, readOnly, cwds, context, line, piped) 
   const operands = args.filter((arg) => !arg.startsWith("-"));
   let deleted = [];
   let overwritten = [];
+  let copiedOnto = [];
   const written = resolveAll(redirectTargets(text));
+  // Das Ziel eines Kopierbefehls, wenn es eine Datei ist: genau ein Quell- und
+  // ein Zieloperand, kein -t, kein / am Ende (sonst ein Verzeichnis).
+  const fileDest = () => {
+    const ops = copyOperands(args);
+    if (ops.length !== 2 || /\/$/.test(ops[1]) || args.some((arg) => /^(?:-t|--target-directory)(?:=|$)/.test(arg) || name !== "rsync" && /^-[a-zA-Z]+$/.test(arg) && arg.includes("t"))) return [];
+    return resolveAll([ops[1]]);
+  };
   if (DELETERS.has(name) || name === "mv" || (name === "git" && args.some((arg) => arg === "clean" || arg === "rm"))) deleted = resolveAll(words);
   else if (name === "find") {
     const exec = args.findIndex((arg) => /^-(?:exec|execdir|ok|okdir)$/.test(arg));
@@ -2330,15 +2357,21 @@ function segmentBolt(text, command, name, readOnly, cwds, context, line, piped) 
     if (args.some((arg) => arg.startsWith("--remove-source-files"))) deleted = resolveAll(words);
     else if (dest && args.some((arg) => /^--(?:delete|del\b)/.test(arg))) deleted = resolveAll(dest.split(/[=:,]/).filter(Boolean));
     if (dest) written.push(...resolveAll(dest.split(/[=:,]/).filter(Boolean)));
+    copiedOnto = fileDest();
   } else if (OVERWRITERS.has(name)) {
     overwritten = name === "dd" ? resolveAll(args.filter((arg) => arg.startsWith("of=")).map((arg) => arg.slice(3))) : resolveAll(words);
   } else if (name === "cp" || name === "install" || name === "ln") {
     const target = args.find((arg, index) => args[index - 1] === "-t" || args[index - 1] === "--target-directory") || args.find((arg) => arg.startsWith("--target-directory="))?.slice(19);
     written.push(...resolveAll(name === "install" && args.includes("-d") ? operands : [target || operands.at(-1)].filter(Boolean)));
+    // ln ohne -f scheitert an einer vorhandenen Datei; install -d legt Verzeichnisse an.
+    if (!(name === "install" && args.includes("-d")) && (name !== "ln" || args.some((arg) => /^-[a-zA-Z]*f/.test(arg) || arg === "--force"))) copiedOnto = fileDest();
   } else if (name === "sed" || name === "perl") {
     // Nur mit -i schreiben sie eine Datei, und dann überschreiben sie sie.
     if (args.some((arg) => /^-[a-zA-Z]*i/.test(arg) || arg.startsWith("--in-place"))) { written.push(...resolveAll(words)); overwritten = resolveAll(words); }
-  } else if (WRITERS.has(name)) written.push(...resolveAll(words));
+  } else if (WRITERS.has(name)) {
+    written.push(...resolveAll(words));
+    if (name === "tee" && !args.some((arg) => /^-[a-zA-Z]*a/.test(arg) || arg === "--append")) copiedOnto = resolveAll(words);
+  }
 
   // 5: Ein Optionswert aus mehreren Wörtern in Quotes (systemd-run --description
   // "alte Sicherungen" rm …) verschiebt das Befehlswort. Darum zählt auch ein
@@ -2349,6 +2382,7 @@ function segmentBolt(text, command, name, readOnly, cwds, context, line, piped) 
   if (deleted.some((path) => touchesBolted(path) || namesUnit(path))) return `${name} deletes or moves backups or their configuration`;
   if (overwritten.some((path) => touchesConfig(path) || touchesData(path, false) || namesUnit(path))) return `${name} overwrites backups or their configuration`;
   if (resolveAll(truncateTargets(text)).some(touchesTruncate)) return `${name || "a redirect"} truncates backups`;
+  if (copiedOnto.some(copiedOntoBackup)) return `${name} overwrites a backup file (cp, install, ln -f, rsync or tee onto a file where only the backup tool writes)`;
   if (written.some((path) => touchesConfig(path) || namesUnit(path))) return `${name} writes the backup configuration, retention, keys or timer`;
 
   // Auf Lab0, dem Rechner mit dem borg-Repo: jedes Löschen, und jeder Befehl,
