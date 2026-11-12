@@ -266,10 +266,13 @@ function resolve(path: string, cwd: string | null): string | null {
 // redirections, separators, groups and a leading backslash (Restbefund R1,
 // t_d3e3959f: wartung>/log, wartung&>/dev/null, wartung</dev/null, \wartung,
 // {wartung,}). The same split for relative names after cd and for PATH names.
-const NAME_SPLIT = /[\s'"=<>&|;()\\{},`]+/;
+// Quotes and backslashes are removed before the split, as bash removes them
+// (B6, t_1748d6c1: w\artung and wa''rtung run wartung; \wartung, 'wartung' and
+// x='wartung' still name it).
+const NAME_SPLIT = /[\s=<>&|;(){},`]+/;
 
 function namesIn(text: string): string[] {
-  return text.split(NAME_SPLIT).filter((word) => /^[A-Za-z0-9_+@%][A-Za-z0-9._+@%-]*$/.test(word));
+  return text.replace(/['"\\]/g, "").split(NAME_SPLIT).filter((word) => /^[A-Za-z0-9_+@%][A-Za-z0-9._+@%-]*$/.test(word));
 }
 
 function pathsIn(text: string, cwd: string | null): string[] {
@@ -357,6 +360,12 @@ function writesOf(segment: Segment, heredoc: boolean, cwd: string | null): Write
     const sources = files.map((source) => resolve(source, cwd)).filter((source): source is string => Boolean(source));
     const into = resolve(destination, cwd);
     if (!into) return out;
+    // A recursive copy, rsync or mv replaces whole trees below the destination
+    // (B3, t_1748d6c1: cp -r /srv/x/. /opt/x/, rsync -a /srv/x/ /opt/x/, mv /srv/x /opt/x).
+    if (command === "mv" || command === "rsync" || (command === "cp" && args.some((word) => /^-[A-Za-z]*[rRa]|^--(?:recursive|archive)$/.test(word)))) {
+      out.push({ path: into, kind: "tree" });
+      for (const source of sources) out.push({ path: posix.join(into, basename(source)), kind: "tree" });
+    }
     out.push({ path: into, kind: "hidden", from: sources });
     for (const source of sources) out.push({ path: posix.join(into, basename(source)), kind: "hidden", from: [source] });
   } else if (command === "dd") {
@@ -380,15 +389,35 @@ interface ScriptLine {
   where: string;
   text: string;
   body: boolean;
+  // The line opens a heredoc whose body is its literal content: the delimiter is
+  // quoted, or the body holds neither $ nor backticks (B5, t_1748d6c1).
   heredoc: boolean;
+  // Every shell body around the line has a quoted delimiter and runs on this host
+  // in this root (B1, t_1748d6c1); top-level lines are trusted.
+  trusted: boolean;
   parts: Array<{ segment: Segment; cwd: string | null }>;
 }
 
 // Commands that run a heredoc body as shell code (bash <<'X', sudo bash -s,
 // sudo -s, su, runuser, ssh, cat <<'X' | bash); "" is a segment of wrappers only.
-const HEREDOC_SHELL = /^(?:sh|bash|dash|zsh|ksh|mksh|ash|busybox|su|runuser|ssh|)$/;
+const HEREDOC_SHELL = /^(?:sh|bash|dash|zsh|ksh|mksh|ash|busybox|fish|csh|tcsh|su|runuser|ssh|)$/;
 // A shell named anywhere in the segment (sudo -u root sh), bare or below /bin, /usr/bin.
-const SHELL_NAME = /^(?:\/(?:usr\/)?bin\/)?(?:sh|bash|dash|zsh|ksh|mksh|ash|busybox)$/;
+const SHELL_NAME = /^(?:\/(?:usr\/)?bin\/)?(?:sh|bash|dash|zsh|ksh|mksh|ash|busybox|fish|csh|tcsh)$/;
+// source /dev/stdin and . - read the heredoc as shell code as well (B4, t_1748d6c1).
+const STDIN_FILE = /^(?:-|\/dev\/stdin|\/dev\/fd\/0|\/proc\/self\/fd\/0)$/;
+// Commands in front of a shell body that run it on another host, in a container
+// or in another root (B1, t_1748d6c1): what the body writes there is not the file
+// this run checks and executes here.
+const ELSEWHERE = /^(?:ssh|chroot|arch-chroot|nsenter|unshare|lxc-attach|systemd-nspawn|machinectl|docker|podman|nerdctl|pct|lxc|incus|kubectl|virsh)$/;
+
+// Does a segment of the opener chain read the heredoc body as shell code?
+// Words are cut at "<", so bash<<'X' is bash (B4, t_1748d6c1).
+function readsShell(segment: Segment): boolean {
+  const words = plainWords(segment.words.map((word) => word.split("<")[0]).filter(Boolean));
+  const command = commandOf(words);
+  if (/^(?:source|\.)$/.test(command)) return words.some((word) => STDIN_FILE.test(word));
+  return HEREDOC_SHELL.test(command) || words.some((word) => SHELL_NAME.test(word));
+}
 
 // Lines of all steps and checks in order; heredoc bodies are marked, whole-line
 // comments and heredoc terminators dropped, a line ending in a backslash joined
@@ -405,7 +434,7 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
   const out: ScriptLine[] = [];
   for (const { prefix, text } of scripts) {
     let cwd: string | null = null;
-    const open: Array<{ delimiter: string; shell: boolean; cwd: string | null }> = [];
+    const open: Array<{ delimiter: string; shell: boolean; cwd: string | null; trusted: boolean }> = [];
     const rows = text.split("\n");
     for (let index = 0; index < rows.length; index += 1) {
       let line = rows[index];
@@ -417,8 +446,8 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
         continue;
       }
       if (inner && !inner.shell) {
-        if (/^\s*#/.test(line) || CHECKSUM_ENTRY.test(line)) { out.push({ where, text: line, body: true, heredoc: false, parts: [] }); continue; }
-        out.push({ where, text: line, body: true, heredoc: false, parts: segmentsOf(line).map((segment) => ({ segment, cwd: null })) });
+        if (/^\s*#/.test(line) || CHECKSUM_ENTRY.test(line)) { out.push({ where, text: line, body: true, heredoc: false, trusted: false, parts: [] }); continue; }
+        out.push({ where, text: line, body: true, heredoc: false, trusted: false, parts: segmentsOf(line).map((segment) => ({ segment, cwd: null })) });
         continue;
       }
       if (/^\s*#/.test(line)) continue;
@@ -436,15 +465,24 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
         }
         return part;
       });
-      out.push({ where, text: line, body: false, heredoc: Boolean(opener), parts });
+      const trusted = inner ? inner.trusted : true;
+      const quoted = Boolean(opener?.[1]);
+      let literal = false;
+      if (opener) {
+        const end = rows.findIndex((row, at) => at > index && row.trim() === opener[2]);
+        literal = quoted || !/[$`]/.test(rows.slice(index + 1, end < 0 ? rows.length : end).join("\n"));
+      }
+      out.push({ where, text: line, body: false, heredoc: literal, trusted, parts });
       if (opener) {
         // The shell that reads the body: the command with the heredoc or one its output is piped into.
         let shell = false;
+        let here = true;
         for (let at = Math.max(0, segments.findIndex((segment) => segment.text.includes("<<"))); at < segments.length && !shell; at += 1) {
-          shell = HEREDOC_SHELL.test(commandOf(plainWords(segments[at].words))) || segments[at].words.some((word) => SHELL_NAME.test(word));
+          shell = readsShell(segments[at]);
+          if (segments[at].words.some((word) => ELSEWHERE.test(basename(word.split("<")[0])))) here = false;
           if (segments[at].pipedInto === null) break;
         }
-        open.push({ delimiter: opener[2], shell, cwd });
+        open.push({ delimiter: opener[2], shell, cwd, trusted: trusted && quoted && here });
       }
     }
   }
@@ -501,8 +539,8 @@ const OPTION_WITH_VALUE = /^-(?:[ugnt]|-user|-group)$/;
 // Fail safe: a segment whose command is not on KEEPS_CONTENT, or whose output goes
 // into one or into xargs, and that names a path this run has shown, takes the
 // heredoc back — unless it runs that path: the path is the command, or follows
-// only wrappers, shells/interpreters, options and assignments (bash /p,
-// sudo -u root /p, sh -c '/p'). sed only reads without -i, -f and without a
+// only wrappers, POSIX shells, options and assignments (bash /p,
+// sudo -u root /p, sh -c '/p'), or comes right after another interpreter (B2). sed only reads without -i, -f and without a
 // script word holding w, W or e (sed -n 1p /p stays free).
 function changesContent(segment: Segment): boolean {
   if (segment.command !== "sed") return !KEEPS_CONTENT.test(segment.command);
@@ -516,14 +554,22 @@ function edits(segment: Segment, receiver: Segment | undefined): boolean {
   return receiver.words.some((word) => /^(?:xargs|parallel)$/.test(basename(word))) || changesContent(receiver);
 }
 
+// Interpreters that are no POSIX shell: their options may edit the file they
+// name (perl -i -pe…, ruby -i, gawk --include=inplace), so the path runs only as
+// the word right after them, for the awk family only right after -f (B2, t_1748d6c1).
+const INTERPRETERS = /^(?:python[\d.]*|perl[\d.]*|ruby[\d.]*|node|nodejs|php[\d.]*|lua[\d.]*|Rscript|pwsh)$/;
+const AWKS = /^(?:awk|gawk|mawk|nawk)$/;
+
 function executes(segment: Segment, path: string, cwd: string | null): boolean {
-  const words = segment.words.map((word) => word.replace(/^\\+/, "").split(/[<>&|;]/)[0]);
+  const words = segment.words.map((word) => word.replace(/\\/g, "").split(/[<>&|;]/)[0]);
   const names = (word: string | undefined) => word !== undefined && (resolve(word, cwd) === path || (PATH_DIRS.has(posix.dirname(path)) && word === basename(path)));
   for (let i = 0; i < words.length; i += 1) {
     const word = words[i];
     if (names(word)) return true;
     if (word.startsWith("-")) { if (OPTION_WITH_VALUE.test(word) && !names(words[i + 1])) i += 1; continue; }
     const name = basename(word);
+    if (INTERPRETERS.test(name)) return names(words[i + 1]);
+    if (AWKS.test(name)) return words[i + 1] === "-f" && names(words[i + 2]);
     if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word) || /^\d+[smhd]?$/.test(word) || PREFIX_WORDS.test(name) || SHELL_WORDS.test(name) || RUN_WRAPPERS.test(name)) continue;
     return false;
   }
@@ -541,29 +587,38 @@ export function hiddenPinnedScripts(manifest: Pick<HostRunManifest, "steps" | "c
     if (!line.body) {
       for (const [index, { segment, cwd }] of line.parts.entries()) {
         for (const write of writesOf(segment, line.heredoc, cwd)) {
+          // In a shell body with an unquoted delimiter, or one that runs on another
+          // host, in a container or another root, nothing written is the content the
+          // plan shows for this host (B1, t_1748d6c1); overwrites and runs are read on.
+          const shows = line.trusted;
           const before = state.get(write.path);
           if (write.kind === "append") {
-            if (before?.kind === "visible") continue;
+            if (before?.kind === "visible" && shows) continue;
             state.set(write.path, { kind: "hidden", where: line.where, visibleBefore: false });
           } else if (write.kind === "tree") {
             const prefix = write.path.endsWith("/") ? write.path : `${write.path}/`;
             for (const path of new Set([...state.keys(), ...pinned.keys()])) {
-              if (path.startsWith(prefix)) state.set(path, { kind: "hidden", where: line.where, visibleBefore: state.get(path)?.kind === "visible" });
+              if (path.startsWith(prefix)) state.set(path, { kind: "hidden", where: line.where, visibleBefore: state.get(path)?.kind === "visible" || Boolean(state.get(path)?.visibleBefore) });
             }
           } else if (write.from) {
             // A copy of a pinned file is pinned as well; its content is as visible as its sources'.
             const pinnedSource = write.from.map((source) => pinned.get(source)).find(Boolean);
             if (pinnedSource && !pinned.has(write.path)) pinned.set(write.path, pinnedSource);
             const kinds = write.from.map((source) => state.get(source)?.kind);
-            const kind = kinds.length && kinds.every((item) => item === "visible") ? "visible" : kinds.length && kinds.every((item) => item === "download") ? "download" : "hidden";
+            const kind = !shows ? "hidden" : kinds.length && kinds.every((item) => item === "visible") ? "visible" : kinds.length && kinds.every((item) => item === "download") ? "download" : "hidden";
             state.set(write.path, { kind, where: line.where, visibleBefore: before?.kind === "visible" || Boolean(before?.visibleBefore) });
           } else {
-            state.set(write.path, { kind: write.kind, where: line.where, visibleBefore: before?.kind === "visible" || Boolean(before?.visibleBefore) });
+            state.set(write.path, { kind: shows ? write.kind : "hidden", where: line.where, visibleBefore: before?.kind === "visible" || Boolean(before?.visibleBefore) });
           }
         }
         if (!edits(segment, line.parts[index + 1]?.segment)) continue;
         const visible = [...state].filter(([, item]) => item.kind === "visible").map(([path]) => path);
-        for (const path of new Set([...pathsIn(segment.text, cwd), ...namedInPath(segment.text, visible)])) {
+        const named = pathsIn(segment.text, cwd);
+        // It also works on a shown path when it names an ancestor of it or runs in
+        // one (B3, t_1748d6c1: cd /opt/x && patch -p1 < /srv/fix.diff, git -C /opt/x checkout -- .).
+        const ancestors = [...named, ...(cwd ? [cwd] : [])].map((dir) => dir.endsWith("/") ? dir : `${dir}/`);
+        const below = visible.filter((path) => ancestors.some((dir) => path.startsWith(dir)));
+        for (const path of new Set([...named, ...namedInPath(segment.text, visible), ...below])) {
           if (state.get(path)?.kind !== "visible" || executes(segment, path, cwd)) continue;
           state.set(path, { kind: "hidden", where: line.where, visibleBefore: true });
         }

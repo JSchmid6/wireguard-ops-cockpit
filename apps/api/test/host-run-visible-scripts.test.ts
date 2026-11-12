@@ -414,3 +414,101 @@ describe("hash-pinned scripts: names next to redirections, in-place editors, her
     expect(hidden(`bash <<'X'\ncat > /tmp/a <<'EOF'\ncat > ${P} <<'Y'\nEOF\nX\n${pin}\n${P}`)).toHaveLength(1);
   });
 });
+
+// Befunde B1–B6 der Zweitprüfung t_1748d6c1 (PR #86), Nacharbeit t_8b84f3a6:
+// /opt/data/out/t_1748d6c1/zweitpruefung-pr86.md, Probe probe5.ts.
+describe("hash-pinned scripts: shell bodies elsewhere or unquoted, interpreter options, tree writes (Befund t_1748d6c1)", () => {
+  const P = "/opt/x/run.sh";
+  const W = "/usr/local/sbin/wartung";
+  const pin = `echo "${HASH}  ${P}" | sha256sum -c -`;
+  const pinW = `echo "${HASH}  ${W}" | sha256sum -c -`;
+  const shown = `cat > ${P} <<'EOF'\necho hi\nEOF`;
+  const hidden = (...runs: string[]) => hiddenPinnedScripts(manifest(runs.map((run, index) => ({ name: `s${index + 1}`, run }))) as never);
+  const body = `cat > ${P} <<'EOF'\necho hi\nEOF`;
+
+  it("B1: a script written in a shell body with an unquoted delimiter is not shown (the caller expands it)", () => {
+    expect(hidden(`bash <<X\ncat > ${P} <<'EOF'\n$(curl -s https://example.org/x)\nEOF\nX\n${pin}\n${P}`)).toHaveLength(1);
+    expect(hidden(`bash <<X\n${body}\nX\n${pin}\n${P}`)).toHaveLength(1);
+  });
+
+  for (const opener of ["ssh other <<'X'", "docker exec -i c bash <<'X'", "podman exec -i c sh <<'X'", "pct exec 121 -- bash <<'X'", "lxc-attach -n c -- bash <<'X'", "chroot /mnt bash <<'X'", "nsenter -t 1 -m bash <<'X'", "systemd-nspawn -D /srv/root bash <<'X'", "machinectl shell c /bin/bash <<'X'", "cat <<'X' | ssh other"]) {
+    it(`B1: a script written in a body run elsewhere is not the local file: ${opener}`, () => {
+      expect(hidden(`${opener}\n${body}\nX\n${pin}\n${P}`)).toEqual([{ path: P, pinnedAt: "S1:L6", executedAt: "S1:L7" }]);
+    });
+  }
+
+  it("B1: still reads overwrites and runs inside such a body", () => {
+    expect(hidden(`${shown}\nssh other <<'X'\ncp /srv/evil.sh ${P}\nX\n${pin}\n${P}`)).toHaveLength(1);
+    expect(hidden(pin, `bash <<X\n${P}\nX`)).toEqual([{ path: P, pinnedAt: "S1:L1", executedAt: "S2:L2" }]);
+  });
+
+  it("B1 guard: a quoted local shell body that writes the script literally stays shown", () => {
+    expect(hidden(`bash <<'X'\n${body}\nX\n${pin}\n${P}`)).toEqual([]);
+    expect(hidden(`sudo bash -s <<'X'\nsudo -u root bash <<'Y'\n${body}\nY\nX\n${pin}\n${P}`)).toEqual([]);
+  });
+
+  const b2 = [
+    `perl -i -pes/hi/ho/ ${P}`,
+    `perl -pi -es/hi/ho/ ${P}`,
+    `sudo perl -i -pes/a/b/ ${P}`,
+    `ruby -i -pe'$_="id"' ${P}`,
+    `gawk --include=inplace 1 ${P}`,
+    `gawk -iinplace '--source={$0="id"}1' ${P}`,
+    `AWKPATH=/srv gawk --include=inplace --include=evil 1 ${P}`,
+    `PERL5OPT=-Mevil perl -i -p ${P}`,
+  ];
+  for (const edit of b2) {
+    it(`B2: an interpreter option before the path is an edit, not a run: ${edit}`, () => {
+      expect(hidden(`${shown}\n${edit}\n${pin}\n${P}`)).toEqual([{ path: P, pinnedAt: "S1:L5", executedAt: "S1:L4", overwrittenAt: "S1:L4" }]);
+    });
+  }
+
+  it("B2 guard: the path right after an interpreter, after awk -f, and after shells with options or wrappers still runs", () => {
+    const uses = [`perl ${P}`, `python3 ${P}`, `sudo ruby ${P}`, `awk -f ${P} /etc/hostname`, `bash -n ${P}`, `bash -x ${P}`, `timeout 60 ${P}`, `nice -n 5 ${P}`];
+    expect(hidden(`${shown}\n${uses.join("\n")}\n${pin}\n${P}`)).toEqual([]);
+  });
+
+  for (const tree of [`cp -r /srv/x/. /opt/x/`, `cp -a /srv/x /opt/`, `rsync -a /srv/x/ /opt/x/`, `rm -r /opt/x && mv /srv/x /opt/x`, `cd /opt/x && patch -p1 < /srv/fix.diff`, `git -C /opt/x checkout -- .`]) {
+    it(`B3: a write or edit on a directory above the shown script takes it back: ${tree}`, () => {
+      const result = hidden(`${shown}\n${tree}\n${pin}\n${P}`);
+      expect(result).toHaveLength(1);
+      expect(result[0]).toMatchObject({ path: P, pinnedAt: "S1:L5", executedAt: "S1:L6", overwrittenAt: "S1:L4" });
+    });
+  }
+
+  it("B3 guard: a plain copy into the directory, reading commands there and a run from there leave the shown script alone", () => {
+    expect(hidden(`${shown}\ncp /srv/other.conf /opt/x/\ncd /opt/x && ls -l && sha256sum run.sh\ncd /opt/x && bash run.sh\nchmod -R 0755 /opt/x\n${pin}\n${P}`)).toEqual([]);
+    expect(hidden(`rsync -a /srv/x/ /opt/x/\n${shown}\n${pin}\n${P}`)).toEqual([]);
+  });
+
+  for (const [label, opener] of [["bash<<'X'", "bash<<'X'"], ["source /dev/stdin <<'X'", "source /dev/stdin <<'X'"], [". /dev/stdin <<'X'", ". /dev/stdin <<'X'"], ["fish <<'X'", "fish <<'X'"]]) {
+    it(`B4: reads the body of ${label} as shell code`, () => {
+      expect(hidden(`${shown}\n${opener}\ncp /srv/evil.sh ${P}\nX\n${pin}\n${P}`)).toEqual([{ path: P, pinnedAt: "S1:L7", executedAt: "S1:L8", overwrittenAt: "S1:L5" }]);
+    });
+  }
+
+  it("B4 guard: source of a file and a heredoc into another command stay content", () => {
+    expect(hidden(`${shown}\nsource /etc/os-release <<'X'\ncp /srv/evil.sh ${P}\nX\n${pin}\n${P}`)).toEqual([]);
+  });
+
+  it("B5: an unquoted heredoc with $ or backticks does not show the script", () => {
+    expect(hidden(`cat > ${P} <<EOF\n$(curl -s https://example.org/x)\nEOF\n${pin}\n${P}`)).toHaveLength(1);
+    expect(hidden(`tee ${P} <<EOF\n\`id\`\nEOF\n${pin}\n${P}`)).toHaveLength(1);
+    expect(hidden(`install -m 0755 /dev/stdin ${P} <<EOF\necho $HOME\nEOF\n${pin}\n${P}`)).toHaveLength(1);
+  });
+
+  it("B5 guard: an unquoted heredoc without $ and backticks, and a quoted one with them, are shown", () => {
+    expect(hidden(`cat > ${P} <<EOF\necho hi\nEOF\n${pin}\n${P}`)).toEqual([]);
+    expect(hidden(`cat > ${P} <<'EOF'\necho "$HOME" \`id\`\nEOF\n${pin}\n${P}`)).toEqual([]);
+  });
+
+  for (const run of ["w\\artung", "wa''rtung", "\"wart\"ung", "\\wartung", "x='wartung'"]) {
+    it(`B6: removes quotes and backslashes before splitting names: ${run}`, () => {
+      expect(hidden(pinW, run)).toEqual([{ path: W, pinnedAt: "S1:L1", executedAt: "S2:L1" }]);
+    });
+  }
+
+  it("B6 guard: other words around quotes stay other names", () => {
+    expect(hidden(pinW, "echo 'wartung-ok'\napt-get install -y \"wartungstool\"")).toEqual([]);
+  });
+});

@@ -126,7 +126,7 @@ GitLab-Stufen, Dienst-Neustarts.
 **Jedes ausgeführte Skript steht wörtlich im Plan** (05.11.2026, Befund X5 aus Job 26fb0860,
 Karte t_41cb8b49; nachgeschärft 09.11.2026 nach Zweitprüfung t_740ac6ee, Karte t_11872429,
 11.11.2026 nach Zweitprüfung t_af29564c, Karte t_0e05c213, und 12.11.2026 nach Zweitprüfung
-t_d3e3959f, Karte t_5d6eff99): Ein
+t_d3e3959f, Karte t_5d6eff99, sowie nach Zweitprüfung t_1748d6c1, Karte t_8b84f3a6): Ein
 stündlicher root-Dienst führte ein Skript aus, das der Lauf nur per Hash festnagelte
 (`printf '<sha256>  /pfad' | sha256sum -c -`); die Unit-Datei stand per Heredoc wörtlich im Plan,
 das Skript nicht — der Türsteher sah einen Hash statt Code. Seitdem lehnt schon
@@ -152,7 +152,8 @@ Die Regel im Einzelnen (`hiddenPinnedScripts` in `apps/api/src/host-run.ts`):
   (`… sha256sum -c - && wartung`, `sudo wartung --jetzt`, `runuser -u x -- wartung`, `ExecStart=wartung`);
   fail-safe jedes Wort, nicht nur das Befehlswort (Entscheidung 11.11.2026). Wörter für Basisnamen und
   relative Namen nach `cd` trennt die Regel an Leerraum, Quotes, `=` und an `<>&|;(){},\`
-  sowie Backticks (12.11.2026, R1): `wartung>/var/log/w.log`, `wartung&>/dev/null`, `wartung</dev/null`,
+  sowie Backticks (12.11.2026, R1); Quotes und Backslashes entfernt sie vorher, wie bash
+  (12.11.2026, B6: `w\artung`, `wa''rtung` zählen wie `wartung`): `wartung>/var/log/w.log`, `wartung&>/dev/null`, `wartung</dev/null`,
   `\wartung`, `{wartung,}`, `cd /opt/x && bash run.sh>/tmp/l` zählen wie das blanke Wort. Eine Zeile mit
   `\` am Ende wird außerhalb von Inhalts-Heredocs vor dem Zerlegen mit der Folgezeile verbunden; die
   Fundstelle ist die erste Zeile (`install -m 0755 \` + `/srv/run.sh /opt/x/run.sh`, `cat /p \` + `| bash`).
@@ -165,14 +166,25 @@ Die Regel im Einzelnen (`hiddenPinnedScripts` in `apps/api/src/host-run.ts`):
   `echo`-Meldung ohne Digest zählt auch, beim Basisnamen ebenso ein gleichlautendes Wort (`apt-get install
   wartung`, `command -v wartung`); der Planer schreibt ihn dann anders.
   **Heredoc an eine Shell** (12.11.2026, R3): Den Körper eines Heredocs, den eine Shell ausführt
-  (`bash <<'X'`, `sudo bash -s <<'X'`, `sudo -s`, `su`, `runuser`, `ssh`, `cat <<'X' | bash`, auch
+  (`bash <<'X'`, auch ohne Leerzeichen `bash<<'X'`, `sudo bash -s <<'X'`, `sudo -s`, `su`, `runuser`,
+  `ssh`, `fish`, `source /dev/stdin <<'X'`, `. /dev/stdin <<'X'`, `cat <<'X' | bash`, auch
   `| sudo -u root sh`), liest die Regel wie die Skriptzeilen um ihn herum — Schreibvorgänge, `cd`,
   Fortsetzungszeilen, Heredocs darin; nur der Körper jedes anderen Heredocs (`cat > /datei`, `python3 -`,
   auch ein Inhalts-Heredoc in einem Shell-Körper) ist Inhalt. Ein Skript, das ein Shell-Körper per Heredoc
-  schreibt, gilt als gezeigt.
+  schreibt, gilt nur dann als gezeigt, wenn der Begrenzer dieses und jedes umschließenden Shell-Körpers
+  gequotet ist und keiner davon woanders läuft (12.11.2026, B1): Bei `bash <<X` expandiert die aufrufende
+  Shell `$(…)` schon beim Bau des Körpers, und was ein Körper hinter `ssh`, `docker`/`podman exec`,
+  `pct exec`, `lxc-attach`, `chroot`, `nsenter`, `unshare`, `systemd-nspawn`, `machinectl` (auch `kubectl`,
+  `incus`, `lxc`, `virsh`) schreibt, ist nicht die Datei, die dieser Lauf hier prüft und ausführt. Dort zählt
+  jeder Schreibvorgang als nicht gezeigt; Überschreiben und Ausführen liest die Regel dort weiter.
 - **Geschrieben** zählt nur der letzte Schreibvorgang vor der Ausführung, und nur, wenn er den Inhalt
   zeigt: `cat >`/`tee` mit Heredoc, `install … /dev/stdin <ziel>` mit Heredoc, `echo`/`printf` ohne
-  `$`/Backticks, eine Kopie eines so geschriebenen Skripts. Anhängen (`cat >>`, `tee -a`) an eine nicht
+  `$`/Backticks, eine Kopie eines so geschriebenen Skripts. Ein Heredoc zeigt den Inhalt nur, wenn sein
+  Begrenzer gequotet ist oder der Körper weder `$` noch Backticks enthält (12.11.2026, B5: dieselbe Regel
+  wie bei `echo`/`printf`; `cat > /p <<EOF` mit `$(curl …)` im Körper zeigt nicht, was in der Datei landet),
+  und nur außerhalb der Shell-Körper aus B1. Eine rekursive Kopie (`cp -r`/`-R`/`-a`), `rsync` und `mv`
+  heben jeden gezeigten Pfad unter dem Ziel (und unter Ziel/Basisname der Quelle) auf wie `tar -x`
+  (12.11.2026, B3: `cp -r /srv/x/. /opt/x/`, `rsync -a /srv/x/ /opt/x/`, `rm -r /opt/x && mv /srv/x /opt/x`). Anhängen (`cat >>`, `tee -a`) an eine nicht
   gezeigte Datei macht sie nicht sichtbar; ein späteres Überschreiben (`cp`, `mv`, `install`, `dd of=`,
   `curl -o`, `wget -O`, `> /pfad`, `tar -x`/`unzip` in das Verzeichnis) hebt den Heredoc auf. Ebenso
   jedes `sed -i`/`--in-place` auf den Pfad (Entscheidung 11.11.2026, Hinweis aus t_af29564c): Mit `$(…)`,
@@ -184,12 +196,22 @@ Die Regel im Einzelnen (`hiddenPinnedScripts` in `apps/api/src/host-run.ts`):
   ohnehin liest (`KEEPS_CONTENT`: die stillen Befehle ohne `curl`, `wget`, `tar`, `unzip`, `openssl`,
   `gpg`, dazu `echo`, `printf`, `tee`, `logger`, `shellcheck`; `sed` nur ohne `-i`/`-f` und ohne
   Skriptwort mit `w`, `W`, `e`), und die Ausführung selbst: Der Pfad ist das Befehlswort oder folgt nur
-  auf Wrapper, Shells/Interpreter, Optionen und Zuweisungen (`bash /p`, `bash -n /p`, `sudo -u root /p`,
-  `runuser -u x -- /p`, `timeout 60 /p`, `sh -c '/p'`). Ebenso eine Ausgabe, die den Pfad nennt und in
+  auf Wrapper, POSIX-Shells, Optionen und Zuweisungen (`bash /p`, `bash -n /p`, `sudo -u root /p`,
+  `runuser -u x -- /p`, `timeout 60 /p`, `sh -c '/p'`). Nach einem Interpreter, der keine POSIX-Shell ist
+  (`perl`, `ruby`, `python`, `node`, `php`, `lua`, `Rscript`, `pwsh`), zählt nur das unmittelbar folgende
+  Wort als ausgeführt, bei der awk-Familie nur das Wort direkt nach `-f` (12.11.2026, B2): Optionen wie
+  `perl -i -pe…`, `ruby -i`, `gawk --include=inplace` ändern die Datei. Ein Befehl, der den Pfad nicht
+  nennt, aber einen Vorfahren davon nennt oder in einem arbeitet (sein `cd`), wirkt ebenso auf ihn
+  (12.11.2026, B3: `cd /opt/x && patch -p1 < /srv/fix.diff`, `git -C /opt/x checkout -- .`). Ebenso eine Ausgabe, die den Pfad nennt und in
   einen ändernden Befehl oder `xargs` geht (`echo /p | xargs perl -pi …`); in eine Shell gepipt bleibt sie
   Ausführung. Preis: Ein gezeigtes Skript, das ein anderer Befehl zwischen Heredoc und Ausführung nennt
-  (`python3 -W ignore /p`, `flock /lock /p`, `setcap … /p`), zählt als überschrieben; der Planer schreibt
-  den Aufruf dann als `bash /p` bzw. den Heredoc nach dem Befehl.
+  (`python3 -W ignore /p`, `python3 -u /p`, `flock /lock /p`, `setcap … /p`), zählt als überschrieben, ebenso
+  eines unter einem Verzeichnis, in dem zwischen Heredoc und Ausführung ein nicht stiller Befehl arbeitet
+  (`cd /opt/app && npm ci`, `find /opt -name …`) oder das eine rekursive Kopie, `rsync` oder `mv` trifft
+  (auch wenn es nur eine Datei hineinlegt: `mv /tmp/a.conf /opt/x/`); der Planer schreibt den Aufruf dann
+  als `python3 /p` bzw. `bash /p` oder den Heredoc nach diesen Befehlen. Ein Skript, das ein Shell-Körper
+  mit ungequotetem Begrenzer oder auf einem anderen Host schreibt, gilt als nicht gezeigt; der Planer
+  quotet den Begrenzer (`bash <<'X'`) bzw. schreibt und prüft das Skript dort, wo es läuft.
 - **Nicht unter der Regel** (Entscheidung 09.11.2026, sonst belohnt sie das Weglassen der Prüfung —
   ohne Hash wäre der Plan frei): ein Programm, das dieser Lauf selbst lädt (`curl -o`, `wget -O`) und
   prüft, sofern es kein Skript ist (Endung `.sh`, `.py` … oder Aufruf über Shell/Interpreter — ein
@@ -202,8 +224,8 @@ Ein geprüfter Download, der nur entpackt wird, und ein Skript ohne Hash bleiben
 Plan anders verbirgt (Skript von anderswo ohne Pin, Pfad aus nicht gezeigten Werten), bleibt Fokus des
 Riegels („content this plan does not show“) und X5 des Türstehers. Die Regel ist eine Planer-Hilfe, kein
 Schloss: Sie lehnt nur zusätzlich ab, der Türsteher liest jeden Lauf weiterhin selbst. Tests:
-`apps/api/test/host-run-visible-scripts.test.ts` (alle Fälle der Probe aus t_740ac6ee und der Gegenprobe
-aus t_af29564c, plus die aufgezeichneten Pläne vom 10.10.2026 als Fehlalarm-Gegenprobe).
+`apps/api/test/host-run-visible-scripts.test.ts` (alle Fälle der Probe aus t_740ac6ee, der Gegenprobe
+aus t_af29564c und der Befunde B1–B6 aus t_1748d6c1, plus die aufgezeichneten Pläne vom 10.10.2026 als Fehlalarm-Gegenprobe).
 
 ## 2a. Backup-Riegel: Backups löschen nur mit Freigabe
 
