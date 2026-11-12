@@ -164,6 +164,8 @@ const needsApproval: Array<[string, string]> = [
   ["sources: a path from a variable", "P=/opt/stacks/x\n/usr/local/sbin/cockpit-borg-action sources add \"$Q\""],
   ["sources: an extra argument", "/usr/local/sbin/cockpit-borg-action sources add /opt/stacks/a /opt/stacks/b"],
   ["sources: an option instead of a path", "/usr/local/sbin/cockpit-borg-action sources add --exclude"],
+  // Hinweis H2 (Karte t_0ea98639): add-large hängt eine Quelle ohne Größengrenze an — Jochens Freigabe.
+  ["sources: add-large skips the size limit", "/usr/local/sbin/cockpit-borg-action sources add-large /opt/stacks/gross"],
   ["sources: writing the patterns file directly", "printf 'R /opt/stacks/x\\n' > /etc/borgmatic/cockpit-sources.patterns"],
   ["sources: emptying the patterns file", "truncate -s 0 /etc/borgmatic/cockpit-sources.patterns"],
   // Zweitprüfung PR #69, Befund 1: der Helfer über eine Shell, per source oder unter anderem Namen.

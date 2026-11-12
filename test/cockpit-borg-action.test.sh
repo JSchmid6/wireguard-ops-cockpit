@@ -411,6 +411,7 @@ exit 0
 EOF
 cat > "$STUBS/curl" <<EOF
 #!/usr/bin/env bash
+[ -f "$WORK/curl-fail" ] && { echo "curl: (7) Failed to connect" >&2; exit 7; }
 cat "$FIXTURE_STATUS"
 EOF
 
@@ -1254,11 +1255,30 @@ rm -f "$DB/frame-line"
 # Anschluss samt Rückweg, dass validate jede Änderung zurückrollt und dass weder
 # config.yaml noch die Ausgabe von validate je nach aussen gehen (der
 # borgmatic-Stub zitiert bei validate die ganze Konfiguration).
-SRC="$WORK/sources"; mkdir -p "$SRC/stacks/wejos-wp/data" "$SRC/srv/daten" "$SRC/geheim"
+SRC="$WORK/sources"; mkdir -p "$SRC/stacks/wejos-wp/data" "$SRC/srv/daten" "$SRC/geheim" "$SRC/stacks/gross"
+# 64 KiB echter Inhalt für die Größengrenze (du -sxb zählt Verzeichnisse auf
+# overlayfs mit 0, auf ext4 mit 4096 Byte — darum eine Datei).
+head -c 65536 /dev/zero > "$SRC/stacks/gross/daten.bin"
 ln -s "$SRC/geheim" "$SRC/stacks/verweis"
 printf '%s\n' "# borgmatic — Klartext-Zugangsdaten" "encryption_passphrase: GEHEIM-QUELLEN" > "$SRC/config.yaml"
 chmod 600 "$SRC/config.yaml"; cp -a "$SRC/config.yaml" "$SRC/config-original"
 PAT="$SRC/cockpit-sources.patterns"
+# H1 (Zweitprüfung PR #83): add nimmt den freien Platz nur aus einer höchstens
+# 24 h alten Statusdatei — für die sources-Fälle bekommt sie ein frisches DATE;
+# die Statusdatei der übrigen Fälle (festes DATE) kommt am Ende zurück.
+cp -a "$FIXTURE_STATUS" "$WORK/status-orig"
+sed -i "s/^DATE: .*/DATE: $(date -u +%Y-%m-%dT%H:%M:%S+00:00)/" "$FIXTURE_STATUS"
+# du-Stub für B1/B2: protokolliert die Argumente; mit $WORK/du-partial liefert er
+# die echte Ausgabe, endet aber mit rc=1 (wie bei einem unlesbaren Unterordner).
+REAL_DU="$(PATH="${PATH#"$STUBS:"}" command -v du)"
+cat > "$STUBS/du" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$WORK/du-args"
+"$REAL_DU" "\$@"; rc=\$?
+[ -f "$WORK/du-partial" ] && exit 1
+exit \$rc
+EOF
+chmod 755 "$STUBS/du"
 src() { # src <cgroup-datei> <argumente…>
   local cg="$1"; shift
   run_helper_env COCKPIT_BORG_ACTION_CONFIG="$SRC/config.yaml" COCKPIT_BORG_ACTION_SOURCES_FILE="$PAT" \
@@ -1276,6 +1296,10 @@ src cgroup-run add
 assert_rc "add ohne Pfad" 64
 src cgroup-run add "$SRC/stacks/wejos-wp" "$SRC/srv/daten"
 assert_rc "add mit zwei Pfaden" 64
+src cgroup-run add-large
+assert_rc "add-large ohne Pfad" 64
+src cgroup-run add-large "$SRC/stacks/wejos-wp" "$SRC/srv/daten"
+assert_rc "add-large mit zwei Pfaden" 64
 src cgroup-run status extra
 assert_rc "status mit Extra-Argument" 64
 
@@ -1328,10 +1352,122 @@ src cgroup-run add "$SRC/stacks/wejos-wp"
 assert_rc "add während des Backups abgewiesen" 3
 rm -f "$WORK/borgmatic-busy"
 
+# Größengrenze (Hinweis H2, Karte t_0ea98639): die Quelle darf höchstens ein
+# Viertel des freien Platzes aus der Statusdatei (DF … /media/RAID) belegen; ist
+# Größe oder Platz nicht lesbar, verändert add nichts.
+cp -a "$FIXTURE_STATUS" "$WORK/status-normal"
+kiste_df() { # kiste_df <Avail-Spalte>|ohne: Statusdatei mit diesem freien Platz
+  grep -v '^DF:' "$WORK/status-normal" > "$FIXTURE_STATUS"
+  [ "$1" = ohne ] || printf 'DF: /dev/md126      5,5T    5,5T  %s  100%% /media/RAID\n' "$1" >> "$FIXTURE_STATUS"
+}
+pat_unchanged() { # pat_unchanged <name>: Musterdatei und Sicherungen wie in $SRC/pat-h2
+  if cmp -s "$PAT" "$SRC/pat-h2" && [ "$(ls -1 "$PAT".vor-* 2>/dev/null | wc -l)" = "$h2_backups" ]; then ok "$1"; else bad "$1 — Musterdatei oder Sicherungen verändert"; fi
+}
+echo "== sources add: Quelle zu groß für den freien Platz (H2) =="
+cp -a "$PAT" "$SRC/pat-h2"; h2_backups="$(ls -1 "$PAT".vor-* 2>/dev/null | wc -l)"
+kiste_df 8,0K
+src cgroup-run add "$SRC/stacks/gross"
+assert_rc "große Quelle abgewiesen" 1
+assert_err "Abweisung sagt: braucht Jochen" "Braucht Jochen"
+assert_err "Abweisung nennt den Weg add-large" "sources add-large $SRC/stacks/gross"
+assert_err "Abweisung nennt Grösse und Grenze" "Quellen zusammen 65536 Byte (neu + 0 vorhandene), frei auf der Kiste 8192 Byte, Grenze 1/4 davon = 2048 Byte"
+pat_unchanged "große Quelle: Musterdatei unverändert, keine Sicherung"
+no_config_out "große Quelle: config.yaml nicht in der Ausgabe"
+echo "== sources add: freier Platz nicht lesbar (H2) =="
+kiste_df ohne
+src cgroup-run add "$SRC/stacks/wejos-wp"
+assert_rc "ohne DF-Zeile abgewiesen" 1
+assert_err "ohne DF-Zeile: Platz nicht lesbar" "freier Platz auf der Kiste nicht lesbar"
+kiste_df "viel"
+src cgroup-run add "$SRC/stacks/wejos-wp"
+assert_rc "unlesbare Avail-Spalte abgewiesen" 1
+cp -a "$WORK/status-normal" "$FIXTURE_STATUS"; : > "$WORK/curl-fail"
+src cgroup-run add "$SRC/stacks/wejos-wp"
+assert_rc "Statusdatei nicht erreichbar → abgewiesen" 1
+assert_err "nicht erreichbar: braucht Jochen" "Braucht Jochen"
+rm -f "$WORK/curl-fail"
+pat_unchanged "nicht prüfbar: Musterdatei unverändert"
+echo "== sources add: kleine Quelle, freier Platz in Punkt-Schreibweise (H2) =="
+kiste_df 1.5G
+src cgroup-run add "$SRC/stacks/gross"
+assert_rc "kleine Quelle bei 1.5G frei" 0
+assert_out "add nennt die bestandene Größenprüfung" "größenprüfung: Quellen zusammen 65536 Byte (neu + 0 vorhandene) ≤ 1/4"
+assert_out "freier Platz 1.5G als Byte gelesen" "von 1610612736 Byte frei"
+src cgroup-run restore
+assert_rc "restore nach der Probe" 0
+pat_unchanged "Probe zurückgenommen"
+cp -a "$WORK/status-normal" "$FIXTURE_STATUS"
+
+echo "== sources add: zweites add vor dem nächsten Backup zählt das erste mit (B3, Zweitprüfung PR #83) =="
+mkdir -p "$SRC/stacks/gross2"; head -c 65536 /dev/zero > "$SRC/stacks/gross2/daten.bin"
+kiste_df 400K   # Grenze 102400 Byte: eine Quelle passt, zwei zusammen (≥ 131072) nicht
+src cgroup-run add "$SRC/stacks/gross"
+assert_rc "erste Quelle unter der Grenze" 0
+src cgroup-run add "$SRC/stacks/gross2"
+assert_rc "zweite Quelle: zusammen über der Grenze abgewiesen" 1
+assert_err "B3: Abweisung zählt die vorhandene Quelle mit" "(neu + 1 vorhandene), frei auf der Kiste 409600 Byte, Grenze 1/4 davon = 102400 Byte"
+assert_err "B3: braucht Jochen" "Braucht Jochen"
+if [ "$(r_lines)" = 1 ] && ! grep -qF -- "$SRC/stacks/gross2" "$PAT"; then ok "B3: zweite Quelle nicht eingetragen"; else bad "B3: R-Zeilen $(r_lines)"; fi
+src cgroup-run restore
+assert_rc "restore nach der B3-Probe" 0
+pat_unchanged "B3-Probe zurückgenommen"
+
+echo "== sources add: du endet mit rc≠0 trotz Ausgabe (B2, Zweitprüfung PR #83) =="
+kiste_df 1.5G
+: > "$WORK/du-partial"
+src cgroup-run add "$SRC/stacks/gross"
+assert_rc "du rc=1 mit Teilsumme → abgewiesen" 1
+assert_err "B2: Größe nicht messbar" "Größe nicht messbar"
+rm -f "$WORK/du-partial"
+pat_unchanged "B2: Musterdatei unverändert"
+
+echo "== sources add: Messung über Mountpunkte hinweg (B1, Zweitprüfung PR #83) =="
+: > "$WORK/du-args"
+src cgroup-run add "$SRC/stacks/gross"
+assert_rc "add für die Mount-Probe" 0
+if [ -s "$WORK/du-args" ] && ! grep -qE '(^| )-[A-Za-z]*x' "$WORK/du-args" && ! grep -qF -- '--one-file-system' "$WORK/du-args"; then ok "B1: du misst ohne -x (zählt auch hinter Mountpunkten)"; else bad "B1: du mit -x: $(tr '\n' ';' < "$WORK/du-args")"; fi
+# Mit echtem Bind-Mount, wo der Prüfstand mounten darf: der Inhalt hinter dem
+# Mountpunkt zählt mit und reisst die Grenze.
+kiste_df 400K   # Grenze 102400 Byte; ohne den Mount läge die Quelle samt gross bei 65536
+mkdir -p "$SRC/stacks/mnt-quelle/vol" "$WORK/mnt-ziel"; head -c 262144 /dev/zero > "$WORK/mnt-ziel/daten.bin"
+if mount --bind "$WORK/mnt-ziel" "$SRC/stacks/mnt-quelle/vol" 2>/dev/null; then
+  src cgroup-run add "$SRC/stacks/mnt-quelle"
+  assert_rc "B1: Quelle mit grossem Mount darunter abgewiesen" 1
+  umount "$SRC/stacks/mnt-quelle/vol"
+else
+  echo "  (Bind-Mount hier nicht erlaubt — nur die Argument-Probe)"
+fi
+rmdir "$SRC/stacks/mnt-quelle/vol" "$SRC/stacks/mnt-quelle"
+src cgroup-run restore
+assert_rc "restore nach der B1-Probe" 0
+pat_unchanged "B1-Probe zurückgenommen"
+
+echo "== sources add: Statusdatei zu alt, ohne DATE oder in der Zukunft (H1, Zweitprüfung PR #83) =="
+for when in "-25 hours" "+2 hours" ohne kaputt; do
+  grep -v '^DATE:' "$WORK/status-normal" > "$FIXTURE_STATUS"
+  case "$when" in
+    ohne) ;;
+    kaputt) printf 'DATE: gestern\n' >> "$FIXTURE_STATUS" ;;
+    *) printf 'DATE: %s\n' "$(date -u -d "$when" +%Y-%m-%dT%H:%M:%S+00:00)" >> "$FIXTURE_STATUS" ;;
+  esac
+  src cgroup-run add "$SRC/stacks/gross"
+  assert_rc "H1: DATE $when → abgewiesen" 1
+  assert_err "H1: DATE $when → Platz nicht lesbar" "freier Platz auf der Kiste nicht lesbar"
+done
+grep -v '^DATE:' "$WORK/status-normal" > "$FIXTURE_STATUS"
+printf 'DATE: %s\n' "$(TZ=Etc/GMT-2 date -d '-21 hours' +%Y-%m-%dT%H:%M:%S+02:00)" >> "$FIXTURE_STATUS"
+src cgroup-run add "$SRC/stacks/gross"
+assert_rc "H1: DATE 21 h alt (Ortszeit +02:00) → gilt" 0
+src cgroup-run restore
+assert_rc "restore nach der H1-Probe" 0
+pat_unchanged "H1-Probe zurückgenommen"
+cp -a "$WORK/status-normal" "$FIXTURE_STATUS"
+
 echo "== sources add =="
 src cgroup-run add "$SRC/stacks/wejos-wp"
 assert_rc "add" 0
 assert_out "add meldet den Pfad" "hinzugefügt: $SRC/stacks/wejos-wp"
+assert_out "kleine Quelle besteht die Größenprüfung (787G frei)" "≤ 1/4 von"
 assert_out "add meldet die gültige Konfiguration" "konfiguration: gültig"
 no_config_out "add zitiert config.yaml nicht"
 if grep -qxF -- "R $SRC/stacks/wejos-wp" "$PAT"; then ok "R-Zeile in der Musterdatei"; else bad "R-Zeile fehlt"; fi
@@ -1363,6 +1499,24 @@ no_config_out "status zitiert config.yaml nicht"
 src cgroup-run restore
 assert_rc "restore" 0
 if [ "$(r_lines)" = 1 ] && grep -qxF -- "R $SRC/stacks/wejos-wp" "$PAT"; then ok "restore: Stand vor der zweiten Quelle"; else bad "restore: R-Zeilen $(r_lines)"; fi
+
+echo "== sources add-large: ohne Größengrenze (Freigabe Jochen), schon drin ohne Messung (H2) =="
+kiste_df 8,0K
+src cgroup-run add "$SRC/stacks/wejos-wp/data"
+assert_rc "schon abgedeckt: auch bei vollem RAID rc=0" 0
+assert_out "schon abgedeckt: ohne Messung" "schon abgedeckt durch $SRC/stacks/wejos-wp"
+src cgroup-run add "$SRC/stacks/gross"
+assert_rc "große Quelle bei vollem RAID abgewiesen" 1
+src cgroup-run add-large "$SRC/stacks/gross"
+assert_rc "add-large bei vollem RAID" 0
+assert_out "add-large meldet den Pfad" "hinzugefügt: $SRC/stacks/gross"
+assert_out "add-large nennt die übersprungene Prüfung" "größenprüfung: übersprungen (add-large, Freigabe Jochen)"
+src cgroup-run add-large "$SRC/geheim"
+assert_rc "add-large hält die Pfadregeln" 64
+src cgroup-run restore
+assert_rc "restore nach add-large" 0
+if [ "$(r_lines)" = 1 ]; then ok "add-large zurückgenommen"; else bad "nach restore R-Zeilen: $(r_lines)"; fi
+cp -a "$WORK/status-normal" "$FIXTURE_STATUS"
 
 echo "== sources: Musterdatei als Symlink oder Hardlink, fremde Zeilen (Zweitprüfung PR #69, Befund 3) =="
 cp -a "$PAT" "$SRC/pat-echt"
@@ -1398,6 +1552,7 @@ if cmp -s "$SRC/config.yaml" "$SRC/config-original"; then ok "config.yaml wieder
 no_config_out "disconnect zitiert config.yaml nicht"
 src cgroup-run add "$SRC/srv/daten"
 assert_rc "add nach disconnect abgewiesen" 1
+cp -a "$WORK/status-orig" "$FIXTURE_STATUS"; rm -f "$STUBS/du"
 
 echo
 printf 'bestanden: %s, fehlgeschlagen: %s\n' "$PASS" "$FAIL"

@@ -324,7 +324,8 @@ gelesen), sondern in einer eigenen Musterdatei ohne Geheimnisse,
 | Form | Wirkung | Riegel |
 | --- | --- | --- |
 | `cockpit-borg-action sources status` | lesend: angeschlossen ja/nein (nur ein Treffer-Test auf `config.yaml`, kein Inhalt), die R-Zeilen, Zahl der Sicherungen | frei |
-| `cockpit-borg-action sources add <pfad>` | hängt genau eine R-Zeile an. Pfad: absolut, nur `[A-Za-z0-9._@+-]` je Ebene, kein `.`/`..`, kein Symlink (`realpath` = Pfad), existierendes Verzeichnis, mindestens eine Ebene unter `/opt/stacks`, `/srv` oder `/var/lib/docker/volumes`. Schon drin oder unter einer vorhandenen Quelle → nichts verändert, rc=0. Alte Datei als `.vor-<UTC-Zeit>`, neue per `mv`, dann `borgmatic config validate`; ungültig → alte Datei zurück, rc=1. Nennt die Größe (`du -shx`), wirkt ab dem nächsten Backup-Lauf | **frei** |
+| `cockpit-borg-action sources add <pfad>` | hängt genau eine R-Zeile an. Pfad: absolut, nur `[A-Za-z0-9._@+-]` je Ebene, kein `.`/`..`, kein Symlink (`realpath` = Pfad), existierendes Verzeichnis, mindestens eine Ebene unter `/opt/stacks`, `/srv` oder `/var/lib/docker/volumes`. Schon drin oder unter einer vorhandenen Quelle → nichts verändert, rc=0. **Größengrenze (H2):** die Quelle zusammen mit allen schon eingetragenen Cockpit-Quellen (`du -sbc`, über Mountpunkte hinweg, rc von `du` ≠ 0 heißt nicht messbar) darf höchstens ¼ des freien Platzes auf `/media/RAID` der Kiste belegen (Spalte Avail der Zeile `DF` in der Statusdatei, wie in `status`; deren `DATE` höchstens 24 h alt); darüber, oder wenn Größe oder Platz nicht lesbar sind, nichts verändert, rc=1, Meldung „Braucht Jochen“ mit dem Weg `add-large`. Alte Datei als `.vor-<UTC-Zeit>`, neue per `mv`, dann `borgmatic config validate`; ungültig → alte Datei zurück, rc=1. Nennt die Größe (`du -sh`), wirkt ab dem nächsten Backup-Lauf | **frei** |
+| `cockpit-borg-action sources add-large <pfad>` | wie `add`, nur ohne Größengrenze (Ausgabe `größenprüfung: übersprungen`) — für eine Quelle, die Jochen trotz Größe will | Jochen |
 | `cockpit-borg-action sources connect` | einmalig: `config.yaml` bekommt am Ende den Block `patterns_from: [<musterdatei>]` (alte Datei als `config.yaml.vor-<Zeit>`, 0600), legt die leere Musterdatei an, `borgmatic config validate`; ungültig → alte `config.yaml` zurück. Nennt `config.yaml` schon ein eigenes `patterns_from`, verändert es nichts (rc=1, dann von Hand) | Jochen |
 | `cockpit-borg-action sources disconnect` | nimmt genau diesen Block wieder heraus — nur, wenn `config.yaml` seit dem Anschluss sonst unverändert ist (Vergleich mit der `.vor`-Datei plus Block), sonst rc=1 und nichts verändert | Jochen |
 | `cockpit-borg-action sources restore` | die jüngste `.vor`-Musterdatei zurück, also Quellen weg | Jochen |
@@ -687,10 +688,57 @@ Grenzen:
   laufen selbst als root und könnten die Markierung schreiben; gegen das Fälschen schützte wieder
   nur der Riegel am Pfad (oder der Türsteher bei Verschleierung) — der Gewinn ist kleiner, als er
   aussieht, und es ist eine Änderung an Schloss und Helfer zugleich (G2, G10). Entscheidet Jochen.
-* Mehr Quellen heißen mehr Platz auf der Kiste (RAID, `DF` in `status`): `add` nennt die Größe,
-  die Entscheidung bleibt „ergänzen ist frei“. **Offen (Hinweis H2, 05.11.2026):** `add` hat keine
-  Größengrenze; eine große Quelle kann das RAID auf Lab0 füllen, dann scheitern alle Nachtläufe.
-  Eine Grenze (fest oder gegen den freien Platz aus `status`) ist nicht gebaut.
+* Mehr Quellen heißen mehr Platz auf der Kiste (RAID, `DF` in `status`). **Größengrenze (Hinweis
+  H2, 05.11.2026, gebaut 10.11.2026, Karte t_0ea98639):** eine große Quelle könnte das RAID auf
+  Lab0 füllen, dann scheitern alle Nachtläufe. Darum misst `add` die neue Quelle **zusammen mit
+  allen schon eingetragenen Cockpit-Quellen** in einem Aufruf `du -sbc` (scheinbare Größe, also
+  eher zu groß; höchstens 120 s, länger heißt „nicht messbar“) und vergleicht die Summe mit dem
+  freien Platz aus der Statusdatei der Kiste — dieselbe Zeile `DF … /media/RAID`, die `status`
+  zeigt (genau eine Zeile, Avail wie von `df -h`: Komma oder Punkt, Einheiten K…E als Potenzen
+  von 1024). Frei ist `add` bis **¼ des freien Platzes**. Nachbesserung nach der Zweitprüfung
+  PR #83 (11.11.2026, Karte t_b6cbeb86):
+  - **Über Mountpunkte (B1):** gemessen wird ohne `-x`. borgmatic geht standardmäßig über
+    Mountpunkte (`one_file_system` ist per Default `false`), etwa in ein Docker-Volume mit
+    nfs/cifs/bind unter `/var/lib/docker/volumes/<v>/_data`; `du -x` sähe davon nichts. Der Helfer
+    hängt damit nicht von der Einstellung auf dem Host ab — steht sie auf `true`, zählt er nur zu
+    viel. Ein hängender Netz-Mount läuft in den Timeout (`timeout -k 10`) und endet als „nicht
+    messbar“. Gewählt statt „Mountpunkt unter der Quelle → abweisen“, weil es ohne eine zweite
+    Quelle der Wahrheit (`/proc/self/mountinfo`) auskommt und ein harmloser Mount kein Fall für
+    Jochen ist.
+  - **Rückgabecode (B2):** endet `du` mit rc ≠ 0 (unlesbarer Unterordner, verschwundene Datei,
+    E/A-Fehler), ist die Ausgabe nur eine Teilsumme — das gilt als „nicht messbar“, rc=1.
+  - **Mehrere `add` vor dem nächsten Backup (B3):** der freie Platz sinkt erst, wenn ein Backup
+    gelaufen ist und die Kiste ihre Statusdatei neu geschrieben hat; jedes `add` dazwischen sähe
+    denselben Wert. Darum zählt die Summe alle schon eingetragenen R-Zeilen mit. Bewusst *alle*
+    statt „nur die seit `DATE` hinzugekommenen“: ob eine Quelle schon im freien Platz steckt,
+    hängt an drei Zeiten (Eintrag, Ende des nächsten Backups, `DATE` der Statusdatei), von denen
+    der Helfer nur zwei sicher kennt — eine Quelle, die vor `DATE` eingetragen, aber erst danach
+    gesichert wurde, fiele durch. Alle zu zählen ist zustandslos und zählt nie zu wenig, nur eine
+    schon gesicherte Quelle doppelt. Die Folge: die Cockpit-Quellen zusammen bleiben frei unter ¼
+    des freien Platzes; wer darüber will, ist ohnehin ein Fall für Jochen (`add-large`). Eine
+    Quelle, die eine schon eingetragene enthält, zählt deren Dateien nur einmal (`du` zählt jede
+    Datei über alle Argumente einmal).
+  - **Alter der Statusdatei (H1):** ihr `DATE` muss genau einmal da, lesbar (`date -d`, mit
+    Zeitzone) und höchstens 24 h alt sein (höchstens 10 min in der Zukunft) — sonst gilt der freie
+    Platz als nicht lesbar, fail-closed. Ein stehender Dienst auf der Kiste liefert sonst einen
+    alten Wert.
+  Begründung des Faktors 4 statt einer festen Grenze in Byte: das erste Archiv der Quelle wächst
+  das Repo um bis zu ihre Größe (Kompression und Deduplizierung machen es nur kleiner), jede
+  Änderung an ihr bleibt bis zum Ende der Aufbewahrung (bis zu 30 Tagessicherungen) zusätzlich
+  liegen, und der Rest gehört dem Wachstum der vorhandenen Quellen; ob 100 GB zu viel sind, hängt
+  allein vom freien Platz ab (am 10.11.2026: 697G frei, 88 % belegt, also Grenze ≈ 174 GiB).
+  Darüber, oder wenn Größe oder Platz nicht lesbar sind (Kiste nicht erreichbar, Zeile fehlt),
+  verändert `add` nichts und endet mit rc=1 und „Braucht Jochen“ — fail-closed, nicht still
+  weiter. Mit Jochens Freigabe geht dieselbe Quelle über `sources add-large <pfad>`; das ist für
+  den Backup-Riegel keine freie Form, also ein Riegel-Treffer ohne Änderung am Riegel (geprüft in
+  `apps/api/test/backup-guard.test.ts`). Gemessen wird vor der Sperre (ein langes `du` hält kein
+  Backup auf); die Abdeckung („schon drin“) gilt vorher und unter der Sperre noch einmal, eine
+  schon gesicherte Quelle wird nicht gemessen. Der installierte Helfer fragt immer die feste
+  Statusdatei `http://10.0.0.5:8088/status.txt`, nie den Prüf-Haken `COCKPIT_BORG_ACTION_KISTE_URL`.
+  Grenze ehrlich: die Prüfung gilt für die Quellen beim Hinzufügen; wachsen sie danach, sieht das nur
+  `status` (`DF`). Tests: `test/cockpit-borg-action.test.sh` (H2-Fälle groß/klein, nicht lesbar,
+  `add-large`; B1 du ohne `-x` — mit echtem Bind-Mount, wo der Prüfstand mounten darf —, B2 du rc=1
+  mit Teilsumme, B3 zweites `add` hintereinander über der Grenze, H1 `DATE` zu alt/fehlt/kaputt/Zukunft).
 
 Ablauf für eine neue Quelle (ohne Jochen, sobald angeschlossen): ein host-run mit dem Schritt
 `/usr/local/sbin/cockpit-borg-action sources add <pfad>`, Prüfung `… sources status`, Rückweg
