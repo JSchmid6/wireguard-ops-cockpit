@@ -512,3 +512,125 @@ describe("hash-pinned scripts: shell bodies elsewhere or unquoted, interpreter o
     expect(hidden(pinW, "echo 'wartung-ok'\napt-get install -y \"wartungstool\"")).toEqual([]);
   });
 });
+
+// Nacharbeit 3 (Zweitprüfung t_b4b11e32, Karte t_fda9d997): R-A positive list for
+// local shell bodies, R-B $'…'/$"…" quoting, hints H1–H4.
+// /opt/data/out/t_b4b11e32/zweitpruefung-pr86-r2.md, Probe probe6.ts.
+describe("hash-pinned scripts: local shell bodies by positive list, ANSI-C quoting, heredoc ends (Befund t_b4b11e32)", () => {
+  const P = "/opt/x/run.sh";
+  const W = "/usr/local/sbin/wartung";
+  const pin = `echo "${HASH}  ${P}" | sha256sum -c -`;
+  const pinW = `echo "${HASH}  ${W}" | sha256sum -c -`;
+  const shown = `cat > ${P} <<'EOF'\necho hi\nEOF`;
+  const body = `cat > ${P} <<'EOF'\necho hi\nEOF`;
+  const hidden = (...runs: string[]) => hiddenPinnedScripts(manifest(runs.map((run, index) => ({ name: `s${index + 1}`, run }))) as never);
+
+  const away = [
+    "qm guest exec 100 --pass-stdin 1 -- bash <<'X'",
+    "cat <<'X' | qm guest exec 100 --pass-stdin 1 -- bash",
+    "schroot -c s -- bash <<'X'",
+    "buildah run c bash <<'X'",
+    "crictl exec -i c bash <<'X'",
+    "runc exec c bash <<'X'",
+    "lxc-execute -n c -- bash <<'X'",
+    "proot -r /mnt bash <<'X'",
+    "bwrap --bind /mnt / bash <<'X'",
+    "firejail --chroot=/mnt bash <<'X'",
+    "systemd-run -M c --pipe bash <<'X'",
+    "systemd-run --machine=c --pipe bash <<'X'",
+    "systemd-run -H host --pipe bash <<'X'",
+    "oc exec -i p -- bash <<'X'",
+    "distrobox enter b -- bash <<'X'",
+    "toolbox run bash <<'X'",
+    "dbclient host bash <<'X'",
+    "rsh host bash <<'X'",
+    "sudo -R /mnt bash <<'X'",
+    "env -S 'ssh other' <<'X'",
+    "su -c 'ssh other' root <<'X'",
+    "bash -c 'ssh other' <<'X'",
+    "cat <<'X' | xargs -0 bash",
+    "nsenter -t 1 -m bash <<'X'",
+    "systemd-run -p RootDirectory=/mnt --pipe bash <<'X'",
+    "systemd-run --property=BindPaths=/srv/x:/opt/x --pipe bash <<'X'",
+    "PATH=/srv/evil:/usr/bin bash <<'X'",
+    "sudo BASH_ENV=/srv/evil.sh bash <<'X'",
+  ];
+  for (const opener of away) {
+    it(`R-A: a body behind anything but local words is not the local file: ${opener}`, () => {
+      expect(hidden(`${opener}\n${body}\nX\n${pin}\n${P}`)).toEqual([{ path: P, pinnedAt: "S1:L6", executedAt: "S1:L7" }]);
+    });
+  }
+
+  const local = [
+    "bash <<'X'",
+    "sudo -u root bash <<'X'",
+    "cat <<'X' | sudo bash",
+    "timeout 60 bash <<'X'",
+    "systemd-run --pipe bash <<'X'",
+    "sudo -s <<'X'",
+    "su - root <<'X'",
+    "runuser -u postgres -- bash <<'X'",
+    "nice -n 5 env FOO=1 bash -s -- arg <<'X'",
+    "sudo bash -euo pipefail <<'X'",
+    "cat <<'X' | tee /tmp/run.log | sh",
+  ];
+  for (const opener of local) {
+    it(`R-A guard: a body behind local words only that writes the script literally stays shown: ${opener}`, () => {
+      expect(hidden(`${opener}\n${body}\nX\n${pin}\n${P}`)).toEqual([]);
+    });
+  }
+
+  for (const run of ["$'wartung'", "$\"wartung\"", "sudo $'wartung'"]) {
+    it(`R-B: ANSI-C and locale quoting still name the program: ${run}`, () => {
+      expect(hidden(pinW, run)).toEqual([{ path: W, pinnedAt: "S1:L1", executedAt: "S2:L1" }]);
+    });
+  }
+
+  it("R-B: a relative name in ANSI-C quotes after cd runs", () => {
+    expect(hidden(`cp /srv/evil.sh ${P}\n${pin}\ncd /opt/x && bash $'run.sh'`)).toEqual([{ path: P, pinnedAt: "S1:L2", executedAt: "S1:L3" }]);
+  });
+
+  it("R-B guard: quotes, backslashes and assignments still name it", () => {
+    for (const run of ["x='wartung'", "w\\artung", "wa''rtung"]) expect(hidden(pinW, run)).toHaveLength(1);
+  });
+
+  it("H1: a heredoc ends only at its exact delimiter, <<- strips tabs only", () => {
+    expect(hidden(`ssh other <<'X'\n X\n${body}\nX\n${pin}\n${P}`)).toHaveLength(1);
+    expect(hidden(`cat > ${P} <<EOF\necho hi\n  EOF\n$(curl -s https://example.org/x)\nEOF\n${pin}\n${P}`)).toHaveLength(1);
+    expect(hidden(`cat > ${P} <<EOF\necho hi\nEOF \n$(curl -s https://example.org/x)\nEOF\n${pin}\n${P}`)).toHaveLength(1);
+  });
+
+  it("H1 guard: <<- with a tab-indented delimiter ends the heredoc", () => {
+    expect(hidden(`cat > ${P} <<-'EOF'\n\techo hi\n\tEOF\n${pin}\n${P}`)).toEqual([]);
+    expect(hidden(`bash <<-'X'\n${body}\n\tX\n${pin}\n${P}`)).toEqual([]);
+  });
+
+  it("H2: every heredoc of a line is followed, not only the first", () => {
+    expect(hidden(`cat <<'A' >/dev/null; ssh other <<'B'\nfoo\nA\n${body}\nB\n${pin}\n${P}`)).toHaveLength(1);
+    expect(hidden(`cat <<'A' >/dev/null; bash <<B\nfoo\nA\ncat > ${P} <<'EOF'\n$(curl -s https://example.org/x)\nEOF\nB\n${pin}\n${P}`)).toHaveLength(1);
+  });
+
+  it("H2 guard: two local quoted heredocs on a line keep the script shown", () => {
+    expect(hidden(`cat <<'A' >/dev/null; bash <<'B'\nfoo\nA\n${body}\nB\n${pin}\n${P}`)).toEqual([]);
+  });
+
+  for (const link of ["ln -sfn /srv/x /opt/x", "rm -rf /opt/x && ln -s /srv/x /opt/x"]) {
+    it(`H3: a symlink switched on a directory above the shown script takes it back: ${link}`, () => {
+      expect(hidden(`${shown}\n${link}\n${pin}\n${P}`)).toEqual([{ path: P, pinnedAt: "S1:L5", executedAt: "S1:L6", overwrittenAt: "S1:L4" }]);
+    });
+  }
+
+  it("H3 guard: a symlink into a PATH directory or a target directory leaves the shown script alone", () => {
+    expect(hidden(`${shown}\nln -sf ${P} /usr/local/bin/runit\nln -s /srv/other.conf /opt/x/\n${pin}\n${P}`)).toEqual([]);
+  });
+
+  for (const edit of [`sudo -e ${P}`, `EDITOR=/srv/evil.sh sudo -e ${P}`, `sudo --edit ${P}`]) {
+    it(`H4: sudo -e writes the file, it does not run it: ${edit}`, () => {
+      expect(hidden(`${shown}\n${edit}\n${pin}\n${P}`)).toEqual([{ path: P, pinnedAt: "S1:L5", executedAt: "S1:L4", overwrittenAt: "S1:L4" }]);
+    });
+  }
+
+  it("H4 guard: sudo with other options still runs the script", () => {
+    expect(hidden(`${shown}\nsudo -E ${P}\nsudo -u root ${P}\n${pin}\n${P}`)).toEqual([]);
+  });
+});

@@ -126,7 +126,8 @@ GitLab-Stufen, Dienst-Neustarts.
 **Jedes ausgeführte Skript steht wörtlich im Plan** (05.11.2026, Befund X5 aus Job 26fb0860,
 Karte t_41cb8b49; nachgeschärft 09.11.2026 nach Zweitprüfung t_740ac6ee, Karte t_11872429,
 11.11.2026 nach Zweitprüfung t_af29564c, Karte t_0e05c213, und 12.11.2026 nach Zweitprüfung
-t_d3e3959f, Karte t_5d6eff99, sowie nach Zweitprüfung t_1748d6c1, Karte t_8b84f3a6): Ein
+t_d3e3959f, Karte t_5d6eff99, nach Zweitprüfung t_1748d6c1, Karte t_8b84f3a6, und nach Zweitprüfung
+t_b4b11e32, Karte t_fda9d997): Ein
 stündlicher root-Dienst führte ein Skript aus, das der Lauf nur per Hash festnagelte
 (`printf '<sha256>  /pfad' | sha256sum -c -`); die Unit-Datei stand per Heredoc wörtlich im Plan,
 das Skript nicht — der Türsteher sah einen Hash statt Code. Seitdem lehnt schon
@@ -153,7 +154,8 @@ Die Regel im Einzelnen (`hiddenPinnedScripts` in `apps/api/src/host-run.ts`):
   fail-safe jedes Wort, nicht nur das Befehlswort (Entscheidung 11.11.2026). Wörter für Basisnamen und
   relative Namen nach `cd` trennt die Regel an Leerraum, Quotes, `=` und an `<>&|;(){},\`
   sowie Backticks (12.11.2026, R1); Quotes und Backslashes entfernt sie vorher, wie bash
-  (12.11.2026, B6: `w\artung`, `wa''rtung` zählen wie `wartung`): `wartung>/var/log/w.log`, `wartung&>/dev/null`, `wartung</dev/null`,
+  (12.11.2026, B6: `w\artung`, `wa''rtung` zählen wie `wartung`; ein `$` direkt vor einem Quote fällt
+  vorher weg, R-B: `$'wartung'`, `$"wartung"`, `sudo $'wartung'`, `cd /opt/x && bash $'run.sh'`): `wartung>/var/log/w.log`, `wartung&>/dev/null`, `wartung</dev/null`,
   `\wartung`, `{wartung,}`, `cd /opt/x && bash run.sh>/tmp/l` zählen wie das blanke Wort. Eine Zeile mit
   `\` am Ende wird außerhalb von Inhalts-Heredocs vor dem Zerlegen mit der Folgezeile verbunden; die
   Fundstelle ist die erste Zeile (`install -m 0755 \` + `/srv/run.sh /opt/x/run.sh`, `cat /p \` + `| bash`).
@@ -170,13 +172,31 @@ Die Regel im Einzelnen (`hiddenPinnedScripts` in `apps/api/src/host-run.ts`):
   `ssh`, `fish`, `source /dev/stdin <<'X'`, `. /dev/stdin <<'X'`, `cat <<'X' | bash`, auch
   `| sudo -u root sh`), liest die Regel wie die Skriptzeilen um ihn herum — Schreibvorgänge, `cd`,
   Fortsetzungszeilen, Heredocs darin; nur der Körper jedes anderen Heredocs (`cat > /datei`, `python3 -`,
-  auch ein Inhalts-Heredoc in einem Shell-Körper) ist Inhalt. Ein Skript, das ein Shell-Körper per Heredoc
+  auch ein Inhalts-Heredoc in einem Shell-Körper) ist Inhalt. Ein Heredoc endet nur an einer Zeile, die
+  genau sein Begrenzer ist; bei `<<-` fallen nur führende Tabs weg (H1, t_b4b11e32: ` X` oder `EOF ` beenden
+  nichts). Stehen mehrere Heredocs auf einer Zeile, folgt die Regel jedem in seiner Reihenfolge (H2:
+  `cat <<'A' >/dev/null; ssh other <<'B'`). Ein Skript, das ein Shell-Körper per Heredoc
   schreibt, gilt nur dann als gezeigt, wenn der Begrenzer dieses und jedes umschließenden Shell-Körpers
-  gequotet ist und keiner davon woanders läuft (12.11.2026, B1): Bei `bash <<X` expandiert die aufrufende
-  Shell `$(…)` schon beim Bau des Körpers, und was ein Körper hinter `ssh`, `docker`/`podman exec`,
-  `pct exec`, `lxc-attach`, `chroot`, `nsenter`, `unshare`, `systemd-nspawn`, `machinectl` (auch `kubectl`,
-  `incus`, `lxc`, `virsh`) schreibt, ist nicht die Datei, die dieser Lauf hier prüft und ausführt. Dort zählt
-  jeder Schreibvorgang als nicht gezeigt; Überschreiben und Ausführen liest die Regel dort weiter.
+  gequotet ist und jeder davon nachweislich hier läuft (12.11.2026, B1): Bei `bash <<X` expandiert die
+  aufrufende Shell `$(…)` schon beim Bau des Körpers, und was ein Körper auf einem anderen Host, in einem
+  Container oder in einer anderen Wurzel schreibt, ist nicht die Datei, die dieser Lauf hier prüft und
+  ausführt. „Hier“ ist eine Positivliste (12.11.2026, R-A aus t_b4b11e32; eine Liste fremder Opener wäre nur
+  die nächste Lücke — `qm guest exec`, `schroot`, `buildah run`, `systemd-run -M` …): Ein Körper läuft nur
+  dann hier, wenn in jedem Segment der Opener-Kette vor dem Shell-Wort nur stehen: Zuweisungen (nicht an
+  `PATH`, `ENV`, `BASH_ENV`, `SHELLOPTS`, `BASHOPTS`, `IFS`, `PS4`, `GLOBIGNORE`, `CDPATH`, `LD_*`, `BASH_*` —
+  sie wählen, welcher `cat` im Körper läuft), Umleitungen, Schlüsselwörter, Zahlen und die lokalen Wrapper
+  `sudo`, `doas`, `su`, `runuser`, `setpriv`, `env`, `nice`, `ionice`, `chrt`, `timeout`, `stdbuf`,
+  `systemd-run`, `systemd-cat`, `nohup`, `setsid`, `exec`, `command`, `builtin`, `time` mit ihren Optionen
+  (Werte nur nach Optionen, die laut Werkzeug einen nehmen; `su`/`runuser` dazu ein Benutzername), vor der
+  Pipe nur `cat` ohne Datei (außer `-`) und `tee`. Nicht hier sind deshalb auch `sudo -R`/`--chroot`/`-h`,
+  `systemd-run -M`/`--machine`/`-H`/`--host` sowie dessen `-p`/`--property` und `-E`/`--setenv` (sie können
+  `RootDirectory=`, `BindPaths=` oder `BASH_ENV=` setzen), `env -S`, `su`/`runuser -c` und `--shell`, `nsenter`
+  und `xargs`. Hinter dem Shell-Wort darf kein `-c` stehen, und ein Datei-Operand nur nach `-s`, `-` oder als
+  `/dev/stdin`, sonst liest die Shell nicht den Körper. Jedes andere Wort (auch `ssh`, `docker exec`,
+  `pct exec`, `chroot`, ein unbekanntes Werkzeug) macht den Körper fremd. Dort zählt jeder Schreibvorgang als
+  nicht gezeigt; Überschreiben und Ausführen liest die Regel dort weiter. Preis: Ein lokaler Opener mit einer
+  hier nicht gelisteten Option, die einen Wert nimmt (`su -s /bin/bash root <<'X'`), gilt als fremd; der Planer
+  schreibt ihn dann schlichter (`bash <<'X'`, `sudo -u root bash <<'X'`).
 - **Geschrieben** zählt nur der letzte Schreibvorgang vor der Ausführung, und nur, wenn er den Inhalt
   zeigt: `cat >`/`tee` mit Heredoc, `install … /dev/stdin <ziel>` mit Heredoc, `echo`/`printf` ohne
   `$`/Backticks, eine Kopie eines so geschriebenen Skripts. Ein Heredoc zeigt den Inhalt nur, wenn sein
@@ -184,7 +204,9 @@ Die Regel im Einzelnen (`hiddenPinnedScripts` in `apps/api/src/host-run.ts`):
   wie bei `echo`/`printf`; `cat > /p <<EOF` mit `$(curl …)` im Körper zeigt nicht, was in der Datei landet),
   und nur außerhalb der Shell-Körper aus B1. Eine rekursive Kopie (`cp -r`/`-R`/`-a`), `rsync` und `mv`
   heben jeden gezeigten Pfad unter dem Ziel (und unter Ziel/Basisname der Quelle) auf wie `tar -x`
-  (12.11.2026, B3: `cp -r /srv/x/. /opt/x/`, `rsync -a /srv/x/ /opt/x/`, `rm -r /opt/x && mv /srv/x /opt/x`). Anhängen (`cat >>`, `tee -a`) an eine nicht
+  (12.11.2026, B3: `cp -r /srv/x/. /opt/x/`, `rsync -a /srv/x/ /opt/x/`, `rm -r /opt/x && mv /srv/x /opt/x`),
+  ebenso ein Symlink, der auf ein Verzeichnis darüber umgeschaltet wird (H3, t_b4b11e32: `ln -sfn /srv/x
+  /opt/x`; nicht mit `-t` oder einem Ziel mit `/` am Ende, dort landet der Link nur im Verzeichnis). Anhängen (`cat >>`, `tee -a`) an eine nicht
   gezeigte Datei macht sie nicht sichtbar; ein späteres Überschreiben (`cp`, `mv`, `install`, `dd of=`,
   `curl -o`, `wget -O`, `> /pfad`, `tar -x`/`unzip` in das Verzeichnis) hebt den Heredoc auf. Ebenso
   jedes `sed -i`/`--in-place` auf den Pfad (Entscheidung 11.11.2026, Hinweis aus t_af29564c): Mit `$(…)`,
@@ -197,7 +219,8 @@ Die Regel im Einzelnen (`hiddenPinnedScripts` in `apps/api/src/host-run.ts`):
   `gpg`, dazu `echo`, `printf`, `tee`, `logger`, `shellcheck`; `sed` nur ohne `-i`/`-f` und ohne
   Skriptwort mit `w`, `W`, `e`), und die Ausführung selbst: Der Pfad ist das Befehlswort oder folgt nur
   auf Wrapper, POSIX-Shells, Optionen und Zuweisungen (`bash /p`, `bash -n /p`, `sudo -u root /p`,
-  `runuser -u x -- /p`, `timeout 60 /p`, `sh -c '/p'`). Nach einem Interpreter, der keine POSIX-Shell ist
+  `runuser -u x -- /p`, `timeout 60 /p`, `sh -c '/p'`); `sudo -e`/`--edit` ist `sudoedit` und schreibt die
+  Datei (H4, t_b4b11e32). Nach einem Interpreter, der keine POSIX-Shell ist
   (`perl`, `ruby`, `python`, `node`, `php`, `lua`, `Rscript`, `pwsh`), zählt nur das unmittelbar folgende
   Wort als ausgeführt, bei der awk-Familie nur das Wort direkt nach `-f` (12.11.2026, B2): Optionen wie
   `perl -i -pe…`, `ruby -i`, `gawk --include=inplace` ändern die Datei. Ein Befehl, der den Pfad nicht
@@ -225,7 +248,7 @@ Plan anders verbirgt (Skript von anderswo ohne Pin, Pfad aus nicht gezeigten Wer
 Riegels („content this plan does not show“) und X5 des Türstehers. Die Regel ist eine Planer-Hilfe, kein
 Schloss: Sie lehnt nur zusätzlich ab, der Türsteher liest jeden Lauf weiterhin selbst. Tests:
 `apps/api/test/host-run-visible-scripts.test.ts` (alle Fälle der Probe aus t_740ac6ee, der Gegenprobe
-aus t_af29564c und der Befunde B1–B6 aus t_1748d6c1, plus die aufgezeichneten Pläne vom 10.10.2026 als Fehlalarm-Gegenprobe).
+aus t_af29564c, der Befunde B1–B6 aus t_1748d6c1 und R-A, R-B, H1–H4 aus t_b4b11e32, plus die aufgezeichneten Pläne vom 10.10.2026 als Fehlalarm-Gegenprobe).
 
 ## 2a. Backup-Riegel: Backups löschen nur mit Freigabe
 
