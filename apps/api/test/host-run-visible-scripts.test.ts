@@ -567,7 +567,6 @@ describe("hash-pinned scripts: local shell bodies by positive list, ANSI-C quoti
     "cat <<'X' | sudo bash",
     "timeout 60 bash <<'X'",
     "systemd-run --pipe bash <<'X'",
-    "sudo -s <<'X'",
     "su - root <<'X'",
     "runuser -u postgres -- bash <<'X'",
     "nice -n 5 env FOO=1 bash -s -- arg <<'X'",
@@ -632,5 +631,152 @@ describe("hash-pinned scripts: local shell bodies by positive list, ANSI-C quoti
 
   it("H4 guard: sudo with other options still runs the script", () => {
     expect(hidden(`${shown}\nsudo -E ${P}\nsudo -u root ${P}\n${pin}\n${P}`)).toEqual([]);
+  });
+});
+
+describe("hash-pinned scripts: redirections, shell operands, $SHELL and startup files at the opener (Befund t_c82f5ac2)", () => {
+  const P = "/opt/x/run.sh";
+  const pin = `echo "${HASH}  ${P}" | sha256sum -c -`;
+  const body = `cat > ${P} <<'EOF'\necho hi\nEOF`;
+  const hidden = (run: string) => hiddenPinnedScripts(manifest([{ name: "s1", run }]) as never);
+  const opened = (opener: string, before = "") => hidden(`${before}${opener}\n${body}\nX\n${pin}\n${P}`);
+
+  const replaced = [
+    "bash <<'X' </srv/evil.sh",
+    "bash <<'X' 0</srv/evil.sh",
+    "bash <<'X' <&3",
+    "bash <<'X' <<<'true'",
+    "sudo bash <<'X' </dev/null",
+    "cat <<'X' | bash </srv/evil.sh",
+    "cat <<'X' >/dev/null | bash",
+    "cat <<'X' >&2 | bash",
+    "cat <<'X' 1>/dev/null | sudo bash",
+    "tee <<'X' >/dev/null | bash",
+    "cat -n <<'X' | bash",
+    "cat -v <<'X' | bash",
+    "bash <<'X' &",
+    "cat <<'X' | bash &",
+  ];
+  for (const opener of replaced) {
+    it(`S-A: a redirection that replaces or empties the body's stdin makes it not local: ${opener}`, () => {
+      expect(opened(opener)).toEqual([{ path: P, pinnedAt: "S1:L6", executedAt: "S1:L7" }]);
+    });
+  }
+
+  it("S-A: bash discards the first of two heredocs on one shell", () => {
+    expect(hidden(`bash <<'X' <<'Y'\n${body}\nX\ntrue\nY\n${pin}\n${P}`)).toHaveLength(1);
+  });
+
+  it("H-c: a stdin redirection after a top-level heredoc writes the file, not the body", () => {
+    expect(hidden(`cat > ${P} <<'EOF' </srv/evil.sh\necho hi\nEOF\n${pin}\n${P}`)).toEqual([{ path: P, pinnedAt: "S1:L4", executedAt: "S1:L5" }]);
+    expect(hidden(`tee ${P} <<'EOF' 0</srv/evil.sh\necho hi\nEOF\n${pin}\n${P}`)).toHaveLength(1);
+  });
+
+  const operand = [
+    "bash -- /srv/evil.sh <<'X'",
+    "bash - /srv/evil.sh <<'X'",
+    "sh -- /srv/evil.sh <<'X'",
+    "sudo bash -e -- /srv/evil.sh <<'X'",
+  ];
+  for (const opener of operand) {
+    it(`S-B: after - or -- the operand is the script, not the body: ${opener}`, () => {
+      expect(opened(opener)).toEqual([{ path: P, pinnedAt: "S1:L6", executedAt: "S1:L7" }]);
+    });
+  }
+
+  const shellVariable = [
+    "su -s /srv/evil.sh <<'X'",
+    "su -s/srv/evil.sh root <<'X'",
+    "runuser -s /srv/evil.sh <<'X'",
+    "SHELL=/srv/evil.sh sudo -s <<'X'",
+    "sudo -s <<'X'",
+    "sudo -Es <<'X'",
+    "sudo --shell <<'X'",
+    "doas -s <<'X'",
+    "SHELL=/srv/evil.sh su -m <<'X'",
+    "SHELL=/srv/evil.sh su -p <<'X'",
+    "su --preserve-environment root <<'X'",
+    "runuser -m root <<'X'",
+    "SHELL=/srv/evil.sh bash <<'X'",
+  ];
+  for (const opener of shellVariable) {
+    it(`S-C: a shell chosen by option or $SHELL is not the one the plan names: ${opener}`, () => {
+      expect(opened(opener)).toEqual([{ path: P, pinnedAt: "S1:L6", executedAt: "S1:L7" }]);
+    });
+  }
+
+  const startup = [
+    "bash --rcfile /srv/e -i <<'X'",
+    "bash --init-file /srv/e -i <<'X'",
+    "bash -i <<'X'",
+    "bash -l <<'X'",
+    "bash --login <<'X'",
+    "bash -O extdebug <<'X'",
+    "bash -n <<'X'",
+    "bash +B <<'X'",
+    "bash -o posix <<'X'",
+    "systemd-run --user --pipe bash <<'X'",
+    "systemd-run --capsule=x --pipe bash <<'X'",
+  ];
+  for (const opener of startup) {
+    it(`S-D: a shell option outside the positive list makes the body not local: ${opener}`, () => {
+      expect(opened(opener)).toEqual([{ path: P, pinnedAt: "S1:L6", executedAt: "S1:L7" }]);
+    });
+  }
+
+  const exported = [
+    "export BASH_ENV=/srv/e\n",
+    "export ENV=/srv/e\n",
+    "declare -x BASH_ENV=/srv/e\n",
+    "typeset -x SHELL=/srv/evil.sh\n",
+    "export PATH=/srv/bin:$PATH\n",
+    "PATH=/srv/bin:$PATH\n",
+    "printf -v BASH_ENV /srv/e; export BASH_ENV\n",
+    "cat() { cp /srv/evil \"$@\"; }; export -f cat\n",
+    "export BASH_ENV=/srv/e; ",
+  ];
+  for (const before of exported) {
+    it(`S-D: an environment set on an earlier line of the step reaches every later body: ${JSON.stringify(before)}`, () => {
+      expect(opened("bash <<'X'", before)).toHaveLength(1);
+    });
+  }
+
+  it("S-D: a later body in a nested shell is not local either", () => {
+    expect(hidden(`bash <<'A'\nexport BASH_ENV=/srv/e\nbash <<'X'\n${body}\nX\nA\n${pin}\n${P}`)).toHaveLength(1);
+  });
+
+  const guards = [
+    "bash <<'X'",
+    "sudo -u root bash <<'X'",
+    "cat <<'X' | sudo bash",
+    "cat - <<'X' | bash",
+    "cat -u <<'X' | bash",
+    "timeout 60 bash <<'X'",
+    "systemd-run --pipe bash <<'X'",
+    "bash -s <<'X'",
+    "bash -xs -- a b <<'X'",
+    "bash - <<'X'",
+    "bash -- /dev/stdin <<'X'",
+    "bash -euxo pipefail <<'X'",
+    "bash --noprofile --norc -e <<'X'",
+    "sudo -i <<'X'",
+    "sudo -s bash <<'X'",
+    "su root <<'X'",
+    "su - root <<'X'",
+    "bash <<'X' >/var/log/run.log 2>&1",
+    "cat <<'X' | bash 2>/dev/null",
+  ];
+  for (const opener of guards) {
+    it(`S-A–S-D guard: a local body with stdin intact and a named shell stays shown: ${opener}`, () => {
+      expect(opened(opener)).toEqual([]);
+    });
+  }
+
+  it("S-D guard: other exports, reading PATH and IFS= read before the body leave it shown", () => {
+    expect(opened("bash <<'X'", "export DEBIAN_FRONTEND=noninteractive\necho \"$PATH\" ${PATH}\nwhile IFS= read -r l; do echo \"$l\"; done </etc/hosts\n")).toEqual([]);
+  });
+
+  it("S-D guard: an export in a later step does not reach this step's body", () => {
+    expect(hiddenPinnedScripts(manifest([{ name: "s1", run: `bash <<'X'\n${body}\nX\n${pin}\n${P}` }, { name: "s2", run: "export BASH_ENV=/srv/e" }]) as never)).toEqual([]);
   });
 });

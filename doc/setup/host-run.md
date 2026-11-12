@@ -126,8 +126,8 @@ GitLab-Stufen, Dienst-Neustarts.
 **Jedes ausgeführte Skript steht wörtlich im Plan** (05.11.2026, Befund X5 aus Job 26fb0860,
 Karte t_41cb8b49; nachgeschärft 09.11.2026 nach Zweitprüfung t_740ac6ee, Karte t_11872429,
 11.11.2026 nach Zweitprüfung t_af29564c, Karte t_0e05c213, und 12.11.2026 nach Zweitprüfung
-t_d3e3959f, Karte t_5d6eff99, nach Zweitprüfung t_1748d6c1, Karte t_8b84f3a6, und nach Zweitprüfung
-t_b4b11e32, Karte t_fda9d997): Ein
+t_d3e3959f, Karte t_5d6eff99, nach Zweitprüfung t_1748d6c1, Karte t_8b84f3a6, nach Zweitprüfung
+t_b4b11e32, Karte t_fda9d997, und nach Zweitprüfung t_c82f5ac2, Karte t_429d7763): Ein
 stündlicher root-Dienst führte ein Skript aus, das der Lauf nur per Hash festnagelte
 (`printf '<sha256>  /pfad' | sha256sum -c -`); die Unit-Datei stand per Heredoc wörtlich im Plan,
 das Skript nicht — der Türsteher sah einen Hash statt Code. Seitdem lehnt schon
@@ -168,7 +168,7 @@ Die Regel im Einzelnen (`hiddenPinnedScripts` in `apps/api/src/host-run.ts`):
   `echo`-Meldung ohne Digest zählt auch, beim Basisnamen ebenso ein gleichlautendes Wort (`apt-get install
   wartung`, `command -v wartung`); der Planer schreibt ihn dann anders.
   **Heredoc an eine Shell** (12.11.2026, R3): Den Körper eines Heredocs, den eine Shell ausführt
-  (`bash <<'X'`, auch ohne Leerzeichen `bash<<'X'`, `sudo bash -s <<'X'`, `sudo -s`, `su`, `runuser`,
+  (`bash <<'X'`, auch ohne Leerzeichen `bash<<'X'`, `sudo bash -s <<'X'`, `sudo -s`, `sudo -i`, `su`, `runuser`,
   `ssh`, `fish`, `source /dev/stdin <<'X'`, `. /dev/stdin <<'X'`, `cat <<'X' | bash`, auch
   `| sudo -u root sh`), liest die Regel wie die Skriptzeilen um ihn herum — Schreibvorgänge, `cd`,
   Fortsetzungszeilen, Heredocs darin; nur der Körper jedes anderen Heredocs (`cat > /datei`, `python3 -`,
@@ -184,19 +184,40 @@ Die Regel im Einzelnen (`hiddenPinnedScripts` in `apps/api/src/host-run.ts`):
   die nächste Lücke — `qm guest exec`, `schroot`, `buildah run`, `systemd-run -M` …): Ein Körper läuft nur
   dann hier, wenn in jedem Segment der Opener-Kette vor dem Shell-Wort nur stehen: Zuweisungen (nicht an
   `PATH`, `ENV`, `BASH_ENV`, `SHELLOPTS`, `BASHOPTS`, `IFS`, `PS4`, `GLOBIGNORE`, `CDPATH`, `LD_*`, `BASH_*` —
-  sie wählen, welcher `cat` im Körper läuft), Umleitungen, Schlüsselwörter, Zahlen und die lokalen Wrapper
+  sie wählen, welcher `cat` im Körper läuft; seit S-C, t_c82f5ac2, auch nicht an `SHELL`), Umleitungen, Schlüsselwörter, Zahlen und die lokalen Wrapper
   `sudo`, `doas`, `su`, `runuser`, `setpriv`, `env`, `nice`, `ionice`, `chrt`, `timeout`, `stdbuf`,
   `systemd-run`, `systemd-cat`, `nohup`, `setsid`, `exec`, `command`, `builtin`, `time` mit ihren Optionen
   (Werte nur nach Optionen, die laut Werkzeug einen nehmen; `su`/`runuser` dazu ein Benutzername), vor der
   Pipe nur `cat` ohne Datei (außer `-`) und `tee`. Nicht hier sind deshalb auch `sudo -R`/`--chroot`/`-h`,
   `systemd-run -M`/`--machine`/`-H`/`--host` sowie dessen `-p`/`--property` und `-E`/`--setenv` (sie können
-  `RootDirectory=`, `BindPaths=` oder `BASH_ENV=` setzen), `env -S`, `su`/`runuser -c` und `--shell`, `nsenter`
-  und `xargs`. Hinter dem Shell-Wort darf kein `-c` stehen, und ein Datei-Operand nur nach `-s`, `-` oder als
-  `/dev/stdin`, sonst liest die Shell nicht den Körper. Jedes andere Wort (auch `ssh`, `docker exec`,
+  `RootDirectory=`, `BindPaths=` oder `BASH_ENV=` setzen), `systemd-run --user`/`--capsule`/`-C` (eine andere
+  Umgebung), `env -S`, `su`/`runuser -c` und `-s`/`--shell`, `nsenter` und `xargs`. Ebenso nicht hier ist ein
+  Wrapper, der `$SHELL` statt einer genannten Shell startet (12.11.2026, S-C aus t_c82f5ac2): `sudo -s`,
+  `doas -s` und `su`/`runuser -m`/`-p`/`--preserve-environment` ohne Shell-Wort dahinter (`sudo -s bash` bleibt
+  lokal; `sudo -i` und `su root` starten die Login-Shell aus der Passwortdatei und bleiben lokal). Hinter dem
+  Shell-Wort gilt ebenfalls eine Positivliste (12.11.2026, S-B/S-D aus t_c82f5ac2): nur `-s` (auch gebündelt
+  wie `-xs`), `-e`, `-u`, `-x`, `-v`, `-o` mit `errexit`, `nounset`, `pipefail`, `xtrace` oder `verbose`,
+  `--noprofile` und `--norc`. Nicht hier sind damit `-c` (ein String statt des Körpers), `-n` (der Körper läuft
+  nicht), `-i`, `-l`, `--login`, `--rcfile`, `--init-file` und `-O extdebug` (sie lesen vorher Dateien, die der
+  Plan nicht zeigt). Ein Datei-Operand liest den Körper nur nach `-s` oder als `/dev/stdin`; nach `-` oder `--`
+  ist der folgende Operand das Skript (`bash -- /srv/x.sh <<'X'` führt die Datei aus, nicht den Körper).
+  Die Umleitungen müssen den Körper als stdin der Shell lassen (12.11.2026, S-A aus t_c82f5ac2): Steht im
+  Segment des Heredocs eine weitere Eingabe-Umleitung oder ein zweiter Heredoc (`bash <<'X' </srv/x.sh`, `0<`,
+  `<&3`, `<<<`, `bash <<'X' <<'Y'` — bash verwirft dann X), hinter der Pipe irgendeine Eingabe-Umleitung oder
+  vor der Pipe eine Ausgabe-Umleitung (`cat <<'X' >/dev/null | bash`, `>&2`), ist der Körper nicht lokal; vor
+  der Pipe ist `cat` nur ohne Optionen außer `-` und `-u` lokal (H-e: `cat -n`/`-v` ändern den Text). Dasselbe
+  gilt auf oberster Ebene (H-c): `cat > /p <<'EOF' </srv/x.sh` schreibt die Datei, nicht den Körper, und
+  zeigt nichts. Ein Körper, dessen Shell im Hintergrund läuft (H-a: ein einzelnes `&` auf der Zeile, `bash
+  <<'X' &`), ist nicht lokal: Pin und Aufruf danach können vor dem Schreiben laufen. Setzt oder exportiert eine frühere Zeile desselben Schritts (auch in einem Shell-Körper) eine
+  dieser Variablen (`export BASH_ENV=…`, `declare -x ENV=…`, `PATH=…`, `printf -v SHELL …`; fail-safe zählt
+  jedes blanke Wort mit dem Namen, nur `$NAME`/`${NAME}` nicht; `IFS` nicht, eine Shell übernimmt es nicht
+  aus der Umgebung) oder exportiert sie eine Funktion (`export -f cat`), ist jeder spätere Körper des Schritts
+  nicht lokal (S-D): Die Umgebung erreicht jede spätere Shell. Jedes andere Wort (auch `ssh`, `docker exec`,
   `pct exec`, `chroot`, ein unbekanntes Werkzeug) macht den Körper fremd. Dort zählt jeder Schreibvorgang als
   nicht gezeigt; Überschreiben und Ausführen liest die Regel dort weiter. Preis: Ein lokaler Opener mit einer
-  hier nicht gelisteten Option, die einen Wert nimmt (`su -s /bin/bash root <<'X'`), gilt als fremd; der Planer
-  schreibt ihn dann schlichter (`bash <<'X'`, `sudo -u root bash <<'X'`).
+  hier nicht gelisteten Option, die einen Wert nimmt, oder mit `sudo -s` (`su -s /bin/bash root <<'X'`), gilt als
+  fremd, ebenso jeder Körper nach einem `export PATH=…` im selben Schritt; der Planer schreibt ihn dann
+  schlichter (`bash <<'X'`, `sudo -u root bash <<'X'`) bzw. setzt die Variable im Körper selbst.
 - **Geschrieben** zählt nur der letzte Schreibvorgang vor der Ausführung, und nur, wenn er den Inhalt
   zeigt: `cat >`/`tee` mit Heredoc, `install … /dev/stdin <ziel>` mit Heredoc, `echo`/`printf` ohne
   `$`/Backticks, eine Kopie eines so geschriebenen Skripts. Ein Heredoc zeigt den Inhalt nur, wenn sein
@@ -248,7 +269,7 @@ Plan anders verbirgt (Skript von anderswo ohne Pin, Pfad aus nicht gezeigten Wer
 Riegels („content this plan does not show“) und X5 des Türstehers. Die Regel ist eine Planer-Hilfe, kein
 Schloss: Sie lehnt nur zusätzlich ab, der Türsteher liest jeden Lauf weiterhin selbst. Tests:
 `apps/api/test/host-run-visible-scripts.test.ts` (alle Fälle der Probe aus t_740ac6ee, der Gegenprobe
-aus t_af29564c, der Befunde B1–B6 aus t_1748d6c1 und R-A, R-B, H1–H4 aus t_b4b11e32, plus die aufgezeichneten Pläne vom 10.10.2026 als Fehlalarm-Gegenprobe).
+aus t_af29564c, der Befunde B1–B6 aus t_1748d6c1, R-A, R-B, H1–H4 aus t_b4b11e32 und S-A–S-D, H-c, H-e aus t_c82f5ac2, plus die aufgezeichneten Pläne vom 10.10.2026 als Fehlalarm-Gegenprobe).
 
 ## 2a. Backup-Riegel: Backups löschen nur mit Freigabe
 
