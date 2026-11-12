@@ -325,3 +325,92 @@ describe("hash-pinned scripts: PATH names, continued lines, sed -i (Befund t_af2
     }
   });
 });
+
+// Restbefund R1–R3 der Zweitprüfung t_d3e3959f (PR #72 Runde 3), Nacharbeit
+// t_5d6eff99: /opt/data/out/t_d3e3959f/zweitpruefung-pr72-runde3.md.
+describe("hash-pinned scripts: names next to redirections, in-place editors, heredocs run by a shell (Restbefund t_d3e3959f)", () => {
+  const P = "/opt/x/run.sh";
+  const W = "/usr/local/sbin/wartung";
+  const pin = `echo "${HASH}  ${P}" | sha256sum -c -`;
+  const pinW = `echo "${HASH}  ${W}" | sha256sum -c -`;
+  const shown = `cat > ${P} <<'EOF'\necho hi\nEOF`;
+  const hidden = (...runs: string[]) => hiddenPinnedScripts(manifest(runs.map((run, index) => ({ name: `s${index + 1}`, run }))) as never);
+
+  for (const run of ["wartung>/var/log/w.log", "wartung&>/dev/null", "wartung</dev/null", "\\wartung", "{wartung,}"]) {
+    it(`R1: recognises the bare name next to a redirection or separator: ${run}`, () => {
+      expect(hidden(pinW, run)).toEqual([{ path: W, pinnedAt: "S1:L1", executedAt: "S2:L1" }]);
+    });
+  }
+
+  it("R1: recognises a relative name after cd with a redirection attached", () => {
+    expect(hidden(pin, "cd /opt/x && bash run.sh>/tmp/l")).toEqual([{ path: P, pinnedAt: "S1:L1", executedAt: "S2:L1" }]);
+    expect(hidden(pin, "cd /opt/x && \\run.sh")).toEqual([{ path: P, pinnedAt: "S1:L1", executedAt: "S2:L1" }]);
+  });
+
+  it("R1: leaves a deployed helper's name with a redirection, other words and names outside PATH directories alone", () => {
+    expect(hidden(`echo "${HASH}  /usr/local/sbin/cockpit-backup-guard" | sha256sum -c -\ncockpit-backup-guard status>/tmp/s`)).toEqual([]);
+    expect(hidden(pinW, "echo wartung-ok>/tmp/x\napt-get install -y wartungstool</dev/null")).toEqual([]);
+    expect(hidden(pin, "bash run.sh>/tmp/l")).toEqual([]);
+  });
+
+  const editors = [
+    `perl -pi -e 's/hi/$ENV{X}/' ${P}`,
+    `awk -i inplace '{print}' ${P}`,
+    `ed -s ${P} < /srv/cmds`,
+    `ex -sc '%s/hi/ho/|x' ${P}`,
+    `patch ${P} < /srv/fix.diff`,
+    `truncate -s 0 ${P}`,
+    `python3 /srv/edit.py ${P}`,
+    `echo ${P} | xargs perl -pi -e 's/hi/ho/'`,
+    `sed -n 'w ${P}' /srv/other.sh`,
+  ];
+  for (const edit of editors) {
+    it(`R2: takes the heredoc back when another command edits it in place: ${edit}`, () => {
+      expect(hidden(`${shown}\n${edit}\n${pin}\n${P}`)).toEqual([{ path: P, pinnedAt: "S1:L5", executedAt: "S1:L4", overwrittenAt: "S1:L4" }]);
+    });
+  }
+
+  it("R2: names the edit in the planner stage", () => {
+    expect(() => parseHostRunManifest(plan(manifest([{ name: "s", run: `${shown}\nperl -pi -e 's/hi/ho/' ${P}\n${pin}\n${P}` }])))).toThrow(/overwritten at S1:L4/);
+  });
+
+  it("R2: an edit by the bare name of a script in a PATH directory takes it back as well", () => {
+    expect(hidden(`cat > ${W} <<'EOF'\necho hi\nEOF`, "cd /usr/local/sbin && perl -pi -e 's/hi/ho/' wartung", `${pinW}\nwartung`)).toEqual([{ path: W, pinnedAt: "S3:L1", executedAt: "S2:L1", overwrittenAt: "S2:L1" }]);
+  });
+
+  it("R2: leaves running, checking and naming a shown script alone", () => {
+    const uses = [
+      `chmod 0755 ${P}`, `chown root:root ${P}`, `bash -n ${P}`, `shellcheck ${P}`, `grep -q hi ${P}`, `sed -n 1p ${P}`, `cat ${P} | sha256sum`,
+      `echo "installed ${P}"`, `logger "installed ${P}"`, `cp ${P} /var/backups/run.sh.bak`, `test -x ${P} && ls -l ${P}`,
+      `sudo -u root ${P}`, `runuser -u nobody -- ${P} --flag`, `timeout 60 ${P}`, `nice -n 5 ${P}`, `env -i FOO=1 ${P}`, `sh -c '${P} --flag'`,
+      `bash ${P}`, `cat ${P} | sudo bash`, `systemd-run --unit=x -p Nice=5 ${P}`,
+    ];
+    expect(hidden(`${shown}\n${uses.join("\n")}\n${pin}\n${P}`)).toEqual([]);
+    expect(hidden(`cat > ${W} <<'EOF'\necho hi\nEOF\n${pinW}\nwartung --jetzt\nsudo wartung>/tmp/l`)).toEqual([]);
+  });
+
+  for (const [label, shell] of [["bash <<'X'", "bash <<'X'"], ["sudo bash -s <<'X'", "sudo bash -s <<'X'"], ["cat <<'X' | bash", "cat <<'X' | bash"], ["cat <<'X' | sudo -u root sh", "cat <<'X' | sudo -u root sh"], ["sudo -s <<'X'", "sudo -s <<'X'"]]) {
+    it(`R3: reads the body of ${label} like script lines: a copy over the shown script`, () => {
+      expect(hidden(`${shown}\n${shell}\ncp /srv/evil.sh ${P}\nX\n${pin}\n${P}`)).toEqual([{ path: P, pinnedAt: "S1:L7", executedAt: "S1:L8", overwrittenAt: "S1:L5" }]);
+    });
+  }
+
+  it("R3: joins a continued line in a body run by a shell", () => {
+    expect(hidden(pin, `bash <<'X'\ncat ${P} \\\n  | bash\nX`)).toEqual([{ path: P, pinnedAt: "S1:L1", executedAt: "S2:L2" }]);
+  });
+
+  it("R3: reads an in-place edit and a cd in a body run by a shell", () => {
+    expect(hidden(`${shown}\nbash <<'X'\ncd /opt/x\nperl -pi -e 's/hi/ho/' run.sh\nX\n${pin}\n${P}`)).toEqual([{ path: P, pinnedAt: "S1:L8", executedAt: "S1:L6", overwrittenAt: "S1:L6" }]);
+  });
+
+  it("R3: keeps the body of any other heredoc as content, also one nested in a shell body", () => {
+    expect(hidden(`${shown}\ncat > /etc/x.conf <<'X'\ncp /srv/evil.sh ${P}\nX\n${pin}\n${P}`)).toEqual([]);
+    expect(hidden(`${shown}\npython3 - <<'X'\nprint("cp /srv/evil.sh ${P}")\nX\n${pin}\n${P}`)).toEqual([]);
+    expect(hidden(`${shown}\nbash <<'X'\ncat > /tmp/a <<'EOF'\ncp /srv/evil.sh ${P}\nEOF\nX\n${pin}\n${P}`)).toEqual([]);
+  });
+
+  it("R3: counts a script written literally inside a body run by a shell as shown, and nothing outside it", () => {
+    expect(hidden(`bash <<'X'\ncat > ${P} <<'EOF'\necho hi\nEOF\nX\n${pin}\n${P}`)).toEqual([]);
+    expect(hidden(`bash <<'X'\ncat > /tmp/a <<'EOF'\ncat > ${P} <<'Y'\nEOF\nX\n${pin}\n${P}`)).toHaveLength(1);
+  });
+});

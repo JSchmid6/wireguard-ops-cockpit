@@ -262,21 +262,31 @@ function resolve(path: string, cwd: string | null): string | null {
   return cwd ? posix.normalize(posix.join(cwd, path)) : null;
 }
 
+// Bare names in a text: split not only at blanks, quotes and "=", but also at
+// redirections, separators, groups and a leading backslash (Restbefund R1,
+// t_d3e3959f: wartung>/log, wartung&>/dev/null, wartung</dev/null, \wartung,
+// {wartung,}). The same split for relative names after cd and for PATH names.
+const NAME_SPLIT = /[\s'"=<>&|;()\\{},`]+/;
+
+function namesIn(text: string): string[] {
+  return text.split(NAME_SPLIT).filter((word) => /^[A-Za-z0-9_+@%][A-Za-z0-9._+@%-]*$/.test(word));
+}
+
 function pathsIn(text: string, cwd: string | null): string[] {
   const found = (text.match(ABSOLUTE_PATH) || []).map((path) => posix.normalize(path));
   if (cwd) {
     for (const rel of text.match(RELATIVE_PATH) || []) found.push(posix.normalize(posix.join(cwd, rel)));
-    for (const word of text.split(/[\s'"=]+/)) if (/^[A-Za-z0-9_+@%][A-Za-z0-9._+@%-]*$/.test(word)) found.push(posix.join(cwd, word));
+    for (const word of namesIn(text)) found.push(posix.join(cwd, word));
   }
   return found.filter((path) => !DIGEST_COMMAND.test(basename(path)));
 }
 
-// Pinned paths in a PATH directory that a segment names by their bare name
+// Paths in a PATH directory that a segment names by their bare name
 // (wartung, ExecStart=wartung, sudo wartung, sh -c 'wartung'): fail safe, every
 // such word counts, not only the command word.
-function pinnedByName(text: string, pinned: Map<string, string>): string[] {
-  const names = new Set(text.split(/[\s'"=]+/).filter((word) => /^[A-Za-z0-9_+@%][A-Za-z0-9._+@%-]*$/.test(word)));
-  return [...pinned.keys()].filter((path) => PATH_DIRS.has(posix.dirname(path)) && names.has(basename(path)));
+function namedInPath(text: string, paths: Iterable<string>): string[] {
+  const names = new Set(namesIn(text));
+  return [...paths].filter((path) => PATH_DIRS.has(posix.dirname(path)) && names.has(basename(path)));
 }
 
 // Non-option operands; options listed in withArgument take the next word.
@@ -374,10 +384,19 @@ interface ScriptLine {
   parts: Array<{ segment: Segment; cwd: string | null }>;
 }
 
+// Commands that run a heredoc body as shell code (bash <<'X', sudo bash -s,
+// sudo -s, su, runuser, ssh, cat <<'X' | bash); "" is a segment of wrappers only.
+const HEREDOC_SHELL = /^(?:sh|bash|dash|zsh|ksh|mksh|ash|busybox|su|runuser|ssh|)$/;
+// A shell named anywhere in the segment (sudo -u root sh), bare or below /bin, /usr/bin.
+const SHELL_NAME = /^(?:\/(?:usr\/)?bin\/)?(?:sh|bash|dash|zsh|ksh|mksh|ash|busybox)$/;
+
 // Lines of all steps and checks in order; heredoc bodies are marked, whole-line
 // comments and heredoc terminators dropped, a line ending in a backslash joined
-// with the next (outside heredoc bodies; the first line's number stays), and each
-// segment carries the working directory a cd before it set (per step).
+// with the next (outside content bodies; the first line's number stays), and each
+// segment carries the working directory a cd before it set (per step). The body
+// of a heredoc that a shell runs (Restbefund R3, t_d3e3959f) is read like the
+// script around it — writes, continued lines, cd, heredocs inside it —, only the
+// body of any other heredoc is content.
 function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): ScriptLine[] {
   const scripts = [
     ...manifest.steps.flatMap((step, index) => step.reboot ? [] : [{ prefix: `S${index + 1}`, text: step.run || "" }]),
@@ -386,24 +405,30 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
   const out: ScriptLine[] = [];
   for (const { prefix, text } of scripts) {
     let cwd: string | null = null;
-    let delimiter: string | null = null;
+    const open: Array<{ delimiter: string; shell: boolean; cwd: string | null }> = [];
     const rows = text.split("\n");
     for (let index = 0; index < rows.length; index += 1) {
       let line = rows[index];
       const where = `${prefix}:L${index + 1}`;
-      if (delimiter !== null) {
-        if (line.trim() === delimiter) { delimiter = null; continue; }
+      const inner = open[open.length - 1];
+      if (inner && line.trim() === inner.delimiter) {
+        open.pop();
+        if (inner.shell) cwd = inner.cwd;
+        continue;
+      }
+      if (inner && !inner.shell) {
         if (/^\s*#/.test(line) || CHECKSUM_ENTRY.test(line)) { out.push({ where, text: line, body: true, heredoc: false, parts: [] }); continue; }
         out.push({ where, text: line, body: true, heredoc: false, parts: segmentsOf(line).map((segment) => ({ segment, cwd: null })) });
         continue;
       }
       if (/^\s*#/.test(line)) continue;
-      while (/(?:^|[^\\])(?:\\\\)*\\$/.test(line) && index + 1 < rows.length) {
+      while (/(?:^|[^\\])(?:\\\\)*\\$/.test(line) && index + 1 < rows.length && rows[index + 1].trim() !== inner?.delimiter) {
         index += 1;
         line = `${line.slice(0, -1)} ${rows[index]}`;
       }
-      const open = line.match(/(?<!<)<<-?\s*(['"]?)([A-Za-z_][\w-]*)\1/);
-      const parts = segmentsOf(line).map((segment) => {
+      const opener = line.match(/(?<!<)<<-?\s*(['"]?)([A-Za-z_][\w-]*)\1/);
+      const segments = segmentsOf(line);
+      const parts = segments.map((segment) => {
         const part = { segment, cwd };
         if (segment.command === "cd") {
           const target = operands(segment.words.slice(segment.words.indexOf("cd") + 1), /^$/)[0];
@@ -411,8 +436,16 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
         }
         return part;
       });
-      out.push({ where, text: line, body: false, heredoc: Boolean(open), parts });
-      if (open) delimiter = open[2];
+      out.push({ where, text: line, body: false, heredoc: Boolean(opener), parts });
+      if (opener) {
+        // The shell that reads the body: the command with the heredoc or one its output is piped into.
+        let shell = false;
+        for (let at = Math.max(0, segments.findIndex((segment) => segment.text.includes("<<"))); at < segments.length && !shell; at += 1) {
+          shell = HEREDOC_SHELL.test(commandOf(plainWords(segments[at].words))) || segments[at].words.some((word) => SHELL_NAME.test(word));
+          if (segments[at].pipedInto === null) break;
+        }
+        open.push({ delimiter: opener[2], shell, cwd });
+      }
     }
   }
   return out;
@@ -455,6 +488,48 @@ function pinnedPaths(lines: ScriptLine[]): Map<string, string> {
   return pinned;
 }
 
+// Commands that do not change the content of a path they name; what they write
+// by redirect, tee, cp/mv/install/ln is read by writesOf. Not on it, because they
+// write through an option writesOf does not read: curl, wget, tar, unzip, openssl, gpg.
+const KEEPS_CONTENT = /^(?:chmod|chown|chgrp|stat|test|\[|\[\[|ls|cat|rm|cp|mv|install|touch|file|du|readlink|realpath|ln|grep|egrep|fgrep|diff|cmp|head|tail|wc|cut|mkdir|rmdir|dirname|basename|cd|gpgv|sha(?:1|224|256|384|512)sum|b2sum|md5sum|shasum|cksum|echo|printf|tee|logger|shellcheck)$/;
+// Wrappers in front of a run and the options whose value they take (sudo -u root, runuser -u x --, nice -n 5).
+const RUN_WRAPPERS = /^(?:runuser|su|nsenter|setpriv)$/;
+const OPTION_WITH_VALUE = /^-(?:[ugnt]|-user|-group)$/;
+
+// Restbefund R2 (t_d3e3959f): perl -pi, awk -i inplace, ed, ex, patch, truncate …
+// edit a file in place like sed -i, and a list of them would only be the next gap.
+// Fail safe: a segment whose command is not on KEEPS_CONTENT, or whose output goes
+// into one or into xargs, and that names a path this run has shown, takes the
+// heredoc back — unless it runs that path: the path is the command, or follows
+// only wrappers, shells/interpreters, options and assignments (bash /p,
+// sudo -u root /p, sh -c '/p'). sed only reads without -i, -f and without a
+// script word holding w, W or e (sed -n 1p /p stays free).
+function changesContent(segment: Segment): boolean {
+  if (segment.command !== "sed") return !KEEPS_CONTENT.test(segment.command);
+  const args = segment.words.slice(segment.words.findIndex((word) => basename(word) === "sed") + 1);
+  return args.some((word) => /^-[A-Za-z]*[if]|^--(?:in-place|file)/.test(word) || (!/^-[A-Za-z]+$/.test(word) && !/^\.{0,2}\//.test(word) && /[wWe]/.test(word)));
+}
+
+function edits(segment: Segment, receiver: Segment | undefined): boolean {
+  if (changesContent(segment)) return true;
+  if (segment.pipedInto === null || !receiver || HEREDOC_SHELL.test(receiver.command)) return false;
+  return receiver.words.some((word) => /^(?:xargs|parallel)$/.test(basename(word))) || changesContent(receiver);
+}
+
+function executes(segment: Segment, path: string, cwd: string | null): boolean {
+  const words = segment.words.map((word) => word.replace(/^\\+/, "").split(/[<>&|;]/)[0]);
+  const names = (word: string | undefined) => word !== undefined && (resolve(word, cwd) === path || (PATH_DIRS.has(posix.dirname(path)) && word === basename(path)));
+  for (let i = 0; i < words.length; i += 1) {
+    const word = words[i];
+    if (names(word)) return true;
+    if (word.startsWith("-")) { if (OPTION_WITH_VALUE.test(word) && !names(words[i + 1])) i += 1; continue; }
+    const name = basename(word);
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word) || /^\d+[smhd]?$/.test(word) || PREFIX_WORDS.test(name) || SHELL_WORDS.test(name) || RUN_WRAPPERS.test(name)) continue;
+    return false;
+  }
+  return false;
+}
+
 export function hiddenPinnedScripts(manifest: Pick<HostRunManifest, "steps" | "checks">): HiddenPinnedScript[] {
   const lines = manifestLines(manifest);
   const pinned = pinnedPaths(lines);
@@ -464,7 +539,7 @@ export function hiddenPinnedScripts(manifest: Pick<HostRunManifest, "steps" | "c
   const seen = new Set<string>();
   for (const line of lines) {
     if (!line.body) {
-      for (const { segment, cwd } of line.parts) {
+      for (const [index, { segment, cwd }] of line.parts.entries()) {
         for (const write of writesOf(segment, line.heredoc, cwd)) {
           const before = state.get(write.path);
           if (write.kind === "append") {
@@ -486,6 +561,12 @@ export function hiddenPinnedScripts(manifest: Pick<HostRunManifest, "steps" | "c
             state.set(write.path, { kind: write.kind, where: line.where, visibleBefore: before?.kind === "visible" || Boolean(before?.visibleBefore) });
           }
         }
+        if (!edits(segment, line.parts[index + 1]?.segment)) continue;
+        const visible = [...state].filter(([, item]) => item.kind === "visible").map(([path]) => path);
+        for (const path of new Set([...pathsIn(segment.text, cwd), ...namedInPath(segment.text, visible)])) {
+          if (state.get(path)?.kind !== "visible" || executes(segment, path, cwd)) continue;
+          state.set(path, { kind: "hidden", where: line.where, visibleBefore: true });
+        }
       }
       // sed -i edits in place and its change is not shown (a $( … ) in the script
       // even splits the segment): every path on the line counts as overwritten.
@@ -499,7 +580,7 @@ export function hiddenPinnedScripts(manifest: Pick<HostRunManifest, "steps" | "c
     }
     for (const { segment, cwd } of line.parts) {
       if (!runs(segment)) continue;
-      for (const path of [...pathsIn(segment.text, cwd), ...pinnedByName(segment.text, pinned)]) {
+      for (const path of [...pathsIn(segment.text, cwd), ...namedInPath(segment.text, pinned.keys())]) {
         const pinnedAt = pinned.get(path);
         if (!pinnedAt || seen.has(path)) continue;
         const written = state.get(path);

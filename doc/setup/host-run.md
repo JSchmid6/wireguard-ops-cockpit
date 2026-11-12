@@ -124,8 +124,9 @@ Routine: Paket-Updates aus den eingetragenen Quellen, Docker-Pulls, Kernel mit N
 GitLab-Stufen, Dienst-Neustarts.
 
 **Jedes ausgeführte Skript steht wörtlich im Plan** (05.11.2026, Befund X5 aus Job 26fb0860,
-Karte t_41cb8b49; nachgeschärft 09.11.2026 nach Zweitprüfung t_740ac6ee, Karte t_11872429, und
-11.11.2026 nach Zweitprüfung t_af29564c, Karte t_0e05c213): Ein
+Karte t_41cb8b49; nachgeschärft 09.11.2026 nach Zweitprüfung t_740ac6ee, Karte t_11872429,
+11.11.2026 nach Zweitprüfung t_af29564c, Karte t_0e05c213, und 12.11.2026 nach Zweitprüfung
+t_d3e3959f, Karte t_5d6eff99): Ein
 stündlicher root-Dienst führte ein Skript aus, das der Lauf nur per Hash festnagelte
 (`printf '<sha256>  /pfad' | sha256sum -c -`); die Unit-Datei stand per Heredoc wörtlich im Plan,
 das Skript nicht — der Türsteher sah einen Hash statt Code. Seitdem lehnt schon
@@ -149,9 +150,12 @@ Die Regel im Einzelnen (`hiddenPinnedScripts` in `apps/api/src/host-run.ts`):
   `/usr/bin`, `/sbin`, `/bin`) — auch als Ziel einer Kopie oder eines Symlinks (`ln -s /opt/x/run.sh
   /usr/local/bin/runit`, `cp /opt/x/run.sh /usr/local/bin/`) —, zählt auch sein **Basisname** als Wort
   (`… sha256sum -c - && wartung`, `sudo wartung --jetzt`, `runuser -u x -- wartung`, `ExecStart=wartung`);
-  fail-safe jedes Wort, nicht nur das Befehlswort (Entscheidung 11.11.2026). Eine Zeile mit `\` am Ende
-  wird außerhalb von Heredoc-Körpern vor dem Zerlegen mit der Folgezeile verbunden; die Fundstelle ist die
-  erste Zeile (`install -m 0755 \` + `/srv/run.sh /opt/x/run.sh`, `cat /p \` + `| bash`).
+  fail-safe jedes Wort, nicht nur das Befehlswort (Entscheidung 11.11.2026). Wörter für Basisnamen und
+  relative Namen nach `cd` trennt die Regel an Leerraum, Quotes, `=` und an `<>&|;(){},\`
+  sowie Backticks (12.11.2026, R1): `wartung>/var/log/w.log`, `wartung&>/dev/null`, `wartung</dev/null`,
+  `\wartung`, `{wartung,}`, `cd /opt/x && bash run.sh>/tmp/l` zählen wie das blanke Wort. Eine Zeile mit
+  `\` am Ende wird außerhalb von Inhalts-Heredocs vor dem Zerlegen mit der Folgezeile verbunden; die
+  Fundstelle ist die erste Zeile (`install -m 0755 \` + `/srv/run.sh /opt/x/run.sh`, `cat /p \` + `| bash`).
   Ausgenommen sind nur Befehle, die ihre Operanden nicht ausführen (`chmod`, `chown`, `stat`,
   `test`/`[`, `ls`, `cat`, `rm`, `cp`, `mv`, `ln`, `install`, `curl`, `wget`, `tar`, `grep`, `cmp` …,
   Liste `QUIET_COMMANDS`; `sed` steht nicht darauf). Vor dem Befehl werden nur Schlüsselwörter und
@@ -160,6 +164,12 @@ Die Regel im Einzelnen (`hiddenPinnedScripts` in `apps/api/src/host-run.ts`):
   Wrapper kein stiller Befehl ist — nicht, weil jede Form einzeln erkannt würde. Preis: Ein Pfad in einer
   `echo`-Meldung ohne Digest zählt auch, beim Basisnamen ebenso ein gleichlautendes Wort (`apt-get install
   wartung`, `command -v wartung`); der Planer schreibt ihn dann anders.
+  **Heredoc an eine Shell** (12.11.2026, R3): Den Körper eines Heredocs, den eine Shell ausführt
+  (`bash <<'X'`, `sudo bash -s <<'X'`, `sudo -s`, `su`, `runuser`, `ssh`, `cat <<'X' | bash`, auch
+  `| sudo -u root sh`), liest die Regel wie die Skriptzeilen um ihn herum — Schreibvorgänge, `cd`,
+  Fortsetzungszeilen, Heredocs darin; nur der Körper jedes anderen Heredocs (`cat > /datei`, `python3 -`,
+  auch ein Inhalts-Heredoc in einem Shell-Körper) ist Inhalt. Ein Skript, das ein Shell-Körper per Heredoc
+  schreibt, gilt als gezeigt.
 - **Geschrieben** zählt nur der letzte Schreibvorgang vor der Ausführung, und nur, wenn er den Inhalt
   zeigt: `cat >`/`tee` mit Heredoc, `install … /dev/stdin <ziel>` mit Heredoc, `echo`/`printf` ohne
   `$`/Backticks, eine Kopie eines so geschriebenen Skripts. Anhängen (`cat >>`, `tee -a`) an eine nicht
@@ -168,6 +178,18 @@ Die Regel im Einzelnen (`hiddenPinnedScripts` in `apps/api/src/host-run.ts`):
   jedes `sed -i`/`--in-place` auf den Pfad (Entscheidung 11.11.2026, Hinweis aus t_af29564c): Mit `$(…)`,
   Backticks oder `r /datei` ist die Änderung nicht sichtbar, und eine literale Ersetzung gehört gleich in
   den Heredoc — eine Unterscheidung nach dem sed-Skript wäre nur eine weitere Lücke.
+  Fail-safe statt Liste (12.11.2026, R2: `perl -pi`, `awk -i inplace`, `ed`, `ex`, `patch`, `truncate` …):
+  Jeder Befehl, der einen bisher gezeigten Pfad nennt (auch per Basisnamen oder relativ nach `cd`), hebt
+  den Heredoc auf — ausgenommen nur Befehle, die den Inhalt nicht ändern oder deren Schreiben die Regel
+  ohnehin liest (`KEEPS_CONTENT`: die stillen Befehle ohne `curl`, `wget`, `tar`, `unzip`, `openssl`,
+  `gpg`, dazu `echo`, `printf`, `tee`, `logger`, `shellcheck`; `sed` nur ohne `-i`/`-f` und ohne
+  Skriptwort mit `w`, `W`, `e`), und die Ausführung selbst: Der Pfad ist das Befehlswort oder folgt nur
+  auf Wrapper, Shells/Interpreter, Optionen und Zuweisungen (`bash /p`, `bash -n /p`, `sudo -u root /p`,
+  `runuser -u x -- /p`, `timeout 60 /p`, `sh -c '/p'`). Ebenso eine Ausgabe, die den Pfad nennt und in
+  einen ändernden Befehl oder `xargs` geht (`echo /p | xargs perl -pi …`); in eine Shell gepipt bleibt sie
+  Ausführung. Preis: Ein gezeigtes Skript, das ein anderer Befehl zwischen Heredoc und Ausführung nennt
+  (`python3 -W ignore /p`, `flock /lock /p`, `setcap … /p`), zählt als überschrieben; der Planer schreibt
+  den Aufruf dann als `bash /p` bzw. den Heredoc nach dem Befehl.
 - **Nicht unter der Regel** (Entscheidung 09.11.2026, sonst belohnt sie das Weglassen der Prüfung —
   ohne Hash wäre der Plan frei): ein Programm, das dieser Lauf selbst lädt (`curl -o`, `wget -O`) und
   prüft, sofern es kein Skript ist (Endung `.sh`, `.py` … oder Aufruf über Shell/Interpreter — ein
