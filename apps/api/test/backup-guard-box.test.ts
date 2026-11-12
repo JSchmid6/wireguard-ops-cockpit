@@ -232,3 +232,41 @@ describe("backup bolt, box (t_a5defddd): abbreviations, attached values, truncat
     expect(focus(": > /var/backups/dpkg.status.0").length).toBeGreaterThan(0);
   });
 });
+
+// Karte t_cef59949 (host-run.md 2a: "Löschen, Verschieben, Überschreiben"):
+// cp, install, ln -f, rsync und tee auf eine Datei dort, wo nur das
+// Backup-Werkzeug schreibt (GitLab-Sicherungen, vzdump-Sicherungen und
+// dump-Verzeichnisse, borg-Repo), überschreiben ein Backup. Ein Verzeichnis als
+// Ziel legt eine neue Sicherung dazu, eine Kopie weg vom Backup liest nur —
+// beides bleibt Fokus des Türstehers.
+describe("backup bolt (t_cef59949): overwriting a backup file by copying", () => {
+  it.each([
+    ["cp onto a vzdump backup", "cp /dev/null /var/lib/vz/dump/vzdump-qemu-100.vma.zst"],
+    ["cp -f onto a vzdump backup", "cp -f /tmp/x /var/lib/vz/dump/vzdump-qemu-100.vma.zst"],
+    ["cp onto a GitLab backup", "cp /tmp/x /var/opt/gitlab/backups/1_gitlab_backup.tar"],
+    ["cp onto a backup after cd", "cd /var/lib/vz/dump && cp /tmp/x vzdump-qemu-100.vma.zst"],
+    ["cp onto a backup on a mounted storage", "cp /tmp/x /mnt/pve/nas/dump/vzdump-lxc-101.tar.zst"],
+    ["install onto a vzdump backup", "install -m600 /dev/null /var/lib/vz/dump/vzdump-qemu-100.vma.zst"],
+    ["install with a separate mode onto a GitLab backup", "install -m 600 /dev/null /var/opt/gitlab/backups/1_gitlab_backup.tar"],
+    ["tee onto a vzdump backup", "tee /var/lib/vz/dump/vzdump-qemu-100.vma.zst </dev/null"],
+    ["tee from a pipe onto a GitLab backup", "echo x | tee /var/opt/gitlab/backups/1_gitlab_backup.tar"],
+    ["rsync onto a vzdump backup", "rsync /dev/null /var/lib/vz/dump/vzdump-qemu-100.vma.zst"],
+    ["rsync -avt onto a GitLab backup", "rsync -avt /tmp/x /var/opt/gitlab/backups/1_gitlab_backup.tar"],
+    ["ln -sf onto a vzdump backup", "ln -sf /tmp/x /var/lib/vz/dump/vzdump-qemu-100.vma.zst"],
+  ])("gated: %s", (_label, run) => {
+    expect(hits(run).length).toBeGreaterThan(0);
+  });
+
+  it.each([
+    ["a new backup into the dump directory", "cp /tmp/x /var/lib/vz/dump/\ncp /tmp/x /var/lib/vz/dump\ncp -t /var/lib/vz/dump /tmp/x"],
+    ["a backup copied away under another name", "cp /var/lib/vz/dump/vzdump-qemu-100.vma.zst /tmp/kopie.vma.zst"],
+    ["a backup copied away under its own name", "cp /var/lib/vz/dump/vzdump-qemu-100.vma.zst /tmp/vzdump-qemu-100.vma.zst"],
+    ["a GitLab backup synced offsite", "rsync -a /var/opt/gitlab/backups/1_gitlab_backup.tar /srv/offsite/"],
+    ["tee -a appends", "tee -a /var/opt/gitlab/backups/notiz.txt </dev/null"],
+    ["a backup log read into a file elsewhere", "cat /var/lib/vz/dump/vzdump-qemu-100.log | tee /tmp/log.txt"],
+    ["a new directory and a new link", "install -d /var/opt/gitlab/backups/neu\nln -s /tmp/x /var/lib/vz/dump/link"],
+    ["a copy into /var/backups (the plan's own return path)", "cp /tmp/x /var/backups/x.tar"],
+  ])("free: %s", (_label, run) => {
+    expect(hits(run)).toEqual([]);
+  });
+});

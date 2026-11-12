@@ -196,7 +196,7 @@ gibt es nicht; nach der Freigabe kann Jochen alles davon tun.
 Die Erkennung ist deterministisch und hat genau eine Quelle:
 `deploy/helpers/cockpit-backup-guard.mjs` (installiert neben dem Helfer als
 `/usr/local/lib/wireguard-ops-cockpit/cockpit-backup-guard.mjs`, Version
-`cockpit-backup-guard/v6`). Sie liefert zwei Listen:
+`cockpit-backup-guard/v7`). Sie liefert zwei Listen:
 
 - `backupGuardHits` — der Riegel (Art `backup`). Drei Stellen fragen ihn:
   1. die Policy der API (`hostRunPolicy`): ein Treffer macht aus `pass` ein
@@ -278,7 +278,15 @@ jedes `cd`-Ziel aufgelöst. Kommentare zählen nicht.
   `/var/backups`, `/var/opt/gitlab/backups`: `rm`, `rmdir`, `mv`, `shred`, `unlink`,
   `find … -delete` (oder `-exec rm`), `rsync --delete` ins Ziel, `git clean|rm`, `truncate`,
   `dd of=`, `chattr`; bei Löschbefehlen auch über einen Vorfahren (`rm -rf /var`,
-  `cd /etc && rm -rf *`, `rm -rf /media`);
+  `cd /etc && rm -rf *`, `rm -rf /media`); seit Karte t_cef59949 (`cockpit-backup-guard/v7`)
+  auch `cp`, `install`, `ln -f`, `rsync` und `tee` (ohne `-a`) auf eine **Datei** dort, wo nur
+  das Backup-Werkzeug schreibt (borg-Repo, `/var/opt/gitlab/backups`, vzdump: `/var/lib/vz/dump`,
+  `/mnt/pve/<speicher>/dump`) — ob die Datei schon da ist, sieht der Riegel nicht, darum zählt der
+  Dateiname als Überschreiben. Ehrlich: Ein Verzeichnis als Ziel (`cp x /var/lib/vz/dump/`,
+  `cp -t …`, mehrere Quellen) legt eine neue Sicherung dazu und bleibt Fokus des Türstehers, auch
+  wenn ein gleichnamiges Backup darin überschrieben würde; ebenso ein vzdump-Name an einem fremden
+  Ort (eine Kopie weg vom Backup trägt denselben Namen) und Kopien nach `/var/backups` (dort legt
+  ein Plan den eigenen Rückweg an);
 - auf Lab0 (`ssh borg@10.0.0.5 …`, `ssh lab0 …`, auch `-o HostName=10.0.0.5`): jeder Löschbefehl
   (`rm`, `mv`, `find -delete`, `zfs destroy` …), auch nach einem Trenner in Quotes
   (`ssh lab0 'true; rm -rf …'`); jeder Befehl dort, den der Riegel nicht lesen kann (fremdes
@@ -302,7 +310,7 @@ jedes `cd`-Ziel aufgelöst. Kommentare zählen nicht.
 - einen Maschinen-Snapshot löschen: `cockpit-vps-snapshot delete`, `DELETE …/snapshots/…`. Die
   Rotation des Werkzeugs selbst (`create` räumt den ältesten cockpit-eigenen Snapshot, Jochen
   28.09.2026) bleibt frei;
-- auf dem Proxmox-Host (Rolle `box`, seit 09.11.2026, Karte t_5f5c89fe, `cockpit-backup-guard/v6` seit Karte t_a5defddd;
+- auf dem Proxmox-Host (Rolle `box`, seit 09.11.2026, Karte t_5f5c89fe, `cockpit-backup-guard/v6` seit Karte t_a5defddd, v7 seit t_cef59949;
   Befund N2 der Prüfung t_88f1e802 — vorher sah das nur der Türsteher, X4):
   - vzdump-Sicherungen löschen, verschieben, kürzen oder überschreiben (`rm`, `mv`, `shred`,
     `truncate`, `dd of=`, `find … -delete`, `rsync --delete` …, wie bei den borg-Zielen) in
