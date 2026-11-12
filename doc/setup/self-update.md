@@ -268,7 +268,7 @@ Flow of a Hermes change job whose plan contains `self.update <sha>` lines:
    | `update-mechanism` | G7 | the self-update helper, runner, snapshot helper, Lab0 deploy script, unit, `update-review.ts`, `update-review-prompt.ts` |
    | `envelope-signing` | G2 | hunks touching `signEnvelope`, `verifyExecutionEnvelopeSignature`, `approveExecutionEnvelope`, `createExecutionEnvelope`, `validateExecutionEnvelope`, and `verifyEnvelope` in the capability helper |
    | `broker-validation` | G3 | hunks touching `validateRequest`/`signature` in the executor broker |
-   | `host-door` | G2/G5/G6/G9/G10 | the general door: `apps/api/src/host-run.ts`, `deploy/helpers/cockpit-host-run`, `cockpit-backup-guard.mjs`, `cockpit-borg-retention-rules.mjs`, `cockpit-state-steps.mjs`, the host-run resume unit, Lab0's net `cockpit-host-snapshot` and the two deploy-installed role files `deploy/{vps,lab0}/instance-role.env` |
+   | `host-door` | G2/G5/G6/G9/G10 | the general door: `apps/api/src/host-run.ts`, `deploy/helpers/cockpit-host-run`, `cockpit-backup-guard.mjs`, `cockpit-borg-retention-rules.mjs`, `cockpit-state-steps.mjs`, the host-run resume unit, Lab0's net `cockpit-host-snapshot` and the three deploy-installed role files `deploy/{vps,lab0,box}/instance-role.env` |
    | `approval-and-auth`, `brokers-and-agents`, `capability-sandbox`, `root-helpers`, `ci` | G1/G6, G3/G6, G5, G4/G5, G7 | file-level areas |
    | `dependencies` | G8 | `package.json` hunks; lockfiles are summarized as a package list with install scripts and non-registry sources first |
    | `tests-deleted` | — | deleted test files |
@@ -523,7 +523,11 @@ enforces it (`applyBackupBolt` in `update-review.ts`, last step of
      `ops/cockpit-vps-snapshot`, `deploy/helpers/cockpit-borg-action` with the
      quarter bound of `sources add`, and the role files
      `deploy/*/instance-role.env`, which pick the snapshot before a mutating
-     run), and `apps/api/src/backup-bolt.ts` itself — changing the list
+     run), the units that run them (finding B3, card t_834fb98c:
+     `deploy/systemd/cockpit-borg-retention.{service,timer}`, the prune/compact
+     run and its start time, and `deploy/systemd/borgmatic-cockpit-borg-lock.conf`,
+     which makes the nightly backup wait for the repo lock instead of failing),
+     and `apps/api/src/backup-bolt.ts` itself — changing the list
      is a bolt change. The runner diffs with `--no-renames`, so moving a bolt
      file names its old path too.
   2. *Places that ask the bolt* (`BACKUP_BOLT_SYMBOLS`): `host-run.ts`, `app.ts`
@@ -535,7 +539,14 @@ enforces it (`applyBackupBolt` in `update-review.ts`, last step of
      `app.ts`), `SECOND_REVIEW_STOP_GUARANTEES`, `stopsDespiteSecondReview` (the
      G10 exception of the second review) or this rule's own names
      (`backupBoltChanges`, `applyBackupBolt`, `backupBolt`) is a bolt change.
-     Tests and documentation are not read for names.
+     Documentation and lockfiles are not read for names, and tests only where
+     they cannot ship (finding B1, card t_834fb98c): under the root `test/` and
+     under `apps/api/test/`, `packages/*/test/`, whose package builds only
+     `src/` (`rootDir: "src"`, so shipped code cannot import from there).
+     Everything else is read — also a `test/` folder or a `*.test.*` file under
+     `src/`, `deploy/` or `ops/`: such a file is built or installed, and a
+     shim there could redefine `backupGuardHits` while `app.ts` changes only
+     its `from` line.
   3. *Fail closed*: a code file whose diff section the runner cut or left out,
      or a clipped file list, makes the check unreadable. A plan that would run
      then stops for James (`blocked_prerequisite`, split the update), and no
