@@ -196,7 +196,7 @@ gibt es nicht; nach der Freigabe kann Jochen alles davon tun.
 Die Erkennung ist deterministisch und hat genau eine Quelle:
 `deploy/helpers/cockpit-backup-guard.mjs` (installiert neben dem Helfer als
 `/usr/local/lib/wireguard-ops-cockpit/cockpit-backup-guard.mjs`, Version
-`cockpit-backup-guard/v4`). Sie liefert zwei Listen:
+`cockpit-backup-guard/v6`). Sie liefert zwei Listen:
 
 - `backupGuardHits` — der Riegel (Art `backup`). Drei Stellen fragen ihn:
   1. die Policy der API (`hostRunPolicy`): ein Treffer macht aus `pass` ein
@@ -301,7 +301,77 @@ jedes `cd`-Ziel aufgelöst. Kommentare zählen nicht.
   Backup-Befehls neu schreiben (`crontab -l | grep -v borgmatic | crontab -`);
 - einen Maschinen-Snapshot löschen: `cockpit-vps-snapshot delete`, `DELETE …/snapshots/…`. Die
   Rotation des Werkzeugs selbst (`create` räumt den ältesten cockpit-eigenen Snapshot, Jochen
-  28.09.2026) bleibt frei.
+  28.09.2026) bleibt frei;
+- auf dem Proxmox-Host (Rolle `box`, seit 09.11.2026, Karte t_5f5c89fe, `cockpit-backup-guard/v6` seit Karte t_a5defddd;
+  Befund N2 der Prüfung t_88f1e802 — vorher sah das nur der Türsteher, X4):
+  - vzdump-Sicherungen löschen, verschieben, kürzen oder überschreiben (`rm`, `mv`, `shred`,
+    `truncate`, `dd of=`, `find … -delete`, `rsync --delete` …, wie bei den borg-Zielen) in
+    `/var/lib/vz/dump`, im `dump`-Verzeichnis jedes eingehängten Speichers
+    (`/mnt/pve/<speicher>/dump`, auch per Glob `/mnt/pve/*/dump`) und über deren Vorfahren
+    (`rm -rf /var/lib/vz`, `rm -rf /mnt/pve/nas`); an jedem Ort eine Datei `vzdump-*` oder `*.vma*`;
+  - `find … -name 'vzdump-*'|'*.vma*' -delete` (oder `-exec rm`) an jedem Ort;
+  - `pvesm free` auf ein Sicherungs-Volume (`…:backup/…`, `backup/… --storage <pbs>`, `vzdump-…`),
+    `pvesm prune-backups` (außer mit `--dry-run`, und nur wenn jede Schreibweise der Option wahr
+    ist: `--dry-run 1 --dry-run 0` ist ein Treffer), `vzdump … --remove` (außer `--remove 0`),
+    auch als `pvesh create /nodes/<n>/vzdump … --remove 1`. Ehrlich: `remove` steht in Proxmox
+    standardmäßig auf 1 (pve-docs `vzdump.1`, gelesen 09.11.2026) — ein nacktes `vzdump` prunet
+    also nach der eingestellten Aufbewahrung, wie ein nacktes `borgmatic`. Der eigentliche Schutz
+    ist darum der Treffer auf jede Änderung dieser Aufbewahrung (nächster Punkt);
+  - jede Änderung der Aufbewahrung `prune-backups`/`maxfiles`/`keep-*` (`pvesm set|add`,
+    `vzdump --prune-backups`, `pvesh set …`, `sed` an einer Datei), jedes Schreiben in
+    `/etc/vzdump.conf`, `/etc/pve/storage.cfg`, `/etc/pve/jobs.cfg`, `/etc/pve/vzdump.cron`,
+    `/etc/cron.d/vzdump`; einen Backup-Auftrag ändern oder löschen (`pvesh set|delete
+    /cluster/backup/<id>`, `PUT|POST|DELETE …/api2/json/cluster/backup/<id>`);
+  - `qm|pct delsnapshot`, `qm|pct rollback`, `qm|pct destroy` und ihre API-Formen: `pvesh delete
+    …/snapshot/<name>`, `pvesh create …/snapshot/<name>/rollback`, `pvesh delete
+    /nodes/<n>/qemu|lxc/<id>`, `pvesh delete|set …/storage/<s>/content/<vol>`, `pvesh delete
+    …/storage/<s>/prunebackups` (auch mit leeren Pfadteilen `//`, ohne führenden `/`, mit Optionen
+    vor dem Pfad) und dieselben Pfade per `curl -X DELETE|POST|PUT` (auch angehängt: `-XDELETE`,
+    `-kXDELETE`, `-X'DELETE'` — ebenso für `…/snapshots` bei Contabo) bzw. `wget --method=…`
+    (auch abgekürzt `--meth=`) auf `…/api2/json/…`;
+  - `qmrestore … --force` und `pct restore … --force` über einen bestehenden Gast: das zerstört ihn
+    samt Snapshots wie `destroy` (Karte t_a5defddd);
+  - am `qm`/`pct` vorbei auf der Speicherebene (die Box nutzt LVM-thin): `lvremove` eines
+    Gast-Volumes oder -Snapshots (`vm-<id>-disk…`, `base-<id>-…`, `snap_…`, der Pool `pve/data`),
+    `lvconvert --merge …snap_…`, `zfs destroy|rollback` auf einen Snapshot (`…@…`) oder ein
+    Gast-Volume, `qemu-img snapshot -d|-a`. Andere Volume-Namen sieht der Türsteher.
+  **Abkürzungen (Zweitprüfung t_eebb73c0, Karte t_a5defddd):** die Proxmox-CLI führt jedes
+  eindeutige Präfix eines Unterbefehls aus (pve-common `CLIHandler.pm`, `expand_command_name` mit
+  `enforce_exact`): `qm delsnap` ist `delsnapshot`, `pct destr` ist `destroy`, `pvesh del` ist
+  `delete`, `pvesm fre` ist `free`. Der Riegel löst die Verben von `qm`, `pct`, `pvesm` und `pvesh`
+  vor dem Vergleich genauso auf (Listen der Unterbefehle aus `qm.pm`, `pct.pm`, `pvesm.pm`,
+  `pvesh.pm`, git.proxmox.com HEAD 10.11.2026, im Riegel als `PVE_COMMANDS`); ein exakter Name gilt
+  vor jedem Präfix, ein Alias nur exakt. Ein mehrdeutiges Präfix, das ein gesperrtes Verb treffen
+  kann (`qm de` → `delsnapshot`/`destroy`, `qm r`), ist ein Treffer (fail-closed), obwohl Proxmox es
+  ablehnt. Frei als Lesen gilt nur ein exaktes oder eindeutig aufgelöstes Leseverb (`qm listsn`,
+  `pvesh g`); `qm li` (list oder listsnapshot) ist kein freies Lesen. Optionen nimmt Getopt::Long
+  mit `-` oder `--` und jedem Präfix (`JSONSchema.pm` `get_options`, `auto_abbrev`): jedes Präfix
+  von `remove` (vzdump, `--rem 1`, `--remov=1`, `-remove 1`, nacktes `--rem`), `maxfiles` und
+  `prune-backups` (`pvesm set local --maxfi 1`) ist ein Treffer, wie schon `--dry-run` in jeder
+  Schreibweise. `$'…'` ohne Backslash liest der Riegel wie `'…'` (`qm del$'s'napshot`).
+  Erkannt wird wie bei borg auch hinter `sudo`, `env`, `bash -c '…'`, absoluten Pfaden
+  (`/usr/sbin/qm`), Quotes (`q"m"`), Variablen, Schleifen, `xargs`, Prozess-Substitution, in
+  Skripten und Cron-Zeilen, die der Lauf schreibt, und in Inline-Code. Der Riegel ist
+  rollenunabhängig (eine Quelle, ohne Rolle); auf VPS und Lab0 gibt es diese Werkzeuge nicht.
+  **Entscheidung (09.11.2026, Auftrag t_5f5c89fe): die Rotation von `cockpit-host-snapshot`
+  bleibt frei, ein `delsnapshot` im Plan nicht — auch nicht für die Namensform `cockpit-run-*`.**
+  Der Helfer rotiert seine eigenen Gast-Snapshots selbst (`qm|pct delsnapshot` als Unterprozess,
+  nur Namen der Form `cockpit-run-*`, die fünf jüngsten bleiben); dieser Befehlstext steht in
+  keinem Plan. Auch ein Aufruf `cockpit-host-snapshot create cockpit-run-… --guests` aus dem Plan
+  ist frei (wie `cockpit-vps-snapshot create` auf dem VPS, Jochen 28.09.2026). Ein Plan, der
+  selbst `qm delsnapshot <vmid> cockpit-run-…` schreibt, ist ein Treffer — wie
+  `cockpit-vps-snapshot delete` auf dem VPS: eine Ausnahme nach dem Namen ließe genau die
+  Rückwege früherer Läufe (oder des eigenen) frei löschen. Ehrliche Grenze dieser Entscheidung
+  (Zweitprüfung 09.11.2026): fünf `create`-Aufrufe in einem Plan rotieren alle älteren
+  cockpit-Snapshots weg, auch den dieses Laufs; das sieht der Türsteher (Fokus „ein Programm,
+  dessen Inhalt der Plan nicht zeigt“, X4), nicht der Riegel. Offen für Jochen.
+- **Kürzen per Umleitung (Entscheidung Karte t_a5defddd, für die Daten-Ziele allgemein):** `: > f`,
+  `> f`, `echo > f`, `>| f` (jede Umleitung, die kürzt; nicht `>>`) ist ein Treffer, wo nur das
+  Backup-Werkzeug selbst schreibt: das borg-Repo `/media/RAID/backup_VServer`, die
+  GitLab-Sicherungen `/var/opt/gitlab/backups`, `/var/lib/vz/dump` und jede vzdump-Datei bzw. jedes
+  `dump`-Verzeichnis eines Proxmox-Speichers. In `/var/backups` bleibt es ein Hinweis für den
+  Türsteher: dort legt ein Plan seinen eigenen Rückweg an (`wp db export - > /var/backups/…`,
+  siehe WordPress oben), und ein frischer Dump unter altem Namen ersetzt nur einen älteren Dump.
 
 **Hinweis für den Türsteher (hält nicht an):**
 
@@ -330,7 +400,12 @@ Backups löscht kein Archiv und ändert keine Aufbewahrung, Karte t_30c9ea52),
 `version`, `info`, `compose ps|config|logs`), Paket-Updates — auch wenn `borgbackup` oder
 `borgmatic` darunter sind —, `gitlab-backup create`, Lesebefehle (`ls`, `cat`, `grep`, `test`;
 nicht auf Zugangsdaten und Repo-Inhalt, siehe oben) und `curl` ohne Upload an die Statusdatei auf
-Lab0. Auf Lab0 bleibt sichtbare Routine per `ssh` frei (Jochen, 13.10.2026: „ein umkehrbarer
+Lab0. Auf box frei: `qm|pct list|listsnapshot|config|status|pending`, `qm|pct snapshot`,
+Gäste starten und stoppen, `pvesm status|list|path|…scan`, `pvesm prune-backups --dry-run`,
+`pvesh get|ls`, `pvesh create /cluster/backup …` (ein neuer Auftrag), ein `vzdump` ohne
+`--remove` (Hinweis für den Türsteher), eine neue Sicherung in das `dump`-Verzeichnis legen, die
+Speicher-Konfiguration lesen. `pvesm free` auf eine Gastplatte (`…:vm-100-disk-1`) und Löschen unter
+`/var/lib/vz/images` bleiben beim Türsteher (X4): keine Sicherungen. Auf Lab0 bleibt sichtbare Routine per `ssh` frei (Jochen, 13.10.2026: „ein umkehrbarer
 Routineschritt braucht kein Ja“): `systemctl start|stop|restart` an Units außerhalb der
 Sicherung (`android-adb.service`, `android-emulator.service`, die Cockpit-Units), Status,
 `journalctl`, Metadaten des Repos (`df`, `du`, `ls`), Paket-Updates. Der Türsteher sieht `ssh`
@@ -362,9 +437,24 @@ Name sagt; ihren Inhalt sieht er nicht. Ein Interpreter-Programm ohne Löschwort
 geschützten Pfad und ohne den Namen des Backup-Helfers wird nicht weiter zerlegt. Einen Helfer-Namen,
 der erst zur Laufzeit entsteht (zusammengesetzt, dekodiert, aus einer Datei), sieht der Riegel
 nicht. Dort bleibt der Türsteher (X4) die Sicherung.
+Auf box kennt der Riegel das `dump`-Verzeichnis eines Verzeichnis-Speichers außerhalb von
+`/var/lib/vz` und `/mnt/pve` nicht (es steht nur in `storage.cfg`); dort greifen die Dateinamen
+(`vzdump-*`, `*.vma*`), ein `rm -rf <anderer-speicher>/dump` ist Sache des Türstehers. Einen
+Speicher entfernen oder abschalten (`pvesm remove`, `--disable 1`) bleibt beim Türsteher, ebenso
+API-Aufrufe aus Inline-Code (`python3 -c 'requests.delete(…)'`) — wie beim Contabo-Snapshot.
+Ein Verb, das erst zur Laufzeit entsteht (`qm ${V:-delsnapshot}`, `qm $(echo delsnapshot)`,
+`` qm `echo rollback` ``, `$'\x64…'`), und `ls …/dump/* | xargs rm` sind wie bei borg Hinweise
+(`uncertain`) für den Türsteher, keine Riegel-Treffer: unlesbarer Text ist sein Fokus (Doktrin
+10.10.2026). `cockpit-host-snapshot` kennt nur `create` und `list`; jede andere Form bricht mit 64 ab.
+Wie bei `keep_*` für borg greift `prune-backups`/`maxfiles` in jedem Befehl, der kein reiner
+Lesebefehl ist: auch `awk '/prune-backups/' /etc/pve/storage.cfg` oder `sed -n …` (beide gelten
+dem Riegel nicht als lesend) brauchen die Freigabe; `grep` und `cat` nicht.
 
 Tests: `apps/api/test/backup-guard.test.ts` (Korpus frei / Riegel / nur Hinweis, die echten Pläne
 vom 10.10.2026 aus `fixtures/host-run-plans-2026-10-10.json`, Policy),
+`backup-guard-lab0.test.ts` (Lab0), `backup-guard-box.test.ts` (box: vzdump, pvesm, pvesh, API,
+Gast-Snapshots, Umgehungen, Namensform `cockpit-run-*`; Abkürzungen von Verben und Optionen,
+`curl -XDELETE`, Kürzen per Umleitung, Speicherebene),
 `host-run-helper.test.ts` (Helfer beim Start und nach dem Neustart, Snapshot-Name ≤ 30 Zeichen),
 `host-run-flow.test.ts` (API: `pass` plus `borg delete` wartet auf Jochen, läuft nach der
 Freigabe).
@@ -647,7 +737,9 @@ Ehrliche Grenze von box: Was nicht auf einer Gastplatte liegt (`/var/lib/vz` mit
 vzdump-Sicherungen, weiterer Speicher), deckt kein Snapshot; ein Snapshot liegt auf demselben Speicher wie
 der Gast (fällt die NVMe aus, ist beides weg); und was ein Gast nach außen geschickt hat, holt kein Rollback
 zurück. Einen Gast oder seine Volumes zerstören, einen Gast-Snapshot löschen oder zurückrollen,
-vzdump-Sicherungen löschen, Speicher entfernen ist für den Türsteher X4. Zurückgerollt wird nur mit Jochens
+vzdump-Sicherungen löschen, Speicher entfernen ist für den Türsteher X4; Gast zerstören, Gast-Snapshot
+löschen oder zurückrollen und vzdump-Sicherungen löschen oder ihre Aufbewahrung kürzen sind seit 09.11.2026
+zusätzlich Treffer des Backup-Riegels (Abschnitt 2a). Zurückgerollt wird nur mit Jochens
 Freigabe (`qm rollback <vmid> <name>` bzw. `pct rollback …`; das Protokoll nennt die Gast-Snapshots als
 Rückweg).
 
