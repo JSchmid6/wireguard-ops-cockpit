@@ -316,7 +316,44 @@ Flow of a Hermes change job whose plan contains `self.update <sha>` lines:
    file of a focus file for context across hunks — at 152 KB it is larger than
    a pass itself, and the hunks already carry their context lines; a reviewer
    who cannot judge a hunk without more says so (`UNVERIFIABLE` of what it saw
-   is a stop, never a pass). The
+   is a stop, never a pass).
+
+   **Unchanged context of the backup bolt** (since 12.11.2026, card
+   t_7ea8785f; case: job 73ebb0fc, self-update b9372e1..0d0edf42, PR #83). Which
+   verbs of the backup helper are free under the bolt (G10) is decided in
+   `deploy/helpers/cockpit-backup-guard.mjs`, not in the helper. That diff added
+   `sources add-large` to `cockpit-borg-action` without touching the guard; the
+   reviewer saw only the helper and answered „UNVERIFIABLE (BEARS ON G10):
+   add-large bolt enforcement not verifiable from the material“ → incomplete,
+   although the bolt reads the verb correctly — a gap of the collection, not a
+   question for the operator. Decision: when a diff changes a helper whose verbs
+   the guard judges by name (`BACKUP_GUARD_CONTEXT` in `update-review.ts`:
+   `cockpit-borg-action`, `cockpit-borg-retention`) and leaves the guard itself
+   unchanged, the passes get a section „Unchanged context, not part of the diff“
+   with the guard's free forms for that helper (`sourcesFree`,
+   `HELPER_FREE_FOLLOWER`, `helperVerbBolt`, the helper's `case` line of the
+   read-only forms; `retentionRoutine` for the retention helper). The text is cut
+   at these declarations from the running Cockpit's own copy of the guard — the
+   file the API policy already imports —, which is the guard's text at the
+   target commit exactly because the diff does not change it; there is no
+   second copy of the rules. A diff that changes the guard brings its own hunks
+   and gets no context. The section sits inside the data markers after the diff
+   excerpt, in the pass that holds the helper, else in any pass with room. It is
+   placed after every diff section, documentation included: it never takes their
+   room and never opens a pass of its own; context without room is recorded as
+   `coverage.contextLeftOut` and stops nothing (the reviewer may still answer
+   `UNVERIFIABLE`, which stays incomplete as before). The coverage records it
+   as `context`. An anchor the guard no longer has is named in the section
+   („not found in the installed copy“), and a unit test pins every anchor to
+   exactly one line of the current guard. The instructions tell the reviewer to
+   judge the diff, not the context. No guarantee, no bolt rule and no stop
+   changes. Way back: revert this change (`update-review.ts`,
+   `update-review-prompt.ts`, the tests and this paragraph) and self-update to
+   the previous commit; the review then sees only the diff again. Note: the
+   collection that runs is the installed one — the first self-update that
+   carries this change is still reviewed without the context.
+
+   The
    passes are asked one after the other (`runUpdateReviewPasses`); a failed
    pass does not keep the others from answering. Their answers are united
    (`mergeUpdateReviewAnswers`): the findings of all passes count; one
