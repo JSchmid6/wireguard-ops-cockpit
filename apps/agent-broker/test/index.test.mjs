@@ -11,7 +11,7 @@ const fakeOpencode = path.join(fakeRoot, "opencode");
 fs.writeFileSync(fakeOpencode, "#!/bin/sh\ncase \"$PWD\" in */agent-dead0000*) exit 3;; esac\nprintf 'argc=%s last=%s\\n' \"$#\" \"$(eval echo \\\"\\$$#\\\")\"\ncat\n", { mode: 0o755 });
 process.env.COCKPIT_OPENCODE_EXECUTABLE = fakeOpencode;
 process.env.COCKPIT_AGENT_WORKSPACE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-agent-run-"));
-const { cleanupStaleWorkspaces, createSessionWorkspace, removeSessionWorkspace, runAgent, validateRequest } = await import("../src/index.mjs");
+const { assertSessionRootClean, cleanupStaleWorkspaces, createSessionWorkspace, removeSessionWorkspace, runAgent, validateRequest } = await import("../src/index.mjs");
 const { PROMPT_LIMITS, promptLimit, promptLimitProblem } = await import("../src/prompt-limits.mjs");
 test.after(() => {
   fs.rmSync(process.env.COCKPIT_AGENT_WORKSPACE_ROOT, { recursive: true, force: true });
@@ -103,4 +103,64 @@ test("a child that ignores stdin does not crash the broker", async () => {
   assert.equal(result.ok, false);
   assert.equal(result.exitCode, 3);
   assert.deepEqual(fs.readdirSync(process.env.COCKPIT_AGENT_WORKSPACE_ROOT), []);
+});
+
+// opencode searches project config and instructions from the workspace up to "/";
+// the session root is the one writable level above a workspace (t_62992d58).
+test("a planted project config in the session root stops every role before opencode starts", async () => {
+  for (const name of ["opencode.json", "opencode.jsonc", ".opencode", "AGENTS.md", "CLAUDE.md", "CONTEXT.md"]) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-agent-planted-"));
+    if (name === ".opencode") fs.mkdirSync(path.join(root, name)); else fs.writeFileSync(path.join(root, name), "{}");
+    assert.throws(() => createSessionWorkspace({ requestId: "12345678", role: "safety", prompt: "review" }, root), new RegExp(`contains ${name.replace(".", "\\.")}`));
+    assert.deepEqual(fs.readdirSync(root), [name]);
+    fs.rmSync(root, { recursive: true });
+  }
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-agent-clean-"));
+  fs.symlinkSync("/nonexistent", path.join(root, "AGENTS.md"));
+  assert.throws(() => assertSessionRootClean(root), /contains AGENTS\.md/);
+  fs.rmSync(root, { recursive: true });
+  const planted = path.join(process.env.COCKPIT_AGENT_WORKSPACE_ROOT, "opencode.json");
+  fs.writeFileSync(planted, "{}");
+  const result = await runAgent({ requestId: "87654323", role: "verifier", prompt: "verify" });
+  fs.rmSync(planted);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /agent workspace setup failed: .*contains opencode\.json/);
+  assert.deepEqual(fs.readdirSync(process.env.COCKPIT_AGENT_WORKSPACE_ROOT), []);
+});
+
+// The unit is the boundary: every role, the runner with build tools too, runs as
+// cockpit-agent in it. What that identity can write, the next safety/verifier run
+// loads: the config, agent definitions and AGENTS.md below the home, and .opencode
+// or opencode.json in the home itself (t_62992d58).
+test("the agent unit keeps the home and the opencode config read-only", () => {
+  const repo = new URL("../../../", import.meta.url);
+  const unit = fs.readFileSync(new URL("deploy/systemd/wireguard-ops-cockpit-agent.service", repo), "utf8");
+  const values = (key) => unit.split("\n").filter((line) => line.startsWith(`${key}=`)).map((line) => line.slice(key.length + 1));
+  const env = Object.fromEntries(values("Environment").map((entry) => [entry.slice(0, entry.indexOf("=")), entry.slice(entry.indexOf("=") + 1)]));
+  const home = env.HOME;
+  assert.equal(home, "/var/lib/wireguard-ops-agent");
+  assert.deepEqual([values("ProtectSystem"), values("ProtectHome")], [["strict"], ["true"]]);
+  const writable = [
+    ...values("ReadWritePaths").flatMap((line) => line.split(/\s+/)),
+    ...values("StateDirectory").flatMap((line) => line.split(/\s+/)).map((dir) => `/var/lib/${dir}`),
+  ].map((entry) => entry.replace(/^-/, ""));
+  const covers = (dir, target) => target === dir || target.startsWith(`${dir}/`);
+  for (const target of [home, env.COCKPIT_OPENCODE_CONFIG, `${home}/.config/opencode/agent/plan.md`, `${home}/.config/opencode/AGENTS.md`, `${home}/.opencode`, `${home}/opencode.json`, `${home}/.claude/CLAUDE.md`]) {
+    assert.deepEqual(writable.filter((dir) => covers(dir, target)), [], `${target} must not be writable for the agent unit`);
+  }
+  assert.ok(covers(`${home}/.config`, env.COCKPIT_OPENCODE_CONFIG));
+  // What must stay writable, or no role starts: the workspaces and opencode's own state.
+  for (const target of [env.COCKPIT_AGENT_WORKSPACE_ROOT, `${home}/.local/share/opencode`, `${home}/.local/state/opencode`, `${home}/.cache/opencode`, "/run/cockpit-agent"]) {
+    assert.ok(writable.some((dir) => covers(dir, target)), `${target} must be writable for the agent unit`);
+  }
+  // The deploys: Lab0/box installs the config root-owned, both place the .gitignore
+  // opencode would otherwise write into its read-only config directory at start.
+  const lab0 = fs.readFileSync(new URL("deploy/lab0/homeserver-cockpit-deploy.sh", repo), "utf8");
+  assert.match(lab0, /install -m 640 -o root -g cockpit-agent-client \\\n\s+"\$COCKPIT_DIR\/deploy\/config\/opencode-agent\.jsonc" "\$AGENT_DIR\/\.config\/opencode\/opencode\.jsonc"/);
+  assert.match(lab0, /"\$COCKPIT_DIR\/deploy\/config\/opencode-config-dir\.gitignore" "\$AGENT_DIR\/\.config\/opencode\/\.gitignore"/);
+  assert.doesNotMatch(lab0, /-o cockpit-agent[^\n]*\.config/);
+  const vps = fs.readFileSync(new URL("deploy/vps/vps-cockpit-deploy.sh", repo), "utf8");
+  assert.match(vps, /"deploy\/config\/opencode-config-dir\.gitignore\|\$ROOT\/var\/lib\/wireguard-ops-agent\/\.config\/opencode\/\.gitignore\|644"/);
+  // The exact bytes opencode 1.18 writes (config.ts ensureGitignore).
+  assert.equal(fs.readFileSync(new URL("deploy/config/opencode-config-dir.gitignore", repo), "utf8"), ["node_modules", "package.json", "package-lock.json", "bun.lock", ".gitignore"].join("\n"));
 });

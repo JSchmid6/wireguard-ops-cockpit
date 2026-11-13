@@ -45,8 +45,24 @@ export function cleanupStaleWorkspaces(root = workspaceRoot, now = Date.now()) {
   }
 }
 
+// opencode looks for project configuration and instructions from the workspace
+// up to "/" (no git repository there), so these names in the shared session root
+// would reach every later role, also safety and verifier. The root is the one
+// level above a workspace the agent identity can write (the unit keeps its home
+// read-only); a runner could plant one there. Fail closed, never load it.
+const projectConfigNames = ["opencode.json", "opencode.jsonc", ".opencode", "AGENTS.md", "CLAUDE.md", "CONTEXT.md"];
+
+export function assertSessionRootClean(root = workspaceRoot) {
+  for (const name of projectConfigNames) {
+    let found = true;
+    try { fs.lstatSync(path.join(root, name)); } catch (error) { if (error.code === "ENOENT") found = false; else throw error; }
+    if (found) throw new Error(`session root ${root} contains ${name}, which opencode would load into every role; refusing to start an agent until it is removed`);
+  }
+}
+
 export function createSessionWorkspace(request, root = workspaceRoot) {
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+  assertSessionRootClean(root);
   const workspace = fs.mkdtempSync(path.join(root, `agent-${request.requestId}-${request.role}-`));
   fs.chmodSync(workspace, 0o700);
   const common = fs.readFileSync(new URL("AGENTS.md", contextRoot), "utf8");

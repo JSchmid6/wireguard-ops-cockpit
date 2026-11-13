@@ -9,6 +9,7 @@ User=cockpit-agent
 Group=cockpit-agent-client
 WorkingDirectory=/opt/wireguard-ops-cockpit
 Environment=NODE_ENV=production
+Environment=HOME=/var/lib/wireguard-ops-agent
 Environment=PATH=/opt/node-v22.23.4-linux-x64/bin:/usr/local/bin:/usr/bin:/bin
 Environment=COCKPIT_AGENT_BROKER_SOCKET=/run/cockpit-agent/agent.sock
 Environment=COCKPIT_AGENT_WORKSPACE_ROOT=/var/lib/wireguard-ops-agent/sessions
@@ -24,7 +25,12 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/wireguard-ops-agent /run/cockpit-agent
+# Writable are only the session workspaces and opencode's own state, never the
+# home: the config, agent definitions, AGENTS.md and .opencode there are what
+# every later role (safety, verifier) loads, and the runner (build) runs here too.
+StateDirectory=wireguard-ops-agent/sessions wireguard-ops-agent/.local/share/opencode wireguard-ops-agent/.local/state/opencode wireguard-ops-agent/.cache/opencode
+StateDirectoryMode=0700
+ReadWritePaths=/run/cockpit-agent
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 [Install]

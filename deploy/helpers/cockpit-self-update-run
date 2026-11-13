@@ -151,7 +151,8 @@ FILE_AREAS = (
     ("brokers-and-agents", ("G3", "G6"), "executor/agent brokers, envelope code, reviewer and agent prompts",
      lambda path: path.startswith(("apps/executor-broker/", "apps/agent-broker/")) or path in (
          "apps/api/src/executor-broker.ts", "apps/api/src/agent-broker.ts", "apps/api/src/hermes-security.ts",
-         "apps/api/src/safety-review.ts")),
+         # The opencode config every role loads, the doorkeeper and the verifier too.
+         "apps/api/src/safety-review.ts", "deploy/config/opencode-agent.jsonc")),
     ("host-door", ("G2", "G5", "G6", "G9", "G10"), "the general door host.run: lock check, doorkeeper, backup bolt, safety net, log redaction",
      lambda path: path in HOST_DOOR_FILES),
     ("capability-sandbox", ("G5",), "dynamic capability sandbox and protected paths",
