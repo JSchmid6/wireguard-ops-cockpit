@@ -45,10 +45,27 @@ ihn). Der Dialog zeigt alles, was vorher direkt auf der Karte stand, und mehr:
 Nichts offen: groß **„Nichts wartet auf dich"**, darunter eine Zeile mit dem letzten Lauf, dem Alter
 des letzten Backups (aus `borg.status`, ohne neue Messung zu erzwingen) und dem freien Platz auf `/`.
 
-## Abgelaufene Frist: „Neu bestellen lassen"
+## Abgelaufene Frist: trotzdem freigeben (bis 72 h)
 
-Ein abgelaufener Envelope ist nicht mehr freigebbar (das prüft der Server ohnehin). Die Karte sagt
-das deutlich und bietet statt Freigeben **Neu bestellen lassen**:
+Seit 13.11.2026 (Karte t_36523a6a, Jochen: „Warum muss ich das immer freigeben?") bleibt ein Job,
+dessen Envelope **nur** abgelaufen ist, freigebbar, solange er jünger als 72 h ist
+(`REACTIVATION_MAX_AGE_HOURS`). Die Karte trägt dann `approvableAfterExpiry: true` und bietet
+**Freigeben (Frist erneuern)** mit Pflichtgrund. `POST /api/hermes/jobs/:id/approval` (nur Jochens
+Sitzung, Automation 403 wie immer) prüft den Envelope vollständig; ist der einzige Fehler
+„execution envelope expired“ und war er nie freigegeben, signiert sie **denselben Inhalt** mit neuer
+Frist neu (`renewExecutionEnvelope`) und gibt ihn in derselben Entscheidung frei — Audit
+`hermes.change.approved_after_expiry` (alte Frist, `notAfter`) vor `hermes.change.approved`, im Job
+`output.approval.afterExpiry`. Jede andere Abweichung (Signatur, Bindung, Plan, Prüfung, Policy,
+Manifest) bleibt ein Stopp. Vorher hieß ein Ablauf „Neu bestellen lassen“: James bestellte neu, die
+neue Prüfung stoppte am selben Befund, Jochen klickte zweimal für dieselbe Entscheidung (lab0-Job
+dc8d47e3, 13.11.2026). Was der Host seit der Prüfung geändert hat, fangen die Prüfungen beim Lauf ab:
+Self-Update vergleicht den geprüften Diff-Hash (65 bei Drift), der Tür-Helfer prüft Netz und
+Snapshot beim Start.
+
+## Abgelaufene Frist: „Neu bestellen lassen" (älter als 72 h)
+
+Ist der Job älter als 72 h, ist der abgelaufene Envelope nicht mehr freigebbar (das prüft der
+Server ohnehin). Die Karte sagt das deutlich und bietet statt Freigeben **Neu bestellen lassen**:
 
 `POST /api/inbox/jobs/:id/reorder` (nur Jochens Sitzung, nie ein Automation-Token; nur wenn der
 Envelope wirklich abgelaufen ist) schließt den alten Job endgültig (`blocked_policy`, mit

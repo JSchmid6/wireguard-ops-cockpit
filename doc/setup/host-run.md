@@ -623,11 +623,15 @@ hebt. Der Normalfall ist Durchlaufen. Das gilt für beide Prüfungen: den Türst
   (`reported: true`); James meldet sie Jochen. Ohne prüfbaren Nachweis bleibt alles wie oben.
   Fehlt die Bindung des geprüften Diffs (Eingabe nicht verfügbar), bleibt es `blocked_prerequisite`.
   Plan-Policy, Safety review, Backup- und Risiko-Riegel und `dienste.update` sind davon nicht berührt.
-  **Schweregrad-Schnitt (Jochen, 10.11.2026, Variante C, Karte t_e49f6254):** Den Marker kann der
-  Agent mit dem Owner-Token selbst setzen. Deshalb macht er nur leichte Befunde zur Meldung: ein
-  Befund mit `high`, einer auf G1/G2/G7/G10, eine `INJECTION` oder einer ohne lesbaren Schweregrad
-  bleibt trotz Nachweis `blocked_user_approval` (ein Klick für Jochen im Cockpit). INCOMPLETE bleibt
-  meldbar.
+  Der Nachweis gilt seit 13.11.2026 auch für mehrere Merges auf einmal (die First-Parent-Linie
+  `base..sha`, höchstens 8 PR-Merges, auch Squash) — Lab0 und box hängen oft mehrere Merges hinterher.
+  **Schweregrad-Schnitt (Jochen, 10.11.2026, Variante C, neu gefasst 13.11.2026, Karte t_36523a6a):**
+  Den Marker kann der Agent mit dem Owner-Token selbst setzen. Trotz Nachweis bleibt
+  `blocked_user_approval` (ein Klick für Jochen) nur ein Befund auf **G10** (Backups, Grundsatz 4),
+  eine **`INJECTION`** oder ein **belegter schwerer Rechte-Befund** (G1/G2/G4, Schwere nicht
+  medium/low, zitierter Code im Diff gefunden). Alles andere — auch G5 und G7 jeder Schwere — wird
+  Meldung: Jochens Ja zu Rechte- und Riegel-Änderungen holt James vor dem Merge, das Ausrollen
+  braucht kein zweites. INCOMPLETE bleibt meldbar.
 
 ## Tests
 

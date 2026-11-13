@@ -2870,8 +2870,24 @@ export async function createApp(options: AppOptions = {}) {
     if (breaker && typeof breaker === "object" && !job.output?.envelope) {
       return decideBreakerOverride(job, jobOwnerId, actor, body.decision, body.reason.trim(), intent, breaker, reply);
     }
+    let reviewedEnvelope = job.output?.envelope as ExecutionEnvelope | undefined;
+    let renewedAfterExpiry: { previousExpiresAt: string; notAfter: string } | null = null;
     if (body.decision === "approved") {
-      const envelopeErrors = envelopeErrorsFor(job, job.output?.envelope as ExecutionEnvelope | undefined, jobOwnerId, intent, true);
+      let envelopeErrors = envelopeErrorsFor(job, reviewedEnvelope, jobOwnerId, intent, true);
+      // Freigabe nach Ablauf (13.11.2026, t_36523a6a): Ist allein die Frist
+      // abgelaufen, gibt Jochens Sitzung den Job trotzdem frei — derselbe
+      // Inhalt, neu signiert, dann freigegeben —, solange er jünger als
+      // REACTIVATION_MAX_AGE_HOURS ist. Vorher hieß das „Neu bestellen lassen“:
+      // James bestellte neu, die neue Prüfung stoppte erneut, Jochen klickte
+      // zweimal für dieselbe Entscheidung. Jede andere Abweichung bleibt ein Stopp.
+      const notAfter = Date.parse(job.createdAt) + REACTIVATION_MAX_AGE_HOURS * 3_600_000;
+      if (reviewedEnvelope && envelopeErrors.length === 1 && envelopeErrors[0] === "execution envelope expired"
+        && !reviewedEnvelope.operatorApproved && Date.now() < notAfter) {
+        const previousExpiresAt = reviewedEnvelope.expiresAt;
+        reviewedEnvelope = renewExecutionEnvelope(reviewedEnvelope, config.executionEnvelopeSecret, config.approvalTtlMinutes, new Date(notAfter));
+        envelopeErrors = envelopeErrorsFor(job, reviewedEnvelope, jobOwnerId, intent, true);
+        renewedAfterExpiry = { previousExpiresAt, notAfter: new Date(notAfter).toISOString() };
+      }
       if (envelopeErrors.length > 0) {
         const blocked = updateHermesJob(job.id, "blocked_policy", explanation({
           phase: "finished", intent, reason: "The approved execution envelope is expired or no longer matches the reviewed action.",
@@ -2885,6 +2901,9 @@ export async function createApp(options: AppOptions = {}) {
         const expired = envelopeErrors.includes("execution envelope expired");
         return reply.code(409).send({ message: expired ? "execution envelope expired" : "execution envelope validation failed", envelopeErrors, job: blocked });
       }
+    }
+    if (renewedAfterExpiry) {
+      database.createAudit({ actorId: actor.id, action: "hermes.change.approved_after_expiry", targetType: "job", targetId: job.id, details: renewedAfterExpiry });
     }
     database.createAudit({
       actorId: actor.id, action: `hermes.change.${body.decision}`, targetType: "job", targetId: job.id,
@@ -2935,8 +2954,8 @@ export async function createApp(options: AppOptions = {}) {
       rollbackAvailable: Boolean((job.output?.policy as Record<string, unknown> | undefined)?.rollbackAvailable),
     }), {
       ...job.output,
-      envelope: approveExecutionEnvelope(job.output?.envelope as ExecutionEnvelope, config.executionEnvelopeSecret, config.approvalTtlMinutes),
-      approval: { decision: "approved", reason: body.reason?.trim() || null, actorId: actor.id },
+      envelope: approveExecutionEnvelope(reviewedEnvelope as ExecutionEnvelope, config.executionEnvelopeSecret, config.approvalTtlMinutes),
+      approval: { decision: "approved", reason: body.reason?.trim() || null, actorId: actor.id, ...(renewedAfterExpiry ? { afterExpiry: renewedAfterExpiry } : {}) },
     });
 
     void (async () => {
@@ -4338,7 +4357,7 @@ Follow these rules:
     const visible = (jobId: string | null) => actor.role === "admin" || (jobId !== null && database.getJobOwnerId(jobId) === actor.id);
     for (const job of database.listJobsByStatus("hermes-change", "blocked_user_approval")) {
       if (!visible(job.id)) continue;
-      cards.push(hermesJobCard(job, now, webUrl));
+      cards.push(hermesJobCard(job, now, webUrl, REACTIVATION_MAX_AGE_HOURS));
     }
     for (const approval of database.listApprovalsForActor(actor.id, "pending")) {
       cards.push(approvalCard(approval, database.getJob(approval.jobId), config.approvalTtlMinutes, now, webUrl));

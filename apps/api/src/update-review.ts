@@ -195,6 +195,8 @@ export interface SecondReviewCheck {
   pr?: number;
   headSha?: string;
   url?: string;
+  // Every proven pull request when the binding installs several merges.
+  prs?: number[];
 }
 
 // Structurally identical to the plan policy in app.ts.
@@ -846,10 +848,11 @@ export function updateReviewFindings(outcome: UpdateReviewOutcome): {
 //   (secondReviewCovers) keeps the plan's own status. The review still ran and
 //   is recorded; the job and GET /api/inbox carry it as a report. A plan block
 //   stays, and so does every other stop outside this review.
-// - severity cut (operator decision 10.11.2026, variant C): a finding that is
-//   high, on G1/G2/G7/G10, an INJECTION or without a readable severity
-//   (secondReviewStops) keeps the finding's stop although the proof holds; the
-//   verified proof is still recorded in the evidence.
+// - severity cut (operator decision 10.11.2026, variant C, narrowed
+//   13.11.2026): a finding on G10, an INJECTION, or a high (or unreadable)
+//   finding on G1/G2/G4 whose quote was found in the diff (secondReviewStops)
+//   keeps the finding's stop although the proof holds; the verified proof is
+//   still recorded in the evidence.
 export function applyUpdateReviewPolicy<P extends ReviewedPolicy>(policy: P, outcome: UpdateReviewOutcome): P {
   const { result, findings, gaps, evidence: reviewEvidence, needed } = updateReviewFindings(outcome);
   const checks = secondReviewCovers(outcome) ? outcome.secondReview ?? [] : [];
@@ -866,7 +869,7 @@ export function applyUpdateReviewPolicy<P extends ReviewedPolicy>(policy: P, out
   }
   if (checks.length > 0) {
     const severe = secondReviewStops(outcome).map((finding) => `${finding.title || "(untitled)"} [${finding.guarantee || "?"}, ${finding.severity || "?"}]`);
-    evidence.push(...verified, `second review does not lift the stop: finding(s) high, on G1/G2/G7/G10, INJECTION or without severity: ${severe.join("; ").slice(0, 600)}`);
+    evidence.push(...verified, `second review does not lift the stop: finding(s) on G10, INJECTION or evidenced severe on G1/G2/G4: ${severe.join("; ").slice(0, 600)}`);
   }
   const merged = { ...policy, evidence: [...policy.evidence, ...evidence] };
   const subject = UPDATE_KINDS[kindOf(outcome.kind)].subject;
@@ -952,31 +955,32 @@ export function summarizeUpdateReview(diffs: UpdateDiff[], outcome: UpdateReview
   };
 }
 
-// --- Second review (operator decision 07.11.2026, „ja alles“, point 4b) ---
-//
-// The same diff used to be judged twice: by the Opus second review of the pull
-// request and by this pre-install review. When the Cockpit verifies on its own
-// (never from what the requester says) that exactly the commit it installs is
-// the merge of a pull request whose head an Opus second review approved, its
-// own review becomes a report instead of a stop. The proof, all from the
-// GitHub API of the allowlisted repository, for every installed sha:
-// 1. sha is a merge commit with two parents; its first parent is the reviewed
-//    base, so the installed diff base..sha is the diff of this one merge.
-// 2. A pull request into main, merged, with merge_commit_sha == sha and
-//    head.sha == the second parent.
-// 3. head.sha contains base (compare base...head: behind_by 0) and sha has the
-//    tree of head.sha: the installed code is byte for byte the reviewed head.
+// Second review (operator decision 07.11.2026, „ja alles“, 4b): when every
+// installed commit is the merge of a pull request whose head an Opus second
+// review approved, its own review becomes a report instead of a stop. The
+// proof, all from the GitHub API of the allowlisted repository, for every
+// installed binding base..sha:
+// 1. The first-parent line from sha down to base (at most
+//    SECOND_REVIEW_MAX_MERGES commits, 13.11.2026: a host that lags behind
+//    installs several merges at once) consists only of pull-request merges;
+//    a commit on that line that is not one breaks the proof.
+// 2. Each of them, with its first parent p: a pull request into main, merged,
+//    with merge_commit_sha == the commit; a merge commit has exactly two
+//    parents and the second is the PR head, a squash merge has one parent and
+//    the PR names its head.
+// 3. The head contains p (compare p...head: behind_by 0) and the commit has
+//    the tree of the head: the installed code is byte for byte the reviewed
+//    head.
 // 4. A comment or review on that pull request by an account with write access
 //    (OWNER, MEMBER, COLLABORATOR) holds the marker line
 //    `Cockpit-Zweitpruefung: FREIGABE <head sha, 40 hex> opus`.
 // Anything not provable (network, rate limit, a page that does not parse, a
-// missing step) is no proof: the review keeps its stop.
+// missing step, a longer line) is no proof: the review keeps its stop.
 // Honest limit: the marker proves that the review record exists for exactly
 // this head, not who wrote it beyond the account's write access — the agent
 // posts it with the owner's token. Its worth is the binding to the sha and the
-// public, immutable record, not a second principal. Therefore it carries only
-// light findings (secondReviewStops, operator decision 10.11.2026): a high
-// finding, one on G1/G2/G7/G10 or an INJECTION stays the operator's stop.
+// public, immutable record, not a second principal. Therefore it does not
+// carry G10, INJECTION or evidenced severe rights findings (secondReviewStops).
 export const SECOND_REVIEW_REPOSITORY = "JSchmid6/wireguard-ops-cockpit";
 export const SECOND_REVIEW_MARKER = /^Cockpit-Zweitpruefung: FREIGABE ([a-f0-9]{40}) opus[ \t]*$/m;
 const SECOND_REVIEW_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
@@ -990,20 +994,35 @@ export function secondReviewCovers(outcome: UpdateReviewOutcome): boolean {
   return outcome.bindings.every((binding) => checks.some((check) => check.sha === binding.sha && check.verified));
 }
 
-// Severity cut (operator decision 10.11.2026, card t_e49f6254, variant C): the
-// marker can be posted by the agent's own token, so it carries only light
-// findings. A finding stays a stop for the operator, marker or not, when it is
-// high, names G1, G2, G7 or G10 (approval, lock, self-update path, backups and risk bolt),
-// is an INJECTION, or carries no severity the cut can read (fail closed: only a
-// severity starting with medium or low is light). UNVERIFIABLE points are gaps,
-// not findings, and an incomplete review stays reportable.
-export const SECOND_REVIEW_STOP_GUARANTEES = new Set([1, 2, 7, 10]);
+// Severity cut (operator decision 10.11.2026, card t_e49f6254, variant C;
+// narrowed 13.11.2026, card t_36523a6a: "Ausrollen entscheidet James, Jochen
+// nur bei einem echten Befund"): the marker can be posted by the agent's own
+// token, so it does not carry everything. A finding stays a stop for the
+// operator, marker or not, when it
+// - names G10 (backups and declared risk — Jochen's one standing exception),
+// - is an INJECTION (someone addressed the reviewer), or
+// - names G1, G2 or G4 (who approves, the lock, sudo — rights) with a severity
+//   that is not medium or low (fail closed) AND its quoted code was found in
+//   the reviewed diff (quoteFound): an evidenced rights finding with a damage
+//   path, not an assertion.
+// Every other finding — G7 and G5 included, of any severity — is a report:
+// Jochen's Ja to a rights or backup-bolt change is asked before the merge, the
+// rollout needs no second one. UNVERIFIABLE points are gaps, not findings, and
+// an incomplete review stays reportable.
+export const SECOND_REVIEW_STOP_GUARANTEES = new Set([10]);
+export const SECOND_REVIEW_RIGHTS_GUARANTEES = new Set([1, 2, 4]);
+
+function namedGuarantees(finding: UpdateReviewFinding): number[] {
+  return [...finding.guarantee.matchAll(/\bG(\d+)\b/g)].map((match) => Number(match[1]));
+}
 
 function stopsDespiteSecondReview(finding: UpdateReviewFinding): boolean {
   if (unverifiable(finding)) return false;
   if (/\bINJECTION\b/.test(finding.guarantee)) return true;
-  if ([...finding.guarantee.matchAll(/\bG(\d+)\b/g)].some((match) => SECOND_REVIEW_STOP_GUARANTEES.has(Number(match[1])))) return true;
-  return !/^(?:medium|low)\b/.test(finding.severity);
+  const named = namedGuarantees(finding);
+  if (named.some((number) => SECOND_REVIEW_STOP_GUARANTEES.has(number))) return true;
+  if (!named.some((number) => SECOND_REVIEW_RIGHTS_GUARANTEES.has(number))) return false;
+  return !/^(?:medium|low)\b/.test(finding.severity) && finding.quoteFound === true;
 }
 
 // The findings the second review cannot turn into a report.
@@ -1025,42 +1044,75 @@ function field(value: unknown, ...keys: string[]): unknown {
   return keys.reduce<unknown>((current, key) => record(current)[key], value);
 }
 
+// At most this many commits on the first-parent line base..sha are proven
+// (each costs four or five requests; the unauthenticated API allows 60 an hour).
+export const SECOND_REVIEW_MAX_MERGES = 8;
+
+interface ProvenMerge { pr: number; head: string; url?: string; login: string }
+
+function parentShas(commit: unknown): unknown[] {
+  return Array.isArray(field(commit, "parents")) ? (field(commit, "parents") as unknown[]).map((parent) => field(parent, "sha")) : [];
+}
+
+// One commit on the first-parent line: the merge (or squash merge) of a pull
+// request into main whose head carries the second-review marker and whose
+// tree it has. Returns the reason it is not, or the proven pull request.
+async function proveMerge(sha: string, commit: unknown, github: GithubFetch): Promise<ProvenMerge | string> {
+  const repo = `/repos/${SECOND_REVIEW_REPOSITORY}`;
+  const parents = parentShas(commit);
+  if (parents.length !== 1 && parents.length !== 2) return `${sha.slice(0, 12)} is not the merge commit of one pull request`;
+  const parent = parents[0];
+  if (typeof parent !== "string" || !SHA.test(parent)) return `the first parent of ${sha.slice(0, 12)} is unreadable`;
+  const pulls = await github(`${repo}/commits/${sha}/pulls`);
+  const pr = (Array.isArray(pulls) ? pulls : []).find((item) =>
+    typeof field(item, "merged_at") === "string" && field(item, "merge_commit_sha") === sha
+    && (parents.length === 1 || field(item, "head", "sha") === parents[1]) && field(item, "base", "ref") === "main"
+    && field(item, "base", "repo", "full_name") === SECOND_REVIEW_REPOSITORY);
+  const number = field(pr, "number");
+  if (typeof number !== "number" || !Number.isInteger(number)) return `no merged pull request into main has ${sha.slice(0, 12)} as its merge commit`;
+  const head = field(pr, "head", "sha");
+  if (typeof head !== "string" || !SHA.test(head)) return "the merged head is unreadable";
+  const compare = await github(`${repo}/compare/${parent}...${head}`);
+  if (field(compare, "behind_by") !== 0) return `the head of #${number} does not contain ${parent.slice(0, 12)}`;
+  const headCommit = await github(`${repo}/commits/${head}`);
+  const tree = field(commit, "commit", "tree", "sha");
+  if (typeof tree !== "string" || tree !== field(headCommit, "commit", "tree", "sha")) return `${sha.slice(0, 12)} does not carry the tree of the reviewed head`;
+  const carries = (items: unknown) => (Array.isArray(items) ? items : []).find((item) => {
+    const body = field(item, "body");
+    const marker = typeof body === "string" ? SECOND_REVIEW_MARKER.exec(body) : null;
+    return marker?.[1] === head && SECOND_REVIEW_ASSOCIATIONS.has(String(field(item, "author_association")));
+  });
+  const approval = carries(await github(`${repo}/issues/${number}/comments?per_page=100`))
+    ?? carries(await github(`${repo}/pulls/${number}/reviews?per_page=100`));
+  if (!approval) return `#${number} carries no second-review marker for head ${head.slice(0, 12)}`;
+  const url = field(approval, "html_url");
+  return { pr: number, head, ...(typeof url === "string" ? { url } : {}), login: String(field(approval, "user", "login") || "?") };
+}
+
 export async function verifySecondReview(binding: UpdateBinding, github: GithubFetch): Promise<SecondReviewCheck> {
   const { sha, base } = binding;
   const no = (reason: string): SecondReviewCheck => ({ sha, verified: false, reason });
   if (!SHA.test(sha) || !SHA.test(base)) return no("malformed sha");
   const repo = `/repos/${SECOND_REVIEW_REPOSITORY}`;
   try {
-    const commit = await github(`${repo}/commits/${sha}`);
-    const parents = Array.isArray(field(commit, "parents")) ? (field(commit, "parents") as unknown[]).map((parent) => field(parent, "sha")) : [];
-    if (parents.length !== 2) return no(`${sha.slice(0, 12)} is not the merge commit of one pull request`);
-    if (parents[0] !== base) return no(`the first parent of ${sha.slice(0, 12)} is not the reviewed base ${base.slice(0, 12)}`);
-    const head = parents[1];
-    if (typeof head !== "string" || !SHA.test(head)) return no("the merged head is unreadable");
-    const pulls = await github(`${repo}/commits/${sha}/pulls`);
-    const pr = (Array.isArray(pulls) ? pulls : []).find((item) =>
-      typeof field(item, "merged_at") === "string" && field(item, "merge_commit_sha") === sha
-      && field(item, "head", "sha") === head && field(item, "base", "ref") === "main"
-      && field(item, "base", "repo", "full_name") === SECOND_REVIEW_REPOSITORY);
-    const number = field(pr, "number");
-    if (typeof number !== "number" || !Number.isInteger(number)) return no(`no merged pull request into main has ${sha.slice(0, 12)} as its merge commit`);
-    const compare = await github(`${repo}/compare/${base}...${head}`);
-    if (field(compare, "behind_by") !== 0) return no(`the head of #${number} does not contain the reviewed base`);
-    const headCommit = await github(`${repo}/commits/${head}`);
-    const tree = field(commit, "commit", "tree", "sha");
-    if (typeof tree !== "string" || tree !== field(headCommit, "commit", "tree", "sha")) return no(`${sha.slice(0, 12)} does not carry the tree of the reviewed head`);
-    const comments = await github(`${repo}/issues/${number}/comments?per_page=100`);
-    const reviews = await github(`${repo}/pulls/${number}/reviews?per_page=100`);
-    const approval = [...(Array.isArray(comments) ? comments : []), ...(Array.isArray(reviews) ? reviews : [])].find((item) => {
-      const body = field(item, "body");
-      const marker = typeof body === "string" ? SECOND_REVIEW_MARKER.exec(body) : null;
-      return marker?.[1] === head && SECOND_REVIEW_ASSOCIATIONS.has(String(field(item, "author_association")));
-    });
-    if (!approval) return no(`#${number} carries no second-review marker for head ${head.slice(0, 12)}`);
-    const url = field(approval, "html_url");
+    const proven: ProvenMerge[] = [];
+    let current = sha;
+    while (current !== base) {
+      if (proven.length >= SECOND_REVIEW_MAX_MERGES) return no(`more than ${SECOND_REVIEW_MAX_MERGES} commits between ${base.slice(0, 12)} and ${sha.slice(0, 12)}`);
+      const commit = await github(`${repo}/commits/${current}`);
+      const merge = await proveMerge(current, commit, github);
+      if (typeof merge === "string") return no(merge);
+      proven.push(merge);
+      current = parentShas(commit)[0] as string;
+    }
+    if (proven.length === 0) return no("nothing installed between base and sha");
+    const [top] = proven;
+    const prs = proven.map((merge) => merge.pr);
     return {
-      sha, verified: true, pr: number, headSha: head, ...(typeof url === "string" ? { url } : {}),
-      reason: `merge of #${number} (head ${head.slice(0, 12)}, same tree), second review by ${String(field(approval, "user", "login") || "?")}`,
+      sha, verified: true, pr: top.pr, headSha: top.head, ...(top.url ? { url: top.url } : {}), ...(prs.length > 1 ? { prs } : {}),
+      reason: proven.length === 1
+        ? `merge of #${top.pr} (head ${top.head.slice(0, 12)}, same tree), second review by ${top.login}`
+        : `merges of ${prs.map((pr) => `#${pr}`).join(", ")} (each the tree of its reviewed head), second reviews by ${[...new Set(proven.map((merge) => merge.login))].join(", ")}`,
     };
   } catch (error) {
     return no(`GitHub not readable: ${(error instanceof Error ? error.message : "request failed").slice(0, 200)}`);

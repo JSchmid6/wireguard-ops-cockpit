@@ -25,6 +25,7 @@ import {
   updateTargets,
   verifyQuotes,
   verifySecondReview,
+  SECOND_REVIEW_MAX_MERGES,
   SECOND_REVIEW_REPOSITORY,
   type GithubFetch,
   type UpdateDiff,
@@ -1060,15 +1061,21 @@ describe("second review: the pre-install review reports instead of stopping (4b)
     expect(summarizeUpdateReview([diff()], reviewed, null)).toMatchObject({ result: "finding", reported: true, secondReview: [check] });
   });
 
-  it("keeps the stop for a high finding, one on G1/G2/G7/G10, an INJECTION or no severity (severity cut, 10.11.2026)", async () => {
+  it("keeps the stop only for G10, an INJECTION and evidenced severe rights findings (severity cut, 13.11.2026)", async () => {
     const check = await verifySecondReview(binding, github());
-    const cases: Array<[string, string | null]> = [
-      ["G5", "high"], ["G1", "medium"], ["G2", "medium"], ["G7", "medium"], ["G10", "medium"],
-      ["G3 (also weakens G1)", "medium"], ["INJECTION", "medium"], ["G5", null], ["G5", "critical"],
+    // The quote of the point under test was found in the reviewed diff.
+    const evidenced = (guarantee: string, severity: string | null) => {
+      const answer = flag(guarantee, severity);
+      return { ...answer, findings: answer.findings.map((finding, index) => index === 1 ? { ...finding, quoteFound: true } : finding) };
+    };
+    const stops: Array<[string, string | null, boolean]> = [
+      ["G10", "medium", false], ["G10", "low", false], ["G5 (also G10)", "medium", false], ["INJECTION", "low", false],
+      ["G1", "high", true], ["G2", "high", true], ["G4", "high", true], ["G3 (also weakens G1)", "high", true],
+      ["G1", null, true], ["G4", "critical", true],
     ];
-    for (const [guarantee, severity] of cases) {
+    for (const [guarantee, severity, quoted] of stops) {
       const name = `${guarantee}/${severity}`;
-      const reviewed = outcome({ answer: flag(guarantee, severity), secondReview: [check] });
+      const reviewed = outcome({ answer: quoted ? evidenced(guarantee, severity) : flag(guarantee, severity), secondReview: [check] });
       const policy = applyUpdateReviewPolicy(readyPolicy, reviewed);
       expect(policy, name).toMatchObject({ status: "blocked_user_approval", allowed: false, zone: "red" });
       expect(policy.evidence.some((line) => line.startsWith(`second review verified for ${SHA.slice(0, 12)}`)), name).toBe(true);
@@ -1076,17 +1083,27 @@ describe("second review: the pre-install review reports instead of stopping (4b)
       expect(policy.evidence.some((line) => line.includes("reported, not a stop")), name).toBe(false);
       expect(summarizeUpdateReview([diff()], reviewed, null), name).toMatchObject({ result: "finding", reported: false });
     }
-    // G1x is not G1, and medium/low outside the four guarantees stay reportable.
-    for (const [guarantee, severity] of [["G11", "medium"], ["G9", "low"], ["G4, G6", "medium"]] as const) {
-      expect(applyUpdateReviewPolicy(readyPolicy, outcome({ answer: flag(guarantee, severity), secondReview: [check] })).status, guarantee).toBe("ready");
+    // Reports: G7 and G5 of any severity, medium/low rights findings, and a
+    // severe rights finding whose quote is not in the diff (no evidenced path).
+    const reports: Array<[string, string | null, boolean]> = [
+      ["G7", "high", true], ["G5", "high", true], ["G5", null, true], ["G9", "critical", true], ["G11", "high", true],
+      ["G1", "medium", true], ["G2", "low", true], ["G4", "medium", true], ["G1", "high", false], ["G4", null, false],
+    ];
+    for (const [guarantee, severity, quoted] of reports) {
+      const name = `${guarantee}/${severity}/${quoted}`;
+      const reviewed = outcome({ answer: quoted ? evidenced(guarantee, severity) : flag(guarantee, severity), secondReview: [check] });
+      expect(applyUpdateReviewPolicy(readyPolicy, reviewed).status, name).toBe("ready");
+      expect(summarizeUpdateReview([diff()], reviewed, null), name).toMatchObject({ result: "finding", reported: true });
     }
-    // Only UNVERIFIABLE points (incomplete) stay reportable even when one names G1.
-    const open = parseUpdateReviewAnswer(["VERDICT: flag", "FINDING: cut", "GUARANTEE: UNVERIFIABLE (G1)", "SEVERITY: high", "FILE: a.ts", "CODE: x", "REASON: r"].join("\n"));
+    // Only UNVERIFIABLE points (incomplete) stay reportable even when one names G10.
+    const open = parseUpdateReviewAnswer(["VERDICT: flag", "FINDING: cut", "GUARANTEE: UNVERIFIABLE (G10)", "SEVERITY: high", "FILE: a.ts", "CODE: x", "REASON: r"].join("\n"));
     expect(applyUpdateReviewPolicy(readyPolicy, outcome({ answer: open, secondReview: [check] })).status).toBe("ready");
     // Without the proof the cut changes nothing: the plain stop, no second-review evidence.
-    const plain = applyUpdateReviewPolicy(readyPolicy, outcome({ answer: flag("G1", "high") }));
-    expect(plain.status).toBe("blocked_user_approval");
-    expect(plain.evidence.some((line) => line.startsWith("second review"))).toBe(false);
+    for (const [guarantee, severity] of [["G7", "high"], ["G5", "medium"]] as const) {
+      const plain = applyUpdateReviewPolicy(readyPolicy, outcome({ answer: flag(guarantee, severity) }));
+      expect(plain.status).toBe("blocked_user_approval");
+      expect(plain.evidence.some((line) => line.startsWith("second review"))).toBe(false);
+    }
   });
 
   it("also reports an incomplete review, but never without the reviewed binding", async () => {
@@ -1122,7 +1139,7 @@ describe("second review: the pre-install review reports instead of stopping (4b)
     const comments = `${REPO}/issues/70/comments?per_page=100`;
     const comment = (pages()[comments] as Array<Record<string, unknown>>)[0];
     const cases: Array<[string, Record<string, unknown>]> = [
-      ["not a merge", { [commit]: { parents: [{ sha: BASE }], commit: { tree: { sha: TREE } } } }],
+      ["three parents", { [commit]: { parents: [{ sha: BASE }, { sha: HEAD }, { sha: HEAD }], commit: { tree: { sha: TREE } } } }],
       ["other base", { [commit]: { parents: [{ sha: HEAD }, { sha: HEAD }], commit: { tree: { sha: TREE } } } }],
       ["no PR", { [pulls]: [] }],
       ["PR not merged", { [pulls]: [{ ...pr, merged_at: null }] }],
@@ -1145,6 +1162,80 @@ describe("second review: the pre-install review reports instead of stopping (4b)
       expect(applyUpdateReviewPolicy(readyPolicy, outcome({ answer: flagged, secondReview: [check] })).status, name).toBe("blocked_user_approval");
     }
     expect((await verifySecondReview(binding, async () => { throw new Error("rate limited"); })).reason).toContain("GitHub not readable: rate limited");
+  });
+
+  it("proves a squash merge: one parent, the tree of the reviewed head", async () => {
+    const check = await verifySecondReview(binding, github({
+      [`${REPO}/commits/${SHA}`]: { sha: SHA, parents: [{ sha: BASE }], commit: { tree: { sha: TREE } } },
+    }));
+    expect(check).toMatchObject({ verified: true, pr: 70, headSha: HEAD });
+    // The squashed tree must still be the head's: a squash of a stale head is no proof.
+    const stale = await verifySecondReview(binding, github({
+      [`${REPO}/commits/${SHA}`]: { sha: SHA, parents: [{ sha: BASE }], commit: { tree: { sha: "3".repeat(40) } } },
+    }));
+    expect(stale.verified).toBe(false);
+  });
+
+  // A host that lags behind installs several merges with one binding (13.11.2026).
+  function chain(length: number, broken: Record<number, Record<string, unknown>> = {}): { sha: string; pages: Record<string, unknown> } {
+    const at = (prefix: string, index: number) => `${prefix}${index.toString(16).padStart(39, "0")}`.slice(0, 40);
+    const known: Record<string, unknown> = {};
+    let parent = BASE;
+    let merge = BASE;
+    for (let index = 1; index <= length; index += 1) {
+      merge = at("a", index);
+      const head = at("b", index);
+      const tree = at("c", index);
+      const number = 100 + index;
+      Object.assign(known, {
+        [`${REPO}/commits/${merge}`]: { sha: merge, parents: [{ sha: parent }, { sha: head }], commit: { tree: { sha: tree } } },
+        [`${REPO}/commits/${merge}/pulls`]: [{ number, merged_at: "2026-11-13T10:00:00Z", merge_commit_sha: merge, head: { sha: head }, base: { ref: "main", repo: { full_name: SECOND_REVIEW_REPOSITORY } } }],
+        [`${REPO}/compare/${parent}...${head}`]: { behind_by: 0 },
+        [`${REPO}/commits/${head}`]: { sha: head, commit: { tree: { sha: tree } } },
+        [`${REPO}/issues/${number}/comments?per_page=100`]: [{ body: `Cockpit-Zweitpruefung: FREIGABE ${head} opus`, author_association: "OWNER", user: { login: "JSchmid6" } }],
+        [`${REPO}/pulls/${number}/reviews?per_page=100`]: [],
+        ...(broken[index] ?? {}),
+      });
+      parent = merge;
+    }
+    return { sha: merge, pages: known };
+  }
+  const reader = (known: Record<string, unknown>): GithubFetch => async (apiPath) => {
+    if (!(apiPath in known) || known[apiPath] === undefined) throw new Error(`GET ${apiPath} answered 404`);
+    return known[apiPath];
+  };
+
+  it("proves every merge on the first-parent line base..sha, up to SECOND_REVIEW_MAX_MERGES", async () => {
+    const { sha, pages: known } = chain(3);
+    const check = await verifySecondReview({ base: BASE, sha, diffSha256: HASH }, reader(known));
+    expect(check).toMatchObject({ sha, verified: true, pr: 103, prs: [103, 102, 101] });
+    expect(check.reason).toContain("#103, #102, #101");
+    const reviewed = outcome({ answer: flagged, bindings: [{ base: BASE, sha, diffSha256: HASH }], secondReview: [check] });
+    expect(applyUpdateReviewPolicy(readyPolicy, reviewed).status).toBe("ready");
+
+    const longest = chain(SECOND_REVIEW_MAX_MERGES);
+    expect((await verifySecondReview({ base: BASE, sha: longest.sha, diffSha256: HASH }, reader(longest.pages))).verified).toBe(true);
+    const tooLong = chain(SECOND_REVIEW_MAX_MERGES + 1);
+    const refused = await verifySecondReview({ base: BASE, sha: tooLong.sha, diffSha256: HASH }, reader(tooLong.pages));
+    expect(refused.verified).toBe(false);
+    expect(refused.reason).toContain(`more than ${SECOND_REVIEW_MAX_MERGES} commits`);
+  });
+
+  it("breaks the line proof at one unproven commit in the middle", async () => {
+    const middle = (index: number) => `b${index.toString(16).padStart(39, "0")}`.slice(0, 40);
+    const cases: Array<[string, Record<number, Record<string, unknown>>]> = [
+      ["no marker", { 2: { [`${REPO}/issues/102/comments?per_page=100`]: [] } }],
+      ["marker of another head", { 2: { [`${REPO}/issues/102/comments?per_page=100`]: [{ body: `Cockpit-Zweitpruefung: FREIGABE ${middle(1)} opus`, author_association: "OWNER" }] } }],
+      ["direct commit without PR", { 2: { [`${REPO}/commits/${"a".padEnd(39, "0")}2/pulls`]: [] } }],
+      ["merge changes the tree", { 2: { [`${REPO}/commits/${middle(2)}`]: { commit: { tree: { sha: "9".repeat(40) } } } } }],
+    ];
+    for (const [name, broken] of cases) {
+      const { sha, pages: known } = chain(3, broken);
+      expect((await verifySecondReview({ base: BASE, sha, diffSha256: HASH }, reader(known))).verified, name).toBe(false);
+    }
+    // A line that never reaches the base (base is not an ancestor on the first-parent line).
+    const { sha, pages: known } = chain(2);
+    expect((await verifySecondReview({ base: "e".repeat(40), sha, diffSha256: HASH }, reader(known))).verified).toBe(false);
   });
 
   it("accepts the marker in a PR review as well", async () => {
