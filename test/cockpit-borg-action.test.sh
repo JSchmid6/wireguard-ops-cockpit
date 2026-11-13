@@ -58,6 +58,10 @@
 # sieht ihn unter /austausch):
 #   docker --context werkstatt run --rm -v /austausch/<klon>:/w:ro \
 #     ubuntu:24.04 bash /w/test/cockpit-borg-action.test.sh
+# Den B1-Mountfall (tmpfs unter einer Quelle) fährt das Harness nur, wenn es
+# mounten darf; im rootless Daemon zusätzlich (--privileged geht dort nicht):
+#   --cap-add SYS_ADMIN --security-opt seccomp=unconfined --security-opt apparmor=unconfined
+# Den Fall „hängendes du“ (gut 130 s) fährt erst COCKPIT_BORG_HARNESS_LANGSAM=1 (-e).
 # Das Image braucht util-linux-flock wie der Host (`flock -w`): das BusyBox-flock
 # in bash:5 kennt kein -w und endet mit rc=1, was der Helfer als
 # Zeitüberschreitung liest — die N1-Fälle wären dort rot.
@@ -1269,11 +1273,13 @@ PAT="$SRC/cockpit-sources.patterns"
 cp -a "$FIXTURE_STATUS" "$WORK/status-orig"
 sed -i "s/^DATE: .*/DATE: $(date -u +%Y-%m-%dT%H:%M:%S+00:00)/" "$FIXTURE_STATUS"
 # du-Stub für B1/B2: protokolliert die Argumente; mit $WORK/du-partial liefert er
-# die echte Ausgabe, endet aber mit rc=1 (wie bei einem unlesbaren Unterordner).
+# die echte Ausgabe, endet aber mit rc=1 (wie bei einem unlesbaren Unterordner);
+# mit $WORK/du-hang hängt er und ignoriert TERM (wie ein hängender Mount).
 REAL_DU="$(PATH="${PATH#"$STUBS:"}" command -v du)"
 cat > "$STUBS/du" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$WORK/du-args"
+[ -f "$WORK/du-hang" ] && { trap "" TERM; sleep 400; }
 "$REAL_DU" "\$@"; rc=\$?
 [ -f "$WORK/du-partial" ] && exit 1
 exit \$rc
@@ -1421,23 +1427,49 @@ assert_err "B2: Größe nicht messbar" "Größe nicht messbar"
 rm -f "$WORK/du-partial"
 pat_unchanged "B2: Musterdatei unverändert"
 
+# Hängendes du: timeout schickt TERM, nach weiteren 10 s KILL → abgewiesen. Der
+# Fall wartet die feste Frist des Helfers ab (gut 130 s) und läuft deshalb nur
+# mit COCKPIT_BORG_HARNESS_LANGSAM=1 (CI fährt dieses Harness nicht).
+if [ "${COCKPIT_BORG_HARNESS_LANGSAM:-0}" = 1 ]; then
+  echo "== sources add: hängendes du (TERM ignoriert) → nach Frist abgewiesen =="
+  kiste_df 1.5G
+  : > "$WORK/du-hang"; t0=$(date +%s)
+  src cgroup-run add "$SRC/stacks/gross"
+  echo "  (abgewiesen nach $(( $(date +%s) - t0 )) s)"
+  assert_rc "hängendes du → abgewiesen" 1
+  assert_err "hängendes du → nicht messbar" "Größe nicht messbar"
+  rm -f "$WORK/du-hang"
+  pat_unchanged "hängendes du: Musterdatei unverändert"
+else
+  echo "  (hängendes du übersprungen — COCKPIT_BORG_HARNESS_LANGSAM=1 fährt es, gut 130 s)"
+fi
+
 echo "== sources add: Messung über Mountpunkte hinweg (B1, Zweitprüfung PR #83) =="
 : > "$WORK/du-args"
 src cgroup-run add "$SRC/stacks/gross"
 assert_rc "add für die Mount-Probe" 0
 if [ -s "$WORK/du-args" ] && ! grep -qE '(^| )-[A-Za-z]*x' "$WORK/du-args" && ! grep -qF -- '--one-file-system' "$WORK/du-args"; then ok "B1: du misst ohne -x (zählt auch hinter Mountpunkten)"; else bad "B1: du mit -x: $(tr '\n' ';' < "$WORK/du-args")"; fi
-# Mit echtem Bind-Mount, wo der Prüfstand mounten darf: der Inhalt hinter dem
-# Mountpunkt zählt mit und reisst die Grenze.
+# Mit echtem Mount, wo der Prüfstand mounten darf: der Inhalt hinter dem
+# Mountpunkt zählt mit und reisst die Grenze. Ein tmpfs, kein Bind-Mount: ein
+# Bind derselben Platte hat dieselbe st_dev, dort zählt auch `du -x` mit und der
+# Fall finge einen Rückfall auf -x nicht (t_6cf8cdb6).
 kiste_df 400K   # Grenze 102400 Byte; ohne den Mount läge die Quelle samt gross bei 65536
-mkdir -p "$SRC/stacks/mnt-quelle/vol" "$WORK/mnt-ziel"; head -c 262144 /dev/zero > "$WORK/mnt-ziel/daten.bin"
-if mount --bind "$WORK/mnt-ziel" "$SRC/stacks/mnt-quelle/vol" 2>/dev/null; then
-  src cgroup-run add "$SRC/stacks/mnt-quelle"
-  assert_rc "B1: Quelle mit grossem Mount darunter abgewiesen" 1
-  umount "$SRC/stacks/mnt-quelle/vol"
+VOL="$SRC/stacks/mnt-quelle/vol"
+mkdir -p "$VOL"
+if mount -t tmpfs -o size=4m tmpfs "$VOL" 2>/dev/null; then
+  if [ "$(stat -c %d "$VOL")" != "$(stat -c %d "$SRC/stacks/mnt-quelle")" ] \
+     && head -c 262144 /dev/zero > "$VOL/daten.bin"; then
+    ok "B1: tmpfs mit eigener st_dev unter der Quelle"
+    src cgroup-run add "$SRC/stacks/mnt-quelle"
+    assert_rc "B1: Quelle mit grossem Mount darunter abgewiesen" 1
+  else
+    bad "B1: tmpfs ohne eigene st_dev oder nicht beschreibbar"
+  fi
+  umount "$VOL"
 else
-  echo "  (Bind-Mount hier nicht erlaubt — nur die Argument-Probe)"
+  echo "  (Mount hier nicht erlaubt — nur die Argument-Probe)"
 fi
-rmdir "$SRC/stacks/mnt-quelle/vol" "$SRC/stacks/mnt-quelle"
+rmdir "$VOL" "$SRC/stacks/mnt-quelle"
 src cgroup-run restore
 assert_rc "restore nach der B1-Probe" 0
 pat_unchanged "B1-Probe zurückgenommen"
