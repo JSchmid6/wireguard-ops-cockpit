@@ -100,7 +100,7 @@ describe("host run across an API restart", () => {
     const agentCalls = await listen(path.join(dir, "agent.sock"), () => ({ ok: true, output: "VERIFICATION_STATUS: passed\nEVIDENCE: uname shows 6.8\nREASON: the new kernel runs" }));
 
     const app = await createApp({
-      config: config(dir, { executorBrokerSocket: path.join(dir, "executor.sock"), executorBrokerSecret: BROKER_SECRET, agentBrokerSocket: path.join(dir, "agent.sock") }),
+      config: config(dir, { executorBrokerSocket: path.join(dir, "executor.sock"), executorBrokerSecret: BROKER_SECRET, agentBrokerSocket: path.join(dir, "agent.sock"), runnerBrokerSocket: path.join(dir, "agent.sock") }),
       hostRunPollMs: 10,
     });
     cleanup.push(() => app.close());

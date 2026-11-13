@@ -819,8 +819,8 @@ sshd lief nicht mehr.
   mit.
 - **Die anderen Wege**: Die Deploy-Unit des Selbst-Updates hat `TimeoutStartSec=infinity`, die
   `einspielen`-Unit von `dienste.update` (docker compose) kein `RuntimeMaxSec` mehr. Die
-  Runner-Rolle des Agent-Brokers (der sie nach ihrem Budget mit SIGTERM→SIGKILL beendet) läuft
-  ohnehin als `cockpit-agent` ohne root, sudo und Docker-Socket; die API gibt ihr zusätzlich
+  Runner-Rolle (ihr Broker beendet sie nach ihrem Budget mit SIGTERM→SIGKILL) läuft
+  ohnehin als `cockpit-runner` (eigene Identität, Karte t_cb81637b) ohne root, sudo und Docker-Socket; die API gibt ihr zusätzlich
   keinen Plan, dessen Text (nicht nur der erste Skriptblock) einen Zustandsschritt nennt — der
   gehört durch die Tür.
 

@@ -1,0 +1,46 @@
+[Unit]
+Description=WireGuard Ops Cockpit isolated runner broker (opencode build)
+After=network-online.target
+Wants=network-online.target
+
+# The runner executes the reviewed plan with opencode's build agent. It runs here,
+# under its own identity, home and socket, and not in the agent unit: there it
+# could write what the plan roles (safety, verifier) load or answer for them —
+# opencode's state, a concurrent workspace, the broker socket, a process left
+# behind (card t_cb81637b, doc/services/execution-control-model.md).
+[Service]
+Type=simple
+User=cockpit-runner
+Group=cockpit-runner-client
+WorkingDirectory=/opt/wireguard-ops-cockpit
+Environment=NODE_ENV=production
+Environment=HOME=/var/lib/wireguard-ops-runner
+Environment=PATH=/opt/node-v22.23.4-linux-x64/bin:/usr/local/bin:/usr/bin:/bin
+Environment=COCKPIT_AGENT_BROKER_SOCKET=/run/cockpit-runner/runner.sock
+Environment=COCKPIT_AGENT_WORKSPACE_ROOT=/var/lib/wireguard-ops-runner/sessions
+Environment=COCKPIT_OPENCODE_CONFIG=/var/lib/wireguard-ops-runner/.config/opencode/opencode.jsonc
+Environment=COCKPIT_AGENT_BROKER_ROLES=runner
+EnvironmentFile=/etc/wireguard-ops-cockpit/agent.env
+RuntimeDirectory=cockpit-runner
+RuntimeDirectoryMode=0770
+ExecStart=/opt/node-v22.23.4-linux-x64/bin/node /opt/wireguard-ops-cockpit/apps/agent-broker/src/index.mjs
+Restart=always
+RestartSec=5
+UMask=0007
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+# The same write boundary as the agent unit: the workspaces, never the home with
+# the config; opencode's state lives in each workspace.
+StateDirectory=wireguard-ops-runner/sessions
+StateDirectoryMode=0700
+ReadWritePaths=/run/cockpit-runner
+# The plan roles' home and socket are not even visible here (their 0750/0770
+# modes and groups already keep this identity out).
+InaccessiblePaths=-/var/lib/wireguard-ops-agent -/run/cockpit-agent
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

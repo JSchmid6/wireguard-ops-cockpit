@@ -94,7 +94,7 @@ async function restart(seedJobs: Seed, agentAnswer?: (request: Record<string, an
       ? { ok: true, output: "The hermes container runs image 0240fa4a and is healthy." }
       : { ok: true, output: "VERIFICATION_STATUS: passed\nEVIDENCE: container up\nREASON: done" }));
   const app = await createApp({
-    config: config(dir, { executorBrokerSocket: path.join(dir, "executor.sock"), executorBrokerSecret: BROKER_SECRET, agentBrokerSocket: path.join(dir, "agent.sock") }),
+    config: config(dir, { executorBrokerSocket: path.join(dir, "executor.sock"), executorBrokerSecret: BROKER_SECRET, agentBrokerSocket: path.join(dir, "agent.sock"), runnerBrokerSocket: path.join(dir, "agent.sock") }),
     hostRunReviewRunner: async () => "VERDICT: pass\nNOTES: routine switch",
     hostRunPollMs: 10,
   });

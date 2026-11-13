@@ -1,19 +1,20 @@
 # Broker identity isolation
 
-Production uses three Unix identities and two non-network Unix sockets.
+Production uses four Unix identities and three non-network Unix sockets.
 
 ## Identities and groups
 
-- `wgops`: Control API; supplementary member of both client groups
-- `cockpit-agent`: primary group `cockpit-agent-client`; no sudo
+- `wgops`: Control API; supplementary member of the three client groups
+- `cockpit-agent`: primary group `cockpit-agent-client`; no sudo; serves the plan roles (planner, research, safety, verifier) on `/run/cockpit-agent/agent.sock`
+- `cockpit-runner`: primary group `cockpit-runner-client`, no other group; no sudo; serves only the runner (opencode `build`) on `/run/cockpit-runner/runner.sock`, home `/var/lib/wireguard-ops-runner` (card t_cb81637b)
 - `cockpit-executor`: primary group `cockpit-executor-client`; only the static service and disk helpers, the signed capability sandbox launcher and the signed host-run launcher (`start`, `status <job>`) in sudoers
 
-Never add `cockpit-agent` to `cockpit-executor-client` or grant it access to Control storage.
+Never add `cockpit-agent` or `cockpit-runner` to `cockpit-executor-client` or grant them access to Control storage, and never add `cockpit-runner` to `cockpit-agent-client` (or the other way round): the runner must not reach what safety and verifier load or trust.
 
 ## Secret placement
 
 - `/etc/wireguard-ops-cockpit/api.env`: envelope and executor-client secrets; no provider key
-- `/etc/wireguard-ops-cockpit/agent.env`: provider key and model selection only
+- `/etc/wireguard-ops-cockpit/agent.env`: provider key and model selection only (read by both the agent and the runner unit)
 - `/etc/wireguard-ops-cockpit/executor.env`: executor broker secret only
 - `/home/hermes/.hermes/credentials/cockpit.token`: Hermes-owned route-scoped bearer token; Control stores only its SHA-256 hash
 - `/etc/wireguard-ops-cockpit/admin-recovery.env`: root-only recovery login, never sourced into an agent service
@@ -25,6 +26,7 @@ The Hermes token file is `hermes:hermes` mode `0600` because Hermes must present
 ## Installed files
 
 - `deploy/systemd/wireguard-ops-cockpit-agent.service`
+- `deploy/systemd/wireguard-ops-cockpit-runner.service`
 - `deploy/systemd/wireguard-ops-cockpit-executor.service`
 - `deploy/systemd/wireguard-ops-cockpit-api-brokers.conf`
 - `deploy/helpers/cockpit-service-action`

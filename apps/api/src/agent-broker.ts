@@ -10,6 +10,22 @@ export function agentPromptLimit(role: AgentBrokerRole): number {
   return promptLimit(role);
 }
 
+// The runner (opencode build) runs under its own identity behind its own socket;
+// the plan roles' broker does not serve it (card t_cb81637b). Fail closed: with
+// isolation on and no runner socket configured, no runner starts — sending it to
+// the plan roles' broker would give it their identity back.
+export function brokerSocketForRole(
+  config: { agentBrokerSocket: string | null; runnerBrokerSocket?: string | null },
+  role: AgentBrokerRole,
+): string {
+  if (!config.agentBrokerSocket) throw new Error("the isolated agent broker is not configured");
+  if (role !== "runner") return config.agentBrokerSocket;
+  if (!config.runnerBrokerSocket) {
+    throw new Error("the runner needs its own broker identity (COCKPIT_RUNNER_BROKER_SOCKET); it never runs in the plan roles' broker");
+  }
+  return config.runnerBrokerSocket;
+}
+
 export async function runBrokerAgent(socketPath: string, role: AgentBrokerRole, prompt: string): Promise<string> {
   // The same check as the broker's, before the socket: the error names bound and length.
   const problem = promptLimitProblem(role, prompt);

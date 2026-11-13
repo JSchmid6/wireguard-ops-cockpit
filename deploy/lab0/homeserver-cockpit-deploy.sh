@@ -87,6 +87,11 @@
 #         Skript das statische Release-Binary ttyd 1.7.7 (sha256 gepinnt) nach
 #         /usr/local/bin/ttyd; die Unit ruft ttyd ohne Pfad auf. Abgleich der übrigen
 #         Pakete gegen trixie main: alle vorhanden.
+#         13.11.2026 (Kanban t_cb81637b): Runner unter eigener Identität — Nutzer
+#         cockpit-runner (Gruppe cockpit-runner-client, kein sudo), Home
+#         /var/lib/wireguard-ops-runner, Unit wireguard-ops-cockpit-runner, Socket
+#         /run/cockpit-runner/runner.sock; wgops kommt in die Gruppe. Paket ripgrep, weil
+#         opencode seinen Cache jetzt je Lauf neu anlegt.
 #
 # Aufruf (als root AUF DER KISTE):
 #   bash homeserver-cockpit-deploy.sh                   # Lab0 bzw. die installierte Rolle
@@ -133,6 +138,8 @@ COCKPIT_DIR="/opt/wireguard-ops-cockpit"
 ENV_DIR="/etc/wireguard-ops-cockpit"
 STATE_DIR="/var/lib/wireguard-ops-cockpit"
 AGENT_DIR="/var/lib/wireguard-ops-agent"
+# The runner (opencode build) under its own identity, home and socket (Kanban t_cb81637b).
+RUNNER_DIR="/var/lib/wireguard-ops-runner"
 EXEC_DIR="/var/lib/wireguard-ops-executor"
 WEBROOT="/var/www/wireguard-ops-cockpit"
 SECRETS_DIR="/root/cockpit-deploy"
@@ -449,7 +456,9 @@ ttyd_present() {
   command -v ttyd >/dev/null 2>&1 || [ -x "$TTYD_LOCAL" ]
 }
 
-APT_PACKAGES=(ca-certificates curl git tmux nginx openssl python3 sudo)
+# ripgrep: opencode keeps its cache per run (Kanban t_cb81637b); without rg on the PATH its
+# grep/glob tools would download ripgrep from GitHub into that empty cache on every run.
+APT_PACKAGES=(ca-certificates curl git tmux nginx openssl python3 sudo ripgrep)
 TTYD_FROM_APT="$(ttyd_apt_candidate)"
 if [ "$TTYD_FROM_APT" = "yes" ]; then APT_PACKAGES+=(ttyd); fi
 # <<< ttyd-logik
@@ -505,10 +514,15 @@ id -u wgops >/dev/null 2>&1 || useradd --system -m -d "$STATE_DIR" -s /bin/bash 
 getent group cockpit-agent-client >/dev/null || groupadd --system cockpit-agent-client
 id -u cockpit-agent >/dev/null 2>&1 || useradd --system -m -d "$AGENT_DIR" -s /usr/sbin/nologin -g cockpit-agent-client cockpit-agent
 
+# Eigene Identität für den Runner: kein Mitglied von cockpit-agent-client, kein sudo.
+getent group cockpit-runner-client >/dev/null || groupadd --system cockpit-runner-client
+id -u cockpit-runner >/dev/null 2>&1 || useradd --system -m -d "$RUNNER_DIR" -s /usr/sbin/nologin -g cockpit-runner-client cockpit-runner
+
 getent group cockpit-executor-client >/dev/null || groupadd --system cockpit-executor-client
 id -u cockpit-executor >/dev/null 2>&1 || useradd --system -m -d "$EXEC_DIR" -s /usr/sbin/nologin -g cockpit-executor-client cockpit-executor
 
 usermod -aG cockpit-agent-client wgops
+usermod -aG cockpit-runner-client wgops
 usermod -aG cockpit-executor-client wgops
 
 # ---------------------------------------------------------------------------
@@ -520,13 +534,16 @@ install -d -m 0700 -o wgops -g wgops "$STATE_DIR/capabilities"
 install -d -m 0700 -o root  -g root  "$STATE_DIR/capability-snapshots"
 install -d -m 0750 -o cockpit-agent -g cockpit-agent-client "$AGENT_DIR"
 install -d -m 0700 -o cockpit-agent -g cockpit-agent-client "$AGENT_DIR/sessions"
+install -d -m 0750 -o cockpit-runner -g cockpit-runner-client "$RUNNER_DIR"
+install -d -m 0700 -o cockpit-runner -g cockpit-runner-client "$RUNNER_DIR/sessions"
 install -d -m 0750 -o cockpit-executor -g cockpit-executor-client "$EXEC_DIR"
 install -d -m 0700 -o root -g root "$ENV_DIR"
 install -d -m 0755 /usr/local/lib/wireguard-ops-cockpit
-chmod 0750 "$STATE_DIR" "$AGENT_DIR" "$EXEC_DIR"
-chmod 0700 "$AGENT_DIR/sessions"
+chmod 0750 "$STATE_DIR" "$AGENT_DIR" "$RUNNER_DIR" "$EXEC_DIR"
+chmod 0700 "$AGENT_DIR/sessions" "$RUNNER_DIR/sessions"
 chown wgops:wgops "$STATE_DIR"
 chown cockpit-agent:cockpit-agent-client "$AGENT_DIR" "$AGENT_DIR/sessions"
+chown cockpit-runner:cockpit-runner-client "$RUNNER_DIR" "$RUNNER_DIR/sessions"
 chown cockpit-executor:cockpit-executor-client "$EXEC_DIR"
 
 # ---------------------------------------------------------------------------
@@ -633,12 +650,13 @@ chown root:root "$ENV_DIR"/*.env
 umask 022   # ab hier wieder normale Rechte für Build-/Web-Dateien
 
 # ---------------------------------------------------------------------------
-# 7) systemd-Units (4 Dienste + API-Drop-in)
+# 7) systemd-Units (5 Dienste + API-Drop-in)
 # ---------------------------------------------------------------------------
 log "7) systemd-Units installieren"
 install -m 644 "$COCKPIT_DIR/deploy/systemd/wireguard-ops-cockpit-api.service"      /etc/systemd/system/
 install -m 644 "$COCKPIT_DIR/deploy/systemd/wireguard-ops-cockpit-ttyd.service"     /etc/systemd/system/
 install -m 644 "$COCKPIT_DIR/deploy/systemd/wireguard-ops-cockpit-agent.service"    /etc/systemd/system/
+install -m 644 "$COCKPIT_DIR/deploy/systemd/wireguard-ops-cockpit-runner.service"   /etc/systemd/system/
 install -m 644 "$COCKPIT_DIR/deploy/systemd/wireguard-ops-cockpit-executor.service" /etc/systemd/system/
 install -d -m 755 /etc/systemd/system/wireguard-ops-cockpit-api.service.d
 install -m 644 "$COCKPIT_DIR/deploy/systemd/wireguard-ops-cockpit-api-brokers.conf" \
@@ -770,6 +788,8 @@ runuser -u cockpit-agent -- test -x "$NODE_DIR/bin/opencode" \
   || die "opencode ist für cockpit-agent nicht ausführbar — Rechte prüfen."
 timeout 60 runuser -u cockpit-agent -- env HOME="$AGENT_DIR" "$NODE_DIR/bin/opencode" --version >/dev/null 2>&1 \
   || die "opencode --version schlägt als cockpit-agent fehl (runuser-Test)."
+timeout 60 runuser -u cockpit-runner -- env HOME="$RUNNER_DIR" "$NODE_DIR/bin/opencode" --version >/dev/null 2>&1 \
+  || die "opencode --version schlägt als cockpit-runner fehl (runuser-Test)."
 ln -sfn "$NODE_DIR/bin/opencode" /usr/local/bin/opencode
 # BEGIN agent-opencode-config (test/cockpit-agent-unit-e2e-inner.sh runs exactly these lines)
 # The config of every agent role belongs to root; the agent identity, which also
@@ -783,6 +803,15 @@ install -m 640 -o root -g cockpit-agent-client \
 install -m 640 -o root -g cockpit-agent-client \
   "$COCKPIT_DIR/deploy/config/opencode-config-dir.gitignore" "$AGENT_DIR/.config/opencode/.gitignore"
 # END agent-opencode-config
+# BEGIN runner-opencode-config
+# The runner's own config, the same file, root-owned in its own home: the runner
+# reads it, and its unit keeps that home read-only as well.
+install -d -m 0750 -o root -g cockpit-runner-client "$RUNNER_DIR/.config" "$RUNNER_DIR/.config/opencode"
+install -m 640 -o root -g cockpit-runner-client \
+  "$COCKPIT_DIR/deploy/config/opencode-agent.jsonc" "$RUNNER_DIR/.config/opencode/opencode.jsonc"
+install -m 640 -o root -g cockpit-runner-client \
+  "$COCKPIT_DIR/deploy/config/opencode-config-dir.gitignore" "$RUNNER_DIR/.config/opencode/.gitignore"
+# END runner-opencode-config
 
 # ---------------------------------------------------------------------------
 # 10) Web-Frontend über nginx (nur WG-IP; Port/TLS aus Ist-Zustand, Re-Run-sicher)
@@ -840,7 +869,7 @@ else
   echo "nginx: gestartet."
 fi
 systemctl enable --now wireguard-ops-cockpit-api wireguard-ops-cockpit-ttyd \
-  wireguard-ops-cockpit-agent wireguard-ops-cockpit-executor
+  wireguard-ops-cockpit-agent wireguard-ops-cockpit-runner wireguard-ops-cockpit-executor
 # Aufräum-Dienst (nur lab0): nur der Timer läuft dauerhaft; der Lauf selbst ist ein oneshot.
 if [ "$COCKPIT_ROLE" = "lab0" ]; then systemctl enable --now cockpit-borg-retention.timer; fi
 # Tür: Fortsetzen nach einem Neustart-Schritt (nur enable, wie auf dem VPS).
@@ -848,7 +877,7 @@ systemctl enable --quiet wireguard-ops-cockpit-host-run-resume.service
 # Re-Run-Falle (Befund 25.09., Review t_57244697/I2): 'enable --now' startet einen
 # LAUFENDEN Dienst nicht neu — nach einem Re-Run liefen API + beide Broker weiter mit
 # dem alten In-Memory-Code (die SMART-/Self-Update-Strecke braucht den neuen Stand).
-# Daher hier der explizite Zyklus der vier Cockpit-Dienste; im Selbst-Update
+# Daher hier der explizite Zyklus der fünf Cockpit-Dienste; im Selbst-Update
 # (COCKPIT_RESTART_MODE=defer) wird er übersprungen — den Neustart übernimmt dort
 # die geplante Aktivierung des Selbst-Update-Runners.
 # >>> dienste-zyklus
@@ -858,7 +887,7 @@ case "${COCKPIT_RESTART_MODE:-}" in
     ;;
   *)
     systemctl restart wireguard-ops-cockpit-api wireguard-ops-cockpit-agent \
-      wireguard-ops-cockpit-executor wireguard-ops-cockpit-ttyd \
+      wireguard-ops-cockpit-runner wireguard-ops-cockpit-executor wireguard-ops-cockpit-ttyd \
       || die "Cockpit-Dienste-Neustart fehlgeschlagen — journalctl -u wireguard-ops-cockpit-<dienst> prüfen."
     echo "Cockpit-Dienste neu gestartet (neuer Stand aktiv)."
     ;;
@@ -870,13 +899,14 @@ esac
 # ---------------------------------------------------------------------------
 log "12) Verifikation"
 sleep 3
-for svc in api ttyd agent executor; do
+for svc in api ttyd agent runner executor; do
   systemctl is-active --quiet "wireguard-ops-cockpit-$svc" \
     || die "wireguard-ops-cockpit-$svc nicht aktiv — journalctl -u wireguard-ops-cockpit-$svc"
 done
-echo "Dienste: alle 4 aktiv."
+echo "Dienste: alle 5 aktiv."
 
 [ -S /run/cockpit-agent/agent.sock ]     || die "agent.sock fehlt."
+[ -S /run/cockpit-runner/runner.sock ]   || die "runner.sock fehlt."
 [ -S /run/cockpit-executor/executor.sock ] || die "executor.sock fehlt."
 echo "Broker-Sockets: vorhanden."
 
@@ -992,7 +1022,7 @@ Nächster Test (vom VPS aus, sobald WG steht):
   Browser: $(site_url)  (Login admin / Passwort aus admin-recovery.env)
 
 Rückbau (nur bei Bedarf, als root):
-  systemctl disable --now wireguard-ops-cockpit-api wireguard-ops-cockpit-ttyd wireguard-ops-cockpit-agent wireguard-ops-cockpit-executor
+  systemctl disable --now wireguard-ops-cockpit-api wireguard-ops-cockpit-ttyd wireguard-ops-cockpit-agent wireguard-ops-cockpit-runner wireguard-ops-cockpit-executor
   # Tür (doc/setup/host-run.md):
   #   systemctl disable wireguard-ops-cockpit-host-run-resume.service
   #   rm -f /usr/local/lib/wireguard-ops-cockpit/cockpit-host-run.mjs /usr/local/lib/wireguard-ops-cockpit/cockpit-backup-guard.mjs \
@@ -1028,7 +1058,7 @@ Rückbau (nur bei Bedarf, als root):
   # Falls entfernt: default-Site zurückholen: ln -s ../sites-available/default /etc/nginx/sites-enabled/default
   # Falls gesetzt: ufw delete allow in on wg0 proto tcp from 10.0.0.0/24 to $WG_BIND_IP port $WEB_PORT
   # Daten (nur auf Wunsch): rm -rf /var/lib/wireguard-ops-cockpit /var/lib/wireguard-ops-agent /var/lib/wireguard-ops-executor
-  # Benutzer (nur auf Wunsch): userdel -r wgops; userdel -r cockpit-agent; userdel -r cockpit-executor
+  # Benutzer (nur auf Wunsch): userdel -r wgops; userdel -r cockpit-agent; userdel -r cockpit-runner; userdel -r cockpit-executor
   # Node/OpenCode (nur auf Wunsch, falls sonst ungenutzt):
   #   npm uninstall -g opencode-ai; rm -f /usr/local/bin/opencode
   #   rm -f /usr/local/bin/ttyd   # nur das Release-Binary (Debian trixie); das apt-Paket bleibt

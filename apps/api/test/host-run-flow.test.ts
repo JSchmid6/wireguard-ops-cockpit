@@ -78,7 +78,7 @@ const planWith = (...manifests: Array<{ version: string }>) => [
 // exactly as on the host ("prompt length <n> exceeds verifier limit <bound>").
 const { validateRequest } = await import("../../agent-broker/src/index.mjs") as { validateRequest: (request: unknown) => unknown };
 
-async function setup(options: { plan: string; doorkeeper: string; intent?: string; ownedByAutomation?: boolean; hostState?: () => Record<string, unknown> | null; instanceRole?: "vps" | "lab0" | null; doorkeeperWait?: Promise<void>; logTail?: string; runStatus?: string; verifier?: () => Record<string, unknown> }) {
+async function setup(options: { plan: string; doorkeeper: string; intent?: string; ownedByAutomation?: boolean; hostState?: () => Record<string, unknown> | null; instanceRole?: "vps" | "lab0" | null; doorkeeperWait?: Promise<void>; logTail?: string; runStatus?: string; verifier?: () => Record<string, unknown>; runnerBroker?: boolean }) {
   const dir = mkdtempSync(path.join(tmpdir(), "host-run-flow-"));
   cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
   const seed = new CockpitDatabase(path.join(dir, "cockpit.sqlite"));
@@ -111,7 +111,7 @@ async function setup(options: { plan: string; doorkeeper: string; intent?: strin
   });
   const doorkeeperPrompts: string[] = [];
   const app = await createApp({
-    config: config(dir, { executorBrokerSocket: path.join(dir, "executor.sock"), executorBrokerSecret: BROKER_SECRET, agentBrokerSocket: path.join(dir, "agent.sock"), instanceRole: options.instanceRole ?? null }),
+    config: config(dir, { executorBrokerSocket: path.join(dir, "executor.sock"), executorBrokerSecret: BROKER_SECRET, agentBrokerSocket: path.join(dir, "agent.sock"), runnerBrokerSocket: options.runnerBroker === false ? null : path.join(dir, "agent.sock"), instanceRole: options.instanceRole ?? null }),
     hostRunReviewRunner: async (prompt) => { doorkeeperPrompts.push(prompt); await options.doorkeeperWait; return options.doorkeeper; },
     hostRunPollMs: 10,
   });
@@ -613,6 +613,20 @@ describe("host door: uninterruptible steps through the API", () => {
     expect(flow.agentCalls.some((call) => call.role === "runner")).toBe(false);
     expect(job.status).not.toBe("completed");
     expect(JSON.stringify(job.output)).toContain("state steps (package)");
+  });
+
+  // The runner (build) runs only under its own identity (t_cb81637b): with the
+  // agent broker configured and no runner broker, the API sends it nowhere —
+  // never to the plan roles' broker — and counts no host failure.
+  it("refuses to start the runner without its own broker and never sends it to the plan roles' broker", async () => {
+    const flow = await setup({ plan: "## Plan\n```bash\nuptime\n```\n## Intent\nKeep the host's packages current.", doorkeeper: "VERDICT: pass", runnerBroker: false });
+    const submitted = await flow.submit();
+    const job = await flow.settled(submitted.id);
+    expect(flow.agentCalls.some((call) => call.role === "planner")).toBe(true);
+    expect(flow.agentCalls.some((call) => call.role === "runner")).toBe(false);
+    expect(job.status).not.toBe("completed");
+    expect(JSON.stringify(job.output)).toContain("the runner needs its own broker identity (COCKPIT_RUNNER_BROKER_SOCKET)");
+    expect(typeof job.output?.executionStartedAt).toBe("undefined");
   });
 });
 
