@@ -1050,6 +1050,14 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
           shell = readsShell(segments[at]);
           if (shell || segments[at].pipedInto === null) break;
         }
+        // R1 (Zweitprüfung t_42ae4123): bash expands an unquoted body before the shell
+        // reads it, \\ becomes \ and the inner shell joins echo foo\\ with a # line;
+        // $ and backticks can put a \ or code there as well (B=\; echo foo$B).
+        // Fail safe: any \, $ or backtick in it, the rest of the step shows nothing.
+        if (shell && !quoted && /[\\$`]/.test(rows.slice(from, end).map(view).join("\n"))) {
+          if (!blind) scriptLine.blind = true;
+          blind = true;
+        }
         const local = shell ? localChain(segments.slice(start, at + 1)) : null;
         let body: ShellScope | null = null;
         if (shell) {

@@ -1463,3 +1463,34 @@ describe("hash-pinned scripts: a backslash at the end of an unquoted heredoc lin
     expect(found(`cat > ${P} <<EOF\necho hi \\\\\nEOF\n${pin}\n${P}`)).toEqual([]);
   });
 });
+
+describe("hash-pinned scripts: an unquoted heredoc a shell reads (R1, t_42ae4123)", () => {
+  const P = "/opt/x/run.sh";
+  const pin = `echo "${HASH}  ${P}" | sha256sum -c -`;
+  const found = (run: string) => hiddenPinnedScripts(manifest([{ name: "s1", run }]) as never).map(({ path }) => path);
+  const shown = `cat > ${P} <<'EOF'\necho gut\nEOF`;
+  // bash expands the body before the inner shell reads it: echo foo\\ arrives as
+  // echo foo\ and the inner shell joins it with the # line, echo foo#;cp … runs.
+  const joined = (tab = "") => `${tab}echo foo\\\\\n${tab}#;cp /tmp/evil ${P}`;
+
+  for (const [name, run] of [
+    ["bash <<X", `bash <<X\n${joined()}\nX`],
+    ["cat <<X | sudo bash", `cat <<X | sudo bash\n${joined()}\nX`],
+    ["bash <<-X with tabs", `bash <<-X\n${joined("\t")}\n\tX`],
+    // $ and backticks put a \ or code there as well.
+    ["$B with B=\\", `B=$(printf '\\134')\nbash <<X\necho foo$B\n#;cp /tmp/evil ${P}\nX`],
+    ["$(…) that prints code", `bash <<X\n$(printf 'cp /tmp/evil ${P}')\nX`],
+    ["backticks that print code", `bash <<X\n\`printf 'cp /tmp/evil ${P}'\`\nX`],
+  ]) {
+    it(`R1: ${name}`, () => {
+      expect(found(`${shown}\n${run}\n${pin}\n${P}`)).toEqual([P]);
+    });
+  }
+
+  it("guard: a quoted shell body, an unquoted one without \\, $ or backticks and unquoted content stay free", () => {
+    expect(found(`${shown}\nbash <<'X'\n${joined()}\nX\n${pin}\n${P}`)).toEqual([]);
+    expect(found(`${shown}\ncat <<'X' | sudo bash\necho foo$B\nX\n${pin}\n${P}`)).toEqual([]);
+    expect(found(`${shown}\nbash <<X\necho hallo\nX\n${pin}\n${P}`)).toEqual([]);
+    expect(found(`${shown}\ncat > /tmp/n <<X\necho foo\\\\ $HOME\nX\n${pin}\n${P}`)).toEqual([]);
+  });
+});

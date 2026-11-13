@@ -318,7 +318,7 @@ Die Regel im Einzelnen (`hiddenPinnedScripts` in `apps/api/src/host-run.ts`):
   verbindet die Regel eine Zeile mit `\` am Ende eines Kommentars mit der nächsten (für bash setzt der Kommentar
   nichts fort), endet eine Inhaltszeile eines ungequoteten Heredocs (`<<EOF`, `<<-EOF`, auch im Körper) auf eine
   ungerade Zahl von `\` (13.11.2026, Hinweis B1 aus t_0bc8fac5: bash verbindet sie vor dem Vergleich mit dem Begrenzer mit
-  der nächsten, `echo hi\` vor `EOF` beendet nichts; gequotete Heredocs verbinden nichts), oder erreicht eine Zeile in einem Körper den Begrenzer eines umschließenden Shell-Körpers (bei
+  der nächsten, `echo hi\` vor `EOF` beendet nichts; gequotete Heredocs verbinden nichts), steht im Körper eines ungequoteten Heredocs, den eine Shell liest (`bash <<X`, `cat <<X | sudo bash`, `bash <<-X`), ein `\`, `$` oder Backtick (13.11.2026, R1 aus t_42ae4123: die äußere bash expandiert den Körper zuerst, aus `echo foo\\` wird `echo foo\`, die innere bash verbindet es ohne Leerzeichen mit einer Zeile `#;cp …`, die die Regel als Kommentar verwirft; `$B` mit `B=\` tut dasselbe ohne `\` im Körper, `$(…)` und Backticks setzen beliebigen Code ein — fail-safe zählt jedes der drei Zeichen, auch eine gerade Zahl `\`), oder erreicht eine Zeile in einem Körper den Begrenzer eines umschließenden Shell-Körpers (bei
   `<<-` auch mit führenden Tabs), dann kann die Regel die Grenzen ab hier anders lesen als bash. Ab dieser Zeile
   gilt für den Rest des Schritts nichts mehr als gezeigt, und was bis dahin gezeigt war, zählt als überschrieben
   (bash kann ab hier Zeilen ausführen, die die Regel für Inhalt hält). Dazu ist im Körper eine Zeile mit einem
@@ -326,8 +326,10 @@ Die Regel im Einzelnen (`hiddenPinnedScripts` in `apps/api/src/host-run.ts`):
   `</dev/null` (Hinweis aus t_ebbf1e40): kein `$`, kein Backtick und kein Pfad unter `/proc/` oder `/dev/` außer
   `/dev/null` (`true >/proc/self/fd/0 </dev/null` kürzt den Körper, wenn er als Temp-Datei vorliegt). Preis: Ein
   Schritt mit `"$(cat <<'EOF'`, einem mehrzeiligen String oder `<<` in einem Kommentar, in Arithmetik (`$(( 1 << 4 ))`)
-  oder in `${…}` oder mit `\` am Zeilenende in einem ungequoteten Heredoc zeigt danach kein festgenageltes Skript mehr; der
-  Planer schreibt den Heredoc schlicht (gequotet, wenn Zeilen auf `\` enden) und den Kommentar ohne `<<`.
+  oder in `${…}`, mit `\` am Zeilenende in einem ungequoteten Heredoc oder mit `\`, `$` oder Backtick im ungequoteten
+  Körper einer Shell (auch `bash <<X` mit `$HOME` oder `\\`) zeigt danach kein festgenageltes Skript mehr; der
+  Planer schreibt den Heredoc schlicht (gequotet, wenn Zeilen auf `\` enden oder eine Shell den Körper liest; Werte
+  gibt er per `export` mit) und den Kommentar ohne `<<`.
 - **Geschrieben** zählt nur der letzte Schreibvorgang vor der Ausführung, und nur, wenn er den Inhalt
   zeigt: `cat >`/`tee` mit Heredoc, `install … /dev/stdin <ziel>` mit Heredoc, `echo`/`printf` ohne
   `$`/Backticks, eine Kopie eines so geschriebenen Skripts. Ein Heredoc zeigt den Inhalt nur, wenn sein
