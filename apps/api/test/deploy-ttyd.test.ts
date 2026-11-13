@@ -34,7 +34,8 @@ function stub(name: string, body: string) {
 }
 
 // candidate: was apt-cache policy als Candidate meldet; tail: Befehle nach dem Block.
-function runBlock(candidate: string, tail: string) {
+// pathTail: was nach den Stubs auf dem PATH steht (Vorgabe: der PATH dieses Prozesses).
+function runBlock(candidate: string, tail: string, pathTail = process.env.PATH) {
   stub("apt-cache", `printf 'ttyd:\\n  Installed: (none)\\n  Candidate: %s\\n' '${candidate}'`);
   const script = [
     "set -euo pipefail",
@@ -45,7 +46,7 @@ function runBlock(candidate: string, tail: string) {
   ].join("\n");
   return spawnSync("bash", ["-c", script], {
     encoding: "utf8",
-    env: { PATH: `${path.join(dir, "bin")}:${process.env.PATH}`, TTYD_LOCAL: path.join(dir, "usr-local-bin", "ttyd") },
+    env: { PATH: `${path.join(dir, "bin")}:${pathTail}`, TTYD_LOCAL: path.join(dir, "usr-local-bin", "ttyd") },
   });
 }
 
@@ -97,6 +98,34 @@ describe("deploy: ttyd", () => {
     expect(out.status).toBe(1);
     expect(out.stdout).toContain("ttyd-Prüfsumme stimmt nicht");
     expect(existsSync(path.join(dir, "usr-local-bin", "ttyd"))).toBe(false);
+  });
+
+  // Der Self-Update-Lauf (cockpit-self-update-run) startet das Deploy mit diesem PATH, ohne
+  // /usr/local/bin. Auf der Box liegt ttyd dort; die Prüfung nach der Installation scheiterte
+  // daran mit exit 1 (Self-Update exit 69, Kanban t_e6b2adb9/t_68b5bdf8).
+  const SELF_UPDATE_PATH = "/usr/sbin:/usr/bin:/sbin:/bin";
+  const ttydOnSystemPath = spawnSync("bash", ["-c", "command -v ttyd"], { env: { PATH: SELF_UPDATE_PATH } }).status === 0;
+
+  it("finds the release binary outside the self-update PATH (/usr/local/bin on box)", () => {
+    const local = path.join(dir, "usr-local-bin", "ttyd");
+    spawnSync("mkdir", ["-p", path.dirname(local)]);
+    writeFileSync(local, "#!/bin/sh\n");
+    chmodSync(local, 0o755);
+    const out = runBlock("(none)", 'ttyd_present && echo vorhanden', SELF_UPDATE_PATH);
+    expect(out.status, out.stdout + out.stderr).toBe(0);
+    expect(out.stdout.trim()).toBe("vorhanden");
+  });
+
+  it.skipIf(ttydOnSystemPath)("still fails when ttyd is neither on the PATH nor at the release location", () => {
+    const out = runBlock("(none)", 'ttyd_present || die "ttyd fehlt nach der Installation."', SELF_UPDATE_PATH);
+    expect(out.status).toBe(1);
+    expect(out.stdout).toContain("ttyd fehlt nach der Installation.");
+  });
+
+  it("checks ttyd after the install with ttyd_present, not with the PATH alone", () => {
+    const script = readFileSync(SCRIPT, "utf8");
+    expect(script).toContain('ttyd_present || die "ttyd fehlt nach der Installation."');
+    expect(script).not.toMatch(/^command -v ttyd /m);
   });
 
   it("starts ttyd by name so systemd finds the package or the release binary", () => {
