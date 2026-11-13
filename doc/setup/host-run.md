@@ -172,7 +172,25 @@ Die Regel im Einzelnen (`hiddenPinnedScripts` in `apps/api/src/host-run.ts`):
   `ssh`, `fish`, `source /dev/stdin <<'X'`, `. /dev/stdin <<'X'`, `cat <<'X' | bash`, auch
   `| sudo -u root sh`), liest die Regel wie die Skriptzeilen um ihn herum — Schreibvorgänge, `cd`,
   Fortsetzungszeilen, Heredocs darin; nur der Körper jedes anderen Heredocs (`cat > /datei`, `python3 -`,
-  auch ein Inhalts-Heredoc in einem Shell-Körper) ist Inhalt. Ein Heredoc endet nur an einer Zeile, die
+  auch ein Inhalts-Heredoc in einem Shell-Körper) ist Inhalt. Den Namen der Shell liest sie wie bash
+  (13.11.2026, X5 aus t_63a24b37, Karte t_cee07772): Quotes und Backslashes fallen vorher weg wie bei B6
+  (`b\ash <<X`, `ba''sh`, `\bash`, `/bin/b\ash`, `sudo b\ash`, `$'bash'`, `cat <<X | b\ash`); ein Wort mit
+  einem Escape in `$'…'` (`$'\x62ash'`) kann jeder Name sein und zählt fail-safe als Shell. Ebenso liest
+  eine Shell den Körper, wenn sie ihn als Ersetzung bekommt: `bash <(cat <<X)`, `bash < <(cat <<X)`,
+  `source <(…)`, `. <(…)`, `sudo bash <(…)`, `eval $(cat <<X)`, eine Ersetzung an der Stelle des Befehls
+  (`$(cat <<X)`, auch hinter Wrappern wie `env $(…)`, `sudo $(…)`) und `cat <<X > >(bash)`. Die Kette endet
+  dann vor der Shell bei `cat`, der Körper ist also nicht lokal: Schreibvorgänge darin zeigen nichts,
+  Überschreiben und Ausführen liest die Regel. Wo die Regel die Ausgabe, die eine Shell liest, keinem
+  Heredoc zuordnen kann, gilt ab dieser Zeile für den Rest des Schritts nichts mehr als gezeigt (wie bei W-A):
+  eine Gruppe, Subshell, Schleife oder ein `if`, die erst auf einer späteren Zeile schließen und in eine Shell
+  gehen (`{ cat <<X` … `X` … `} | bash`, `( … ) | bash`, `done | bash`, `fi | bash`, `} 2>&1 | bash`,
+  `} |& bash`, `} > >(bash)`), eine Funktion des Schritts, deren Ausgabe eine Shell liest (`f() { cat <<X`
+  … `}` + `f | bash`, `bash <(f)`), und eine Ersetzung, die eine Shell oder `eval` liest und die über das
+  Zeilenende offen bleibt (`bash <(` + Zeilenumbruch). Ehrliche Grenze: Kommt der Code über einen Wert, den
+  der Plan nicht zeigt (`$BASH <<X`, `x=$(cat <<X)` + `bash -c "$x"`), oder über eine Datei ohne Pin
+  (`cat > /tmp/s <<X` + `bash /tmp/s`), sieht die Regel keinen Shell-Körper; das liest der Türsteher (X5),
+  wie jedes Skript ohne Hash. Preis: Ein Schritt mit `} | bash`, `) | bash` (auch `echo $(…) | bash`) oder
+  einer Funktion, die in eine Shell geht, zeigt danach kein festgenageltes Skript mehr. Ein Heredoc endet nur an einer Zeile, die
   genau sein Begrenzer ist; bei `<<-` fallen nur führende Tabs weg (H1, t_b4b11e32: ` X` oder `EOF ` beenden
   nichts). Bei einem Shell-Körper mit `<<-` (`bash <<-'X'`) gilt das für **jede** Zeile des Körpers, auch für die
   Zeilen eines inneren Heredocs (13.11.2026, X-A aus t_6024cbc7): bash streift die Tabs, bevor die innere Shell
@@ -381,7 +399,7 @@ Plan anders verbirgt (Skript von anderswo ohne Pin, Pfad aus nicht gezeigten Wer
 Riegels („content this plan does not show“) und X5 des Türstehers. Die Regel ist eine Planer-Hilfe, kein
 Schloss: Sie lehnt nur zusätzlich ab, der Türsteher liest jeden Lauf weiterhin selbst. Tests:
 `apps/api/test/host-run-visible-scripts.test.ts` (alle Fälle der Probe aus t_740ac6ee, der Gegenprobe
-aus t_af29564c, der Befunde B1–B6 aus t_1748d6c1, R-A, R-B, H1–H4 aus t_b4b11e32, S-A–S-D, H-c, H-e aus t_c82f5ac2, T-A–T-D aus t_683da1d6, U-A, U-B aus t_f7778d43 und V-A–V-C samt Hinweisen aus t_cdad398e, W-A, W-B und Hinweis M aus t_ebbf1e40, X-A und Hinweis Arithmetik aus t_6024cbc7, plus die aufgezeichneten Pläne vom 10.10.2026 als Fehlalarm-Gegenprobe).
+aus t_af29564c, der Befunde B1–B6 aus t_1748d6c1, R-A, R-B, H1–H4 aus t_b4b11e32, S-A–S-D, H-c, H-e aus t_c82f5ac2, T-A–T-D aus t_683da1d6, U-A, U-B aus t_f7778d43 und V-A–V-C samt Hinweisen aus t_cdad398e, W-A, W-B und Hinweis M aus t_ebbf1e40, X-A und Hinweis Arithmetik aus t_6024cbc7, Hinweis B1 aus t_0bc8fac5, R1 aus t_42ae4123, X5 aus t_63a24b37 (Karte t_cee07772), plus die aufgezeichneten Pläne vom 10.10.2026 als Fehlalarm-Gegenprobe).
 
 ## 2a. Backup-Riegel: Backups löschen nur mit Freigabe
 

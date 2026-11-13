@@ -180,6 +180,8 @@ interface Segment {
   // The simple command goes on across a substitution: a ) or backtick closes one
   // right before it, or one opens right after it (env $(…) bash, bash <<'X' $(…)).
   joined: boolean;
+  // The separator behind it (";", "|", "&&", "$(", "<(", ">(", ")", "`", "").
+  sep: string;
 }
 
 function basename(word: string): string {
@@ -199,16 +201,20 @@ function commandOf(words: string[]): string {
 }
 
 // The command around a substitution: the segment's command, "" when the segment
-// only assigns (VAR=$(…)), "$(" when the substitution itself is the command.
+// only assigns (VAR=$(…)), "$(" when the substitution itself is the command —
+// also behind wrappers, options or keywords only (sudo $(…), FOO=1 $(…), X5,
+// t_cee07772: the output runs as a command there).
 function enclosingOf(text: string): string {
   const words = wordsOf(text);
-  return words.length ? commandOf(words) : "$(";
+  if (!words.length) return "$(";
+  return commandOf(words) || (/[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=["']?\S*$/.test(text) ? "" : "$(");
 }
 
 // Simple commands of one line, split at ; & && || | ( ) $( <( >( and backticks.
 // Quotes are not parsed: a separator inside quotes only splits more, and every
-// piece still counts as running unless its own command is quiet.
-function segmentsOf(line: string): Segment[] {
+// piece still counts as running unless its own command is quiet. open: the
+// commands around substitutions the line leaves open (bash <( at the line's end).
+function splitLine(line: string): { segments: Segment[]; open: Array<string | null> } {
   const exec = line.match(/^\s*Exec[A-Za-z]*\s*=\s*[-@:+!|]*(.*)$/);
   const code = exec ? exec[1] : line;
   const raw: Array<{ text: string; enclosing: string | null; sep: string }> = [];
@@ -240,12 +246,17 @@ function segmentsOf(line: string): Segment[] {
     current += ch;
   }
   close("");
-  return raw.map((item, index) => {
+  const segments = raw.map((item, index) => {
     const words = wordsOf(item.text);
     const next = item.sep === "|" ? raw[index + 1] : undefined;
     const joined = /^(?:\)|`)$/.test(raw[index - 1]?.sep ?? "") || /^(?:\$\(|`|<\(|>\()$/.test(item.sep);
-    return { text: item.text, words, command: commandOf(words), enclosing: item.enclosing, pipedInto: next ? commandOf(wordsOf(next.text)) : null, joined };
+    return { text: item.text, words, command: commandOf(words), enclosing: item.enclosing, pipedInto: next ? commandOf(wordsOf(next.text)) : null, joined, sep: item.sep };
   }).filter((segment) => segment.words.length);
+  return { segments, open: stack };
+}
+
+function segmentsOf(line: string): Segment[] {
+  return splitLine(line).segments;
 }
 
 function quiet(command: string, text: string): boolean {
@@ -423,10 +434,28 @@ const SHELL_NAME = /^(?:\/(?:usr\/)?bin\/)?(?:sh|bash|dash|zsh|ksh|mksh|ash|busy
 // source /dev/stdin and . - read the heredoc as shell code as well (B4, t_1748d6c1).
 const STDIN_FILE = /^(?:-|\/dev\/stdin|\/dev\/fd\/0|\/proc\/self\/fd\/0)$/;
 
+// X5 (Zweitprüfung t_63a24b37, Karte t_cee07772): bash removes quotes and
+// backslashes before it looks a command up, as for base names (B6): b\ash,
+// ba''sh, \bash, $'bash' run bash. A word with an escape inside $'…'
+// ($'\x62ash') may name any command; fail safe, it counts as a shell.
+function shellWords(segment: Segment): string[] {
+  return segment.text.trim().split(/\s+/).map((word) => /\$'[^']*\\/.test(word) ? "bash" : word.replace(/\$(?=['"])/g, "").replace(/['"\\]/g, "")).filter(Boolean);
+}
+
+// Commands that run their substitution's output as shell code: a shell or source
+// reading <(…) (bash <(cat <<'X'), bash < <(…), source <(…)), eval $(…) and a
+// substitution in place of the command ($(cat <<'X'), sudo $(…)).
+const CODE_RUNNER = /^(?:sh|bash|dash|zsh|ksh|mksh|ash|busybox|fish|csh|tcsh|su|runuser|ssh|source|\.|eval|\$\()$/;
+
+function runsCode(enclosing: string | null): boolean {
+  return enclosing !== null && CODE_RUNNER.test(enclosing.replace(/\$(?=['"])/g, "").replace(/['"\\]/g, ""));
+}
+
 // Does a segment of the opener chain read the heredoc body as shell code?
-// Words are cut at "<", so bash<<'X' is bash (B4, t_1748d6c1).
+// Words are cut at "<", so bash<<'X' is bash (B4, t_1748d6c1); quotes and
+// backslashes go first (X5, shellWords).
 function readsShell(segment: Segment): boolean {
-  const words = plainWords(segment.words.map((word) => word.split("<")[0]).filter(Boolean));
+  const words = plainWords(shellWords(segment).map((word) => word.split("<")[0]).filter(Boolean));
   const command = commandOf(words);
   if (/^(?:source|\.)$/.test(command)) return words.some((word) => STDIN_FILE.test(word));
   return HEREDOC_SHELL.test(command) || words.some((word) => SHELL_NAME.test(word));
@@ -900,6 +929,32 @@ function openersReadable(line: string, openers: number): boolean {
 // A line ending in an odd number of backslashes: bash joins it with the next.
 const CONTINUED = /(?:^|[^\\])(?:\\\\)*\\$/;
 
+// X5 (Zweitprüfung t_63a24b37, Karte t_cee07772): output a shell reads although
+// the tool cannot tell which heredoc it comes from — a group, subshell, loop or
+// if that closes on a later line ({ cat <<'X' … X … } | bash, ( … ) | bash,
+// done | bash, } > >(bash)), a function of the step (f() { cat <<'X' …; }; f |
+// bash, bash <(f)), a substitution a shell or eval reads that stays open over
+// the line's end (bash <( + newline). Fail safe: the rest of the step shows
+// nothing (ScriptLine.blind).
+const COMPOUND_OUT = /(?:^|[\s;&|])(?:\}|\)|done|fi|esac)\s*(?:\d*(?:>>?|<<?|>&|<&|&>>?)\s*\S+\s*)*(?:\|&?|>\s*>\()/g;
+const FUNCTION_NAME = /(?:^|[\s;&|(){])(?:function\s+([^\s(){};&|<>]+)|([^\s(){};&|<>$`'"=]+)\s*\(\s*\))/g;
+
+function feedsShell(segments: Segment[], at: number): boolean {
+  const segment = segments[at];
+  const next = segments[at + 1];
+  return runsCode(segment.enclosing) || (Boolean(next) && (segment.sep === "|" || segment.sep === ">(") && readsShell(next));
+}
+
+function shellReadsUnseen(line: string, segments: Segment[], open: Array<string | null>, functions: Set<string>): boolean {
+  if (open.some(runsCode)) return true;
+  if (segments.some((segment, at) => functions.has(segment.command) && feedsShell(segments, at))) return true;
+  for (const match of line.matchAll(COMPOUND_OUT)) {
+    const after = segmentsOf(line.slice(match.index + match[0].length))[0];
+    if (after && readsShell(after)) return true;
+  }
+  return false;
+}
+
 // Lines of all steps and checks in order; heredoc bodies are marked, whole-line
 // comments and heredoc terminators dropped, a line ending in a backslash joined
 // with the next (outside content bodies; the first line's number stays), and each
@@ -929,6 +984,8 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
     // W-A/W-B: once the tool may read the heredoc bounds other than bash, the
     // rest of the step shows nothing (ScriptLine.blind).
     let blind = false;
+    // X5: functions the step defines; their output piped into a shell is unseen.
+    const functions = new Set([...text.matchAll(FUNCTION_NAME)].map((match) => match[1] ?? match[2]));
     // cwd: the directory after the body; inside: the one its first line runs in
     // (null after a wrapper that changes it, T-B, t_683da1d6); started: the body
     // has begun (bodies of one line follow one after the other); scope: the
@@ -983,7 +1040,7 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
       }
       // H2: every heredoc of the line; their bodies follow one after the other.
       const openers = [...line.matchAll(/(?<!<)<<(-?)\s*(['"]?)([A-Za-z_][\w-]*)\2/g)];
-      const segments = segmentsOf(line);
+      const { segments, open: unclosed } = splitLine(line);
       rebound ||= REBIND.test(line);
       environment ||= STEP_ENVIRONMENT.test(line) || rebound || EXPORT_EXPANSION.test(line) || segments.some((segment) => (/^(?:export|declare|typeset)$/.test(segment.command) && segment.words.some((word) => /^-[A-Za-z]*f/.test(word))) || (segment.command === "set" && segment.words.some((word) => /^-[A-Za-z]*a|^allexport$/.test(word))));
       const parts = segments.map((segment) => {
@@ -999,6 +1056,7 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
       // W-A (Zweitprüfung t_ebbf1e40): a << in a comment or in quotes, an opener of
       // another form, or more openers than heredocs in the segments.
       if (!openersReadable(line, openers.length) || owners.length !== openers.length) blind = true;
+      if (shellReadsUnseen(line, segments, unclosed, functions)) blind = true;
       // The rows of each heredoc's body; the bodies follow one after the other.
       const bounds: { from: number; end: number }[] = [];
       for (const opener of openers) {
@@ -1046,8 +1104,12 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
         const start = owners.length === openers.length ? owners[k] : Math.max(0, segments.findIndex((segment) => segment.text.includes("<<")));
         let shell = false;
         let at = start;
+        // X5 (t_cee07772): also a substitution a shell or eval reads (bash <(cat <<'X'),
+        // bash < <(…), eval $(…), $(cat <<'X')) and output into >(bash). The chain
+        // then ends in cat, so localChain makes the body not local: its writes show
+        // nothing, its overwrites and runs are read.
         for (; at < segments.length; at += 1) {
-          shell = readsShell(segments[at]);
+          shell = readsShell(segments[at]) || runsCode(segments[at].enclosing) || (segments[at].sep === ">(" && at + 1 < segments.length && readsShell(segments[at + 1]));
           if (shell || segments[at].pipedInto === null) break;
         }
         // R1 (Zweitprüfung t_42ae4123): bash expands an unquoted body before the shell

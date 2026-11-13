@@ -1494,3 +1494,65 @@ describe("hash-pinned scripts: an unquoted heredoc a shell reads (R1, t_42ae4123
     expect(found(`${shown}\ncat > /tmp/n <<X\necho foo\\\\ $HOME\nX\n${pin}\n${P}`)).toEqual([]);
   });
 });
+
+describe("hash-pinned scripts: a heredoc a shell reads by way of a group, a function, <(…) or a quoted name (X5, t_cee07772)", () => {
+  const P = "/opt/x/run.sh";
+  const pin = `echo "${HASH}  ${P}" | sha256sum -c -`;
+  const found = (run: string) => hiddenPinnedScripts(manifest([{ name: "s1", run }]) as never).map(({ path }) => path);
+  const shown = `cat > ${P} <<'EOF'\necho gut\nEOF`;
+  const evil = `cp /tmp/boese ${P}`;
+  // Zweitprüfung t_63a24b37 (H1): real bash runs the cp in each body, the tool
+  // took it for content. Gegenprobe with bash: /opt/data/out/t_cee07772/harness.
+  const forms = (q: string): Array<[string, string]> => [
+    ["{ cat <<X … } | bash", `{ cat <<${q}\n${evil}\nX\n} | bash`],
+    ["( cat <<X … ) | bash", `( cat <<${q}\n${evil}\nX\n) | bash`],
+    ["f() { cat <<X …; }; f | bash", `f() { cat <<${q}\n${evil}\nX\n}\nf | bash`],
+    ["f() { … }; f | bash on one line", `f() { cat <<${q}\n${evil}\nX\n}; f | bash`],
+    ["bash <(cat <<X …)", `bash <(cat <<${q}\n${evil}\nX\n)`],
+    ["bash < <(cat <<X …)", `bash < <(cat <<${q}\n${evil}\nX\n)`],
+    ["b\\ash <<X", `b\\ash <<${q}\n${evil}\nX`],
+    ["{ cat <<X; } | bash on one line", `{ cat <<${q}; } | bash\n${evil}\nX`],
+    ["bash <(cat <<X) on one line", `bash <(cat <<${q})\n${evil}\nX`],
+    ["source <(cat <<X)", `source <(cat <<${q})\n${evil}\nX`],
+    ["sudo bash <(cat <<X)", `sudo bash <(cat <<${q})\n${evil}\nX`],
+    ["eval $(cat <<X)", `eval $(cat <<${q})\n${evil}\nX`],
+    ["$(cat <<X) as the command", `$(cat <<${q})\n${evil}\nX`],
+    ["env $(cat <<X)", `env $(cat <<${q})\n${evil}\nX`],
+    ["sudo $(cat <<X)", `sudo $(cat <<${q})\n${evil}\nX`],
+    ["FOO=1 $(cat <<X)", `FOO=1 $(cat <<${q})\n${evil}\nX`],
+    ["cat <<X > >(bash)", `cat <<${q} > >(bash)\n${evil}\nX`],
+    ["{ cat <<X … } > >(bash)", `{ cat <<${q}\n${evil}\nX\n} > >(bash)`],
+    ["bash <(f)", `f() { cat <<${q}\n${evil}\nX\n}\nbash <(f)`],
+    ["bash <( open over the line's end", `bash <(\ncat <<${q}\n${evil}\nX\n)`],
+    ["if … fi | bash", `if true; then cat <<${q}\n${evil}\nX\nfi | bash`],
+    ["for … done | bash", `for i in 1; do cat <<${q}\n${evil}\nX\ndone | bash`],
+    ["{ … } 2>&1 | bash", `{ cat <<${q}\n${evil}\nX\n} 2>&1 | bash`],
+    ["{ … } |& bash", `{ cat <<${q}\n${evil}\nX\n} |& bash`],
+    ["cat <<X | b\\ash", `cat <<${q} | b\\ash\n${evil}\nX`],
+    ["ba''sh <<X", `ba''sh <<${q}\n${evil}\nX`],
+    ["\\bash <<X", `\\bash <<${q}\n${evil}\nX`],
+    ["$'bash' <<X", `$'bash' <<${q}\n${evil}\nX`],
+    ["$'\\x62ash' <<X", `$'\\x62ash' <<${q}\n${evil}\nX`],
+    ["/bin/b\\ash <<X", `/bin/b\\ash <<${q}\n${evil}\nX`],
+    ["sudo b\\ash <<X", `sudo b\\ash <<${q}\n${evil}\nX`],
+  ];
+  for (const q of ["X", "'X'"]) {
+    for (const [name, run] of forms(q)) {
+      it(`X5: ${name} (${q === "X" ? "unquoted" : "quoted"})`, () => {
+        expect(found(`${shown}\n${run}\n${pin}\n${P}`)).toEqual([P]);
+      });
+    }
+  }
+
+  it("guard: a group into a file, a pipe without a shell, python3 -, a function without a shell and the plain bodies stay free", () => {
+    expect(found(`${shown}\n${pin}\n${P}`)).toEqual([]);
+    expect(found(`${shown}\n{ cat <<'X'\nhallo\nX\n} > /tmp/log\n${pin}\n${P}`)).toEqual([]);
+    expect(found(`${shown}\n( cd /tmp && ls ) | tee /tmp/l\n${pin}\n${P}`)).toEqual([]);
+    expect(found(`${shown}\npython3 - <<'X'\nprint("hallo")\nX\n${pin}\n${P}`)).toEqual([]);
+    expect(found(`${shown}\nf() { echo hi; }\nf\n${pin}\n${P}`)).toEqual([]);
+    expect(found(`${shown}\nwhile read -r l; do echo "$l"; done < <(printf 'x\\n')\n${pin}\n${P}`)).toEqual([]);
+    expect(found(`${shown}\nx=$(cat <<'X'\nhallo\nX\n)\necho "$x"\n${pin}\n${P}`)).toEqual([]);
+    expect(found(`bash <<'X'\nset -e\n${shown}\nX\n${pin}\n${P}`)).toEqual([]);
+    expect(found(`cat <<'X' | bash\nset -e\n${shown}\nX\n${pin}\n${P}`)).toEqual([]);
+  });
+});
