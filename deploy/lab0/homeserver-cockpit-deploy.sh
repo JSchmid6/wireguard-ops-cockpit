@@ -442,6 +442,13 @@ ttyd_install_binary() {
   echo "ttyd: Release-Binary $TTYD_VERSION nach $TTYD_LOCAL (sha256 geprüft)."
 }
 
+# ttyd vorhanden: auf dem PATH (Paket) oder als Release-Binary unter $TTYD_LOCAL. Der
+# Self-Update-Lauf startet das Skript mit PATH=/usr/sbin:/usr/bin:/sbin:/bin, also ohne
+# /usr/local/bin (13.11.2026, Kanban t_68b5bdf8) — die Prüfung darf sich nicht auf den PATH verlassen.
+ttyd_present() {
+  command -v ttyd >/dev/null 2>&1 || [ -x "$TTYD_LOCAL" ]
+}
+
 APT_PACKAGES=(ca-certificates curl git tmux nginx openssl python3 sudo)
 TTYD_FROM_APT="$(ttyd_apt_candidate)"
 if [ "$TTYD_FROM_APT" = "yes" ]; then APT_PACKAGES+=(ttyd); fi
@@ -457,7 +464,7 @@ else
   echo "ttyd: kein apt-Paket (z. B. Debian trixie) — gepinntes Release-Binary."
   ttyd_install_binary
 fi
-command -v ttyd >/dev/null 2>&1 || die "ttyd fehlt nach der Installation."
+ttyd_present || die "ttyd fehlt nach der Installation."
 if [ "$NGINX_PREEXISTED" = "no" ]; then
   systemctl disable --now nginx >/dev/null 2>&1 || true   # frisch installiert: erst nach Konfiguration aktivieren
 fi
