@@ -196,6 +196,32 @@ describe("Wartet auf dich", () => {
     expect(await screen.findByText("Neu bestellt: Selbstupdate auf PR #25 einspielen.")).toBeTruthy();
   });
 
+  it("still offers approval after expiry while the server can renew the deadline (13.11.2026)", async () => {
+    const fetchMock = serve([hermesCard({ expiresAt: new Date(Date.now() - 60_000).toISOString(), expired: true, approvableAfterExpiry: true })]);
+    const user = userEvent.setup();
+    render(<Inbox />);
+    expect(await screen.findByText("Abgelaufen")).toBeTruthy();
+    await openDetails(user);
+    expect(screen.getByText(/trotzdem freigeben/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Neu bestellen lassen" })).toBeNull();
+    const approve = screen.getByRole("button", { name: "Freigeben (Frist erneuern)" }) as HTMLButtonElement;
+    expect(approve.disabled).toBe(true);
+    await user.type(screen.getByLabelText(/Grund \(Pflicht\)/), "Go");
+    await user.click(approve);
+    await waitFor(() => expect(posted(fetchMock, "/api/hermes/jobs/j1/approval")).toEqual({ decision: "approved", reason: "Go" }));
+  });
+
+  it("falls back to the re-order when the server refuses the late approval as expired", async () => {
+    serve([hermesCard({ expiresAt: new Date(Date.now() - 60_000).toISOString(), expired: true, approvableAfterExpiry: true })],
+      { "/api/hermes/jobs/j1/approval": { status: 409, body: { message: "execution envelope expired" } } });
+    const user = userEvent.setup();
+    render(<Inbox />);
+    await openDetails(user);
+    await user.type(screen.getByLabelText(/Grund \(Pflicht\)/), "Go");
+    await user.click(screen.getByRole("button", { name: "Freigeben (Frist erneuern)" }));
+    expect(await screen.findByRole("button", { name: "Neu bestellen lassen" })).toBeTruthy();
+  });
+
   it("decides plan approvals through the approval queue", async () => {
     const fetchMock = serve([{ ...hermesCard(), id: "approval-a1", kind: "approval", jobId: "jx", approvalId: "a1", findings: [] }]);
     const user = userEvent.setup();

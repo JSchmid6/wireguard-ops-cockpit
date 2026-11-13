@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import BetterSqlite3 from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createApp } from "../src/app.js";
@@ -159,7 +160,12 @@ async function setup(options: { halted?: boolean; approvedAnomaly?: boolean } = 
   database.close();
   const login = await app.inject({ method: "POST", url: "/api/auth/login", payload: { username: "admin", password: "test-password" } });
   const inspect = () => { const db = new CockpitDatabase(dbPath); db.initialize(); return db; };
-  return { app, admin: { cookie: login.headers["set-cookie"] as string }, automation: { authorization: `Bearer ${token}` }, unscoped: { authorization: `Bearer ${unscopedToken}` }, fresh, stale, foreign, foreignStale, inspect };
+  const backdate = (jobId: string, hours: number) => {
+    const raw = new BetterSqlite3(dbPath);
+    raw.prepare("UPDATE jobs SET created_at = ? WHERE id = ?").run(new Date(Date.now() - hours * 3_600_000).toISOString(), jobId);
+    raw.close();
+  };
+  return { app, backdate, admin: { cookie: login.headers["set-cookie"] as string }, automation: { authorization: `Bearer ${token}` }, unscoped: { authorization: `Bearer ${unscopedToken}` }, fresh, stale, foreign, foreignStale, inspect };
 }
 
 describe("GET /api/inbox", () => {
@@ -257,9 +263,10 @@ describe("halted retention service after the approval", () => {
 
 describe("POST /api/inbox/jobs/:jobId/reorder", () => {
   it("still re-orders a job whose approval came just too late", async () => {
-    const { app, admin, stale, inspect } = await setup();
-    // Ein echt signierter, abgelaufener Envelope: die Freigabe-Route prüft ihn
-    // vollständig und schließt den Job mit "execution envelope expired".
+    const { app, admin, stale, inspect, backdate } = await setup();
+    // Ein echt signierter, abgelaufener Envelope eines Jobs, der älter als 72 h
+    // ist: die Freigabe-Route prüft ihn vollständig und schließt ihn mit
+    // "execution envelope expired" (jünger erneuert sie die Frist, s. u.).
     const db = inspect();
     const current = db.getJob(stale.id)!;
     const intent = hostRunOutput.explanation.intent;
@@ -271,6 +278,7 @@ describe("POST /api/inbox/jobs/:jobId/reorder", () => {
     });
     db.updateJob(stale.id, { status: "blocked_user_approval", output: { ...output, envelope }, completedAt: null });
     db.close();
+    backdate(stale.id, 73);
     const late = await app.inject({ method: "POST", url: `/api/hermes/jobs/${stale.id}/approval`, headers: admin, payload: { decision: "approved", reason: "eben noch" } });
     expect(late.statusCode).toBe(409);
     expect(late.json().job.status).toBe("blocked_policy");
@@ -354,8 +362,49 @@ describe("approval against the deadline the card shows", () => {
     db.close();
   });
 
+  it("approves a job whose envelope only expired: same content, new deadline, then approved (13.11.2026)", async () => {
+    const { app, admin, automation, jobId, envelope, inspect } = await signed(31);
+    const card = (await app.inject({ method: "GET", url: "/api/inbox", headers: admin })).json()
+      .cards.find((item: { jobId: string }) => item.jobId === jobId);
+    expect(card).toMatchObject({ expired: true, approvableAfterExpiry: true });
+    // Nie ein Automation-Token.
+    expect((await app.inject({ method: "POST", url: `/api/hermes/jobs/${jobId}/approval`, headers: automation, payload: { decision: "approved", reason: "x" } })).statusCode).toBe(403);
+    const response = await app.inject({ method: "POST", url: `/api/hermes/jobs/${jobId}/approval`, headers: admin, payload: { decision: "approved", reason: "Go" } });
+    expect(response.json().message).not.toMatch(/expired|validation failed/);
+    expect(response.json().job?.status).not.toBe("blocked_policy");
+    const db = inspect();
+    expect(db.hasAudit("hermes.change.approved_after_expiry", jobId)).toBe(true);
+    expect(db.hasAudit("hermes.change.approved", jobId)).toBe(true);
+    // Der Rest des Laufs (Vorschlagsdatei, Runner) ist hier nicht aufgebaut; dass
+    // der erneuerte Envelope signiert und freigegeben wird, prüft hermes-security.
+    expect(envelope.expiresAt < new Date().toISOString()).toBe(true);
+    db.close();
+  });
+
+  it("keeps every other drift a stop after expiry, and older than 72 h stays 'expired'", async () => {
+    const drift = await signed(31);
+    const db = drift.inspect();
+    const current = db.getJob(drift.jobId)!;
+    db.updateJob(drift.jobId, { status: "blocked_user_approval", output: { ...current.output, plan: "plan, nachträglich geändert" }, completedAt: null });
+    db.close();
+    const refused = await drift.app.inject({ method: "POST", url: `/api/hermes/jobs/${drift.jobId}/approval`, headers: drift.admin, payload: { decision: "approved", reason: "Go" } });
+    expect(refused.statusCode).toBe(409);
+    expect(refused.json().envelopeErrors).toEqual(expect.arrayContaining(["execution envelope expired", "reviewed plan drift"]));
+
+    const old = await signed(31);
+    old.backdate(old.jobId, 73);
+    const card = (await old.app.inject({ method: "GET", url: "/api/inbox", headers: old.admin })).json()
+      .cards.find((item: { jobId: string }) => item.jobId === old.jobId);
+    expect(card.expired).toBe(true);
+    expect(card.approvableAfterExpiry).toBeUndefined();
+    const expired = await old.app.inject({ method: "POST", url: `/api/hermes/jobs/${old.jobId}/approval`, headers: old.admin, payload: { decision: "approved", reason: "zu spät" } });
+    expect(expired.statusCode).toBe(409);
+    expect(expired.json()).toMatchObject({ message: "execution envelope expired", envelopeErrors: ["execution envelope expired"] });
+  });
+
   it("calls a refusal 'expired' only when the shown deadline has passed", async () => {
     const late = await signed(31);
+    late.backdate(late.jobId, 73);
     const lateCard = (await late.app.inject({ method: "GET", url: "/api/inbox", headers: late.admin })).json()
       .cards.find((item: { jobId: string }) => item.jobId === late.jobId);
     expect(lateCard).toMatchObject({ expiresAt: late.envelope.expiresAt, expired: true });

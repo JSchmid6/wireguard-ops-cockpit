@@ -36,6 +36,10 @@ export interface InboxCard {
   // Ablauf des Envelopes bzw. der Freigabe; null, wo nichts abläuft.
   expiresAt: string | null;
   expired: boolean;
+  // Nur hermes-change: die Frist ist abgelaufen, aber Jochen kann trotzdem
+  // freigeben (POST /api/hermes/jobs/:id/approval erneuert den Envelope mit
+  // demselben Inhalt), solange der Job jünger als 72 h ist (13.11.2026).
+  approvableAfterExpiry?: boolean;
   // Direktlink auf die Karte (Hash-Anker der Startseite).
   link: string;
   jobId?: string;
@@ -102,7 +106,7 @@ function fullIntent(text: string, title: string): { intent?: string } {
   return flat && flat.replace(/\s+/g, " ") !== title ? { intent: clip(flat, 4000) } : {};
 }
 
-export function hermesJobCard(job: JobRecord, now: number, webUrl: string | null): InboxCard {
+export function hermesJobCard(job: JobRecord, now: number, webUrl: string | null, renewHours = 72): InboxCard {
   const output = record(job.output);
   const explanation = record(output.explanation);
   const policy = record(output.policy);
@@ -114,6 +118,8 @@ export function hermesJobCard(job: JobRecord, now: number, webUrl: string | null
   const expiresAt = str(envelope.expiresAt) || str(breaker.approvalExpiresAt) || null;
   const id = `job-${job.id}`;
   const title = oneSentence(str(explanation.intent) || "Änderung von James");
+  // Ohne Envelope gibt es nichts freizugeben: die Karte gilt als abgelaufen.
+  const expired = expiresAt ? isExpired(expiresAt, now) : true;
   return {
     id,
     kind: "hermes-change",
@@ -122,9 +128,10 @@ export function hermesJobCard(job: JobRecord, now: number, webUrl: string | null
     reason: clip(str(policy.reason) || str(explanation.reason) || "Kein Grund gespeichert.", 1200),
     findings,
     createdAt: job.createdAt,
-    // Ohne Envelope gibt es nichts freizugeben: die Karte gilt als abgelaufen.
     expiresAt,
-    expired: expiresAt ? isExpired(expiresAt, now) : true,
+    expired,
+    ...(expired && str(envelope.expiresAt) && envelope.operatorApproved !== true && now < Date.parse(job.createdAt) + renewHours * 3_600_000
+      ? { approvableAfterExpiry: true } : {}),
     link: cardLink(id, webUrl),
     jobId: job.id,
   };

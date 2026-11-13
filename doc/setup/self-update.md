@@ -383,17 +383,25 @@ review of the pull request and by this review — and the second judgement
 stopped twice on what the first had already cleared (PR #64, t_ff43a907). When a
 self-update review comes to `finding` or `incomplete`, the running Cockpit looks
 on GitHub itself — never at what the requester says — for proof that **every**
-installed commit is exactly a reviewed pull request. All of it, per sha, from
-the unauthenticated API of `JSchmid6/wireguard-ops-cockpit` (bounded, 15 s per
-request):
+installed commit is exactly a reviewed pull request. All of it, per binding
+`base..sha`, from the unauthenticated API of `JSchmid6/wireguard-ops-cockpit`
+(bounded, 15 s per request):
 
-1. `GET /commits/<sha>`: a merge commit with exactly two parents, the first
-   parent is the reviewed `base` (so `base..sha` is the diff of this one merge).
-2. `GET /commits/<sha>/pulls`: a pull request into `main` of this repository,
-   merged, with `merge_commit_sha == sha` and `head.sha ==` the second parent.
-3. `GET /compare/<base>...<head>`: `behind_by == 0` (the head contains the
-   base), and `GET /commits/<head>` has the same tree as `sha`: the installed
-   code is byte for byte the reviewed head.
+1. The first-parent line from `sha` down to `base` (`GET /commits/<c>`, walking
+   the first parent) holds at most `SECOND_REVIEW_MAX_MERGES` = 8 commits and
+   each of them is the merge of one pull request (since 13.11.2026, card
+   t_36523a6a: a host that lags behind — Lab0, box — installs several merges
+   with one binding; before, only `base..sha` of exactly one merge counted, and
+   squash merges never did). A commit on the line that is not proven breaks the
+   proof; so does a longer line or one that never reaches `base`.
+2. For each commit `c` with first parent `p`: `GET /commits/<c>/pulls` names a
+   pull request into `main` of this repository, merged, with
+   `merge_commit_sha == c`. A merge commit has exactly two parents and the PR's
+   `head.sha` is the second; a squash merge has one parent and the PR names its
+   head.
+3. `GET /compare/<p>...<head>`: `behind_by == 0` (the head contains `p`), and
+   `GET /commits/<head>` has the same tree as `c`: the installed code is byte
+   for byte the reviewed head.
 4. `GET /issues/<n>/comments` or `GET /pulls/<n>/reviews` (first 100 each): a
    comment or review by an account with write access (`author_association`
    `OWNER`, `MEMBER` or `COLLABORATOR`) with the line, alone on its line,
@@ -430,25 +438,38 @@ the operator learns of it afterwards, not before. Job 9bc909ed's own pre-install
 review flagged exactly this path (G1/G7, high); the operator kept the second
 review and narrowed it instead (10.11.2026, variant C):
 
-**Severity cut** (`secondReviewStops`, `secondReviewReports`). Because the
-marker is no second principal, it carries only light findings. A finding stays
-the operator's stop (`blocked_user_approval`) despite a verified proof when it
-is `high`, names G1, G2, G7 or G10 anywhere in its `GUARANTEE` line (approval,
-lock, self-update path, backups and risk bolt — the guarantees a self-posted marker could
-be used to get past), is an `INJECTION`, or has a severity that does not start
-with `medium` or `low` (fail closed). The verified proof is still recorded
-(`second review verified for <sha>`, then `second review does not lift the stop:
-…` with the findings beyond the cut), and `reported` stays `false`. Light
-findings (`medium`/`low` on the other guarantees) and `incomplete` (tool-chain
-gaps, `UNVERIFIABLE` only) stay reports as above, so a fault of the review chain
-still does not block the agent. Effect: a severe finding behind a
-self-posted marker no longer installs without the operator. What is left open:
-the reviewer sets the severity itself — a severe point it rates `medium` on a
-guarantee outside the four still becomes a report. Staying able to act
-(operator, 10.11.2026): a stop here is one approval click in "Wartet auf dich";
-host runs, repairs and rollbacks through `host.run` never pass this review; a
-revert is a new merge with its own, usually unflagged diff. If such stops pile
-up, the operator wants to talk again (no silent loosening).
+**Severity cut** (`secondReviewStops`, `secondReviewReports`; operator decision
+10.11.2026, variant C, set anew 13.11.2026, card t_36523a6a). Because the marker
+is no second principal, it does not carry every finding. Since 13.11.2026 the
+operator's rule decides what is a stop ("Ausrollen entscheidet James; Jochen nur
+bei einem echten Befund"; "mach den Scheiß raus", 13.11.2026): Jochen's Ja to a
+change of rights or of the backup bolt is asked **before the merge**, the
+rollout needs no second one. A finding stays the operator's stop
+(`blocked_user_approval`) despite a verified proof only when
+
+- it names **G10** anywhere in its `GUARANTEE` line (backups and declared risk —
+  the one standing exception, Grundsatz 4),
+- it is an **`INJECTION`** (someone addressed the reviewer inside the material), or
+- it names **G1, G2 or G4** (who approves, the lock, sudo — rights) with a
+  severity that does not start with `medium` or `low` (fail closed) **and** its
+  quoted code was found in the reviewed diff (`quoteFound`) — an evidenced rights
+  finding with a damage path, not an assertion.
+
+Everything else is a report: G5, G7 and the other guarantees of any severity,
+medium/low rights findings and a severe rights finding whose quote is not in the
+diff. The verified proof is still recorded (`second review verified for <sha>`,
+then `second review does not lift the stop: …` with the findings beyond the cut),
+and `reported` stays `false` for a stop. `incomplete` (tool-chain gaps,
+`UNVERIFIABLE` only) stays a report. Honest limit, unchanged in kind: the agent
+can post the marker itself, so a G7 weakening of this very path, a G5 loosening
+of a safety net or a severe point the reviewer mislabels installs with a report
+(inbox `reviewFindings`, audit, the public PR comment) instead of a click.
+A change that lets the proof lift one of the remaining stops is a G1 finding of
+the review itself (`update-review-prompt.ts`) and, evidenced and severe, stays a
+stop. Earlier cut (10.11.2026 to 13.11.2026): every `high` finding and every
+finding on G1/G2/G7/G10 stopped; in practice it stopped the rollout of every
+reviewed fix to the update path (G7) and of Jochen's own net decision of
+28.10.2026 on Lab0 (job dc8d47e3, three G5 findings).
 Way back: revert this change (one commit in `update-review.ts`,
 `update-review-prompt.ts`, tests and docs) and self-update to the previous
 commit.
@@ -476,6 +497,25 @@ a binding (review input unavailable) is `blocked_prerequisite` since
 envelope without a binding (hash taken at execution) only serves jobs approved
 before that. If the review itself is broken in the running Cockpit, the way
 out is the host deploy (`deploy/vps/vps-cockpit-deploy.sh`), not an approval.
+
+**Bootstrap when the update path itself is broken** (decision 13.11.2026, card
+t_36523a6a, case job f7b522b6: the installed runner computed `self.diff` with a
+bug, so no self-update could bring its fix). The way out is a `host.run` that
+installs the fixed file from the merged commit, or runs the deploy script for
+it. The doorkeeper flags that as X2 ("Cockpit code changed outside the reviewed
+self-update path"), and it **stays** an operator click: such a run installs new
+Cockpit code without the pre-install review of the running Cockpit (old judges
+new), which is exactly what Jochen kept when he left the rollout to James
+(12.11.2026: "das Cockpit prüft vorher"). Conditions that would close the risk
+together — the source is `git show <sha>:<path>` of a commit the root helper
+verifies as merged into `origin/main`; the commit carries the verified second
+review; the installed file is the known previous version; the snapshot and the
+old file stay — replace the review only by the self-postable marker, so they do
+not lift the click. Kept small instead: a bootstrap is needed only when the
+update mechanism itself is broken (twice so far), and on a host that lags far
+behind (Lab0, box) one host deploy to the current head, one click, replaces a
+chain of staged self-updates that each stop on the old prompt.
+
 
 **The old one-argument form** (`cockpit-self-update-action <sha>`, runner
 `deploy <sha>`) is refused with 65: every self-update must come from a job
@@ -513,7 +553,7 @@ finding names a concrete way **past** one of its guards, or a weakening of it:
 
 | Guarantee | holds |
 | --- | --- |
-| G1 Approval | only the admin session approves; a bearer token never approves or sets `operatorApproved`/`gatePassed`. A `host.run` start on the doorkeeper's pass is intended. A job that needed the operator (evidenced finding, a declared risk other than `contained`, a door without doorkeeper) never runs without the operator's approval. Exception by decision (07.11.2026): a self-update review finding whose commits carry a second review the Cockpit verified itself on GitHub is a report, not a stop ([Second review](#review-before-install)); the marker can be posted by the agent's own token, so this exception rests on a public record, not on a second principal, and it holds only for light findings: a `high` finding, one on G1/G2/G7/G10 or an `INJECTION` stays a stop (severity cut, 10.11.2026). |
+| G1 Approval | only the admin session approves; a bearer token never approves or sets `operatorApproved`/`gatePassed`. A `host.run` start on the doorkeeper's pass is intended. A job that needed the operator (evidenced finding, a declared risk other than `contained`, a door without doorkeeper) never runs without the operator's approval. Exception by decision (07.11.2026): a self-update review finding whose commits carry a second review the Cockpit verified itself on GitHub is a report, not a stop ([Second review](#review-before-install)); the marker can be posted by the agent's own token, so this exception rests on a public record, not on a second principal, and it does not carry a finding on G10, an `INJECTION` or a severe, evidenced finding on G1/G2/G4 — those stay stops (severity cut, 10.11.2026, set anew 13.11.2026). Also intended (13.11.2026): the admin session approves a job whose envelope only expired, within 72 h of its creation; the envelope is re-signed with the same content and approved in that one decision. |
 | G2 Lock | HMAC envelope (timing-safe, host secret), bound to plan and `manifestHash`, with expiry, capability and the job id (its form; the run directory is named by it); the root helper checks it at the start and on every resume; a blocked job's envelope never opens. |
 | G3 Doors | `host.run` is the one general door; every other action stays typed and narrow. No second general door, no way into `host.run` past G2, G9, G10. |
 | G4 Root helpers and sudoers | narrow, typed; the host-run helper keeps exactly `start` and `status <job>`. |
