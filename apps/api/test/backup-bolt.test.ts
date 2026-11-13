@@ -112,13 +112,16 @@ describe("backup bolt: changes in a diff", () => {
     expect(check([pin, context])).toEqual({ changes: [], unreadable: [] });
   });
 
-  it("tests that cannot ship and documentation are not read for names", () => {
+  it("data under a test root and documentation are not read for names, test code is", () => {
     expect(check([
-      section("apps/api/test/host-run.test.ts", ["@@ -1 +1 @@", "-backupGuardHits(a)", "+backupGuardHits(b)"]),
       section("doc/setup/self-update.md", ["@@ -1 +1 @@", "-hostRunRisksNeedingApproval", "+x"]),
       section("test/cockpit-host-run.test.sh", ["@@ -1 +1 @@", "-backupGuardHits", "+x"]),
-      section("packages/domain/test/x.test.ts", ["@@ -1 +1 @@", "-backupGuardHits", "+x"]),
+      section("apps/api/test/fixtures/x.json", ["@@ -1 +1 @@", "-\"backupGuardHits\"", "+x"]),
     ])).toEqual({ changes: [], unreadable: [] });
+    expect(check([
+      section("apps/api/test/host-run.test.ts", ["@@ -1 +1 @@", "-backupGuardHits(a)", "+backupGuardHits(b)"]),
+      section("packages/domain/test/x.test.ts", ["@@ -1 +1 @@", "-backupGuardHits", "+x"]),
+    ])).toEqual({ changes: ["apps/api/test/host-run.test.ts: backupGuardHits", "packages/domain/test/x.test.ts: backupGuardHits"], unreadable: [] });
   });
 
   // Finding B1 (second review t_f7369424, probe /opt/data/out/t_f7369424/):
@@ -204,22 +207,57 @@ describe("backup bolt: changes in a diff", () => {
     }
     // Fail closed: such a file without its section is unreadable, not exempt.
     expect(check([], { files: [{ path: "test/host-run-shim.mjs" }], filesTotal: 1 }).unreadable).toEqual(["test/host-run-shim.mjs"]);
-    // TypeScript sources and data under a test root stay unread: tsc refuses them (TS6059).
-    for (const path of ["test/s.ts", "test/s.mts", "test/s.cts", "test/s.tsx", "apps/api/test/fixtures/x.json", "test/x.test.sh"]) {
+    // Only data under a test root stays unread.
+    for (const path of ["apps/api/test/fixtures/x.json", "test/x.test.sh", "test/notes.md", "packages/domain/test/x.txt"]) {
       expect(check([section(path, ["@@ -1 +1 @@", "-backupGuardHits", "+x"])]).changes, path).toEqual([]);
     }
   });
 
+  // Finding B1 rest 2 (second review t_f723a268, probe /opt/data/out/t_f723a268/sonde/):
+  // TS6059 holds only for tsc. Node >= 22.18 loads .ts/.mts itself (type
+  // stripping), so a test/host-run-shim.mjs re-exporting a test/host-run-impl.mts
+  // built with tsc rc=0 and backupGuardHits returned [] at run time.
+  it("TypeScript under a test root is read like code: a JavaScript trampoline to a .mts or .ts", () => {
+    for (const ext of ["mts", "ts"]) {
+      for (const [dir, up, from] of [
+        ["test", "../", "../../../test/host-run-shim.mjs"],
+        ["apps/api/test", "../../../", "../test/host-run-shim.mjs"],
+        ["packages/domain/test", "../../../", "../../../packages/domain/test/host-run-shim.mjs"],
+      ]) {
+        const trampoline = [
+          section(`${dir}/host-run-impl.${ext}`, [
+            "new file mode 100644",
+            "@@ -0,0 +1,2 @@",
+            `+export * from "${up}apps/api/dist/host-run.js";`,
+            "+export function backupGuardHits(): unknown[] { return []; }",
+          ]),
+          section(`${dir}/host-run-shim.d.mts`, ["new file mode 100644", "@@ -0,0 +1 @@", `+export * from "${up}apps/api/src/host-run.js";`]),
+          section(`${dir}/host-run-shim.mjs`, ["new file mode 100644", "@@ -0,0 +1 @@", `+export * from "./host-run-impl.${ext}";`]),
+        ];
+        expect(check([sondeAppFrom(from), ...trampoline]), `${dir} .${ext}`).toEqual({
+          changes: [`${dir}/host-run-impl.${ext}: backupGuardHits`],
+          unreadable: [],
+        });
+      }
+    }
+    // Every TypeScript form, also a test that only drops the name.
+    for (const path of ["test/s.ts", "test/s.mts", "test/s.cts", "test/s.tsx", "apps/api/test/backup-bolt.test.ts"]) {
+      expect(check([section(path, ["@@ -1 +1 @@", "-backupGuardHits", "+x"])]).changes, path).toEqual([`${path}: backupGuardHits`]);
+    }
+    // Fail closed: a cut TypeScript test is unreadable, not exempt.
+    expect(check([], { files: [{ path: "test/host-run-impl.mts" }], filesTotal: 1 }).unreadable).toEqual(["test/host-run-impl.mts"]);
+  });
+
   it("a tsconfig, jsconfig or package.json in the same update voids the test exemption", () => {
-    const tsTest = section("test/host-run-shim.ts", ["@@ -0,0 +1 @@", "+export function backupGuardHits() { return []; }"]);
-    expect(check([tsTest]).changes).toEqual([]);
+    const dataTest = section("test/fixtures/hits.json", ["@@ -0,0 +1 @@", "+{ \"backupGuardHits\": [] }"]);
+    expect(check([dataTest]).changes).toEqual([]);
     for (const config of ["apps/api/tsconfig.json", "packages/domain/tsconfig.json", "tsconfig.base.json",
       "apps/api/tsconfig.build.json", "apps/api/jsconfig.json", "package.json", "apps/api/package.json"]) {
       const widen = section(config, ["@@ -6 +6 @@", "-    \"rootDir\": \"src\"", "+    \"rootDir\": \"../..\""]);
-      expect(check([widen, tsTest]).changes, config).toEqual(["test/host-run-shim.ts: backupGuardHits"]);
+      expect(check([widen, dataTest]).changes, config).toEqual(["test/fixtures/hits.json: backupGuardHits"]);
       // Also when the config sits in another diff of the same update.
-      expect(backupBoltChanges([diff([widen]), diff([tsTest])], supplementary).changes, config)
-        .toEqual(["test/host-run-shim.ts: backupGuardHits"]);
+      expect(backupBoltChanges([diff([widen]), diff([dataTest])], supplementary).changes, config)
+        .toEqual(["test/fixtures/hits.json: backupGuardHits"]);
     }
   });
 

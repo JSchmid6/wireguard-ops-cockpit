@@ -20,8 +20,8 @@
 //    of these code names is a bolt change. A name counts also when written
 //    with escapes (\u0048, \u{48}, \x48) or across a backslash line
 //    continuation; JavaScript and TypeScript read those as the same name.
-//    Documentation and lockfiles are not read for names, and tests only where
-//    they cannot ship (TEST_ROOT).
+//    Documentation and lockfiles are not read for names, nor data files under
+//    the test roots (TEST_ROOT); test code is read like any code.
 // 3. Fail closed: a file the names rule must read and cannot (the runner cut
 //    or left out its section, or clipped the file list) is reported as
 //    unreadable; the update then stops for the agent and no second review lifts
@@ -76,23 +76,26 @@ export const BACKUP_BOLT_SYMBOLS: string[] = [
 ];
 
 const SYMBOL = new RegExp(`\\b(?:${BACKUP_BOLT_SYMBOLS.join("|")})\\b`);
-// Tests that cannot ship (finding B1, cards t_834fb98c, t_a1e77c69): in the
-// root test/ and in the test folders of packages that build only src/, only
-// TypeScript sources and data stay unread. rootDir "src" keeps shipped code from
-// importing a .ts/.mts/.cts/.tsx there (tsc fails, TS6059), but it does not
-// cover JavaScript with a declaration file: a test/shim.mjs next to a
-// test/shim.d.mts builds (the pattern host-run.ts uses for deploy/helpers), and
-// on Lab0 and box the API runs from the checkout, so test/ lies next to dist.
-// JavaScript (.js/.mjs/.cjs/.jsx), declaration files (.d.*) and anything
-// without a known extension are therefore read like code there. A test/ folder
-// or *.test.* file anywhere else — under src/, deploy/ or ops/ — is built or
-// installed and is read like code as well.
+// Tests that cannot ship (finding B1, cards t_834fb98c, t_a1e77c69,
+// t_c8fc1f51): in the root test/ and in the test folders of packages that build
+// only src/, only data stays unread (.json, .md, .txt, .sh). Code there is read
+// like code, in every form: rootDir "src" only makes tsc refuse to import a
+// .ts/.mts/.cts/.tsx from there (TS6059), and only tsc. JavaScript with a
+// declaration file builds (a test/shim.mjs next to a test/shim.d.mts, the
+// pattern host-run.ts uses for deploy/helpers), and the pinned Node (>= 22.18)
+// loads .ts/.mts itself at run time (type stripping), so test/shim.mjs can
+// re-export a test/impl.mts, and a computed `await import(p)` in src can reach
+// a .ts directly. On Lab0 and box the API runs from the checkout, so test/ lies
+// next to dist. Consequence: an update that changes a test naming the bolt
+// (backup-bolt.test.ts) waits for the operator. A test/ folder or *.test.* file
+// anywhere else — under src/, deploy/ or ops/ — is built or installed and is
+// read like code as well. JSON imported with `with { type: "json" }` stays data.
 const TEST_ROOT = /^(?:test|apps\/api\/test|packages\/[^/]+\/test)\//;
-const TEST_ROOT_UNSHIPPED = /^(?![^/]*\.d\.)[^/]*\.(?:ts|mts|cts|tsx|json|md|txt|sh)$/;
-// The exemption rests on rootDir/include of the packages and on their build
-// and import maps. A diff that changes a tsconfig, jsconfig or package.json
-// could widen them (rootDir "..", include "../../test", allowJs, "imports"),
-// so with such a file in the same update no test file is exempt.
+const TEST_ROOT_UNSHIPPED = /^[^/]*\.(?:json|md|txt|sh)$/;
+// The exemption rests on how the packages build and load files. A diff that
+// changes a tsconfig, jsconfig or package.json could change that (rootDir "..",
+// include "../../test", allowJs, "imports"), so with such a file in the same
+// update no test file is exempt.
 const BUILD_CONFIG = /(?:^|\/)(?:[tj]sconfig[^/]*\.json|package\.json)$/;
 
 function unshippedTest(path: string): boolean {
