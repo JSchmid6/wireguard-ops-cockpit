@@ -98,7 +98,6 @@ import {
   type UpdateTarget,
 } from "./update-review.js";
 import {
-  backupGuardHits,
   buildHostRunReviewPrompt,
   hostRunManifestHash,
   hostRunPlannerContract,
@@ -350,40 +349,11 @@ export function evaluatePlanPolicy(plan: string, safetyVerdict: string): PlanPol
       : "green";
   const rollback = sectionValue(plan, "Rollback");
   const rollbackAvailable = Boolean(rollback && !/^none\.?$/i.test(rollback));
-  const executableScript = typedPlanScript(plan);
 
-  // These are intentionally few hard boundaries. Contextual classification
-  // remains the Safety LLM's job.
-  const hardBoundaries: Array<[RegExp, string]> = [
-    [/\b(rm\s+-rf|mkfs|wipefs|shred)\b/i, "destructive data operation"],
-    [/\b(iptables|nft|ufw|useradd|userdel|usermod|groupadd|groupdel|visudo)\b/i, "network or identity boundary"],
-    [/\b(mysql|mariadb)\b.{0,80}\b(nextcloud|oc_)/i, "direct Nextcloud database access"],
-    [/(?:>|tee\b|sed\s+-i\b)[^\n]*(?:\/etc\/sudoers|NOPASSWD)/i, "sudo authority change"],
-      // The agent's own key material. Never a legitimate runbook target in any
-      // direction — a write extends the agent's rights (the NEWKEYBAD fixture
-      // probes exactly this), a read is exfiltration. Matched as a bare path
-      // mention because the fixture hides the write behind variables:
-      // FILE="/home/hermes/.hermes/.env"; echo "$LINE" >> "$FILE".
-      [/(?:\/home\/hermes|~|\$HOME)\/\.hermes\/\.?env\b/i, "agent environment (API keys)"],
-      [/(?:\/home\/hermes|~|\$HOME)\/\.hermes\/credentials/i, "agent credential store"],
-      // The Cockpit's own secrets: execution authority (api.env, executor.env)
-      // and the hoster API (contabo.env). The latter can roll the whole
-      // machine back — for an agent on an external model the most powerful
-      // capability in the system. Same rule as the agent's credentials: never
-      // a runbook target, in either direction.
-      [/\/etc\/wireguard-ops-cockpit\b/i, "cockpit secrets (execution authority, hoster API)"],
-
-  ];
-  const hit = hardBoundaries.find(([pattern]) => pattern.test(executableScript));
-  if (hit) {
-    return {
-      zone: "red", allowed: false, status: "blocked_user_approval",
-      reason: `The plan crosses a protected boundary: ${hit[1]}.`,
-      evidence: [hit[1]],
-      neededToContinue: ["Explicit operator approval or a lower-impact alternative."],
-      rollbackAvailable,
-    };
-  }
+  // No text-pattern boundaries here (Jochen 08./13.11.2026, card t_abe2651b):
+  // classification is the independent safety review's job on the whole plan;
+  // secrets and identities are held by the executor's sandbox and the
+  // capability manifest's scopes, not by a regex over the plan text.
   if (safetyVerdict === "blocked" || safetyVerdict === "not_run") {
     return {
       zone: "red", allowed: false, status: "blocked_policy",
@@ -2316,10 +2286,6 @@ export async function createApp(options: AppOptions = {}) {
 
   async function runHostRun(envelope: ExecutionEnvelope, manifest: HostRunManifest): Promise<string> {
     if (!config.executorBrokerSocket || !config.executorBrokerSecret) throw new Error("executor broker is not configured");
-    // Backup bolt (host-run.ts): the policy already stops such a run for the
-    // operator; this is the second check before the helper, which asks a third time.
-    const backup = backupGuardHits(manifest);
-    if (backup.length > 0 && !envelope.operatorApproved) throw new Error(`the host run touches the backups and runs only with the operator's approval (${backup[0].where} ${backup[0].reason})`);
     // Risk bolt (host-run.ts): a declared risk beyond "contained" waits for the operator too.
     const risks = hostRunRisksNeedingApproval(manifest);
     if (risks.length > 0 && !envelope.operatorApproved) throw new Error(`the host run declares risk ${risks.join(", ")} and runs only with the operator's approval`);

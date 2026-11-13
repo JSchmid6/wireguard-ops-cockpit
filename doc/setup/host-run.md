@@ -1,6 +1,6 @@
 # Die allgemeine Tür: Host-Lauf mit Schloss und Türsteher
 
-Stand 30.09.2026. Betrifft `apps/api/src/host-run.ts`, `deploy/helpers/cockpit-host-run`,
+Stand 30.09.2026, Textmuster-Riegel ausgebaut 13.11.2026 (Abschnitt 2a). Betrifft `apps/api/src/host-run.ts`, `deploy/helpers/cockpit-host-run`,
 `deploy/systemd/wireguard-ops-cockpit-host-run-resume.service`, den Executor-Broker
 (`host.run`, `host.status`) und den Planer-Vertrag.
 
@@ -110,9 +110,9 @@ ein X1-Befund. Ein harmloser Name, der nur so aussieht (`task-runner-…` trifft
 stoppt so nichts.
 
 Es gibt keine Freigabe als Regel, auch nicht für „geschützte Pfade“ — mit zwei ausdrücklichen
-Ausnahmen, dem Backup-Riegel (2a) und dem Risiko-Riegel (2b). Die harten Grenzen der
-Plan-Policy (`evaluatePlanPolicy`) und der borg-Repair-Riegel gelten weiter für die anderen
-Türen; ein Host-Lauf geht nicht durch sie, sondern durch den Türsteher. Dessen Anweisung macht
+Ausnahmen: Backups löschen (2a, als X4-Befund des Türstehers) und dem Risiko-Riegel (2b). Die
+Plan-Policy (`evaluatePlanPolicy`: Risikozone, typisierte Fähigkeiten, borg-Repair) gilt weiter für
+die anderen Türen; ein Host-Lauf geht nicht durch sie, sondern durch den Türsteher. Dessen Anweisung macht
 einen borg-Repair und das Löschen oder Zurückspielen eines Maschinen-Snapshots ausdrücklich zu
 einem X4-Befund: die Entscheidung bleibt bei Jochen, jetzt über den Türsteher statt über eine
 Regel.
@@ -123,550 +123,65 @@ Datenbank-Passwörter ist dort immer ein Befund, egal wohin die Ausgabe geht. Ro
 Routine: Paket-Updates aus den eingetragenen Quellen, Docker-Pulls, Kernel mit Neustart,
 GitLab-Stufen, Dienst-Neustarts.
 
-**Jedes ausgeführte Skript steht wörtlich im Plan** (05.11.2026, Befund X5 aus Job 26fb0860,
-Karte t_41cb8b49; nachgeschärft 09.11.2026 nach Zweitprüfung t_740ac6ee, Karte t_11872429,
-11.11.2026 nach Zweitprüfung t_af29564c, Karte t_0e05c213, und 12.11.2026 nach Zweitprüfung
-t_d3e3959f, Karte t_5d6eff99, nach Zweitprüfung t_1748d6c1, Karte t_8b84f3a6, nach Zweitprüfung
-t_b4b11e32, Karte t_fda9d997, und nach Zweitprüfung t_c82f5ac2, Karte t_429d7763): Ein
+**Jedes ausgeführte Skript steht wörtlich im Plan** (05.11.2026, Befund X5 aus Job 26fb0860): Ein
 stündlicher root-Dienst führte ein Skript aus, das der Lauf nur per Hash festnagelte
-(`printf '<sha256>  /pfad' | sha256sum -c -`); die Unit-Datei stand per Heredoc wörtlich im Plan,
-das Skript nicht — der Türsteher sah einen Hash statt Code. Seitdem lehnt schon
-`parseHostRunManifest` (Planer-Stufe, also auch das Manifest aus dem Intent) einen Plan ab, der einen
-Pfad per Prüfsumme festnagelt und ausführt, ohne seinen Inhalt in diesem Lauf zu zeigen. Die Meldung
-nennt Pfad, Ausführungs- und Pin-Zeile (und ggf. die Zeile, die den Heredoc überschrieben hat); der
-Weg ist das Muster der Units: Inhalt per `cat > /pfad <<'EOF' … EOF` oder
-`install -m 0755 /dev/stdin /pfad <<'EOF' … EOF` in den Lauf, eine Hash-Prüfung danach ist erlaubt.
-Die Regel im Einzelnen (`hiddenPinnedScripts` in `apps/api/src/host-run.ts`):
+(`printf '<sha256>  /pfad' | sha256sum -c -`); der Türsteher sah einen Hash statt Code. Das ist ein
+X5-Befund des Türstehers („a script the run executes but does not write literally in this plan — a hash
+pin shows you the hash, not the code“). Der Weg ist das Muster der Units: Inhalt per
+`cat > /pfad <<'EOF' … EOF` oder `install -m 0755 /dev/stdin /pfad <<'EOF' … EOF` in den Lauf, eine
+Hash-Prüfung danach ist erlaubt.
 
-- **Pin** heißt echte Prüfung: ein Digest-Werkzeug (`sha*sum`, `b2sum`, `md5sum`, `shasum`,
-  `cksum`, `openssl dgst`) mit `-c`/`--check` (samt der Prüfsummenzeile, die der Lauf dafür schreibt,
-  auch relativ nach `cd`), oder ein Digest, der im selben Schritt mit einem Digest-Literal bzw. einer
-  Variablen verglichen wird (`[ "$(sha256sum /p | cut …)" = "$SOLL" ]`). Ein `sha256sum /pfad`, das
-  nur ausgibt, neben einem fremden Digest (`docker pull img@sha256:…`, Commit-ID) nagelt nichts fest.
-- **Ausgeführt** ist fail-safe (Entscheidung 09.11.2026): Ein festgenagelter Pfad gilt überall als
-  ausgeführt, wo er als Wort in einem Befehl steht — auch normalisiert (`/a//b`), relativ nach
-  `cd <abs>` (`./name`, `bash name`), in `ExecStart=`-Zeilen, in einer per `printf` geschriebenen Unit,
-  über eine Variable, als Kopie oder Symlink unter anderem Namen, in `$(…)`/`<(…)` oder in eine Shell
-  gepipt. Liegt der Pfad in einem PATH-Verzeichnis (`/usr/local/sbin`, `/usr/local/bin`, `/usr/sbin`,
-  `/usr/bin`, `/sbin`, `/bin`) — auch als Ziel einer Kopie oder eines Symlinks (`ln -s /opt/x/run.sh
-  /usr/local/bin/runit`, `cp /opt/x/run.sh /usr/local/bin/`) —, zählt auch sein **Basisname** als Wort
-  (`… sha256sum -c - && wartung`, `sudo wartung --jetzt`, `runuser -u x -- wartung`, `ExecStart=wartung`);
-  fail-safe jedes Wort, nicht nur das Befehlswort (Entscheidung 11.11.2026). Wörter für Basisnamen und
-  relative Namen nach `cd` trennt die Regel an Leerraum, Quotes, `=` und an `<>&|;(){},\`
-  sowie Backticks (12.11.2026, R1); Quotes und Backslashes entfernt sie vorher, wie bash
-  (12.11.2026, B6: `w\artung`, `wa''rtung` zählen wie `wartung`; ein `$` direkt vor einem Quote fällt
-  vorher weg, R-B: `$'wartung'`, `$"wartung"`, `sudo $'wartung'`, `cd /opt/x && bash $'run.sh'`): `wartung>/var/log/w.log`, `wartung&>/dev/null`, `wartung</dev/null`,
-  `\wartung`, `{wartung,}`, `cd /opt/x && bash run.sh>/tmp/l` zählen wie das blanke Wort. Eine Zeile mit
-  `\` am Ende wird außerhalb von Inhalts-Heredocs vor dem Zerlegen mit der Folgezeile verbunden; die
-  Fundstelle ist die erste Zeile (`install -m 0755 \` + `/srv/run.sh /opt/x/run.sh`, `cat /p \` + `| bash`).
-  Ausgenommen sind nur Befehle, die ihre Operanden nicht ausführen (`chmod`, `chown`, `stat`,
-  `test`/`[`, `ls`, `cat`, `rm`, `cp`, `mv`, `ln`, `install`, `curl`, `wget`, `tar`, `grep`, `cmp` …,
-  Liste `QUIET_COMMANDS`; `sed` steht nicht darauf). Vor dem Befehl werden nur Schlüsselwörter und
-  Wrapper ohne eigene Argumente übersprungen; `sudo -u root /p`, `runuser -u x -- /p`, `su -c`, `flock`, `nsenter`,
-  `python3 -W ignore /p`, `awk -f`, `sh -c '/p'` gelten deshalb als Ausführung, weil das Wort nach dem
-  Wrapper kein stiller Befehl ist — nicht, weil jede Form einzeln erkannt würde. Preis: Ein Pfad in einer
-  `echo`-Meldung ohne Digest zählt auch, beim Basisnamen ebenso ein gleichlautendes Wort (`apt-get install
-  wartung`, `command -v wartung`); der Planer schreibt ihn dann anders.
-  **Heredoc an eine Shell** (12.11.2026, R3): Den Körper eines Heredocs, den eine Shell ausführt
-  (`bash <<'X'`, auch ohne Leerzeichen `bash<<'X'`, `sudo bash -s <<'X'`, `sudo -s`, `sudo -i`, `su`, `runuser`,
-  `ssh`, `fish`, `source /dev/stdin <<'X'`, `. /dev/stdin <<'X'`, `cat <<'X' | bash`, auch
-  `| sudo -u root sh`), liest die Regel wie die Skriptzeilen um ihn herum — Schreibvorgänge, `cd`,
-  Fortsetzungszeilen, Heredocs darin; nur der Körper jedes anderen Heredocs (`cat > /datei`, `python3 -`,
-  auch ein Inhalts-Heredoc in einem Shell-Körper) ist Inhalt. Ein Heredoc endet nur an einer Zeile, die
-  genau sein Begrenzer ist; bei `<<-` fallen nur führende Tabs weg (H1, t_b4b11e32: ` X` oder `EOF ` beenden
-  nichts). Bei einem Shell-Körper mit `<<-` (`bash <<-'X'`) gilt das für **jede** Zeile des Körpers, auch für die
-  Zeilen eines inneren Heredocs (13.11.2026, X-A aus t_6024cbc7): bash streift die Tabs, bevor die innere Shell
-  liest, und eine Zeile `<TAB>EOF` beendet dort auch `cat > /p <<'EOF'`. Die Regel liest jede Zeile in einem
-  solchen Körper ohne führende Tabs (Inhalt, Code, Grenzen, Fortsetzungszeilen); beendet eine Zeile erst ohne
-  ihre Tabs einen offenen Heredoc, gilt fail-safe zudem ab hier nichts mehr als gezeigt (Preis: im `<<-`-Körper
-  den inneren Begrenzer ohne Tab schreiben oder den inneren Heredoc ebenfalls mit `<<-` öffnen). Stehen mehrere Heredocs auf einer Zeile, folgt die Regel jedem in seiner Reihenfolge (H2:
-  `cat <<'A' >/dev/null; ssh other <<'B'`). Ein Skript, das ein Shell-Körper per Heredoc
-  schreibt, gilt nur dann als gezeigt, wenn der Begrenzer dieses und jedes umschließenden Shell-Körpers
-  gequotet ist und jeder davon nachweislich hier läuft (12.11.2026, B1): Bei `bash <<X` expandiert die
-  aufrufende Shell `$(…)` schon beim Bau des Körpers, und was ein Körper auf einem anderen Host, in einem
-  Container oder in einer anderen Wurzel schreibt, ist nicht die Datei, die dieser Lauf hier prüft und
-  ausführt. „Hier“ ist eine Positivliste (12.11.2026, R-A aus t_b4b11e32; eine Liste fremder Opener wäre nur
-  die nächste Lücke — `qm guest exec`, `schroot`, `buildah run`, `systemd-run -M` …): Ein Körper läuft nur
-  dann hier, wenn in jedem Segment der Opener-Kette vor dem Shell-Wort nur stehen: Zuweisungen (nicht an
-  `PATH`, `ENV`, `BASH_ENV`, `SHELLOPTS`, `BASHOPTS`, `IFS`, `PS4`, `GLOBIGNORE`, `CDPATH`, `LD_*`, `BASH_*` —
-  sie wählen, welcher `cat` im Körper läuft; seit S-C, t_c82f5ac2, auch nicht an `SHELL`), Umleitungen, Schlüsselwörter, Zahlen und die lokalen Wrapper
-  `sudo`, `doas`, `su`, `runuser`, `setpriv`, `env`, `nice`, `ionice`, `chrt`, `timeout`, `stdbuf`,
-  `systemd-run`, `systemd-cat`, `nohup`, `setsid`, `exec`, `command`, `builtin`, `time` mit den Optionen
-  ihrer Positivliste (13.11.2026, T-A aus t_683da1d6: `LOCAL_WRAPPERS` nennt je Wrapper die Optionen ohne
-  und mit Wert; Werte nur nach Optionen, die laut Werkzeug einen nehmen; `su`/`runuser` dazu ein
-  Benutzername). Jede andere Option macht den Körper fremd, wie hinter dem Shell-Wort: `--help` und
-  `--version` jedes Wrappers (der Befehl läuft dann gar nicht), `sudo -V`/`-l`/`--list`/`-K`/`-S`/`-b`,
-  `doas -C`, `chrt -p`, `setpriv -d`, `setsid -f`, bei `systemd-run` `--root-directory`/`--root-image`
-  (auch mit `=`), `-S`/`--shell`, `-t`/`--pty` und `--no-block`. `systemd-run` ist nur mit `--pipe`/`-P`
-  oder `--scope` lokal, sonst liest die Unit `/dev/null` statt des Körpers. Ein Argument null mit
-  führendem `-` (`env --argv0=-bash`, `env -a -bash`, `exec -a -bash`) und `exec -l` machen bash zur
-  Login-Shell, die vorher `/etc/profile` liest: fremd wie `bash -l` (`env --argv0=ssh`, `exec -a ssh`
-  bleiben lokal). In der Opener-Kette gilt ein Wort mit `$` oder Backtick nicht als Wort (T-D:
-  `bash -s $o`, `su $u`, `su "$u"`, `runuser $u`, `sudo -u $u` — die Shell zerlegt es erst beim Lauf in
-  Optionen), ausser dem Wert einer Zuweisung (`LANG=$L bash`); ebenso fremd ist ein Segment, das eine
-  Substitution von seinem Befehl abtrennt (`env $(…) bash <<'X'`, `bash <<'X' $(…)`). Dasselbe gilt für ein
-  Wort mit Klammern oder einem Glob-Zeichen (13.11.2026, U-B aus t_f7778d43: `bash -s {-c,true}`, `bash -s {-n,}`,
-  `{-l,}`, `{--rcfile,/srv/rc}`, `su {-c,true}`, `bash -s -[c] true` — bash macht daraus erst beim Lauf
-  Optionen); fail-safe auch gequotet, ausser dem einzelnen Schlüsselwort `{` und dem Wert einer Zuweisung. Vor der
-  Pipe nur `cat` ohne Datei (außer `-`) und `tee` ohne andere Optionen als `-a`, `-i`, `-p`. Nicht hier sind deshalb auch `sudo -R`/`--chroot`/`-h`,
-  `systemd-run -M`/`--machine`/`-H`/`--host` sowie dessen `-p`/`--property` und `-E`/`--setenv` (sie können
-  `RootDirectory=`, `BindPaths=` oder `BASH_ENV=` setzen), `systemd-run --user`/`--capsule`/`-C` (eine andere
-  Umgebung), `env -S`, `su`/`runuser -c` und `-s`/`--shell`, `nsenter` und `xargs`. Ebenso nicht hier ist ein
-  Wrapper, der `$SHELL` statt einer genannten Shell startet (12.11.2026, S-C aus t_c82f5ac2): `sudo -s`,
-  `doas -s` und `su`/`runuser -m`/`-p`/`--preserve-environment` ohne Shell-Wort dahinter (`sudo -s bash` bleibt
-  lokal; `sudo -i` und `su root` starten die Login-Shell aus der Passwortdatei und bleiben lokal). Hinter dem
-  Shell-Wort gilt ebenfalls eine Positivliste (12.11.2026, S-B/S-D aus t_c82f5ac2): nur `-s` (auch gebündelt
-  wie `-xs`), `-e`, `-u`, `-x`, `-v`, `-o` mit `errexit`, `nounset`, `pipefail`, `xtrace` oder `verbose`,
-  `--noprofile` und `--norc`. Nicht hier sind damit `-c` (ein String statt des Körpers), `-n` (der Körper läuft
-  nicht), `-i`, `-l`, `--login`, `--rcfile`, `--init-file` und `-O extdebug` (sie lesen vorher Dateien, die der
-  Plan nicht zeigt). Ein Datei-Operand liest den Körper nur nach `-s` oder als `/dev/stdin`; nach `-` oder `--`
-  ist der folgende Operand das Skript (`bash -- /srv/x.sh <<'X'` führt die Datei aus, nicht den Körper).
-  Die Umleitungen müssen den Körper als stdin der Shell lassen (12.11.2026, S-A aus t_c82f5ac2): Steht im
-  Segment des Heredocs eine weitere Eingabe-Umleitung oder ein zweiter Heredoc (`bash <<'X' </srv/x.sh`, `0<`,
-  `<&3`, `<<<`, `bash <<'X' <<'Y'` — bash verwirft dann X; seit T-C, t_683da1d6, auch jede Umleitung von fd 0
-  ohne `<`: `0>&-`, `0>/dev/null`, `0>>`, `00>&-`, `0>&3`), hinter der Pipe irgendeine Eingabe-Umleitung oder
-  vor der Pipe eine Ausgabe-Umleitung (`cat <<'X' >/dev/null | bash`, `>&2`), ist der Körper nicht lokal; vor
-  der Pipe ist `cat` nur ohne Optionen außer `-` und `-u` lokal (H-e: `cat -n`/`-v` ändern den Text). Dasselbe
-  gilt auf oberster Ebene (H-c): `cat > /p <<'EOF' </srv/x.sh` und `cat > /p <<'EOF' 0>&3` schreiben die
-  Datei, nicht den Körper, und zeigen nichts; ebenso `cat` mit einem Datei-Operanden oder einer anderen
-  Option als `-`/`-u` (`cat /srv/evil.sh > /p <<'EOF'`, `cat $f > /p`, `cat -n > /p`, t_683da1d6).
-  Wechselt ein Wrapper der Opener-Kette das Verzeichnis (13.11.2026, T-B aus t_683da1d6: `env -C`/`--chdir`,
-  `sudo -D`/`--chdir`, `sudo -i`/`--login`, `su`/`runuser` mit `-`, `-l` oder `--login`, `systemd-run` ohne
-  `--same-dir`/`-d`/`--scope` — die Unit startet laut systemd.exec(5) in `/` — und `systemd-run
-  --working-directory`), bleibt der Körper lokal, beginnt aber ohne bekanntes Verzeichnis: Ein relativer
-  Schreibvorgang dort (`cat > run.sh <<'EOF'`) zählt nicht als gezeigt, ein absoluter schon, und nach dem
-  Körper gilt wieder das Verzeichnis des Aufrufers. Ein Körper, dessen Shell im Hintergrund läuft (H-a: ein einzelnes `&` auf der Zeile, `bash
-  <<'X' &`), ist nicht lokal: Pin und Aufruf danach können vor dem Schreiben laufen. Setzt oder exportiert eine frühere Zeile desselben Schritts (auch in einem Shell-Körper) eine
-  dieser Variablen (`export BASH_ENV=…`, `declare -x ENV=…`, `PATH=…`, `printf -v SHELL …`; fail-safe zählt
-  jedes blanke Wort mit dem Namen, nur `$NAME`/`${NAME}` nicht; `IFS` nicht, eine Shell übernimmt es nicht
-  aus der Umgebung), exportiert sie eine Funktion (`export -f cat`), einen Namen, den der Plan nicht zeigt
-  (`export $(cat /srv/env)`, `export "${n}H_ENV=…"`; der Wert eines benannten Exports wie
-  `export STAMP=$(date)` bleibt frei), oder schaltet sie `set -a`/`allexport` ein, ist jeder spätere Körper
-  des Schritts nicht lokal (S-D, t_683da1d6): Die Umgebung erreicht jede spätere Shell. Ebenso, wenn eine
-  Zeile des Schritts den Namen eines Openers oder Schreibers umbindet (13.11.2026, Hinweis aus t_cdad398e):
-  eine Funktion namens `bash`, `sh`, `sudo`, `cat`, `tee`, `install` oder eines lokalen Wrappers (`bash() {…}`,
-  `function sudo {…}`, `cat() { true; }`), `alias`, `unalias`, `hash`, `enable` oder `expand_aliases`; dann
-  läuft `bash <<'X'` bzw. `cat <<'X' | bash` nicht den Körper. Dasselbe gilt für einen Schreibvorgang auf
-  oberster Ebene nach einer solchen Zeile (`cat() { true; }` vor `cat > /p <<'EOF'`, auch auf main frei). Eine
-  Funktion mit anderem Namen (`retry() {…}`, `f() {…}`) bleibt frei. Jedes andere Wort (auch `ssh`, `docker exec`,
-  `pct exec`, `chroot`, ein unbekanntes Werkzeug) macht den Körper fremd. Dort zählt jeder Schreibvorgang als
-  nicht gezeigt; Überschreiben und Ausführen liest die Regel dort weiter. Preis: Ein lokaler Opener mit einer
-  hier nicht gelisteten Option, die einen Wert nimmt, oder mit `sudo -s` (`su -s /bin/bash root <<'X'`), gilt als
-  fremd, ebenso jeder Körper nach einem `export PATH=…` im selben Schritt und jede Opener-Zeile mit einer
-  Substitution (`FOO=$(…) bash <<'X'`); der Planer schreibt ihn dann schlichter (`bash <<'X'`,
-  `sudo -u root bash <<'X'`) bzw. setzt die Variable im Körper selbst.
-  **Der Körper muss den Schreibvorgang erreichen** (13.11.2026, U-A aus t_f7778d43): Eine Shell liest ihren
-  Körper von stdin. Eine Zeile davor, die stdin liest (`head -n 1 >/dev/null`, `cat >/dev/null`, `sed -n 1p`,
-  `read`, `ssh other true`), frisst die folgenden Zeilen, und `exit`, `exec`, `return` beenden nur den Körper.
-  Pin und Aufruf danach laufen dann auf der alten Datei weiter. Ein Schreibvorgang in einem Körper zeigt den
-  Inhalt deshalb nur, wenn drei Dinge gelten, alle per Positivliste:
-  1. Jede Zeile davor im selben Körper und in jedem umschließenden Körper vor dessen Opener steht auf der
-     Liste: Leerzeile, Kommentar, `set -e`/`-u`/`-x`/`-o pipefail` (auch gebündelt), `cd`, `mkdir`, `chmod`,
-     `chown`, `umask`, `install -d`, Zuweisungen ohne `$`, Schreibvorgänge mit eigenem Heredoc in der Form, die
-     den Inhalt zeigt (13.11.2026, V-B aus t_cdad398e): `cat` ohne Operanden außer `-`/`-u`, `tee` nur mit
-     `-a`/`-i`/`-p` und schlichten Zielen, `install` nur mit `-m`/`-o`/`-g`/`-D`/`-C`/`-p`/`-v`/`-T` (bzw.
-     `--mode=`, `--owner=`, `--group=`) und genau `/dev/stdin <ziel>`; das Segment enthält kein `$`, keinen
-     Backtick, keine Umleitung auf fd 0 und keinen Pfad unter `/proc/` oder `/dev/` außer `/dev/null` (und
-     `/dev/stdin` als Quelle von `install`). Sonst leert `cat /proc/$$/fd/0 >/dev/null <<'E'` die stdin-Pipe des
-     Körpers, und `cat >/dev/stdin <<'E'` schreibt in sie. Jedes andere Programm zählt nur mit `</dev/null`.
-     Builtins und Schlüsselwörter zählen nie, auch nicht mit `</dev/null`: `exit`, `exec`, `return`, `eval`,
-     `trap`, `source`, `read`, `kill` (auch `/bin/kill`), `set +e`, `if`, `{`, Funktionen. Ebenso zählen `ssh`
-     und eine verschachtelte Shell nie, auch nicht mit `</dev/null` (13.11.2026, V-C aus t_cdad398e:
-     `sh -c 'cat /proc/$PPID/fd/0 >/dev/null' </dev/null` leert den Körper): kein Befehl aus `SHELL_WORDS`
-     (Shells, `busybox`, `python`, `perl`, `ruby`, `node`, `php`, `lua`, `awk` …), kein Starter (`env`, `xargs`,
-     `sudo`, `doas`, `su`, `runuser`, `setpriv`, `setsid`, `nohup`, `timeout`, `nice`, `ionice`, `chrt`, `stdbuf`,
-     `systemd-run`, `systemd-cat`, `nsenter`, `chroot`, `unshare`, `flock`, `script`, `watch`, `parallel`) und
-     kein Segment, in dem irgendwo ein Shell-Name steht (`find … -exec sh`). Ebenso zählt ein Befehlswort mit
-     Klammern oder `$` nie. Keine Negativliste: Jedes unbekannte Werkzeug kann stdin lesen. Damit
-     sind `if false; then`, `false &&` und eine nie aufgerufene Funktion im Körper mit erledigt.
-  2. Ein Fehler vor dem Schreiben beendet den ganzen Schritt (Schritte laufen mit `bash -eo pipefail`,
-     `cockpit-host-run` Z. 507). Deshalb fängt die Opener-Zeile keinen Fehler ab: kein `||`, `&&`, `!`, kein
-     `if`/`while`, keine Gruppe `{ … }`/`( … )` und keine Funktion um sie herum, kein `set +e`/`set +o pipefail`
-     davor (auf oberster Ebene nach der Tiefenzählung; nach einem `case` ist die Tiefe fail-safe für den Rest des
-     Schritts unbekannt, weil das `)` eines Musters keine Klammer schließt, Hinweis aus t_cdad398e). Eine Pipe
-     hinter der Shell ist nur unter `pipefail` erlaubt. Ein verschachtelter Körper muss seinen
-     Eltern-Körper scheitern lassen: Dort ist `set -e` an, oder der Opener ist dessen letzter Befehl. Was auf
-     der Zeile eines verschachtelten Openers vor ihm steht, muss selbst auf der Liste aus 1 stehen (13.11.2026,
-     V-A aus t_cdad398e): bash liest die ganze Zeile samt Heredoc und führt erst dann `exit 0`, `exec true`,
-     `exec 0<&-`, `read -r _`, `cat >/dev/null`, `kill $$` oder `false` vor `bash <<'Y'` aus; der Eltern-Körper
-     endet oder ist leer, bevor die innere Shell startet. `set -e; bash <<'Y'` und `mkdir -p /opt/x; cd /opt/x;
-     bash <<'Y'` bleiben frei; `set -e` auf derselben Zeile gilt für die Frage „Opener ist letzter Befehl“ erst
-     ab der nächsten Zeile.
-  3. Scheitert der Schreibvorgang selbst, endet der Körper mit ihm. Davor ist im Körper `set -e` an (oder `-e`
-     an der Shell, `bash -euo pipefail <<'X'`), oder er ist der letzte Befehl des Körpers.
-  Ohne 2 und 3 übersprängen `kill $$`, `set -e` mit `false` oder einem scheiternden `mkdir`, ein beendendes
-  Programm mit `</dev/null` oder eine schreibgeschützte Datei hinter `bash <<'X' || true` den Schreibvorgang.
-  Damit ist auch die frühere Grenze zu `{ bash <<'X'` … `} &` bzw. `( bash <<'X'` … `) &` geschlossen. Reale
-  Pläne bleiben frei, auch mit `set -euo pipefail`, `mkdir -p`/`cd` und `apt-get … </dev/null` vor dem Heredoc.
-  Preis: Steht im Körper ohne `set -e` noch ein Befehl hinter dem Schreibvorgang, gilt das Skript als nicht
-  gezeigt; der Planer setzt dann `set -euo pipefail` an den Anfang des Körpers. Ehrliche Grenze, gleich wie main
-  auf oberster Ebene: Ein Programm mit `</dev/null` läuft als root. Es kann alles, was ein Programm vor einem
-  Schreibvorgang auf oberster Ebene auch kann, zum Beispiel einen Prozess starten, der die Datei nach dem
-  Schreiben ersetzt. Das liest der Türsteher (X5). In einem Körper ohne bekanntes Verzeichnis (T-B) zählt eine
-  relative Ausführung (`./run.sh`) fail-safe über den Basisnamen.
-  **Die Heredoc-Grenzen liest die Regel wie bash, sonst zeigt der Schritt nichts** (13.11.2026, W-A/W-B aus t_ebbf1e40): Ein `<<` in einem
-  Kommentar oder in Quotes öffnet für bash nichts (`mkdir -p /opt/x # <<'C'`, `mkdir -p '/tmp/<<C'`); die Zeilen
-  bis `C` laufen dann, etwa `exit 0`, oder auf oberster Ebene schluckt ein `: <<'Z'` den Schreibvorgang. Und bash
-  beendet den Körper von `bash <<'X'` an der ersten Zeile `X`, auch wenn sie im Inhalt eines inneren Heredocs
-  steht (`cat > /tmp/a <<'EOF'` … `X` … `: <<'X'`). Fail-safe, für jede Zeile außerhalb von Inhalt, auf oberster
-  Ebene wie im Körper: Die Regel liest Quotes (`'…'`, `"…"`, `$'…'`, auch verschachtelt in `$(…)` und Backticks)
-  und Kommentare (`#` am Wortanfang), dazu Arithmetik und Parameter-Expansion (`((…))`, `$((…))`, `$[…]`, `${…}`,
-  13.11.2026, Hinweis aus t_6024cbc7: dort ist `<<` für bash ein Shift oder Text, `echo $(( 1 << C ))` öffnet
-  nichts). Steht ein `<<` (nicht `<<<`) in einem Kommentar, in Quotes, in Arithmetik oder in `${…}`, hat ein Opener
-  nicht genau die Form `<<[-]NAME`, `<<[-]'NAME'` oder `<<[-]"NAME"` mit einem Trenner dahinter (`<<\Z`, `<<'Z'x`,
-  `<<Z.1`, `<<$Z`), endet die Zeile in einem offenen Quote oder einer offenen Arithmetik bzw. `${…}`, gibt es mehr Opener als Heredocs in den Segmenten,
-  verbindet die Regel eine Zeile mit `\` am Ende eines Kommentars mit der nächsten (für bash setzt der Kommentar
-  nichts fort), endet eine Inhaltszeile eines ungequoteten Heredocs (`<<EOF`, `<<-EOF`, auch im Körper) auf eine
-  ungerade Zahl von `\` (13.11.2026, Hinweis B1 aus t_0bc8fac5: bash verbindet sie vor dem Vergleich mit dem Begrenzer mit
-  der nächsten, `echo hi\` vor `EOF` beendet nichts; gequotete Heredocs verbinden nichts), steht im Körper eines ungequoteten Heredocs, den eine Shell liest (`bash <<X`, `cat <<X | sudo bash`, `bash <<-X`), ein `\`, `$` oder Backtick (13.11.2026, R1 aus t_42ae4123: die äußere bash expandiert den Körper zuerst, aus `echo foo\\` wird `echo foo\`, die innere bash verbindet es ohne Leerzeichen mit einer Zeile `#;cp …`, die die Regel als Kommentar verwirft; `$B` mit `B=\` tut dasselbe ohne `\` im Körper, `$(…)` und Backticks setzen beliebigen Code ein — fail-safe zählt jedes der drei Zeichen, auch eine gerade Zahl `\`), oder erreicht eine Zeile in einem Körper den Begrenzer eines umschließenden Shell-Körpers (bei
-  `<<-` auch mit führenden Tabs), dann kann die Regel die Grenzen ab hier anders lesen als bash. Ab dieser Zeile
-  gilt für den Rest des Schritts nichts mehr als gezeigt, und was bis dahin gezeigt war, zählt als überschrieben
-  (bash kann ab hier Zeilen ausführen, die die Regel für Inhalt hält). Dazu ist im Körper eine Zeile mit einem
-  Kommentar nach dem Zeilenanfang nicht auf der Liste aus 1. Die Regel aus V-B gilt zudem für jedes Programm mit
-  `</dev/null` (Hinweis aus t_ebbf1e40): kein `$`, kein Backtick und kein Pfad unter `/proc/` oder `/dev/` außer
-  `/dev/null` (`true >/proc/self/fd/0 </dev/null` kürzt den Körper, wenn er als Temp-Datei vorliegt). Preis: Ein
-  Schritt mit `"$(cat <<'EOF'`, einem mehrzeiligen String oder `<<` in einem Kommentar, in Arithmetik (`$(( 1 << 4 ))`)
-  oder in `${…}`, mit `\` am Zeilenende in einem ungequoteten Heredoc oder mit `\`, `$` oder Backtick im ungequoteten
-  Körper einer Shell (auch `bash <<X` mit `$HOME` oder `\\`) zeigt danach kein festgenageltes Skript mehr; der
-  Planer schreibt den Heredoc schlicht (gequotet, wenn Zeilen auf `\` enden oder eine Shell den Körper liest; Werte
-  gibt er per `export` mit) und den Kommentar ohne `<<`.
-- **Geschrieben** zählt nur der letzte Schreibvorgang vor der Ausführung, und nur, wenn er den Inhalt
-  zeigt: `cat >`/`tee` mit Heredoc, `install … /dev/stdin <ziel>` mit Heredoc, `echo`/`printf` ohne
-  `$`/Backticks, eine Kopie eines so geschriebenen Skripts. Ein Heredoc zeigt den Inhalt nur, wenn sein
-  Begrenzer gequotet ist oder der Körper weder `$` noch Backticks enthält (12.11.2026, B5: dieselbe Regel
-  wie bei `echo`/`printf`; `cat > /p <<EOF` mit `$(curl …)` im Körper zeigt nicht, was in der Datei landet),
-  und nur außerhalb der Shell-Körper aus B1. Eine rekursive Kopie (`cp -r`/`-R`/`-a`), `rsync` und `mv`
-  heben jeden gezeigten Pfad unter dem Ziel (und unter Ziel/Basisname der Quelle) auf wie `tar -x`
-  (12.11.2026, B3: `cp -r /srv/x/. /opt/x/`, `rsync -a /srv/x/ /opt/x/`, `rm -r /opt/x && mv /srv/x /opt/x`),
-  ebenso ein Symlink, der auf ein Verzeichnis darüber umgeschaltet wird (H3, t_b4b11e32: `ln -sfn /srv/x
-  /opt/x`; nicht mit `-t` oder einem Ziel mit `/` am Ende, dort landet der Link nur im Verzeichnis). Anhängen (`cat >>`, `tee -a`) an eine nicht
-  gezeigte Datei macht sie nicht sichtbar; ein späteres Überschreiben (`cp`, `mv`, `install`, `dd of=`,
-  `curl -o`, `wget -O`, `> /pfad`, `tar -x`/`unzip` in das Verzeichnis) hebt den Heredoc auf. Ebenso
-  jedes `sed -i`/`--in-place` auf den Pfad (Entscheidung 11.11.2026, Hinweis aus t_af29564c): Mit `$(…)`,
-  Backticks oder `r /datei` ist die Änderung nicht sichtbar, und eine literale Ersetzung gehört gleich in
-  den Heredoc — eine Unterscheidung nach dem sed-Skript wäre nur eine weitere Lücke.
-  Fail-safe statt Liste (12.11.2026, R2: `perl -pi`, `awk -i inplace`, `ed`, `ex`, `patch`, `truncate` …):
-  Jeder Befehl, der einen bisher gezeigten Pfad nennt (auch per Basisnamen oder relativ nach `cd`), hebt
-  den Heredoc auf — ausgenommen nur Befehle, die den Inhalt nicht ändern oder deren Schreiben die Regel
-  ohnehin liest (`KEEPS_CONTENT`: die stillen Befehle ohne `curl`, `wget`, `tar`, `unzip`, `openssl`,
-  `gpg`, dazu `echo`, `printf`, `tee`, `logger`, `shellcheck`; `sed` nur ohne `-i`/`-f` und ohne
-  Skriptwort mit `w`, `W`, `e`), und die Ausführung selbst: Der Pfad ist das Befehlswort oder folgt nur
-  auf Wrapper, POSIX-Shells, Optionen und Zuweisungen (`bash /p`, `bash -n /p`, `sudo -u root /p`,
-  `runuser -u x -- /p`, `timeout 60 /p`, `sh -c '/p'`); `sudo -e`/`--edit` ist `sudoedit` und schreibt die
-  Datei (H4, t_b4b11e32). Nach einem Interpreter, der keine POSIX-Shell ist
-  (`perl`, `ruby`, `python`, `node`, `php`, `lua`, `Rscript`, `pwsh`), zählt nur das unmittelbar folgende
-  Wort als ausgeführt, bei der awk-Familie nur das Wort direkt nach `-f` (12.11.2026, B2): Optionen wie
-  `perl -i -pe…`, `ruby -i`, `gawk --include=inplace` ändern die Datei. Ein Befehl, der den Pfad nicht
-  nennt, aber einen Vorfahren davon nennt oder in einem arbeitet (sein `cd`), wirkt ebenso auf ihn
-  (12.11.2026, B3: `cd /opt/x && patch -p1 < /srv/fix.diff`, `git -C /opt/x checkout -- .`). Ebenso eine Ausgabe, die den Pfad nennt und in
-  einen ändernden Befehl oder `xargs` geht (`echo /p | xargs perl -pi …`); in eine Shell gepipt bleibt sie
-  Ausführung. Preis: Ein gezeigtes Skript, das ein anderer Befehl zwischen Heredoc und Ausführung nennt
-  (`python3 -W ignore /p`, `python3 -u /p`, `flock /lock /p`, `setcap … /p`), zählt als überschrieben, ebenso
-  eines unter einem Verzeichnis, in dem zwischen Heredoc und Ausführung ein nicht stiller Befehl arbeitet
-  (`cd /opt/app && npm ci`, `find /opt -name …`) oder das eine rekursive Kopie, `rsync` oder `mv` trifft
-  (auch wenn es nur eine Datei hineinlegt: `mv /tmp/a.conf /opt/x/`); der Planer schreibt den Aufruf dann
-  als `python3 /p` bzw. `bash /p` oder den Heredoc nach diesen Befehlen. Ein Skript, das ein Shell-Körper
-  mit ungequotetem Begrenzer oder auf einem anderen Host schreibt, gilt als nicht gezeigt; der Planer
-  quotet den Begrenzer (`bash <<'X'`) bzw. schreibt und prüft das Skript dort, wo es läuft.
-- **Nicht unter der Regel** (Entscheidung 09.11.2026, sonst belohnt sie das Weglassen der Prüfung —
-  ohne Hash wäre der Plan frei): ein Programm, das dieser Lauf selbst lädt (`curl -o`, `wget -O`) und
-  prüft, sofern es kein Skript ist (Endung `.sh`, `.py` … oder Aufruf über Shell/Interpreter — ein
-  Skript lässt sich zeigen); und die vom Deploy installierten Cockpit-Helfer
-  (`/usr/local/sbin/cockpit-*`, `/usr/local/lib/wireguard-ops-cockpit/cockpit-*`), deren
-  Integritätsprüfung vor dem Aufruf erwünscht ist, solange der Lauf sie nicht überschreibt. Beide bleiben
-  wie vorher Fokus des Riegels und Sache des Türstehers.
+Bis 13.11.2026 lehnte zusätzlich ein Shell-Lexer in `parseHostRunManifest` (`hiddenPinnedScripts`)
+solche Pläne ab. Er ist ausgebaut (Karte t_abe2651b, siehe „Keine Textmuster-Riegel“ unten): sieben
+Nachschärf-Runden in einer Woche haben gezeigt, dass ein Textfilter jede Shell-Form nachbauen muss und
+trotzdem Lücken behält. Ob ein Plan Code verbirgt, beurteilt der Türsteher am ganzen Plan.
 
-Ein geprüfter Download, der nur entpackt wird, und ein Skript ohne Hash bleiben frei; Code, den der
-Plan anders verbirgt (Skript von anderswo ohne Pin, Pfad aus nicht gezeigten Werten), bleibt Fokus des
-Riegels („content this plan does not show“) und X5 des Türstehers. Die Regel ist eine Planer-Hilfe, kein
-Schloss: Sie lehnt nur zusätzlich ab, der Türsteher liest jeden Lauf weiterhin selbst. Tests:
-`apps/api/test/host-run-visible-scripts.test.ts` (alle Fälle der Probe aus t_740ac6ee, der Gegenprobe
-aus t_af29564c, der Befunde B1–B6 aus t_1748d6c1, R-A, R-B, H1–H4 aus t_b4b11e32, S-A–S-D, H-c, H-e aus t_c82f5ac2, T-A–T-D aus t_683da1d6, U-A, U-B aus t_f7778d43 und V-A–V-C samt Hinweisen aus t_cdad398e, W-A, W-B und Hinweis M aus t_ebbf1e40, X-A und Hinweis Arithmetik aus t_6024cbc7, plus die aufgezeichneten Pläne vom 10.10.2026 als Fehlalarm-Gegenprobe).
-
-## 2a. Backup-Riegel: Backups löschen nur mit Freigabe
+## 2a. Backups: Löschen nur mit Jochens Ja (Grundsatz 4)
 
 Jochen, 30.09.2026: „Ein Admin muss auch die Backups löschen können. Aber halt mit Freigabe.“
-Geschärft am 10.10.2026: „Ich bin eh der Meinung, dass Updates nicht freigegeben werden
-müssten.“ Das ist die eine Ausnahme von „keine Freigabe als Regel“, und sie gilt **nur für echtes
-Löschen**: ein Lauf, der Sicherungen löscht, ihre Aufbewahrung ändert oder sie abschaltet,
-startet nur mit `operatorApproved`, **auch wenn der Türsteher `pass` sagt**. Alles andere —
-auch was der Riegel nicht lesen kann — entscheidet der Türsteher mit Belegpflicht. Append-only
-gibt es nicht; nach der Freigabe kann Jochen alles davon tun.
+Das ist die eine Ausnahme von „keine Freigabe als Regel“: ein Lauf, der Sicherungen löscht, prunt,
+compactet, ihre Aufbewahrung kürzt oder sie abschaltet, startet nur mit `operatorApproved`.
 
-Die Erkennung ist deterministisch und hat genau eine Quelle:
-`deploy/helpers/cockpit-backup-guard.mjs` (installiert neben dem Helfer als
-`/usr/local/lib/wireguard-ops-cockpit/cockpit-backup-guard.mjs`, Version
-`cockpit-backup-guard/v7`). Sie liefert zwei Listen:
+**Wer das erkennt (seit 13.11.2026, Karte t_abe2651b):** der Türsteher, am ganzen Plan. Seine
+Anweisung macht jeden solchen Lauf zu einem X4-Befund („The same holds for deleting backups or
+shortening their retention …“, `HOST_RUN_REVIEW_BODY` in `apps/api/src/host-run.ts`), auch über
+Umwege (eval, Dekodieren, Pipe in eine Shell, ein Skript, das der Plan nicht zeigt, eine entfernte
+Shell). Ein belegter Befund geht wie jeder andere an Jochen (`blocked_user_approval`); erst seine
+Freigabe des genau signierten Plans setzt `operatorApproved`. Frei bleiben, wie bisher in der
+Anweisung festgehalten: Lesen (`borg list/info/check`), neue Sicherungen, `cockpit-borg-action
+status|check|sources status|sources add <Verzeichnis>`, auf Lab0 `cockpit-borg-retention
+status|run` und `set` innerhalb der festen Grenzen.
 
-- `backupGuardHits` — der Riegel (Art `backup`). Drei Stellen fragen ihn:
-  1. die Policy der API (`hostRunPolicy`): ein Treffer macht aus `pass` ein
-     `blocked_user_approval` (bei einem belegten Befund kommen die Treffer dazu; eine
-     unvollständige Prüfung bleibt `blocked_prerequisite`). Der Envelope trägt dann kein
-     `gatePassed`;
-  2. `runHostRun` in der API vor dem Aufruf des Executors;
-  3. der Root-Helfer selbst (`verifyRequest`), beim Start und bei jeder Fortsetzung nach einem
-     Neustart: ohne `operatorApproved` Abbruch mit Code 77, bevor irgendetwas angelegt wird.
-- `backupGuardFocus` — Hinweise für den Türsteher (Art `mention` oder `uncertain`). Sie halten
-  den Lauf **nicht** an. Der Türsteher sieht sie als Fokus `backup-focus:*`, die Riegel-Treffer
-  als `backup-approval:*`; seine Anweisung (X4) verlangt weiterhin, jeden Löschbefehl und jede
-  Verschleierung eines Löschbefehls als belegten Befund zu melden.
+**Was strukturell darunter liegt** (unabhängig vom Türsteher):
+- VPS: der borg-Schlüssel des VPS ist auf Lab0 append-only (`borg serve --append-only
+  --restrict-to-path`, `doc/setup/borg-retention.md`): ein Lauf auf dem VPS kann Archive nur
+  hinzufügen; was er „löscht“, bleibt im Repo, bis Lab0s Aufräum-Dienst nach seinen festen Grenzen
+  aufräumt. Vor jedem verändernden Lauf zusätzlich der Maschinen-Snapshot beim Hoster.
+- Lab0 und box: vor jedem verändernden Lauf ein Host-Snapshot (`cockpit-host-snapshot`; auf box
+  zusätzlich ein Proxmox-Snapshot jedes Gasts), die Datenpfade auf Lab0 hängt die Lauf-Unit
+  read-only ein.
+- Der Aufräum-Dienst auf Lab0 hält seine festen Grenzen selbst
+  (`deploy/helpers/cockpit-borg-retention-rules.mjs`) und hält bei fremden Löschungen an.
+- Der Envelope ist an genau dieses Manifest gebunden (Schloss), der Rückweg steht je Lauf im Manifest.
 
-Gelesen wird jede Zeile, die läuft: alle Schritte und Prüfschritte, dazu die Skripte, die der
-Lauf per Heredoc schreibt und ausführt (und `ExecStart=`-Zeilen von Units, die er schreibt),
-Inline-Code (`python -c`, `perl -e`) und der Befehl hinter `ssh <host> …`. Quotes und
-Backslashes zählen nicht (`b"o"rg` ist `borg`), bekannte Variablen werden eingesetzt, Globs und
-`{a,b}` gegen die geschützten Pfade geprüft, relative Pfade gegen `/` (das cwd des Helfers) und
-jedes `cd`-Ziel aufgelöst. Kommentare zählen nicht.
+**Keine Textmuster-Riegel (Jochen, 08. und 13.11.2026).** Bis 13.11.2026 entschied zusätzlich ein
+deterministischer Backup-Riegel (`deploy/helpers/cockpit-backup-guard.mjs`, 2700 Zeilen Regex und
+Shell-Zerlegung) an drei Stellen (Policy, `runHostRun`, Root-Helfer). Er ist samt Tests ausgebaut:
+„Textfilter sind immer fehleranfällig und schrottig. Weg damit, und zwar ganz.“ In 14 Tagen gingen
+228 Kartenläufe (13 % der Kartenzeit) allein in Riegel-PRs mit bis zu neun Prüfrunden. Ebenso
+ausgebaut: der Skript-Lexer (`hiddenPinnedScripts`, siehe oben) und die Textmuster-Grenzen der
+Planer-Vorprüfung (`evaluatePlanPolicy`: `rm -rf`, `iptables`, Pfade der Geheimnisse). Der Schutz
+liegt in Schloss, Türsteher (andere Modellfamilie, der ganze Plan einmal), Risiko-Riegel (erklärte
+Klasse, kein Textmuster), Netz und den Unit-Grenzen (`ProtectHome`, `InaccessiblePaths=
+/etc/wireguard-ops-cockpit` in der Agent-Unit). Nicht ausgebaut, weil keine Textfilter: die
+typisierten Zeilenformen der Sondertüren (`parseTyped*`, `requestsBorgRepair` — dieselbe Grammatik,
+die der Executor ausführt, mit zweiter Prüfung im Executor), die festen Formen der Netz-Ausnahmen im
+Root-Helfer (eine Erlaubnisliste, kein Sperrfilter), die Fokus-Hinweise an den Türsteher
+(`classifyHostRunFocus`, sie stoppen nie) und die Zustandserkennung `cockpit-state-steps` (entscheidet
+nur „nie abbrechen“).
 
-**Riegel (`backup`, Freigabe nötig):**
-
-- `borg`/`borgmatic` `delete`, `prune`, `compact`, `recreate`, `break-lock`, eine
-  Schlüsseländerung (`key change-passphrase|import|migrate-to-repokey …`), `check --repair`,
-  `borgmatic borg …`, ein `borgmatic`-Lauf mit anderer Konfiguration (`-c`) oder `--override`,
-  `cockpit-borg-action` außer `status|check|db-access …|sources status|sources add <pfad>` (also auch
-  `sources add-large|connect|disconnect|restore` und `sources add` mit einem Pfad außerhalb der Wurzeln oder
-  aus einer Variablen; auch als `bash|sh|source|. <helfer> …`; eine Kopie oder ein Link des Helfers per
-  `cp|ln|install|rsync`) — auch als Text in `sh -c '…'`, in einem Skript,
-  das der Lauf schreibt, in einer Cron-Zeile oder in `echo/printf`; seit 05.11.2026 (Karte
-  t_5ce5f79f) allgemein jeder Befehl, der den Helfer nennt (Name, auch in Quotes; Glob auf seinen
-  Pfad; find-Filter `-name|-path|-regex`, der auf ihn passt) und weder die freie Direktform noch
-  reines Lesen oder Textausgabe ist: `find … -exec {} …`, `xargs` auf einer Zeile, die ihn nennt,
-  Inline-Code (`perl -e`, `python3 -c`, `ruby`, `node`, `php`, Heredoc für `python3 -`) mit seinem
-  Namen — gleich mit welchem Verb —, ein Argument in Quotes über das Zeilenende neben ihm, und
-  (seit 09.11.2026, Karte t_fd6dfaa4) eine Shell, ein Interpreter, `source` oder `at`, die Text
-  aus einer Pipe oder ein Skript, das der Plan nicht zeigt (`<(…)`), auf einer Zeile ausführen,
-  die ihn nennt (`ls <helfer> | sed 's/$/ repair/' | sh`, `bash <(echo '<helfer> repair')`); der
-  Wert von `xargs -I|-i|--replace` zählt dabei wie `{}` (`xargs -I@ /usr/local/sbin/@ repair`);
-  seit Karte t_3dce65e1 (09.11.2026) auch eine Gruppe `( … )`/`{ …; }` als Pipe-Ziel, eine über
-  `|`/`&&`/`||` am Zeilenende fortgesetzte Zeile (als eine logische Zeile gelesen), Pipe-Ausgabe,
-  deren Quelle den Helfer nennt, in eine Datei, die laufen kann (`> /etc/cron.d/x`, `| tee /tmp/r`),
-  `eval` auf einer Zeile, die ihn nennt, und ein `grep`-Filter auf seinen Namen über seinem
-  Verzeichnis; seit Karte t_6735af09 (09.11.2026) statt weiterer Senken eine **Zeilen-Allowlist**:
-  nennt eine logische Zeile den Helfer außerhalb der freien Formen (auch über eine Variable, deren
-  Wert ihn nennt, in einer späteren Zeile), dürfen alle übrigen Befehle der Zeile nur Filter oder
-  Datensenken sein (`grep`, `jq`, `head`, `tail`, `wc`, `sort`, `cut`, `tr`, `awk` ohne `system`/`|`,
-  `sed` ohne `e`/`w`/`-i`, Lesebefehle, `echo`, `tee` bzw. Umleitung nur in Datendateien); listet ein
-  Befehl sein Verzeichnis (`ls /usr/local/sbin`, `find` über einem Vorfahren ohne fremden
-  Namensfilter, `compgen -c`, `locate`), gilt dasselbe für die Befehle hinter ihm in der Pipe.
-  `|&` ist eine Pipe. Seit Karte t_d16c58d1 (09.11.2026, Zweitprüfung t_20ae3cda) gilt das für den
-  **ganzen Plan**: nennt irgendeine Zeile (Schritte und Prüfschritte) den Helfer außerhalb seiner
-  freien Formen — frei sind nur die Direktform und `test`/`[`/`[[` auf ihn; `echo` seines Namens,
-  `ls`/`stat`/`sha256sum` auf ihn, ein Glob, ein find-Filter, das Listen seines Verzeichnisses oder
-  eine Variable mit seinem Namen sind es nicht —, muss **jede** Zeile filtern und Daten ablegen, und
-  nichts darf Namen oder Werte umbinden (Funktion, `alias`, `hash`, PATH/BASH_ENV/ENV, PS0–PS4,
-  `${!…}`, `declare -n`, `export` eines Helfer-Werts); `sed` wird positiv gelesen (jeder Trenner,
-  ohne `e`/`w`). Seit Karte t_2e391eba (Zweitprüfung t_f1b3ea8c) lässt ein solcher Plan Bash auch
-  **keinen Wert als Code auswerten**: kein `${…@P}`, keine Zuweisung an PS0–PS4 (`set -x` führt PS4
-  aus) oder an die Integer-Variablen RANDOM/SRANDOM/OPTIND/HISTCMD, kein `declare`/`local`/`typeset
-  -i`, und Arithmetik — `$((…))`, `((…))`, `$[…]`, `let`, `for ((…))`, `[[ … -eq|-ne|-lt|-le|-gt|-ge
-  … ]]`, `${s:off:len}`, ein Index `${a[i]}`/`a[i]=`/`b=([i]=…)` auch in `unset`, `test -v`, `read`,
-  `printf -v`, `declare` — nur mit Zahlen; ein Name oder `$` darin ist ein Treffer, denn Bash rechnet
-  den Wert eines Namens aus und führt dabei ein `a[$(sh)]` darin aus, auch wenn der Wert erst aus
-  Teilen entsteht (`z=$x$y`). `test`/`[` mit `-eq` rechnen nicht und bleiben frei. Preis: ein Plan,
-  der den Helfer so nennt und daneben fremde Arbeit tut (`sha256sum <helfer>` plus `apt-get
-  upgrade`), geht an Jochen — dafür zwei Läufe (Einzelheiten `doc/setup/borg-maintenance.md`,
-  „Riegel über Umwege“);
-- jede Änderung der Aufbewahrung: `keep_*`/`--keep-*`, `keepDaily|Weekly|Monthly`,
-  `backup_keep_time` (GitLab), außerhalb eines reinen Lesebefehls;
-- Schreiben in die Konfiguration: `/etc/borgmatic`, `/etc/borgmatic.d`, `/root/.config/borg`
-  (Schlüssel), `/root/.borgmatic`, die borgmatic-Units samt `timers.target.wants`-Link,
-  `/usr/bin/borg*`, `cockpit-borg-action`, den Aufräum-Dienst (unten), die Drop-in- und
-  Generator-Verzeichnisse, über die systemd die Units still abschalten könnte
-  (`cockpit-.service.d`, `service.d`, `system-generators`, `system.attached` …), jede Datei mit
-  dem Namen einer dieser Units;
-- Löschen, Verschieben, Überschreiben in Backup-Zielen — borg-Repo (`/media/RAID/backup_VServer`),
-  `/var/backups`, `/var/opt/gitlab/backups`: `rm`, `rmdir`, `mv`, `shred`, `unlink`,
-  `find … -delete` (oder `-exec rm`), `rsync --delete` ins Ziel, `git clean|rm`, `truncate`,
-  `dd of=`, `chattr`; bei Löschbefehlen auch über einen Vorfahren (`rm -rf /var`,
-  `cd /etc && rm -rf *`, `rm -rf /media`); seit Karte t_cef59949 (`cockpit-backup-guard/v7`)
-  auch `cp`, `install`, `ln -f`, `rsync` und `tee` (ohne `-a`) auf eine **Datei** dort, wo nur
-  das Backup-Werkzeug schreibt (borg-Repo, `/var/opt/gitlab/backups`, vzdump: `/var/lib/vz/dump`,
-  `/mnt/pve/<speicher>/dump`) — ob die Datei schon da ist, sieht der Riegel nicht, darum zählt der
-  Dateiname als Überschreiben. Ehrlich: Ein Verzeichnis als Ziel (`cp x /var/lib/vz/dump/`,
-  `cp -t …`, mehrere Quellen) legt eine neue Sicherung dazu und bleibt Fokus des Türstehers, auch
-  wenn ein gleichnamiges Backup darin überschrieben würde; ebenso ein vzdump-Name an einem fremden
-  Ort (eine Kopie weg vom Backup trägt denselben Namen) und Kopien nach `/var/backups` (dort legt
-  ein Plan den eigenen Rückweg an);
-- auf Lab0 (`ssh borg@10.0.0.5 …`, `ssh lab0 …`, auch `-o HostName=10.0.0.5`): jeder Löschbefehl
-  (`rm`, `mv`, `find -delete`, `zfs destroy` …), auch nach einem Trenner in Quotes
-  (`ssh lab0 'true; rm -rf …'`); jeder Befehl dort, den der Riegel nicht lesen kann (fremdes
-  Skript, `eval`, Dekodieren, `$CMD`, verschachteltes `ssh`); `ssh` nach Lab0 mit Text aus einer
-  Pipe oder Datei (`… | ssh lab0 bash`, `ssh lab0 sh < plan.sh`) — ein Heredoc wird gelesen wie
-  ein Schritt; und jeder Riegel-Treffer im Befehl hinter einem beliebigen `ssh <host>`;
-- Lesen der Zugangsdaten und des Repo-Inhalts (seit 13.10.2026, `cockpit-backup-guard/v4`):
-  `/etc/borgmatic`, `/etc/borgmatic.d`, `/root/.config/borg` (Schlüssel), `/root/.borgmatic`,
-  `/etc/cockpit-borg-retention` (Passphrase des Aufräum-Dienstes) und `/media/RAID/backup_VServer`
-  — mit jedem Befehl außer Metadaten (`ls`, `stat`, `du`, `df`, `test`, Prüfsummen …): `cat`,
-  `grep`, `cp`, `ln -s`, `base64`, `find -exec`, `docker -v`, Eingabe-Umleitung (`< f`, `$(< f)`),
-  `scp`/`rsync`/`sshfs` von `lab0:` — auch über Globs, Variablen, `sudo`, `bash -c`; ganze Bäume
-  über einen Vorfahren (`grep -r … /etc`, `cp -a /etc`, `tar c /root`, `sshfs lab0:/media`);
-  `borg mount|extract|export-tar`, `borgmatic mount|extract|export-tar|restore`;
-- Abschalten: `systemctl` mit einem Verb, das eine Unit nicht laufen lässt (`stop`, `disable`,
-  `mask`, `kill`, `edit`, `revert`, `set-property`, `freeze` …) an `borgmatic.timer|.service`,
-  `cockpit-borg-retention.*` oder `timers.target` (auch per Glob wie `*.timer`), `service …
-  stop`, `systemctl isolate|rescue|emergency`, `init`/`telinit`, die borg-Pakete entfernen
-  (`apt-get remove|purge|autoremove`, `dpkg -r|-P`), die crontab aus der Ausgabe eines
-  Backup-Befehls neu schreiben (`crontab -l | grep -v borgmatic | crontab -`);
-- einen Maschinen-Snapshot löschen: `cockpit-vps-snapshot delete`, `DELETE …/snapshots/…`. Die
-  Rotation des Werkzeugs selbst (`create` räumt den ältesten cockpit-eigenen Snapshot, Jochen
-  28.09.2026) bleibt frei;
-- auf dem Proxmox-Host (Rolle `box`, seit 09.11.2026, Karte t_5f5c89fe, `cockpit-backup-guard/v6` seit Karte t_a5defddd, v7 seit t_cef59949;
-  Befund N2 der Prüfung t_88f1e802 — vorher sah das nur der Türsteher, X4):
-  - vzdump-Sicherungen löschen, verschieben, kürzen oder überschreiben (`rm`, `mv`, `shred`,
-    `truncate`, `dd of=`, `find … -delete`, `rsync --delete` …, wie bei den borg-Zielen) in
-    `/var/lib/vz/dump`, im `dump`-Verzeichnis jedes eingehängten Speichers
-    (`/mnt/pve/<speicher>/dump`, auch per Glob `/mnt/pve/*/dump`) und über deren Vorfahren
-    (`rm -rf /var/lib/vz`, `rm -rf /mnt/pve/nas`); an jedem Ort eine Datei `vzdump-*` oder `*.vma*`;
-  - `find … -name 'vzdump-*'|'*.vma*' -delete` (oder `-exec rm`) an jedem Ort;
-  - `pvesm free` auf ein Sicherungs-Volume (`…:backup/…`, `backup/… --storage <pbs>`, `vzdump-…`),
-    `pvesm prune-backups` (außer mit `--dry-run`, und nur wenn jede Schreibweise der Option wahr
-    ist: `--dry-run 1 --dry-run 0` ist ein Treffer), `vzdump … --remove` (außer `--remove 0`),
-    auch als `pvesh create /nodes/<n>/vzdump … --remove 1`. Ehrlich: `remove` steht in Proxmox
-    standardmäßig auf 1 (pve-docs `vzdump.1`, gelesen 09.11.2026) — ein nacktes `vzdump` prunet
-    also nach der eingestellten Aufbewahrung, wie ein nacktes `borgmatic`. Der eigentliche Schutz
-    ist darum der Treffer auf jede Änderung dieser Aufbewahrung (nächster Punkt);
-  - jede Änderung der Aufbewahrung `prune-backups`/`maxfiles`/`keep-*` (`pvesm set|add`,
-    `vzdump --prune-backups`, `pvesh set …`, `sed` an einer Datei), jedes Schreiben in
-    `/etc/vzdump.conf`, `/etc/pve/storage.cfg`, `/etc/pve/jobs.cfg`, `/etc/pve/vzdump.cron`,
-    `/etc/cron.d/vzdump`; einen Backup-Auftrag ändern oder löschen (`pvesh set|delete
-    /cluster/backup/<id>`, `PUT|POST|DELETE …/api2/json/cluster/backup/<id>`);
-  - `qm|pct delsnapshot`, `qm|pct rollback`, `qm|pct destroy` und ihre API-Formen: `pvesh delete
-    …/snapshot/<name>`, `pvesh create …/snapshot/<name>/rollback`, `pvesh delete
-    /nodes/<n>/qemu|lxc/<id>`, `pvesh delete|set …/storage/<s>/content/<vol>`, `pvesh delete
-    …/storage/<s>/prunebackups` (auch mit leeren Pfadteilen `//`, ohne führenden `/`, mit Optionen
-    vor dem Pfad) und dieselben Pfade per `curl -X DELETE|POST|PUT` (auch angehängt: `-XDELETE`,
-    `-kXDELETE`, `-X'DELETE'` — ebenso für `…/snapshots` bei Contabo) bzw. `wget --method=…`
-    (auch abgekürzt `--meth=`) auf `…/api2/json/…`;
-  - `qmrestore … --force` und `pct restore … --force` über einen bestehenden Gast: das zerstört ihn
-    samt Snapshots wie `destroy` (Karte t_a5defddd);
-  - am `qm`/`pct` vorbei auf der Speicherebene (die Box nutzt LVM-thin): `lvremove` eines
-    Gast-Volumes oder -Snapshots (`vm-<id>-disk…`, `base-<id>-…`, `snap_…`, der Pool `pve/data`),
-    `lvconvert --merge …snap_…`, `zfs destroy|rollback` auf einen Snapshot (`…@…`) oder ein
-    Gast-Volume, `qemu-img snapshot -d|-a`. Andere Volume-Namen sieht der Türsteher.
-  **Abkürzungen (Zweitprüfung t_eebb73c0, Karte t_a5defddd):** die Proxmox-CLI führt jedes
-  eindeutige Präfix eines Unterbefehls aus (pve-common `CLIHandler.pm`, `expand_command_name` mit
-  `enforce_exact`): `qm delsnap` ist `delsnapshot`, `pct destr` ist `destroy`, `pvesh del` ist
-  `delete`, `pvesm fre` ist `free`. Der Riegel löst die Verben von `qm`, `pct`, `pvesm` und `pvesh`
-  vor dem Vergleich genauso auf (Listen der Unterbefehle aus `qm.pm`, `pct.pm`, `pvesm.pm`,
-  `pvesh.pm`, git.proxmox.com HEAD 10.11.2026, im Riegel als `PVE_COMMANDS`); ein exakter Name gilt
-  vor jedem Präfix, ein Alias nur exakt. Ein mehrdeutiges Präfix, das ein gesperrtes Verb treffen
-  kann (`qm de` → `delsnapshot`/`destroy`, `qm r`), ist ein Treffer (fail-closed), obwohl Proxmox es
-  ablehnt. Frei als Lesen gilt nur ein exaktes oder eindeutig aufgelöstes Leseverb (`qm listsn`,
-  `pvesh g`); `qm li` (list oder listsnapshot) ist kein freies Lesen. Optionen nimmt Getopt::Long
-  mit `-` oder `--` und jedem Präfix (`JSONSchema.pm` `get_options`, `auto_abbrev`): jedes Präfix
-  von `remove` (vzdump, `--rem 1`, `--remov=1`, `-remove 1`, nacktes `--rem`), `maxfiles` und
-  `prune-backups` (`pvesm set local --maxfi 1`) ist ein Treffer, wie schon `--dry-run` in jeder
-  Schreibweise. `$'…'` ohne Backslash liest der Riegel wie `'…'` (`qm del$'s'napshot`).
-  Erkannt wird wie bei borg auch hinter `sudo`, `env`, `bash -c '…'`, absoluten Pfaden
-  (`/usr/sbin/qm`), Quotes (`q"m"`), Variablen, Schleifen, `xargs`, Prozess-Substitution, in
-  Skripten und Cron-Zeilen, die der Lauf schreibt, und in Inline-Code. Der Riegel ist
-  rollenunabhängig (eine Quelle, ohne Rolle); auf VPS und Lab0 gibt es diese Werkzeuge nicht.
-  **Entscheidung (09.11.2026, Auftrag t_5f5c89fe): die Rotation von `cockpit-host-snapshot`
-  bleibt frei, ein `delsnapshot` im Plan nicht — auch nicht für die Namensform `cockpit-run-*`.**
-  Der Helfer rotiert seine eigenen Gast-Snapshots selbst (`qm|pct delsnapshot` als Unterprozess,
-  nur Namen der Form `cockpit-run-*`, die fünf jüngsten bleiben); dieser Befehlstext steht in
-  keinem Plan. Auch ein Aufruf `cockpit-host-snapshot create cockpit-run-… --guests` aus dem Plan
-  ist frei (wie `cockpit-vps-snapshot create` auf dem VPS, Jochen 28.09.2026). Ein Plan, der
-  selbst `qm delsnapshot <vmid> cockpit-run-…` schreibt, ist ein Treffer — wie
-  `cockpit-vps-snapshot delete` auf dem VPS: eine Ausnahme nach dem Namen ließe genau die
-  Rückwege früherer Läufe (oder des eigenen) frei löschen. Ehrliche Grenze dieser Entscheidung
-  (Zweitprüfung 09.11.2026): fünf `create`-Aufrufe in einem Plan rotieren alle älteren
-  cockpit-Snapshots weg, auch den dieses Laufs; das sieht der Türsteher (Fokus „ein Programm,
-  dessen Inhalt der Plan nicht zeigt“, X4), nicht der Riegel. Offen für Jochen.
-- **Kürzen per Umleitung (Entscheidung Karte t_a5defddd, für die Daten-Ziele allgemein):** `: > f`,
-  `> f`, `echo > f`, `>| f` (jede Umleitung, die kürzt; nicht `>>`) ist ein Treffer, wo nur das
-  Backup-Werkzeug selbst schreibt: das borg-Repo `/media/RAID/backup_VServer`, die
-  GitLab-Sicherungen `/var/opt/gitlab/backups`, `/var/lib/vz/dump` und jede vzdump-Datei bzw. jedes
-  `dump`-Verzeichnis eines Proxmox-Speichers. In `/var/backups` bleibt es ein Hinweis für den
-  Türsteher: dort legt ein Plan seinen eigenen Rückweg an (`wp db export - > /var/backups/…`,
-  siehe WordPress oben), und ein frischer Dump unter altem Namen ersetzt nur einen älteren Dump.
-
-**Hinweis für den Türsteher (hält nicht an):**
-
-- `mention` — ein Befehl nennt oder berührt die Backups, ohne zu löschen: eine neue Sicherung
-  nach `/var/backups` legen (`cp`, `install`, `mkdir`), `docker run -v /var/backups:/b`,
-  `systemctl restart borgmatic.timer`, `apt-mark hold borgbackup`, ein Schreiben in einen Baum,
-  der die Backups enthält;
-- `uncertain` — der Text, der läuft, ist nicht der Text im Plan: `ssh`/`scp`/`rsync` zu einem
-  anderen Rechner, `eval`, Dekodieren, `$'\x..'`, Code aus einer Pipe, `alias`, `PATH`/
-  `BASH_ENV`/`LD_PRELOAD`/`BORG_*`, ein Skript, das der Lauf nicht selbst schreibt, ein
-  Befehlsname oder Ziel aus einem unbekannten Wert (`$CMD`, `rm -rf "$X"`, `xargs`), ein
-  Platzhalter als Befehlswort (`find … -exec {} …`, `xargs -I{} {}`; nennt die Zeile den
-  Backup-Helfer, ist es ein Riegel-Treffer — ebenso für Code aus einer Pipe und ein ungezeigtes
-  Skript), Inline-Code mit Prozessen oder Dateizugriffen.
-
-**Frei** (weder Riegel noch Hinweis) bleiben die Routine und das Lesen: `systemctl start
-borgmatic.service`, ein nacktes `borgmatic` (konfigurierte Aufbewahrung),
-`borg list|info|check|create|diff`, `borgmatic list|info|check|create`,
-`cockpit-borg-action status|check|db-access status|check|ensure|adopt|restore` (der DB-Zugang des
-Backups löscht kein Archiv und ändert keine Aufbewahrung, Karte t_30c9ea52),
-`cockpit-borg-action sources status|add <pfad>` mit einem wörtlichen Verzeichnis unter `/opt/stacks`,
-`/srv` oder `/var/lib/docker/volumes` (eine Backup-Quelle ergänzen stärkt den Rückweg; Jochen
-31.10.2026: „Ergänzen ja, Schwächen nein“, Karte t_2b394537, `doc/setup/borg-maintenance.md`;
-der Helfer selbst weist eine Quelle über ¼ des freien RAID-Platzes ab, dafür `add-large`, Karte t_0ea98639),
-`systemctl status|is-active|show|list-timers …`,
-`journalctl -u borgmatic`, lesende docker-Befehle (`ps`, `images`, `inspect`, `logs`, `stats`,
-`version`, `info`, `compose ps|config|logs`), Paket-Updates — auch wenn `borgbackup` oder
-`borgmatic` darunter sind —, `gitlab-backup create`, Lesebefehle (`ls`, `cat`, `grep`, `test`;
-nicht auf Zugangsdaten und Repo-Inhalt, siehe oben) und `curl` ohne Upload an die Statusdatei auf
-Lab0. Auf box frei: `qm|pct list|listsnapshot|config|status|pending`, `qm|pct snapshot`,
-Gäste starten und stoppen, `pvesm status|list|path|…scan`, `pvesm prune-backups --dry-run`,
-`pvesh get|ls`, `pvesh create /cluster/backup …` (ein neuer Auftrag), ein `vzdump` ohne
-`--remove` (Hinweis für den Türsteher), eine neue Sicherung in das `dump`-Verzeichnis legen, die
-Speicher-Konfiguration lesen. `pvesm free` auf eine Gastplatte (`…:vm-100-disk-1`) und Löschen unter
-`/var/lib/vz/images` bleiben beim Türsteher (X4): keine Sicherungen. Auf Lab0 bleibt sichtbare Routine per `ssh` frei (Jochen, 13.10.2026: „ein umkehrbarer
-Routineschritt braucht kein Ja“): `systemctl start|stop|restart` an Units außerhalb der
-Sicherung (`android-adb.service`, `android-emulator.service`, die Cockpit-Units), Status,
-`journalctl`, Metadaten des Repos (`df`, `du`, `ls`), Paket-Updates. Der Türsteher sieht `ssh`
-nach Lab0 weiter als Hinweis.
-
-**Aufräum-Dienst auf Lab0** (`doc/setup/borg-retention.md`): frei ist seine Routine —
-`/usr/local/sbin/cockpit-borg-retention status|run`, `set <d> <w> <m> <HH:MM>` innerhalb der festen
-Grenzen (`deploy/helpers/cockpit-borg-retention-rules.mjs`, dieselbe Datei wie in API und Helfer)
-und `systemctl start cockpit-borg-retention.service`. Der Riegel greift bei `set` unter der
-Untergrenze oder mit `--freigabe`, `freigeben` (Fortsetzen nach einer Anomalie), jeder anderen
-Form des Helfers, `systemctl stop|disable|mask|edit` an seinem Timer oder seiner Unit, und jedem
-Schreiben in `/etc/cockpit-borg-retention`, `/var/lib/cockpit-borg-retention`, seine Units samt
-`.d`-Verzeichnissen und seinen Code.
-
-Was jetzt ohne Klick läuft, das vorher einen brauchte (Sicherheitsannahme, 10.10.2026): Text,
-den der Riegel nicht lesen kann (Verschleierung, unbekannte Ziele, fremde Skripte, `ssh` zu einem
-unbekannten Rechner), und Befehle, die die Backups nur nennen oder neue Sicherungen anlegen. Ein
-Löschbefehl, der sich so versteckt, ist dann nur noch durch den Türsteher gesperrt: seine
-Anweisung macht ihn zum X4-Befund mit Beleg, und ein belegter Befund geht an Jochen. Eine
-Plan-Erzeugung, die den Türsteher täuscht UND den Löschbefehl vor dem Riegel versteckt, wäre der
-verbleibende Weg; die Abwägung hat Jochen getroffen (eine Tür, keine Klick-Freigaben).
-Ausnahme seit 13.10.2026: auf Lab0, dem Rechner mit dem Repo, ist unlesbarer Text hinter `ssh`
-ein Riegel-Treffer (siehe oben) — dort ist jeder Befehl schon nah an den Sicherungen, und die
-sichtbare Routine (Dienst-Neustart, Status, Logs) bleibt trotzdem frei.
-
-Ehrliche Grenze: Programme, die schon auf dem Host liegen und über ihren Namen oder aus den
-System-Verzeichnissen (`/usr`, `/opt/gitlab`) aufgerufen werden, nimmt der Riegel für das, was ihr
-Name sagt; ihren Inhalt sieht er nicht. Ein Interpreter-Programm ohne Löschwort, ohne
-geschützten Pfad und ohne den Namen des Backup-Helfers wird nicht weiter zerlegt. Einen Helfer-Namen,
-der erst zur Laufzeit entsteht (zusammengesetzt, dekodiert, aus einer Datei), sieht der Riegel
-nicht. Dort bleibt der Türsteher (X4) die Sicherung.
-Auf box kennt der Riegel das `dump`-Verzeichnis eines Verzeichnis-Speichers außerhalb von
-`/var/lib/vz` und `/mnt/pve` nicht (es steht nur in `storage.cfg`); dort greifen die Dateinamen
-(`vzdump-*`, `*.vma*`), ein `rm -rf <anderer-speicher>/dump` ist Sache des Türstehers. Einen
-Speicher entfernen oder abschalten (`pvesm remove`, `--disable 1`) bleibt beim Türsteher, ebenso
-API-Aufrufe aus Inline-Code (`python3 -c 'requests.delete(…)'`) — wie beim Contabo-Snapshot.
-Ein Verb, das erst zur Laufzeit entsteht (`qm ${V:-delsnapshot}`, `qm $(echo delsnapshot)`,
-`` qm `echo rollback` ``, `$'\x64…'`), und `ls …/dump/* | xargs rm` sind wie bei borg Hinweise
-(`uncertain`) für den Türsteher, keine Riegel-Treffer: unlesbarer Text ist sein Fokus (Doktrin
-10.10.2026). `cockpit-host-snapshot` kennt nur `create` und `list`; jede andere Form bricht mit 64 ab.
-Wie bei `keep_*` für borg greift `prune-backups`/`maxfiles` in jedem Befehl, der kein reiner
-Lesebefehl ist: auch `awk '/prune-backups/' /etc/pve/storage.cfg` oder `sed -n …` (beide gelten
-dem Riegel nicht als lesend) brauchen die Freigabe; `grep` und `cat` nicht.
-
-Tests: `apps/api/test/backup-guard.test.ts` (Korpus frei / Riegel / nur Hinweis, die echten Pläne
-vom 10.10.2026 aus `fixtures/host-run-plans-2026-10-10.json`, Policy),
-`backup-guard-lab0.test.ts` (Lab0), `backup-guard-box.test.ts` (box: vzdump, pvesm, pvesh, API,
-Gast-Snapshots, Umgehungen, Namensform `cockpit-run-*`; Abkürzungen von Verben und Optionen,
-`curl -XDELETE`, Kürzen per Umleitung, Speicherebene),
-`host-run-helper.test.ts` (Helfer beim Start und nach dem Neustart, Snapshot-Name ≤ 30 Zeichen),
-`host-run-flow.test.ts` (API: `pass` plus `borg delete` wartet auf Jochen, läuft nach der
-Freigabe).
+Tests: `host-run-flow.test.ts` (API: ein `borg delete` wird als X4-Befund des Türstehers zu
+`blocked_user_approval` und läuft erst nach Jochens Freigabe), `host-run.test.ts` (Anweisung).
 
 ## 2b. Risiko-Riegel: erklärtes Risiko nur mit Freigabe
 
@@ -681,7 +196,7 @@ Capability-Manifest dagegen erzwingt dieselbe Klasse seit jeher die Freigabe
 Seitdem gilt: erklärt das Manifest eine Risikoklasse außer `contained` — `exposure`,
 `data_loss` oder `identity_or_secret` —, startet der Lauf nur mit `operatorApproved`, **auch wenn
 der Türsteher `pass` sagt**. Die Regel ist „alles außer `contained`“, damit es keine zweite Liste
-gibt, die auseinanderlaufen kann. Drei Stellen fragen sie, wie beim Backup-Riegel:
+gibt, die auseinanderlaufen kann. Drei Stellen fragen sie:
 
 1. `hostRunPolicy` (`hostRunRisksNeedingApproval`): aus `pass` wird `blocked_user_approval`
    (Zone rot, Beleg `declared risk: <klasse>`); bei einem belegten Befund kommt der Grund dazu;
@@ -847,7 +362,7 @@ X1/X4), mit Rolle `box` mit dem Proxmox-Host (Gäste HAOS/UniFi, ihre Platten, S
 = X4), sonst — `vps`, fehlende oder unbekannte Rolle — mit dem strengsten Text, dem
 Produktionshost. Der Rest des Vertrags (X1–X6, Antwortformat) ist auf beiden Hosts gleich. Grund:
 Auf Lab0 hielt der Türsteher einen Lab0-Plan für einen Widerspruch zum Produktionshost (X5) und
-stoppte jeden verändernden Lauf. Die Rolle ändert nur den Text, nie Schloss, Netz oder Riegel.
+stoppte jeden verändernden Lauf. Die Rolle ändert nur den Text, nie Schloss, Netz oder Risiko-Riegel.
 
 **vps**:
 
@@ -947,8 +462,8 @@ vzdump-Sicherungen, weiterer Speicher), deckt kein Snapshot; ein Snapshot liegt 
 der Gast (fällt die NVMe aus, ist beides weg); und was ein Gast nach außen geschickt hat, holt kein Rollback
 zurück. Einen Gast oder seine Volumes zerstören, einen Gast-Snapshot löschen oder zurückrollen,
 vzdump-Sicherungen löschen, Speicher entfernen ist für den Türsteher X4; Gast zerstören, Gast-Snapshot
-löschen oder zurückrollen und vzdump-Sicherungen löschen oder ihre Aufbewahrung kürzen sind seit 09.11.2026
-zusätzlich Treffer des Backup-Riegels (Abschnitt 2a). Zurückgerollt wird nur mit Jochens
+löschen oder zurückrollen und vzdump-Sicherungen löschen oder ihre Aufbewahrung kürzen gehen damit an
+Jochen (Abschnitt 2a). Zurückgerollt wird nur mit Jochens
 Freigabe (`qm rollback <vmid> <name>` bzw. `pct rollback …`; das Protokoll nennt die Gast-Snapshots als
 Rückweg).
 
@@ -1062,7 +577,7 @@ Weitere bekannte Grenzen:
 Selbstupdate (`doc/setup/self-update.md`, Abschnitt „The guarantees and the one door“). Deren
 Garantien bilden seit 02.10.2026 dieses Modell ab: dass `host.run` Plantext als root ohne
 Sandkasten ausführt und der Türsteher ohne Jochen freigibt, ist gewollt und kein Befund. Ein
-Befund ist ein Weg am Schloss (G2), am Türsteher (G9), am Backup-Riegel (G10) oder am Netz (G5)
+Befund ist ein Weg am Schloss (G2), am Türsteher (G9), an der Backup-Regel oder am Risiko-Riegel (G10) oder am Netz (G5)
 vorbei. Der Runner markiert die Dateien der Tür als Fokus `host-door`.
 Wer an der Tür ändert, liest vorher `doc/setup/self-update.md` „Before you change this door“ und
 schreibt `G-Garantien berührt: …` in die PR-Beschreibung; ohne diese Zeile ist die CI rot
@@ -1093,10 +608,8 @@ hebt. Der Normalfall ist Durchlaufen. Das gilt für beide Prüfungen: den Türst
   verdict“).
 - INCOMPLETE ist nie ein Durchlass. James klärt die Ursache (Einsammeln reparieren, Lauf
   wiederholen) und reicht neu ein; kommt er nicht weiter, fragt er Jochen selbst.
-- Harte Blocker, die unabhängig vom Prüfergebnis zu Jochen gehen: Backup-Riegel (Abschnitt 2a,
-  nur `host.run`); Risiko-Riegel (Abschnitt 2b, erklärtes `exposure`/`data_loss`/
-  `identity_or_secret`, nur `host.run`); für die typisierten Türen die Plan-Policy (`evaluatePlanPolicy`: geschützte
-  Grenze, Risikozone rot, nicht autorisierte Capability, `shell.exception`, `borg.repair`).
+- Harte Blocker, die unabhängig vom Prüfergebnis zu Jochen gehen: Risiko-Riegel (Abschnitt 2b, erklärtes `exposure`/`data_loss`/
+  `identity_or_secret`, nur `host.run`); für die typisierten Türen die Plan-Policy (`evaluatePlanPolicy`: Risikozone rot, nicht autorisierte Capability, `shell.exception`, `borg.repair`).
 - Die Sicherungskette vor einem verändernden Lauf (borg-Prüfung, Snapshot) hängt nicht an dieser
   Matrix und bleibt unverändert.
 - **Zweitprüfung (Jochen, 07.11.2026, „ja alles“, Punkt 4b), nur Selbstupdate:** Prüft das Cockpit

@@ -169,7 +169,7 @@ It must not be the only component that can authorize privileged execution.
 
 ### Deterministic policy gate
 
-The policy gate is the authoritative allow or deny layer. It keeps only stable hard boundaries deterministic; contextual classification and changing tool interfaces remain with the agents.
+The policy gate is the authoritative allow or deny layer. It decides on structure (signed manifests, typed capability forms, declared risk, scopes), never on text patterns in the plan (decision 08./13.11.2026, card t_abe2651b); contextual classification and changing tool interfaces remain with the agents.
 
 It validates:
 

@@ -16,12 +16,12 @@
 //              Safety-Reviewer liest diese Schritte, bevor der Envelope
 //              entsteht. Hier wird nichts mehr eingestuft oder abgelehnt, was
 //              er gesehen hat.
-//   Riegel     Ein Lauf, der Backups löscht, ihre Aufbewahrung ändert oder
-//              sie abschaltet, öffnet nur mit operatorApproved, auch bei
-//              bestandenem Türsteher (cockpit-backup-guard.mjs, backupGuardHits,
-//              dieselbe Erkennung wie in der API; installiert neben diesem
-//              Helfer). Was der Riegel nur als Hinweis für den Türsteher meldet
-//              (backupGuardFocus), hat der Türsteher schon gelesen.
+//   Backups    Backups löschen, prunen, compacten oder ihre Aufbewahrung
+//              kürzen braucht Jochens Ja (Grundsatz 4). Das erkennt der
+//              Türsteher am ganzen Plan (X4-Befund → operatorApproved), kein
+//              Textmuster (Jochen 08./13.11.2026, Karte t_abe2651b). Strukturell
+//              ist der borg-Schlüssel des VPS auf Lab0 append-only; Lab0 und box
+//              machen vor jedem verändernden Lauf einen Host-Snapshot.
 //   Netz       Vor einem Lauf, der den Systemzustand ändert (mutates, Standard),
 //              je Instanzrolle (vom Deploy root-eigen in instance-role.env gelegt,
 //              nie aus Plan, Manifest oder Umgebung des Aufrufers):
@@ -85,7 +85,6 @@ import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFile
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { backupGuardHits } from "./cockpit-backup-guard.mjs";
 import { stateStepKinds, stepUninterruptible } from "./cockpit-state-steps.mjs";
 
 const env = process.env;
@@ -191,12 +190,6 @@ function verifyRequest(request, { checkExpiry }) {
   if (envelope.gatePassed !== true && envelope.operatorApproved !== true) fail("the envelope carries neither a passed doorkeeper review nor an operator approval", 77);
   if (!JOB_ID.test(envelope.jobId || "")) fail("invalid envelope job id");
   validateManifest(manifest);
-  // Backups löschen nur mit Jochens Freigabe: ein bestandener Türsteher reicht
-  // hier nie, auch nicht bei der Fortsetzung nach einem Neustart.
-  const backup = backupGuardHits(manifest);
-  if (backup.length > 0 && envelope.operatorApproved !== true) {
-    fail(`the run touches the backups and needs the operator's approval: ${backup.slice(0, 3).map((hit) => `${hit.where} ${hit.reason}`).join("; ")}`, 77);
-  }
   // Erklärtes Risiko (Vorfall 23.10.2026, Job d7df65dc): jede Klasse außer
   // "contained" (exposure, data_loss, identity_or_secret) öffnet nur mit
   // operatorApproved — dieselbe Regel wie hostRunRisksNeedingApproval in der API.
@@ -763,7 +756,7 @@ function borgFresh() {
 // Prüfung und jedes Rückwegs ist genau eine der Formen unten — ganze Zeile,
 // keine Shell-Zeichen, keine Variablen. Ein einziger fremder Befehl, und der
 // Lauf ist ein gewöhnlicher Lauf (preflight_failed ohne Rückweg). Schloss,
-// Türsteher, Riegel und der Maschinen-Snapshot bleiben bei beiden unverändert.
+// Türsteher, Risiko-Riegel und der Maschinen-Snapshot bleiben bei beiden unverändert.
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9@._-]{0,79}$/;
 const OTHER_UNIT_TYPE = /\.(?:socket|device|mount|automount|swap|target|path|timer|slice|scope)$/;
 // Was ein Notfall stoppen darf, ist eine Positivliste (Zweitprüfung B3,

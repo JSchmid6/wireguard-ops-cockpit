@@ -15,9 +15,6 @@ import { hostRunManifestHash, parseHostRunManifest } from "../src/host-run.js";
 // payload synchronously, so `start` returns when the run is over.
 
 const HELPER = fileURLToPath(new URL("../../../deploy/helpers/cockpit-host-run", import.meta.url));
-const GUARD = fileURLToPath(new URL("../../../deploy/helpers/cockpit-backup-guard.mjs", import.meta.url));
-// Der Riegel importiert die Grenzen des Aufräum-Diensts; installiert liegen beide nebeneinander.
-const RETENTION_RULES = fileURLToPath(new URL("../../../deploy/helpers/cockpit-borg-retention-rules.mjs", import.meta.url));
 const STATE_STEPS = fileURLToPath(new URL("../../../deploy/helpers/cockpit-state-steps.mjs", import.meta.url));
 const HOST_SNAPSHOT = fileURLToPath(new URL("../../../deploy/helpers/cockpit-host-snapshot", import.meta.url));
 const REPO = fileURLToPath(new URL("../../../", import.meta.url));
@@ -111,8 +108,6 @@ beforeEach(() => {
   dir = mkdtempSync(path.join(tmpdir(), "host-run-"));
   helper = path.join(dir, "cockpit-host-run.mjs");
   copyFileSync(HELPER, helper);
-  copyFileSync(GUARD, path.join(dir, "cockpit-backup-guard.mjs"));
-  copyFileSync(RETENTION_RULES, path.join(dir, "cockpit-borg-retention-rules.mjs"));
   copyFileSync(STATE_STEPS, path.join(dir, "cockpit-state-steps.mjs"));
   // Steps run with a clean environment: the stubs carry their directory in their text.
   mkdirSync(path.join(dir, "bin"));
@@ -253,22 +248,12 @@ describe("cockpit-host-run: lock", () => {
     expect(status().state.status).toBe("success");
   });
 
-  // The steps really run here: they only write marker files whose names the
-  // backup bolt recognizes (a deleting command as text), never a real borg or
-  // systemctl command.
-  it("keeps a run that touches the backups shut without the operator's approval, even with a passed doorkeeper", () => {
-    const prune = manifest({ steps: [{ name: "prune", run: `echo 'borgmatic prune --keep-daily 1' > ${dir}/borgmatic-prune.txt`, timeoutSeconds: 30 }] });
-    const out = run(["start"], request(prune));
-    expect(out.code).toBe(77);
-    expect(out.stderr).toContain("touches the backups");
-    expect(existsSync(path.join(dir, "runs", "job-1"))).toBe(false);
-    expect(existsSync(path.join(dir, "units.log"))).toBe(false);
-  });
-
-  it("opens a run that touches the backups for the operator's approval", () => {
-    const prune = manifest({ steps: [{ name: "status", run: `echo keep_daily: 1 > ${dir}/borgmatic-retention.txt`, timeoutSeconds: 30 }],
-      checks: [{ name: "written", run: `test -f ${dir}/borgmatic-retention.txt`, timeoutSeconds: 30 }] });
-    expect(run(["start"], request(prune, { gatePassed: undefined, operatorApproved: true })).code).toBe(0);
+  // No text bolt in the helper any more (card t_abe2651b): deleting backups is
+  // the doorkeeper's X4 finding in the API; a passed doorkeeper opens the door.
+  it("runs a passed plan whose text names the backups (no text bolt)", () => {
+    const named = manifest({ steps: [{ name: "note", run: `echo 'borgmatic prune --keep-daily 1' > ${dir}/borgmatic-prune.txt`, timeoutSeconds: 30 }],
+      checks: [{ name: "written", run: `test -f ${dir}/borgmatic-prune.txt`, timeoutSeconds: 30 }] });
+    expect(run(["start"], request(named)).code).toBe(0);
     expect(status().state.status).toBe("success");
   });
 
@@ -287,10 +272,10 @@ describe("cockpit-host-run: lock", () => {
     expect(status().state.status).toBe("success");
   });
 
-  it("asks the backup bolt again when a run continues after the boot", () => {
+  it("asks the risk bolt again when a run continues after the boot", () => {
     // A request.json that lost its approval (or was forged) does not continue.
-    const prune = manifest({ steps: [{ name: "reboot", reboot: true }, { name: "delete", run: `echo 'borg delete ::a' > ${dir}/borg-delete.txt`, timeoutSeconds: 30 }] });
-    expect(run(["start"], request(prune, { gatePassed: undefined, operatorApproved: true })).code).toBe(0);
+    const risky = manifest({ risk: ["data_loss"], steps: [{ name: "reboot", reboot: true }, { name: "note", run: `echo done > ${dir}/note.txt`, timeoutSeconds: 30 }] });
+    expect(run(["start"], request(risky, { gatePassed: undefined, operatorApproved: true })).code).toBe(0);
     expect(status().state.phase).toBe("rebooting");
     const file = path.join(dir, "runs", "job-1", "request.json");
     const stored = JSON.parse(readFileSync(file, "utf8"));
@@ -542,17 +527,20 @@ describe("cockpit-host-run: net exceptions without a return path", () => {
     });
   }
 
-  // What the backup bolt holds stays with the bolt: no exception gets that far.
-  const bolted: Array<[string, () => Manifest]> = [
+  // Forms close to an exception that the fixed grammar does not take: without a
+  // return path they do not run (formerly held by the text bolt, card t_abe2651b).
+  const nearExceptions: Array<[string, () => Manifest]> = [
     ["stopping the backup timer", () => emergency({ steps: [{ name: "s", run: "systemctl stop borgmatic.timer", timeoutSeconds: 60 }], rollback: ["systemctl start borgmatic.timer"] })],
     ["repair with adopt plus an extra argument", () => repair({ steps: [{ name: "db access", run: `${BA} db-access adopt nextDB`, timeoutSeconds: 300 }] })],
     ["repair with another helper verb", () => repair({ steps: [{ name: "db access", run: `${BA} db-access ensure`, timeoutSeconds: 300 }, { name: "r", run: `${BA} repair`, timeoutSeconds: 300 }] })],
   ];
-  for (const [what, build] of bolted) {
-    it(`the backup bolt refuses before any exception: ${what}`, () => {
-      const out = run(["start"], request(build()), noReturnPath);
-      expect(out.code).not.toBe(0);
-      expect(out.stderr).toMatch(/operator/);
+  for (const [what, build] of nearExceptions) {
+    it(`no exception without a return path: ${what}`, () => {
+      run(["start"], request(build()), noReturnPath);
+      const { state } = status();
+      expect(state.status).toBe("preflight_failed");
+      expect(state.error).toContain("no return path");
+      expect(state.netException).toBeNull();
       expect(existsSync(path.join(dir, "emergency.log"))).toBe(false);
       expect(existsSync(path.join(dir, "snapshot.log"))).toBe(false);
     });

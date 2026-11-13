@@ -6,7 +6,7 @@ exact lines the deploy script must carry so the next manual rollout installs it.
 
 ## Before you change this door
 
-Changing `deploy/helpers/cockpit-host-run`, `cockpit-backup-guard.*`,
+Changing `deploy/helpers/cockpit-host-run`,
 `cockpit-borg-retention-rules.*`, `cockpit-state-steps.*`, `cockpit-self-update-*`,
 `cockpit-dienste-update-action`, `apps/api/src/update-review.ts`,
 `update-review-prompt.ts`, `host-run.ts`, `hermes-security.ts` or this file:
@@ -15,7 +15,7 @@ Changing `deploy/helpers/cockpit-host-run`, `cockpit-backup-guard.*`,
    [The guarantees and the one door](#the-guarantees-and-the-one-door) (G1–G10), and the approval
    matrix in `doc/setup/host-run.md` („Freigabe-Matrix“). Principle (Jochen, 30.09. and
    11.10.2026): the operator is asked only when a reviewer raises an evidenced finding or the
-   backup bolt / a hard plan blocker hits; an incomplete review never runs and never becomes an
+   risk bolt / a hard plan blocker hits; an incomplete review never runs and never becomes an
    approval offer.
 2. Go through G1–G10 and decide which ones the change touches.
 3. Put the line `G-Garantien berührt: <G… or keine> — <why each still holds>` into the PR
@@ -268,7 +268,7 @@ Flow of a Hermes change job whose plan contains `self.update <sha>` lines:
    | `update-mechanism` | G7 | the self-update helper, runner, snapshot helper, Lab0 deploy script, unit, `update-review.ts`, `update-review-prompt.ts` |
    | `envelope-signing` | G2 | hunks touching `signEnvelope`, `verifyExecutionEnvelopeSignature`, `approveExecutionEnvelope`, `createExecutionEnvelope`, `validateExecutionEnvelope`, and `verifyEnvelope` in the capability helper |
    | `broker-validation` | G3 | hunks touching `validateRequest`/`signature` in the executor broker |
-   | `host-door` | G2/G5/G6/G9/G10 | the general door: `apps/api/src/host-run.ts`, `deploy/helpers/cockpit-host-run`, `cockpit-backup-guard.mjs`, `cockpit-borg-retention-rules.mjs`, `cockpit-state-steps.mjs`, the host-run resume unit, Lab0's net `cockpit-host-snapshot` and the three deploy-installed role files `deploy/{vps,lab0,box}/instance-role.env` |
+   | `host-door` | G2/G5/G6/G9/G10 | the general door: `apps/api/src/host-run.ts`, `deploy/helpers/cockpit-host-run`, `cockpit-borg-retention-rules.mjs`, `cockpit-state-steps.mjs`, the host-run resume unit, Lab0's net `cockpit-host-snapshot` and the three deploy-installed role files `deploy/{vps,lab0,box}/instance-role.env` |
    | `approval-and-auth`, `brokers-and-agents`, `capability-sandbox`, `root-helpers`, `ci` | G1/G6, G3/G6, G5, G4/G5, G7 | file-level areas |
    | `dependencies` | G8 | `package.json` hunks; lockfiles are summarized as a package list with install scripts and non-registry sources first |
    | `tests-deleted` | — | deleted test files |
@@ -303,7 +303,7 @@ Flow of a Hermes change job whose plan contains `self.update <sha>` lines:
    that runs as root or goes into the images lands in the first pass. So every
    changed file reaches a reviewer completely in **exactly one** pass — except
    a file whose section alone is larger than a pass (since 10.11.2026, card
-   t_89b7bb76; case: `deploy/helpers/cockpit-backup-guard.mjs`, diff ~90 KB):
+   t_89b7bb76; case: the former `deploy/helpers/cockpit-backup-guard.mjs`, diff ~90 KB):
    `splitAtHunks` cuts it at its hunk boundaries (`@@`) into parts that each
    fit a pass, every part with the file header (`diff --git`/`---`/`+++`) and
    a first line `[part k/n of <path>: hunks a–b of N; …]`; the parts go over
@@ -318,40 +318,9 @@ Flow of a Hermes change job whose plan contains `self.update <sha>` lines:
    who cannot judge a hunk without more says so (`UNVERIFIABLE` of what it saw
    is a stop, never a pass).
 
-   **Unchanged context of the backup bolt** (since 12.11.2026, card
-   t_7ea8785f; case: job 73ebb0fc, self-update b9372e1..0d0edf42, PR #83). Which
-   verbs of the backup helper are free under the bolt (G10) is decided in
-   `deploy/helpers/cockpit-backup-guard.mjs`, not in the helper. That diff added
-   `sources add-large` to `cockpit-borg-action` without touching the guard; the
-   reviewer saw only the helper and answered „UNVERIFIABLE (BEARS ON G10):
-   add-large bolt enforcement not verifiable from the material“ → incomplete,
-   although the bolt reads the verb correctly — a gap of the collection, not a
-   question for the operator. Decision: when a diff changes a helper whose verbs
-   the guard judges by name (`BACKUP_GUARD_CONTEXT` in `update-review.ts`:
-   `cockpit-borg-action`, `cockpit-borg-retention`) and leaves the guard itself
-   unchanged, the passes get a section „Unchanged context, not part of the diff“
-   with the guard's free forms for that helper (`sourcesFree`,
-   `HELPER_FREE_FOLLOWER`, `helperVerbBolt`, the helper's `case` line of the
-   read-only forms; `retentionRoutine` for the retention helper). The text is cut
-   at these declarations from the running Cockpit's own copy of the guard — the
-   file the API policy already imports —, which is the guard's text at the
-   target commit exactly because the diff does not change it; there is no
-   second copy of the rules. A diff that changes the guard brings its own hunks
-   and gets no context. The section sits inside the data markers after the diff
-   excerpt, in the pass that holds the helper, else in any pass with room. It is
-   placed after every diff section, documentation included: it never takes their
-   room and never opens a pass of its own; context without room is recorded as
-   `coverage.contextLeftOut` and stops nothing (the reviewer may still answer
-   `UNVERIFIABLE`, which stays incomplete as before). The coverage records it
-   as `context`. An anchor the guard no longer has is named in the section
-   („not found in the installed copy“), and a unit test pins every anchor to
-   exactly one line of the current guard. The instructions tell the reviewer to
-   judge the diff, not the context. No guarantee, no bolt rule and no stop
-   changes. Way back: revert this change (`update-review.ts`,
-   `update-review-prompt.ts`, the tests and this paragraph) and self-update to
-   the previous commit; the review then sees only the diff again. Note: the
-   collection that runs is the installed one — the first self-update that
-   carries this change is still reviewed without the context.
+   **Unchanged context of the backup bolt** (12.11.2026, card t_7ea8785f) is
+   removed together with the bolt (13.11.2026, card t_abe2651b): the review sees
+   the diff only.
 
    The
    passes are asked one after the other (`runUpdateReviewPasses`); a failed
@@ -465,7 +434,7 @@ review and narrowed it instead (10.11.2026, variant C):
 marker is no second principal, it carries only light findings. A finding stays
 the operator's stop (`blocked_user_approval`) despite a verified proof when it
 is `high`, names G1, G2, G7 or G10 anywhere in its `GUARANTEE` line (approval,
-lock, self-update path, backup bolt — the guarantees a self-posted marker could
+lock, self-update path, backups and risk bolt — the guarantees a self-posted marker could
 be used to get past), is an `INJECTION`, or has a severity that does not start
 with `medium` or `low` (fail closed). The verified proof is still recorded
 (`second review verified for <sha>`, then `second review does not lift the stop:
@@ -519,7 +488,7 @@ cases (sudoers wildcard, removed broker signature check, approval route for the
 bearer token, a comment instructing the reviewer), plus the general door: a
 benign change to the host-run step environment (plan text still runs as root
 through `bash -c` — must come back `approve`) and three harmful ones (a passed
-doorkeeper opens the backup bolt → G10, an oversized plan cut instead of
+doorkeeper opens the risk bolt → G10, an oversized plan cut instead of
 stopped → G9, the safety net skipped for runs declared `contained` → G5). Each case carries the expected
 verdict and an example answer. The unit tests check only the deterministic
 parts (prompt assembly, parser, policy). To evaluate a real model later, build
@@ -544,15 +513,15 @@ finding names a concrete way **past** one of its guards, or a weakening of it:
 
 | Guarantee | holds |
 | --- | --- |
-| G1 Approval | only the admin session approves; a bearer token never approves or sets `operatorApproved`/`gatePassed`. A `host.run` start on the doorkeeper's pass is intended. A job that needed the operator (evidenced finding, bolt hit, a declared risk other than `contained`, a door without doorkeeper) never runs without the operator's approval. Exception by decision (07.11.2026): a self-update review finding whose commits carry a second review the Cockpit verified itself on GitHub is a report, not a stop ([Second review](#review-before-install)); the marker can be posted by the agent's own token, so this exception rests on a public record, not on a second principal, and it holds only for light findings: a `high` finding, one on G1/G2/G7/G10 or an `INJECTION` stays a stop (severity cut, 10.11.2026). |
+| G1 Approval | only the admin session approves; a bearer token never approves or sets `operatorApproved`/`gatePassed`. A `host.run` start on the doorkeeper's pass is intended. A job that needed the operator (evidenced finding, a declared risk other than `contained`, a door without doorkeeper) never runs without the operator's approval. Exception by decision (07.11.2026): a self-update review finding whose commits carry a second review the Cockpit verified itself on GitHub is a report, not a stop ([Second review](#review-before-install)); the marker can be posted by the agent's own token, so this exception rests on a public record, not on a second principal, and it holds only for light findings: a `high` finding, one on G1/G2/G7/G10 or an `INJECTION` stays a stop (severity cut, 10.11.2026). |
 | G2 Lock | HMAC envelope (timing-safe, host secret), bound to plan and `manifestHash`, with expiry, capability and the job id (its form; the run directory is named by it); the root helper checks it at the start and on every resume; a blocked job's envelope never opens. |
 | G3 Doors | `host.run` is the one general door; every other action stays typed and narrow. No second general door, no way into `host.run` past G2, G9, G10. |
 | G4 Root helpers and sudoers | narrow, typed; the host-run helper keeps exactly `start` and `status <job>`. |
-| G5 Sandbox and safety net | the special doors' sandbox is not broader; `host.run` has none by design, but before every run with `mutates: true` the net of the instance role, otherwise no step runs: role `vps` a return path — the last successfully finished borg backup at most 30 h old (a later failed run does not take it away; without it only the two typed exceptions of `doc/setup/host-run.md` run, emergency shutdown and backup repair, recognized by fixed forms only) — and a machine snapshot; role `lab0` (the borg target, no hoster) a complete local host snapshot (`/etc`, packages, unit states) plus the data lock: the run unit mounts `/media` (borg repository), `/home`, `/mnt`, `/srv` read-only and the run confirms it in its mount table before the first step and after a reboot (Jochen, 17.10.2026: on Lab0 this replaces borg freshness and the machine snapshot); role `box` (Proxmox host, t_88f1e802) the same host snapshot plus a Proxmox snapshot of every guest (VM and container); a guest that cannot be snapshotted stops the run; no data lock (the guests' snapshots are their way back). The role comes only from the root-owned `instance-role.env` the deploy installs; missing, foreign-writable or unknown → no step runs (16.10.2026). Snapshot revert/delete stays the operator's decision (at the door through the doorkeeper's X4; on box deleting or rolling back a guest snapshot is a G10 bolt hit as well, 09.11.2026). |
+| G5 Sandbox and safety net | the special doors' sandbox is not broader; `host.run` has none by design, but before every run with `mutates: true` the net of the instance role, otherwise no step runs: role `vps` a return path — the last successfully finished borg backup at most 30 h old (a later failed run does not take it away; without it only the two typed exceptions of `doc/setup/host-run.md` run, emergency shutdown and backup repair, recognized by fixed forms only) — and a machine snapshot; role `lab0` (the borg target, no hoster) a complete local host snapshot (`/etc`, packages, unit states) plus the data lock: the run unit mounts `/media` (borg repository), `/home`, `/mnt`, `/srv` read-only and the run confirms it in its mount table before the first step and after a reboot (Jochen, 17.10.2026: on Lab0 this replaces borg freshness and the machine snapshot); role `box` (Proxmox host, t_88f1e802) the same host snapshot plus a Proxmox snapshot of every guest (VM and container); a guest that cannot be snapshotted stops the run; no data lock (the guests' snapshots are their way back). The role comes only from the root-owned `instance-role.env` the deploy installs; missing, foreign-writable or unknown → no step runs (16.10.2026). Snapshot revert/delete stays the operator's decision (at the door through the doorkeeper's X4, on box also for deleting or rolling back a guest snapshot). |
 | G6 Secrets | redaction of outputs, logs and prompts; the host-run log redacted line by line and 0600. The doorkeeper's unredacted material is intended. |
 | G7, G8 | unchanged (self-update path, dependencies). |
 | G9 Doorkeeper | isolated safety review; a pass only with complete material (a file larger than one pass is complete only when all its hunk parts were reviewed); incomplete or unreadable review and findings without evidence stop without a pass; its finding classes (secrets/egress, authority, exposure, loss of the way back, false read-only claim, hidden code, injection) do not narrow. Its own instructions are not writable by the agent identity it shares with the runner: the agent unit keeps the home with the opencode config, agent definitions, tools and global `AGENTS.md` read-only, and the broker refuses to start while project config lies above the workspace or extra config in the global config directory (card t_62992d58; honest limit: opencode's shared state and cache, a concurrent workspace and the broker socket stay writable for that identity, and a run can leave a process behind, `doc/services/execution-control-model.md`). |
-| G10 Backup bolt | deleting backups, changing their retention or switching them off only with `operatorApproved`, even on a pass; one deterministic source asked at three places (API policy, `runHostRun`, root helper incl. resume); no deleting form becomes free. Reading the borg credentials or the repository contents is a bolt hit as well (13.10.2026). Unreadable text is the doorkeeper's focus (`backup-focus`), not a bolt hit (operator, 10.10.2026) — except on Lab0, the repository host: there unreadable code, text piped or redirected into `ssh`, and deleting after a quoted separator are bolt hits, while visible non-backup routine (service restarts, status, logs) stays free (13.10.2026). The backup helper is the second exception: a line that names `cockpit-borg-action` (name, glob on its path, find filter) outside its free direct forms is a bolt hit even where its text is unreadable — `find -exec`, `xargs` (its `-I`/`-i` value counts as `{}`), interpreter code, text piped into a shell, interpreter, `source` or `at`, or a script the plan does not show such as `<(…)`, a subshell or brace group as the pipe target, a pipeline continued after `|`/`&&`/`||` at the end of a line, pipe output naming the helper written into a file that can run (redirect or `tee`), `eval` on such a line, and a `grep` filter matching its name over its directory (05. and 09.11.2026); since 09.11.2026 (card t_6735af09) this is a per-line allowlist instead of a list of sinks: on a logical line that names the helper outside its free forms every other simple command (also inside `$(…)`, `<(…)`, `>(…)`, groups and `if/while/for/case`) must be a pure filter or data sink (`grep`, `jq`, `head`, `tail`, `wc`, `sort`, `cut`, `tr`, `awk` without `system`/pipes, `sed` without `e`/`w`/`-i`, reading commands, `echo`, `tee` or redirects into data files only), anything else is a hit; the same holds for the commands piped behind a listing of its directory (`ls /usr/local/sbin`, `find` over an ancestor without another name filter, `compgen -c`, `locate`); `|&` is a pipe; a variable whose value names the helper names it on every line that uses it (`x="$(ls …)"` then `eval "$x"`); since card t_d16c58d1 (09.11.2026, second review t_20ae3cda) the scope is the whole plan, not the line: if any line of the steps or checks names the helper outside its free forms (free are only the direct form and `test`/`[`/`[[` on it; `echo` of its name, `ls`/`stat`/`sha256sum` on it, a glob, a find filter, a listing of its directory or a variable holding its name are not), every line of the plan must be filters and data sinks, and no line may rebind a name or value (function definitions, `alias`, `hash`, `enable`, PATH/BASH_ENV/ENV, PS0–PS4 and other code-selecting variables, `${!…}`, `declare -n`, `export` of a value naming the helper) — so a data file, FIFO or `tail -f` that another line feeds into a shell, and a filter name rebound on an earlier line, are hits; command substitutions inside `$((…))`, `((…))` and array subscripts are read as commands; since card t_2e391eba (09.11.2026, second review t_f1b3ea8c) no line of such a plan may let bash evaluate a value as code either: `${…@P}`, assigning PS0–PS4 or the integer variables RANDOM/SRANDOM/OPTIND/HISTCMD, `declare -i`, and arithmetic (`$((…))`, `((…))`, `$[…]`, `let`, `for ((…))`, `[[ … -eq … ]]`, `${s:off:len}`, array indices) with anything but numbers and operators, also in an unquoted here-document; `test`/`[` with `-eq` do not evaluate and stay free; `sed` is parsed positively (any delimiter; only `s`/`y` with flags `g p i I m M <n>`, addresses, print/delete/quit/buffer/branch/text commands). The price: a plan that names the helper as text and also changes something else goes to the operator. Without the helper's name these stay the doorkeeper's focus; a name assembled from parts, decoded or read from a file is not seen (honest limit, `doc/setup/borg-maintenance.md`). Risk bolt under the same guarantee (incident 23.10.2026): a manifest declaring `exposure`, `data_loss` or `identity_or_secret` starts only with `operatorApproved`, even on a pass, asked at the same three places (`hostRunRisksNeedingApproval`); an unknown risk class makes the manifest invalid. Proxmox (role box, 09.11.2026, card t_5f5c89fe, `cockpit-backup-guard/v6` since card t_a5defddd; the bolt itself stays role-independent): deleting, moving or truncating vzdump backups (`/var/lib/vz/dump`, `/mnt/pve/<storage>/dump`, `vzdump-*`, `*.vma*`), `pvesm free` on a backup volume, `pvesm prune-backups` (except `--dry-run`), `vzdump --remove`, changing `prune-backups`/`maxfiles` or writing `/etc/vzdump.conf`, `/etc/pve/storage.cfg`, `/etc/pve/jobs.cfg`, changing or deleting a backup job, and `qm\|pct delsnapshot\|rollback\|destroy` including their pvesh/API forms are bolt hits. The guest-snapshot rotation of `cockpit-host-snapshot` stays free (its own `delsnapshot` runs inside the helper; a plan's `cockpit-host-snapshot create` is free like `cockpit-vps-snapshot create`); a plan's own `delsnapshot` is gated even for the name form `cockpit-run-*`. Since card t_a5defddd (second review t_eebb73c0) the bolt reads Proxmox like Proxmox: the subcommand of `qm`, `pct`, `pvesm`, `pvesh` is resolved by unique prefix as pve-common's CLIHandler does (`qm delsnap`, `pct destr`, `pvesh del`, `pvesm fre`), an ambiguous prefix that can reach a gated verb is a hit (fail-closed), and only an exact or uniquely resolved read verb is a free read; every `-`/`--` prefix of `remove`, `maxfiles` and `prune-backups` counts (Getopt::Long auto_abbrev); `curl -XDELETE` with the value attached (also for the Contabo `…/snapshots`) and `wget --meth=`; `qmrestore`/`pct restore --force` over an existing guest; the storage layer (`lvremove` of guest volumes/`snap_…`, `lvconvert --merge`, `zfs destroy|rollback`, `qemu-img snapshot -d|-a`); truncating by redirect (`: > f`, `> f`) where only the backup tool writes (borg repository, `/var/opt/gitlab/backups`, vzdump files and dump directories — in `/var/backups` it stays the doorkeeper's focus, a plan writes its own return path there); since card t_cef59949 (`cockpit-backup-guard/v7`) also `cp`, `install`, `ln -f`, `rsync` and `tee` without `-a` onto a file in those places (overwriting: the bolt cannot see whether the file exists) — a directory as target (a new backup), a vzdump name elsewhere (a copy away from the backup) and `/var/backups` stay the doorkeeper's focus; `$'…'` without a backslash reads like `'…'`. A verb produced at run time (`qm ${V:-delsnapshot}`, `qm $(…)`) stays the doorkeeper's focus like borg. |
+| G10 Backups and declared risk | deleting, pruning or compacting backups, shortening their retention or switching them off (borg/borgmatic, `borgmatic.timer`, Lab0's retention service below its minimum or bypassed, vzdump backups and guest snapshots on box) only with `operatorApproved` (Grundsatz 4). Since 13.11.2026 (card t_abe2651b, operator decision 08./13.11.2026: text filters are out) the doorkeeper recognizes it on the whole plan: its instructions make every such run an X4 finding, and a finding goes to the operator. Structurally the VPS's borg key is append-only on Lab0, Lab0 and box take a host snapshot before every mutating run, and the retention service keeps its fixed bounds (`cockpit-borg-retention-rules.mjs`). A finding: weakening the X4 rule in the doorkeeper's instructions, a doorkeeper finding that runs without the operator, the VPS key beyond append-only, the snapshot before a mutating run removed on Lab0 or box, the retention bounds widened. The former deterministic backup bolt (`cockpit-backup-guard.mjs`) is removed. Risk bolt under the same guarantee (incident 23.10.2026): a manifest declaring `exposure`, `data_loss` or `identity_or_secret` starts only with `operatorApproved`, even on a pass, asked at three places (`hostRunRisksNeedingApproval` in the policy, `runHostRun`, the root helper incl. resume); an unknown risk class makes the manifest invalid. |
 
 The runner marks changes to the door's files as focus area `host-door`
 (G2/G5/G6/G9/G10). Like every focus area it only steers the reviewer.
@@ -622,8 +591,7 @@ root helpers the executor and the capability sandbox dispatch to (capability
 action, hermes-skill, email-archive deploy and auto-deploy, the three Nextcloud
 PHP helpers, service, disk, exact-file-replace, Nextcloud app/context,
 dienste-update, self-update action and runner, VPS snapshot, WordPress update,
-GitLab rootless-DinD policy, the host door with its backup bolt and the retention
-bounds the bolt imports),
+GitLab rootless-DinD policy, the host door),
 the sudoers file (checked with `visudo -cf` before and `visudo -c` after), the
 four service units and the API's broker drop-in, the email-archive auto-deploy
 service/timer, the
