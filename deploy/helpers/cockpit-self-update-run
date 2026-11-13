@@ -418,8 +418,16 @@ def full_diff(base, sha, phase):
     return result.stdout
 
 
+# --unified implies a patch: next to --numstat -z git would append the whole
+# patch text, and any tab in a changed line then looks like a numstat record.
+# The listing modes need no patch options, so they run without them.
+PATCH_OPTIONS = ("--unified=3", "--inter-hunk-context=0")
+
+
 def diff_listing(base, sha, mode):
-    result = run_bytes(diff_args(mode, "-z", base, sha, "--"), "diff")
+    argv = [GIT, "-C", REPO_DIR, "-c", "core.quotePath=true", "diff",
+            *(option for option in DIFF_OPTIONS if option not in PATCH_OPTIONS), mode, "-z", base, sha, "--"]
+    result = run_bytes(argv, "diff")
     if result.returncode != 0:
         raise Failure(67, "diff", "git diff %s failed" % mode)
     return [item.decode("utf-8", "replace") for item in result.stdout.split(b"\0")]
