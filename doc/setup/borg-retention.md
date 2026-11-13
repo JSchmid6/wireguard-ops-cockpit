@@ -80,8 +80,8 @@ Bestand im Cockpit anzusehen.
 
 ## Feste Grenzen
 
-Die Grenzen stehen in `deploy/helpers/cockpit-borg-retention-rules.mjs`; API, Helfer,
-Dienstlauf und Backup-Riegel lesen dieselbe Datei.
+Die Grenzen stehen in `deploy/helpers/cockpit-borg-retention-rules.mjs`; API, Helfer
+und Dienstlauf lesen dieselbe Datei.
 
 | Feld | Boden (nie darunter) | Untergrenze (darunter nur mit Freigabe) | Obergrenze (nie darüber) | Vorgabe |
 | --- | --- | --- | --- | --- |
@@ -103,8 +103,8 @@ Aufbewahrung des VPS (`keep_daily 3`, `keep_weekly 2`).
 | Einstellung unter der Untergrenze | Cockpit mit Bestätigung und Grund, Helfer `set … --freigabe` | **Jochen**, Audit `borg.retention.changed_with_approval` |
 | Fortsetzen nach einer Anomalie | Cockpit „Approve and resume“, Helfer `freigeben <id>` | **Jochen**, Audit `borg.retention.resumed` |
 | über der Obergrenze, unter dem Boden, Uhrzeit außerhalb | — | nie |
-| `borg delete`, `recreate`, prune mit eigenen Werten, compact von Hand | host-run | **Jochen** (Backup-Riegel) |
-| Dienst abschalten oder umgehen (Timer stoppen/abschalten/maskieren, Units, Einstellung, Zustand oder Code ändern) | host-run | **Jochen** (Backup-Riegel) |
+| `borg delete`, `recreate`, prune mit eigenen Werten, compact von Hand | host-run | **Jochen** (X4-Befund des Türstehers) |
+| Dienst abschalten oder umgehen (Timer stoppen/abschalten/maskieren, Units, Einstellung, Zustand oder Code ändern) | host-run | **Jochen** (X4-Befund des Türstehers) |
 
 „Freigabe“ heißt im Cockpit: eine **Admin-Sitzung** (Jochen) mit `approval: { confirmed:
 true, reason: "…" }` (Grund mindestens 10 Zeichen). Ein Automation-Token (James) kann nicht
@@ -112,14 +112,15 @@ freigeben, auch nicht sich selbst (403, Audit `borg.retention.approval_refused`)
 Anfrage unter der Untergrenze ohne Freigabe endet mit 409 (`needsApproval`, Audit
 `borg.retention.approval_needed`).
 
-**Backup-Riegel** (`deploy/helpers/cockpit-backup-guard.mjs`, `doc/setup/host-run.md` 2a):
-frei sind nur `/usr/local/sbin/cockpit-borg-retention status|run`, `set D W M HH:MM` innerhalb
-der Grenzen und `systemctl start cockpit-borg-retention.service`. Alles andere, was den Dienst
-oder seine Dateien berührt, ist ein Treffer und wartet auf Jochen — auch Drop-ins, die systemd
-ohne „borg“ im Namen auf seine Units anwendet (`cockpit-.service.d`, `cockpit-.timer.d`,
-`service.d`, `timer.d` in `/etc`, `/run` und `/usr/lib/systemd/system`), systemd-Generatoren
-(`system-generators`, `/run/systemd/generator*`) und `system.attached`. Der Helfer über
-`node …mjs` statt über seinen sbin-Namen ist ebenfalls ein Treffer.
+**Im host-run** (`doc/setup/host-run.md` 2a): frei sind `/usr/local/sbin/cockpit-borg-retention
+status|run`, `set D W M HH:MM` innerhalb der Grenzen und `systemctl start
+cockpit-borg-retention.service`. Alles andere, was den Dienst oder seine Dateien berührt (auch
+Drop-ins, Generatoren, der Helfer über `node …mjs`, `set … --freigabe`, `freigeben`), ist nach der
+Anweisung des Türstehers ein X4-Befund und wartet auf Jochen. Bis 13.11.2026 prüfte das zusätzlich
+der Textmuster-Riegel `cockpit-backup-guard.mjs`; er ist ausgebaut (Karte t_abe2651b). Strukturell
+bleibt: der Helfer nimmt nie etwas über der Obergrenze oder unter dem Boden an (mindestens ein
+tägliches Archiv) und hält bei fremden Löschungen an. `--freigabe` ist nur eine Markierung, kein Ja —
+das Ja holt der Türsteher-Befund ein.
 
 Die Prüf-Haken des Helfers (`BORG_RETENTION_*`, nur für die Tests) wirken nur außerhalb des
 installierten Orts: die Kopie unter `/usr/local/lib/wireguard-ops-cockpit/` liest sie nie,
@@ -177,9 +178,7 @@ systemctl enable --now cockpit-borg-retention.timer
 ```
 
 Die sudoers-Zeile kommt mit `deploy/sudoers/cockpit-executor`, das Schritt 8 ohnehin
-installiert. Auf dem VPS läuft der Dienst nicht; dort installiert
-`deploy/vps/vps-cockpit-deploy.sh` nur die Grenzen-Datei, weil der Backup-Riegel sie
-importiert. Das Cockpit-Panel sagt auf einem Host ohne Dienst „not available on this host“.
+installiert. Auf dem VPS läuft der Dienst nicht und wird nichts davon installiert. Das Cockpit-Panel sagt auf einem Host ohne Dienst „not available on this host“.
 
 Einmalig von Hand (nicht Teil des Deploys): die Passphrase ablegen, z. B.
 `install -m 600 -o root -g root /dev/stdin /etc/cockpit-borg-retention/passphrase`, und mit
@@ -226,6 +225,5 @@ Einmalig von Hand (nicht Teil des Deploys): die Passphrase ablegen, z. B.
   Untergrenze/Obergrenze/Boden/Uhrzeit, Status-Bericht, Läufe außerhalb der Unit.
 - `apps/api/test/borg-retention-api.test.ts`: Routen, Freigabe nur aus Jochens Sitzung,
   Audit-Einträge, Bericht-Prüfung.
-- `apps/api/test/backup-guard.test.ts`: Routine des Diensts frei, alle Freigabe-Formen gesperrt.
 - `apps/executor-broker/test/index.test.mjs`: die fünf gepinnten Executor-Formen.
 - `apps/web/src/RetentionPanel.test.tsx`: Anzeige, Speichern, Freigabe-Dialog, Anomalie.

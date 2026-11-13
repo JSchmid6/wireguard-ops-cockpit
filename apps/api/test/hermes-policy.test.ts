@@ -28,10 +28,12 @@ describe("Hermes plan policy", () => {
     });
   });
 
-  it("requires operator approval at hard boundaries", () => {
-    expect(evaluatePlanPolicy(plan("green", "restore", "rm -rf /etc/example"), "passed")).toMatchObject({
-      allowed: false, zone: "red", status: "blocked_user_approval",
+  it("leaves the classification of a destructive command to the safety review and the typed contract", () => {
+    // No text-pattern boundary (card t_abe2651b): the safety verdict decides.
+    expect(evaluatePlanPolicy(plan("green", "restore", "rm -rf /etc/example"), "blocked")).toMatchObject({
+      allowed: false, status: "blocked_policy",
     });
+    expect(evaluatePlanPolicy(plan("green", "restore", "rm -rf /etc/example"), "passed")).toMatchObject({ allowed: true });
   });
 
   it("allows read-only evidence checks for public bind addresses", () => {

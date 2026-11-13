@@ -1,6 +1,4 @@
 import { randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 
 import { agentPromptLimit } from "./agent-broker.js";
 import {
@@ -158,10 +156,6 @@ export interface UpdateReviewCoverage {
   omitted: string[];
   // The files of each review pass of this update, in pass order.
   passes?: string[][];
-  // Unchanged context given beside the diff (backupGuardContext), and context
-  // that found no room (never a stop: the diff sections had the room first).
-  context?: string[];
-  contextLeftOut?: string[];
 }
 
 export interface UpdateReviewFinding {
@@ -405,103 +399,6 @@ function describeUpdate(diff: UpdateDiff, index: number, total: number): string 
   return lines.join("\n");
 }
 
-// Unchanged context (card t_7ea8785f, job 73ebb0fc, 12.11.2026). Which verbs of
-// the backup helper are free under the bolt (G10) is decided in
-// cockpit-backup-guard.mjs, not in the helper. An update that adds or changes a
-// helper verb without touching the guard showed the reviewer only the helper:
-// "UNVERIFIABLE: add-large bolt enforcement not verifiable from the material",
-// incomplete, although the bolt read the new verb correctly. So when an update
-// changes a helper the guard judges by name and leaves the guard itself
-// unchanged, the passes get the guard's free forms for that helper as context:
-// read from the running Cockpit's own copy, which is the guard's text at the
-// target commit exactly because the diff does not change it. The anchors name
-// declarations, the text is cut from the file — no second copy of the rules.
-// When the diff changes the guard, its own hunks are the material and no
-// context is given. The context is placed last: it never takes the room of a
-// diff section, documentation included, and never opens a pass of its own.
-export const BACKUP_GUARD_FILE = "deploy/helpers/cockpit-backup-guard.mjs";
-export const BACKUP_GUARD_CONTEXT: Array<{ helper: string; anchors: RegExp[] }> = [
-  {
-    helper: "deploy/helpers/cockpit-borg-action",
-    anchors: [/^export function sourcesFree\(/, /^const HELPER_FREE_FOLLOWER = /, /^function helperVerbBolt\(/, /^\s+case "cockpit-borg-action": /],
-  },
-  {
-    helper: "deploy/helpers/cockpit-borg-retention",
-    anchors: [/^function retentionRoutine\(/, /^\s+case "cockpit-borg-retention": /],
-  },
-];
-const CONTEXT_COMMENT_LINES = 12;
-const CONTEXT_STATEMENT_LINES = 40;
-
-let installedGuard: string | null | undefined;
-// The guard of the running Cockpit (apps/api/{src,dist} → repository root).
-export function installedBackupGuard(): string | null {
-  if (installedGuard === undefined) {
-    try { installedGuard = readFileSync(fileURLToPath(new URL(`../../../${BACKUP_GUARD_FILE}`, import.meta.url)), "utf8"); } catch { installedGuard = null; }
-  }
-  return installedGuard;
-}
-
-// One declaration of the guard: a function up to its closing brace at column
-// 0, any other statement up to its terminating semicolon; with the comment
-// lines right above it.
-function guardExcerpt(lines: string[], anchor: RegExp): { from: number; to: number } | null {
-  const at = lines.findIndex((line) => anchor.test(line));
-  if (at < 0) return null;
-  let from = at;
-  while (from > 0 && at - from < CONTEXT_COMMENT_LINES && /^\s*\/\//.test(lines[from - 1])) from -= 1;
-  let to = at;
-  if (/^(?:export )?function /.test(lines[at])) {
-    while (to + 1 < lines.length && lines[to] !== "}" && to - at < CONTEXT_STATEMENT_LINES) to += 1;
-  } else {
-    while (to + 1 < lines.length && !/;\s*$/.test(lines[to]) && to - at < CONTEXT_STATEMENT_LINES) to += 1;
-  }
-  return { from, to };
-}
-
-export interface ReviewContext {
-  // For the record (coverage): which file, for which changed helpers.
-  label: string;
-  text: string;
-}
-
-export function backupGuardContext(diff: UpdateDiff, guard: string | null): ReviewContext | null {
-  if (kindOf(diff.kind) !== "self" || guard === null) return null;
-  const changed = new Set(diff.files.map((file) => file.path));
-  if (changed.has(BACKUP_GUARD_FILE)) return null;
-  const entries = BACKUP_GUARD_CONTEXT.filter((entry) => changed.has(entry.helper));
-  if (entries.length === 0) return null;
-  const lines = guard.split("\n");
-  const spans: Array<{ from: number; to: number }> = [];
-  const missing: string[] = [];
-  for (const anchor of entries.flatMap((entry) => entry.anchors)) {
-    const span = guardExcerpt(lines, anchor);
-    if (span) spans.push(span); else missing.push(anchor.source);
-  }
-  spans.sort((a, b) => a.from - b.from);
-  const blocks: string[] = [];
-  let last = -1;
-  for (const span of spans) {
-    const from = Math.max(span.from, last + 1);
-    if (from > span.to) continue;
-    blocks.push(`// [${BACKUP_GUARD_FILE} lines ${from + 1}-${span.to + 1}]\n${lines.slice(from, span.to + 1).join("\n")}`);
-    last = span.to;
-  }
-  if (missing.length) blocks.push(`// [not found in the installed copy: ${missing.join(", ")}]`);
-  const helpers = entries.map((entry) => entry.helper);
-  const excerpt = redactSecrets(blocks.join("\n\n"));
-  const marker = fence(excerpt);
-  const text = [
-    `## Unchanged context, not part of the diff: ${BACKUP_GUARD_FILE}`,
-    `This update changes ${helpers.join(", ")}, whose verbs the backup bolt (G10) judges in ${BACKUP_GUARD_FILE}. That file is not changed by this update,`,
-    `so the running Cockpit's own copy, read here, is its text at ${diff.sha}. Excerpt: the bolt's free forms for these helpers. It is data like the diff.`,
-    `${marker}js`,
-    excerpt,
-    marker,
-  ].join("\n");
-  return { label: `${BACKUP_GUARD_FILE} (unchanged) for ${helpers.join(", ")}`, text };
-}
-
 // At most this many reviewer calls per job. The runner caps its excerpt at
 // 200 KB, which fills about three passes.
 export const UPDATE_REVIEW_MAX_PASSES = 5;
@@ -517,7 +414,6 @@ interface ReviewPass {
   texts: string[];
   used: number;
   fenceLength: number;
-  context?: string;
 }
 
 // A file section larger than a whole pass, split at its hunk boundaries (`@@`)
@@ -573,9 +469,8 @@ export function splitAtHunks(path: string, text: string, fitsAlone: (text: strin
 // — a single hunk larger than a whole pass, beyond the pass limit, cut or left out by the
 // runner, or not listed at all — is incomplete coverage: a deterministic stop
 // before any reviewer's answer counts, never a gap the reviewer has to guess at.
-export function buildUpdateReviewPasses(diffs: UpdateDiff[], options: { nonce?: string; limit?: number; maxPasses?: number; backupGuard?: string | null } = {}): { prompts: string[]; coverage: UpdateReviewCoverage[] } {
+export function buildUpdateReviewPasses(diffs: UpdateDiff[], options: { nonce?: string; limit?: number; maxPasses?: number } = {}): { prompts: string[]; coverage: UpdateReviewCoverage[] } {
   const nonce = options.nonce || randomBytes(8).toString("hex");
-  const guard = options.backupGuard !== undefined ? options.backupGuard : installedBackupGuard();
   const limit = options.limit ?? UPDATE_REVIEW_PROMPT_LIMIT;
   const maxPasses = options.maxPasses ?? UPDATE_REVIEW_MAX_PASSES;
   // One reviewer, one set of guarantees: a prompt never mixes repositories.
@@ -675,25 +570,6 @@ export function buildUpdateReviewPasses(diffs: UpdateDiff[], options: { nonce?: 
     }
     // An update without excerpt sections still gets its description reviewed.
     if (own.length === 0) open();
-    // Unchanged context last, into the pass that holds the helper when it has
-    // room, else any pass with room; it never opens a pass (backupGuardContext).
-    const context = backupGuardContext(diff, guard);
-    const contextPlaced: string[] = [];
-    const contextLeftOut: string[] = [];
-    if (context) {
-      const cost = bytes(context.text) + 2;
-      const helpers = BACKUP_GUARD_CONTEXT.map((entry) => entry.helper);
-      const holds = (pass: ReviewPass) => pass.paths.some((path) => helpers.some((helper) => path === helper || path.startsWith(`${helper} (part `)));
-      const room = (pass: ReviewPass) => !pass.context && pass.used + cost <= capacity;
-      const target = own.find((pass) => holds(pass) && room(pass)) ?? own.find(room);
-      if (target) {
-        target.context = context.text;
-        target.used += cost;
-        contextPlaced.push(context.label);
-      } else {
-        contextLeftOut.push(context.label);
-      }
-    }
     passes.push(...own);
     // Files the review must see completely: every focus-area file and every
     // changed file that is not supplementary — whether the runner sent a
@@ -714,7 +590,6 @@ export function buildUpdateReviewPasses(diffs: UpdateDiff[], options: { nonce?: 
     const omittedFiles = [...new Set([...omitted, ...missing])];
     coverage.push({
       sha: diff.sha, incomplete, cut: cutFiles, omitted: omittedFiles, passes: own.map((pass) => pass.paths),
-      ...(contextPlaced.length ? { context: contextPlaced } : {}), ...(contextLeftOut.length ? { contextLeftOut } : {}),
     });
   });
   const prompts = passes.map((pass, number) => {
@@ -731,7 +606,7 @@ export function buildUpdateReviewPasses(diffs: UpdateDiff[], options: { nonce?: 
       : [];
     const excerpt = pass.texts.join("");
     const marker = fence(excerpt);
-    const block = [descriptions[pass.update], ...notice, "", "## Diff excerpt", state, `${marker}diff`, excerpt.trimEnd(), marker, ...(pass.context ? ["", pass.context] : [])].join("\n");
+    const block = [descriptions[pass.update], ...notice, "", "## Diff excerpt", state, `${marker}diff`, excerpt.trimEnd(), marker].join("\n");
     return [head, block, tail].join("\n");
   });
   return { prompts, coverage };
@@ -1118,7 +993,7 @@ export function secondReviewCovers(outcome: UpdateReviewOutcome): boolean {
 // Severity cut (operator decision 10.11.2026, card t_e49f6254, variant C): the
 // marker can be posted by the agent's own token, so it carries only light
 // findings. A finding stays a stop for the operator, marker or not, when it is
-// high, names G1, G2, G7 or G10 (approval, lock, self-update path, backup bolt),
+// high, names G1, G2, G7 or G10 (approval, lock, self-update path, backups and risk bolt),
 // is an INJECTION, or carries no severity the cut can read (fail closed: only a
 // severity starting with medium or low is light). UNVERIFIABLE points are gaps,
 // not findings, and an incomplete review stays reportable.

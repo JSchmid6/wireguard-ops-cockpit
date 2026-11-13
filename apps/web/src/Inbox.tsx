@@ -13,7 +13,7 @@ import { request } from "./lib";
  */
 
 interface Finding {
-  source: "doorkeeper" | "update-review" | "backup-bolt";
+  source: "doorkeeper" | "update-review" | "retention";
   title: string;
   guarantee: string;
   location: string;
@@ -23,7 +23,7 @@ interface Finding {
 
 export interface InboxCard {
   id: string;
-  kind: "hermes-change" | "backup-bolt" | "approval" | "retention-anomaly";
+  kind: "hermes-change" | "approval" | "retention-anomaly";
   title: string;
   reason: string;
   findings: Finding[];
@@ -51,7 +51,6 @@ interface InboxView {
 
 const KIND_LABELS: Record<InboxCard["kind"], string> = {
   "hermes-change": "Änderung von James",
-  "backup-bolt": "Backup-Riegel",
   approval: "Freigabe",
   "retention-anomaly": "Aufräum-Dienst",
 };
@@ -59,7 +58,7 @@ const KIND_LABELS: Record<InboxCard["kind"], string> = {
 const SOURCE_LABELS: Record<Finding["source"], string> = {
   doorkeeper: "Türsteher",
   "update-review": "Update-Prüfer",
-  "backup-bolt": "Backup-Riegel",
+  retention: "Aufräum-Dienst",
 };
 
 const POLL_MS = 30_000;

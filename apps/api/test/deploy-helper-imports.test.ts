@@ -78,7 +78,7 @@ describe.each([
 
   it("findet die Tür im Deploy (Parser greift)", () => {
     expect(installed.get("cockpit-host-run.mjs")).toBe("deploy/helpers/cockpit-host-run");
-    expect(installed.get("cockpit-backup-guard.mjs")).toBe("deploy/helpers/cockpit-backup-guard.mjs");
+    expect(installed.get("cockpit-state-steps.mjs")).toBe("deploy/helpers/cockpit-state-steps.mjs");
   });
 
   it("jeder relative Import liegt als dieselbe Quelle in LIB", () => {

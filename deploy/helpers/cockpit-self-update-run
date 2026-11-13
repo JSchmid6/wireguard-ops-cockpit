@@ -127,11 +127,10 @@ AUTH_PATH_RE = re.compile(r"auth|token|secret|credential|password", re.I)
 CI_PATH_RE = re.compile(r"^(?:\.github/|\.gitlab/|\.gitlab-ci\.yml$)")
 TEST_PATH_RE = re.compile(r"(?:^|/)tests?/|\.(?:test|spec)\.[A-Za-z0-9]+$")
 # The general door (doc/setup/host-run.md): lock check in the root helper,
-# doorkeeper, backup bolt and its bounds, safety net, resume after a reboot.
+# doorkeeper, risk bolt, retention bounds, safety net, resume after a reboot.
 HOST_DOOR_FILES = (
     "apps/api/src/host-run.ts",
     "deploy/helpers/cockpit-host-run",
-    "deploy/helpers/cockpit-backup-guard.mjs",
     "deploy/helpers/cockpit-borg-retention-rules.mjs",
     "deploy/helpers/cockpit-state-steps.mjs",
     "deploy/systemd/wireguard-ops-cockpit-host-run-resume.service",
@@ -155,7 +154,7 @@ FILE_AREAS = (
          # the unit whose write boundary keeps it out of a run's reach.
          "apps/api/src/safety-review.ts", "deploy/config/opencode-agent.jsonc",
          "deploy/systemd/wireguard-ops-cockpit-agent.service")),
-    ("host-door", ("G2", "G5", "G6", "G9", "G10"), "the general door host.run: lock check, doorkeeper, backup bolt, safety net, log redaction",
+    ("host-door", ("G2", "G5", "G6", "G9", "G10"), "the general door host.run: lock check, doorkeeper, risk bolt, safety net, log redaction",
      lambda path: path in HOST_DOOR_FILES),
     ("capability-sandbox", ("G5",), "dynamic capability sandbox and protected paths",
      lambda path: path in ("deploy/helpers/cockpit-capability-action", "apps/api/src/capability-manifest.ts")),

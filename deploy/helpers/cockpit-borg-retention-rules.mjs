@@ -3,14 +3,14 @@
 //
 // Jochen, 02.10.2026: „Wir deployen fürs Aufräumen einen Dienst, und der kann in
 // bestimmten Bereichen eingestellt werden.“ Diese Datei ist die eine Quelle der
-// Bereiche. Drei Stellen fragen sie:
+// Bereiche. Zwei Stellen fragen sie:
 //
 //   * die Cockpit-API (apps/api/src/borg-retention.ts), bevor sie eine Änderung
 //     an den Helfer gibt,
 //   * der Root-Helfer cockpit-borg-retention (set) und der Dienstlauf selbst,
-//     bevor sie eine Einstellung schreiben oder nach ihr löschen,
-//   * der Backup-Riegel (cockpit-backup-guard.mjs): ein `set` innerhalb der
-//     Grenzen ist im host-run frei, alles darunter braucht Jochens Freigabe.
+//     bevor sie eine Einstellung schreiben oder nach ihr löschen.
+//   Im host-run beurteilt der Türsteher einen `set` am Plan (X4 unter dem
+//   Minimum), kein Textmuster (Karte t_abe2651b).
 //
 // Mehr behalten geht immer, bis zur Obergrenze (max). Weniger als die
 // Untergrenze (min) nur mit Freigabe, und nie weniger als der Boden (floor):

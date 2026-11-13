@@ -43,7 +43,6 @@ const hostRunOutput = {
       { title: "borg repair without the operator", class: "X4", where: "S3:L1", code: "cockpit-borg-action repair", path: "a repair can drop archives", severity: "high", evidenced: true },
       { title: "unproven guess", class: "X5", where: "nowhere", code: "", path: "", severity: "low", evidenced: false },
     ],
-    backupGuard: [{ kind: "repair", where: "S3:L1", reason: "borg repair can delete archives", code: "cockpit-borg-action repair" }],
   } },
   updateReview: { findings: [{ title: "Doorkeeper approves root", guarantee: "G1", file: "apps/api/src/host-run.ts:461", code: "allowed: true", reason: "no operator in the loop", severity: "high", quoteFound: true }] },
 };
@@ -57,22 +56,21 @@ describe("inbox cards", () => {
     expect(cardLink("job-1", "https://cockpit.example/")).toBe("https://cockpit.example/#karte-job-1");
   });
 
-  it("shows only evidenced doorkeeper findings, the backup bolt and the update reviewer", () => {
+  it("shows only evidenced doorkeeper findings and the update reviewer", () => {
     const findings = jobFindings(hostRunOutput);
     expect(findings.map((finding) => [finding.source, finding.guarantee, finding.location])).toEqual([
       ["doorkeeper", "X4", "S3:L1"],
-      ["backup-bolt", "repair", "S3:L1"],
       ["update-review", "G1", "apps/api/src/host-run.ts:461"],
     ]);
     expect(findings[0].detail).toContain("a repair can drop archives");
-    expect(findings[2].detail).toContain("no operator in the loop");
+    expect(findings[1].detail).toContain("no operator in the loop");
     expect(jobFindings({})).toEqual([]);
   });
 
   it("turns a blocked Hermes job into a card with countdown data", () => {
     const card = hermesJobCard(job(hostRunOutput), NOW, null);
     expect(card).toMatchObject({
-      id: "job-job-1", kind: "backup-bolt", jobId: "job-1",
+      id: "job-job-1", kind: "hermes-change", jobId: "job-1",
       title: "Selbstupdate auf PR #25 einspielen.",
       reason: "The doorkeeper found 1 evidenced finding(s): S3:L1 borg repair.",
       expiresAt: "2026-10-02T12:20:00.000Z", expired: false, link: "/#karte-job-job-1",
@@ -173,8 +171,8 @@ describe("GET /api/inbox", () => {
     expect(body.cards.map((card: { jobId: string }) => card.jobId).slice(0, 2)).toEqual([foreign.id, fresh.id]);
     expect(body.cards.map((card: { jobId: string }) => card.jobId).slice(2).sort()).toEqual([stale.id, foreignStale.id].sort());
     const card = body.cards.find((item: { jobId: string }) => item.jobId === fresh.id);
-    expect(card).toMatchObject({ kind: "backup-bolt", expired: false, link: `https://cockpit.example/#karte-job-${fresh.id}` });
-    expect(card.findings).toHaveLength(3);
+    expect(card).toMatchObject({ kind: "hermes-change", expired: false, link: `https://cockpit.example/#karte-job-${fresh.id}` });
+    expect(card.findings).toHaveLength(2);
     expect(body.cards.at(-1).expired).toBe(true);
     expect(body.status).toHaveProperty("lastRuns");
     expect(body.status).toHaveProperty("backup");

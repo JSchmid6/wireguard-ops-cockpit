@@ -4,14 +4,14 @@
 // gespeichert hat, und bauen daraus die Karte für die Startseite. Entschieden
 // wird weiter über die bestehenden Wege (POST /api/hermes/jobs/:id/approval,
 // POST /api/approvals/:id/decision, POST /api/borg/retention/resume); die
-// Karten ändern an Schloss, Türsteher und Riegel nichts.
+// Karten ändern an Schloss und Türsteher nichts.
 import type { ApprovalRecord, JobRecord } from "@wireguard-ops-cockpit/domain";
 
-export type InboxKind = "hermes-change" | "backup-bolt" | "approval" | "retention-anomaly";
+export type InboxKind = "hermes-change" | "approval" | "retention-anomaly";
 
 export interface InboxFinding {
-  // Woher der Befund stammt: Türsteher (host-run), Update-Prüfer, Backup-Riegel.
-  source: "doorkeeper" | "update-review" | "backup-bolt";
+  // Woher der Befund stammt: Türsteher (host-run), Update-Prüfer, Aufräum-Dienst auf Lab0.
+  source: "doorkeeper" | "update-review" | "retention";
   title: string;
   // Garantie oder Klasse, gegen die der Befund steht (G1, X4, prune, ...).
   guarantee: string;
@@ -83,16 +83,6 @@ export function jobFindings(output: Record<string, unknown>): InboxFinding[] {
       detail: clip([str(finding.path), str(finding.code) ? `Code:\n${str(finding.code)}` : ""].filter(Boolean).join("\n\n"), 4000),
     });
   }
-  for (const hit of list(safetyDetails.backupGuard)) {
-    findings.push({
-      source: "backup-bolt",
-      title: clip(str(hit.reason) || "Backup-Riegel", 200),
-      guarantee: clip(str(hit.kind), 40),
-      location: clip(str(hit.where), 60),
-      severity: "",
-      detail: clip(str(hit.code) ? `Code:\n${str(hit.code)}` : "", 1000),
-    });
-  }
   for (const finding of list(record(output.updateReview).findings)) {
     findings.push({
       source: "update-review",
@@ -126,7 +116,7 @@ export function hermesJobCard(job: JobRecord, now: number, webUrl: string | null
   const title = oneSentence(str(explanation.intent) || "Änderung von James");
   return {
     id,
-    kind: findings.some((finding) => finding.source === "backup-bolt") ? "backup-bolt" : "hermes-change",
+    kind: "hermes-change",
     title,
     ...fullIntent(str(explanation.intent), title),
     reason: clip(str(policy.reason) || str(explanation.reason) || "Kein Grund gespeichert.", 1200),
@@ -179,7 +169,7 @@ export function retentionAnomalyCard(anomaly: RetentionAnomalyInput, now: number
     title: `Der Aufräum-Dienst auf Lab0 ist angehalten: ${anomaly.count} Archiv(e) fehlen, die er nicht selbst entfernt hat.`,
     reason: "Bis zu deiner Freigabe räumt er nicht weiter auf und verdichtet nicht (compact). Prüfe zuerst, wer die Archive entfernt hat.",
     findings: names.length ? [{
-      source: "backup-bolt",
+      source: "retention",
       title: `${anomaly.count} fehlende(s) Archiv(e)${anomaly.phase ? ` (${anomaly.phase})` : ""}`,
       guarantee: "Anomalie",
       location: "Lab0 borg-Repo",

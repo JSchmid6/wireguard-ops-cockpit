@@ -31,6 +31,10 @@ ProtectHome=true
 StateDirectory=wireguard-ops-agent/sessions wireguard-ops-agent/.local/share/opencode wireguard-ops-agent/.local/state/opencode wireguard-ops-agent/.cache/opencode
 StateDirectoryMode=0700
 ReadWritePaths=/run/cockpit-agent
+# The Cockpit's own secrets (execution envelope, hoster API) are out of every
+# role's reach by structure, not by a text filter on the plan (card t_abe2651b).
+# systemd reads EnvironmentFile= above before it builds this namespace.
+InaccessiblePaths=-/etc/wireguard-ops-cockpit
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 [Install]

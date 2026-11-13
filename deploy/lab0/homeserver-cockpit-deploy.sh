@@ -734,17 +734,12 @@ for f in deploy/helpers/cockpit-self-update-snapshot deploy/lab0/homeserver-cock
 done
 
 # Die eine Tür (doc/setup/host-run.md), wie auf dem VPS (vps-cockpit-deploy.sh, Tabelle):
-# Root-Helfer, Backup-Riegel daneben und die Unit, die Läufe nach einem Neustart
-# fortsetzt. Der Riegel importiert die Grenzen-Datei aus dem Aufräum-Block unten —
-# beide liegen nach diesem Schritt im selben Verzeichnis (Claude, 02.10.2026).
+# Root-Helfer und die Unit, die Läufe nach einem Neustart fortsetzt.
 [ -f "$COCKPIT_DIR/deploy/helpers/cockpit-host-run" ] \
   || die "deploy/helpers/cockpit-host-run fehlt im Checkout ($REPO_COMMIT) — Skript mit REPO_COMMIT=<merge-sha> erneut ausführen."
 install -m 755 -o root -g root "$COCKPIT_DIR/deploy/helpers/cockpit-host-run" \
   /usr/local/lib/wireguard-ops-cockpit/cockpit-host-run.mjs
-install -m 644 -o root -g root "$COCKPIT_DIR/deploy/helpers/cockpit-backup-guard.mjs" \
-  /usr/local/lib/wireguard-ops-cockpit/cockpit-backup-guard.mjs
-# Der Riegel importiert die Grenzen-Datei des Aufräum-Dienstes — auf jeder Rolle, auch
-# ohne den Dienst (box), sonst bricht der Root-Helfer mit ERR_MODULE_NOT_FOUND ab.
+# Die festen Grenzen des Aufräum-Dienstes (cockpit-borg-retention.mjs importiert sie).
 install -m 644 -o root -g root "$COCKPIT_DIR/deploy/helpers/cockpit-borg-retention-rules.mjs" \
   /usr/local/lib/wireguard-ops-cockpit/cockpit-borg-retention-rules.mjs
 # Zustandsschritte nie mittendrin abbrechen: die eine Erkennung, die der Helfer
@@ -1029,12 +1024,12 @@ Rückbau (nur bei Bedarf, als root):
   systemctl disable --now wireguard-ops-cockpit-api wireguard-ops-cockpit-ttyd wireguard-ops-cockpit-agent wireguard-ops-cockpit-executor
   # Tür (doc/setup/host-run.md):
   #   systemctl disable wireguard-ops-cockpit-host-run-resume.service
-  #   rm -f /usr/local/lib/wireguard-ops-cockpit/cockpit-host-run.mjs /usr/local/lib/wireguard-ops-cockpit/cockpit-backup-guard.mjs \
+  #   rm -f /usr/local/lib/wireguard-ops-cockpit/cockpit-host-run.mjs \
   #         /usr/local/lib/wireguard-ops-cockpit/cockpit-state-steps.mjs \
   #         /usr/local/lib/wireguard-ops-cockpit/cockpit-host-snapshot /etc/wireguard-ops-cockpit/instance-role.env \
   #         /etc/systemd/system/wireguard-ops-cockpit-host-run-resume.service
   #   rm -rf /var/lib/wireguard-ops-cockpit-host-snapshots   # Host-Snapshots der Tür (Rückweg, nur nach Prüfung)
-  #   (cockpit-borg-retention-rules.mjs nimmt der Aufräum-Block unten mit — Riegel und Dienst teilen sie.)
+  #   (cockpit-borg-retention-rules.mjs nimmt der Aufräum-Block unten mit.)
   # Aufräum-Dienst (nur mit Jochens Freigabe abschalten — doc/setup/borg-retention.md):
   #   systemctl disable --now cockpit-borg-retention.timer
   #   rm -f /usr/local/sbin/cockpit-borg-retention /usr/local/lib/wireguard-ops-cockpit/cockpit-borg-retention*.mjs \
