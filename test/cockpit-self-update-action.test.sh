@@ -669,6 +669,9 @@ git -C "$WORK" rm -q test/example.test.sh
 echo 'fixture readme, second edition' > "$WORK/README.md"
 mkdir -p "$WORK/docs"
 python3 -c "print('\n'.join('line %06d of the large plain fixture document' % i for i in range(6000)))" > "$WORK/docs/big.txt"
+# A changed line with tabs ("a<TAB>b<TAB>c") must not be read as a numstat
+# record: --numstat is listed without patch options (regression, card t_9f90a14f).
+printf 'timestamp=x level=INFO\tmessage=loop\tstep=7\n' > "$WORK/docs/a-tabs.txt"
 git -C "$WORK" add -A && git -C "$WORK" commit -qm "C5 review fixture"
 git -C "$WORK" push -q origin main
 C5="$(git -C "$WORK" rev-parse main)"
