@@ -1371,3 +1371,59 @@ describe("hash-pinned scripts: heredoc bounds read as bash reads them (Befund t_
     expect(found(`bash <<-'X'\n\tcat > ${P} <<-'EOF'\n\techo hi\n\tEOF\n\tX\n${pin}\n${P}`)).toEqual([]);
   });
 });
+
+describe("hash-pinned scripts: tabs an outer <<- strips, << in arithmetic and ${…} (Befund t_6024cbc7)", () => {
+  const P = "/opt/x/run.sh";
+  const pin = `echo "${HASH}  ${P}" | sha256sum -c -`;
+  const body = `cat > ${P} <<'EOF'\necho hi\nEOF`;
+  const found = (run: string) => hiddenPinnedScripts(manifest([{ name: "s1", run }]) as never).map(({ path }) => path);
+
+  // X-A: bash strips the leading tabs of every line of a <<- body, also of the
+  // lines of a heredoc in it; <TAB>EOF ends the inner heredoc for the inner shell,
+  // and the lines after it run instead of being content.
+  for (const opener of ["bash <<-'X'", "cat <<-'X' | sudo bash", "sudo -u root bash <<-'X'"]) {
+    for (const inner of ["'EOF'", "EOF"]) {
+      for (const pre of ["", "set -euo pipefail\n"]) {
+        it(`X-A: a tab-indented delimiter ends the inner heredoc of a <<- body: ${opener} / <<${inner}${pre ? " / set -e" : ""}`, () => {
+          expect(found(`${opener}\n${pre}cat > ${P} <<${inner}\necho hi\n\tEOF\nprintf 'echo BOESE\\n' > ${P}\nexit 0\nEOF\nX\n${pin}\n${P}`)).toEqual([P]);
+        });
+      }
+    }
+  }
+
+  it("X-A: the lines of a <<- body are read without their tabs, in a nested body as well", () => {
+    expect(found(`bash <<-'X'\n\tcat > ${P} <<-'EOF'\n\techo hi\n\tEOF\n\tprintf 'echo BOESE\\n' > ${P}\nX\n${pin}\n${P}`)).toEqual([P]);
+    expect(found(`bash <<-'X'\nbash <<'Y'\ncat > ${P} <<'EOF'\necho hi\n\tEOF\nexit 0\nEOF\nY\nX\n${pin}\n${P}`)).toEqual([P]);
+    expect(found(`bash <<-'X'\nbash <<'Y'\n${body}\n\tY\nexit 0\nY\nX\n${pin}\n${P}`)).toEqual([P]);
+  });
+
+  // Hint: in ((…)), $((…)), $[…] and ${…} a << is a shift or text for bash; at top
+  // level : <<'Z' then swallows the write the tool takes for code.
+  const lines = [
+    "(( y = 1 << C ))",
+    "echo $(( 1 << C ))",
+    "y=$(( 1 << C ))",
+    "echo ${x:-<<C }",
+    "echo \"${x:-\"<<C \"}\"",
+    "[[ $(( 1 << C )) ]]",
+    "echo ${x/<<C /y}",
+    "echo $[ 1 << C ]",
+    "echo \"$(( 1 << C ))\"",
+    "echo $(( 1 \\\n<< C ))",
+  ];
+  for (const line of lines) {
+    it(`hint: a << in arithmetic or \${…} opens nothing: ${line.split("\n")[0]}`, () => {
+      expect(found(`${line}\n: <<'Z'\nC\n${body}\nZ\n${pin}\n${P}`)).toEqual([P]);
+    });
+  }
+
+  it("hint: a write whose target holds a << in ${…} shows nothing", () => {
+    expect(found(`cat > /tmp/a\${x:-<<C } <<'E'\nE\n: <<'Z'\nC\nE\n${body}\nZ\n${pin}\n${P}`)).toEqual([P]);
+  });
+
+  it("guard: <<- bodies with tabs, arithmetic and ${…} without << stay free", () => {
+    expect(found(`bash <<-'X'\n\tset -euo pipefail\n\tcat > ${P} <<-'EOF'\n\techo hi\n\tEOF\n\tX\n${pin}\n${P}`)).toEqual([]);
+    expect(found(`bash <<-'X'\n\tset -euo pipefail\n${body}\nX\n${pin}\n${P}`)).toEqual([]);
+    expect(found(`n=$(( 1 + 2 ))\n(( n++ )) || true\necho "\${n:-0} $[n]" >/dev/null\n${body}\n${pin}\n${P}`)).toEqual([]);
+  });
+});

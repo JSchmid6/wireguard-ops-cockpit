@@ -834,6 +834,10 @@ function shellScopeTrust(scopes: ShellScope[]): void {
 // or a comment, where bash opens nothing; whether a comment starts after the
 // line's beginning; whether the line ends inside a quote, so the next line goes
 // on with the string. $( … ) and backticks nest, also inside double quotes.
+// Hint of t_6024cbc7: in ((…)), $((…)), $[…] and ${…} a << is a shift or text
+// for bash; fail safe, a << anywhere inside them is no code, and a line that
+// ends inside one counts as ending inside a quote.
+const ARITHMETIC = new Set(["((", "[", "{"]);
 const STRICT_OPENER = /^<<-?[ \t]*(?:'[A-Za-z_][\w-]*'|"[A-Za-z_][\w-]*"|[A-Za-z_][\w-]*)(?=[\s;&|()<>]|$)/;
 
 function shellLex(text: string): { heredocs: Array<{ at: number; code: boolean }>; comment: boolean; quoted: boolean } {
@@ -845,7 +849,7 @@ function shellLex(text: string): { heredocs: Array<{ at: number; code: boolean }
     const top = stack[stack.length - 1];
     if (text.startsWith("<<", i) && text[i - 1] !== "<") {
       if (text[i + 2] === "<") { i += 2; continue; }
-      heredocs.push({ at: i, code: top === undefined || top === "(" || top === "`" });
+      heredocs.push({ at: i, code: (top === undefined || top === "(" || top === "`") && !stack.some((item) => ARITHMETIC.has(item)) });
       i += 1;
       continue;
     }
@@ -854,6 +858,9 @@ function shellLex(text: string): { heredocs: Array<{ at: number; code: boolean }
     if (top === "\"") {
       if (ch === "\\") i += 1;
       else if (ch === "\"") stack.pop();
+      else if (text.startsWith("$((", i)) { stack.push("(("); i += 2; }
+      else if (text.startsWith("$[", i)) { stack.push("["); i += 1; }
+      else if (text.startsWith("${", i)) { stack.push("{"); i += 1; }
       else if (text.startsWith("$(", i)) { stack.push("("); i += 1; }
       else if (ch === "`") stack.push("`");
       continue;
@@ -868,11 +875,16 @@ function shellLex(text: string): { heredocs: Array<{ at: number; code: boolean }
     if (ch === "'") stack.push("'");
     else if (text.startsWith("$'", i)) { stack.push("$'"); i += 1; }
     else if (ch === "\"") stack.push("\"");
+    else if (text.startsWith("((", i)) { stack.push("(("); i += 1; }
+    else if (text.startsWith("$[", i)) { stack.push("["); i += 1; }
+    else if (text.startsWith("${", i)) { stack.push("{"); i += 1; }
     else if (ch === "(") stack.push("(");
-    else if (ch === ")") { if (top === "(") stack.pop(); }
+    else if (ch === ")") { if (top === "(") stack.pop(); else if (top === "((" && text[i + 1] === ")") { stack.pop(); i += 1; } }
+    else if (ch === "]") { if (top === "[") stack.pop(); }
+    else if (ch === "}") { if (top === "{") stack.pop(); }
     else if (ch === "`") { if (top === "`") stack.pop(); else stack.push("`"); }
   }
-  return { heredocs, comment, quoted: stack.some((item) => item === "'" || item === "$'" || item === "\"") };
+  return { heredocs, comment, quoted: stack.some((item) => item === "'" || item === "$'" || item === "\"" || ARITHMETIC.has(item)) };
 }
 
 // Does the tool read this line's heredoc openers as bash does? Fail safe: every
@@ -924,9 +936,21 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
     // H1: a heredoc ends only at a line that is exactly its delimiter; <<- strips leading tabs only.
     const ends = (row: string | undefined, here: { delimiter: string; tabs: boolean } | undefined) => Boolean(here) && row !== undefined && (here!.tabs ? row.replace(/^\t+/, "") : row) === here!.delimiter;
     for (let index = 0; index < rows.length; index += 1) {
-      let line = rows[index];
+      // X-A (Zweitprüfung t_6024cbc7): bash strips the leading tabs of every line
+      // of a <<- body before the shell reading it sees the line, also the lines of
+      // a heredoc inside it. While a begun shell body with <<- is open, the tool
+      // reads each line as that shell gets it: content, code, bounds, continued lines.
+      const stripped = open.some((here) => here.started && here.shell && here.tabs);
+      const view = (row: string) => stripped ? row.replace(/^\t+/, "") : row;
+      let line = view(rows[index]);
       const where = `${prefix}:L${index + 1}`;
       const inner = open[open.length - 1];
+      // Fail safe on top: a tab prefix that, stripped, ends an open heredoc it
+      // would not end as written makes the rest of the step show nothing.
+      if (!blind && line !== rows[index] && open.some((here) => ends(line, here) && !ends(rows[index], here))) {
+        blind = true;
+        out.push({ where, text: line, body: true, heredoc: false, trusted: false, parts: [], blind: true });
+      }
       // W-B (Zweitprüfung t_ebbf1e40): bash ends a shell body at the first line
       // that is its delimiter, also inside a heredoc in the body; the tool's stack
       // would read on. Fail safe: the body and all in it, and the rest of the step.
@@ -948,11 +972,11 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
       }
       if (/^\s*#/.test(line)) continue;
       const blindBefore = blind;
-      while (/(?:^|[^\\])(?:\\\\)*\\$/.test(line) && index + 1 < rows.length && !ends(rows[index + 1], inner)) {
+      while (/(?:^|[^\\])(?:\\\\)*\\$/.test(line) && index + 1 < rows.length && !ends(view(rows[index + 1]), inner)) {
         // W-A: a backslash at the end of a comment continues nothing for bash.
         if (shellLex(line).comment) blind = true;
         index += 1;
-        line = `${line.slice(0, -1)} ${rows[index]}`;
+        line = `${line.slice(0, -1)} ${view(rows[index])}`;
       }
       // H2: every heredoc of the line; their bodies follow one after the other.
       const openers = [...line.matchAll(/(?<!<)<<(-?)\s*(['"]?)([A-Za-z_][\w-]*)\2/g)];
@@ -1001,10 +1025,10 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
       for (const [k, opener] of openers.entries()) {
         const here = { delimiter: opener[3], tabs: opener[1] === "-" };
         const quoted = Boolean(opener[2]);
-        let end = rows.findIndex((row, at) => at >= from && ends(row, here));
+        let end = rows.findIndex((row, at) => at >= from && ends(view(row), here));
         if (end < 0) end = rows.length;
         // The line's heredoc content counts as literal only when every body on it is (B5, t_1748d6c1).
-        literal = literal && (quoted || !/[$`]/.test(rows.slice(from, end).join("\n")));
+        literal = literal && (quoted || !/[$`]/.test(rows.slice(from, end).map(view).join("\n")));
         from = end + 1;
         // The shell that reads the body: the command with the heredoc or one its output is piped into.
         const start = owners.length === openers.length ? owners[k] : Math.max(0, segments.findIndex((segment) => segment.text.includes("<<")));
