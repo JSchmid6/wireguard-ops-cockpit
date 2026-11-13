@@ -50,7 +50,7 @@ Research and change planning use distinct prompt contracts. Research agents perf
 
 Research is also a distinct broker role. It maps to OpenCode's non-mutating `plan` agent but receives its own root-controlled role file, a six-tool budget, and a 120-second child-process hard limit. Change planning, safety, and verification retain their separate five-minute limits; runner execution retains ten minutes. A research timeout is a preserved diagnostic failure, never authority to broaden inspection or fall back to shell execution.
 
-Planner and safety model selection is configuration, not policy. The current deployment deliberately uses `opencode/big-pickle` for planning/research and `deepseek/deepseek-v4-pro` for safety review so correlated single-model failures are visible. Operators may replace either model without changing the execution contracts or deterministic effect boundary.
+Planner and safety model selection is configuration, not policy. The models are set per host in the cockpit's env files (the deploy writes defaults only on first install) and are not recorded here; using different models for planning and safety review keeps correlated single-model failures visible. Operators may replace either model without changing the execution contracts or deterministic effect boundary.
 
 The isolated broker maps non-executing roles (`planner`, research through planner, `safety`, and `verifier`) to OpenCode's `plan` agent. Only the bounded `runner` role uses the `build` agent. Broker invocations use `--pure` so external OpenCode plugins cannot silently expand a role's tools or instructions.
 
