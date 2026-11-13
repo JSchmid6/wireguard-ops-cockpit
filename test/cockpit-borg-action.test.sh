@@ -350,10 +350,10 @@ case "\$cmd" in
     # systemctl show <unit> -p Result -p ExecMainStatus: genau die zwei Werte,
     # die der Datenblock für den letzten Backup-Lauf übernimmt. Über
     # \$WORK/borgmatic-failed lässt sich ein fehlgeschlagener Lauf nachstellen.
-    unit=""
+    unit=""; prop=""
     while [ "\$#" -gt 0 ]; do
       case "\$1" in
-        -p|--property) shift 2 ;;
+        -p|--property) prop="\$2"; shift 2 ;;
         -*) shift ;;
         *) unit="\$1"; shift ;;
       esac
@@ -368,8 +368,11 @@ case "\$cmd" in
         fi
         exit 0 ;;
       mariadb.service)
-        # -p Environment --value: ein Drop-in mit MYSQLD_OPTS lässt sich nachstellen.
-        cat "$WORK/mariadb-unit-env" 2>/dev/null; echo
+        # -p Environment|EnvironmentFiles --value: Drop-in bzw. EnvironmentFile nachstellen.
+        case "\$prop" in
+          Environment) cat "$WORK/mariadb-unit-env" 2>/dev/null; echo ;;
+          EnvironmentFiles) cat "$WORK/mariadb-unit-envfiles" 2>/dev/null ;;
+        esac
         exit 0 ;;
       *)
         # Wie echtes systemd für eine unbekannte Unit: keine Eigenschaften, rc=4.
@@ -383,6 +386,7 @@ case "\$cmd" in
     for a in "\$@"; do printf '%s\n' "\$a" >> "$WORK/manager-env"; done
     exit 0 ;;
   unset-environment)
+    [ -e "$WORK/unset-broken" ] && exit 1
     for a in "\$@"; do
       [ -f "$WORK/manager-env" ] || continue
       grep -v "^\$a=" "$WORK/manager-env" > "$WORK/manager-env.neu"; mv "$WORK/manager-env.neu" "$WORK/manager-env"
@@ -1085,7 +1089,7 @@ EOF
 chmod 755 "$STUBS/runuser" "$STUBS/php" "$STUBS/mysql" "$STUBS/mysqldump"
 reset_db() {
   rm -f "$DB"/frame-line "$DB"/created-hash "$DB"/plaintext-sql "$DB"/sql.log "$DB"/mysql.log "$DB"/admin-denied "$DB"/dump-denied "$DB"/mysqldump.cnf*
-  rm -f "$DB"/root-socket "$DB"/runuser.log "$DB"/restart.log "$DB"/init-* "$WORK/manager-env" "$WORK/mariadb-unit-env" "$WORK/units/mariadb.state"
+  rm -f "$DB"/root-socket "$DB"/runuser.log "$DB"/restart.log "$DB"/init-* "$WORK/manager-env" "$WORK/mariadb-unit-env" "$WORK/mariadb-unit-envfiles" "$WORK/unset-broken" "$WORK/units/mariadb.state"
   printf '[client]\nuser=nextDB\npassword=%s\n[mysqldump]\nmax_allowed_packet=64M\n' "$ALTPW" > "$DB/mysqldump.cnf"
   chmod 600 "$DB/mysqldump.cnf"; cp -a "$DB/mysqldump.cnf" "$DB/cnf-original"
 }
@@ -1339,6 +1343,14 @@ if grep -qx 'MYSQLD_OPTS=--skip-name-resolve' "$WORK/manager-env"; then ok "frem
 rm -f "$WORK/manager-env"
 printf 'MYSQLD_OPTS=--x\n' > "$WORK/mariadb-unit-env"; boot cgroup-run; rm -f "$WORK/mariadb-unit-env"
 assert_rc "MYSQLD_OPTS im Drop-in: abgewiesen" 67
+printf 'export MYSQLD_OPTS=--y\n' > "$DB/envfile"; printf '%s (ignore_errors=no)\n' "$DB/envfile" > "$WORK/mariadb-unit-envfiles"
+boot cgroup-run
+assert_rc "MYSQLD_OPTS aus einem EnvironmentFile: abgewiesen" 67
+assert_err "Grund nennt das EnvironmentFile" "(EnvironmentFile)"
+printf 'OTHER=1\n' > "$DB/envfile"; printf '%s (ignore_errors=no)\n' "$DB/nicht-da" >> "$WORK/mariadb-unit-envfiles"
+boot cgroup-run
+assert_rc "nicht lesbares EnvironmentFile: abgewiesen" 67
+rm -f "$WORK/mariadb-unit-envfiles" "$DB/envfile"
 [ "$(restarts)" = 0 ] && ok "kein Neustart bei abgewiesenen Vorbedingungen" || bad "Neustart trotz abgewiesener Vorbedingung"
 cnf_unchanged "Vorbedingungen: Datei unverändert"
 assert_no_file "Vorbedingungen: kein Konto angelegt" "$DB/created-hash"
@@ -1355,6 +1367,17 @@ assert_err "Grund nennt den Rückweg" "normal neu gestartet: active"
 clean_after "Abbruch"
 cnf_unchanged "Abbruch: Datei unverändert"
 if ls "$DB"/mysqldump.cnf.neu.* >/dev/null 2>&1; then bad "Abbruch: Arbeitsdatei bleibt liegen"; else ok "Abbruch: Arbeitsdatei weggeräumt"; fi
+
+echo "== db-access bootstrap: MYSQLD_OPTS lässt sich nicht zurücknehmen → kein Rückweg-Neustart, laut =="
+reset_db; : > "$WORK/unset-broken"; : > "$DB/init-abort"
+boot cgroup-run
+assert_rc "bootstrap bei nicht rücknehmbarem MYSQLD_OPTS" 1
+assert_err "Warnung nennt den Handgriff" "systemctl unset-environment MYSQLD_OPTS"
+[ "$(restarts)" = 1 ] && ok "kein zweiter Start mit stehengebliebenem --init-file" || bad "Rückweg-Neustart trotz stehengebliebenem MYSQLD_OPTS ($(restarts))"
+assert_no_out "keine falsche Meldung 'zurückgenommen'" "MYSQLD_OPTS zurückgenommen"
+cnf_unchanged "nicht rücknehmbar: Datei unverändert"
+if ls -d "$INIT_BASE"/cockpit-db-init.* >/dev/null 2>&1; then bad "nicht rücknehmbar: Init-Datei bleibt liegen"; else ok "nicht rücknehmbar: Init-Datei trotzdem gelöscht"; fi
+rm -f "$WORK/unset-broken" "$DB/init-abort" "$WORK/manager-env"
 
 echo "== db-access bootstrap: Init-Datei wirkt nicht → Datei unverändert =="
 reset_db; : > "$DB/init-noop"
@@ -1380,7 +1403,13 @@ if grep -qF -- "$NEWPW" "$DB/init-seen.sql"; then bad "Klartext-Passwort in der 
 if grep -qF "GRANT SELECT, SHOW VIEW, TRIGGER, LOCK TABLES, SHOW DATABASES ON *.* TO 'cockpit_backup'@'localhost';" "$DB/init-seen.sql" \
   && grep -qF "REVOKE ALL PRIVILEGES, GRANT OPTION FROM 'cockpit_backup'@'localhost';" "$DB/init-seen.sql"; then ok "Init-Datei: nur lesende Rechte, vorher alle entzogen"; else bad "Init-Datei: Rechte-SQL anders als erwartet"; fi
 if grep -qE '(^|[^A-Z])(ALL PRIVILEGES ON|WITH GRANT OPTION|SUPER|FILE|EVENT)' "$DB/init-seen.sql"; then bad "Init-Datei: zu weite Rechte"; else ok "Init-Datei: keine weiten Rechte"; fi
-if grep -qF "IDENTIFIED VIA unix_socket OR " "$DB/init-seen.sql" && ! grep -qiE "DROP USER|SET PASSWORD|IDENTIFIED BY '" "$DB/init-seen.sql"; then ok "root: unix_socket zusätzlich, bisheriges Verfahren bleibt"; else bad "root-Änderung anders als erwartet"; fi
+ROOTLINE="$(grep -F 'SET @cockpit_root = (SELECT' "$DB/init-seen.sql")"
+if grep -qF "'ALTER USER ''root''@''localhost'' IDENTIFIED VIA unix_socket OR ', JSON_VALUE(Priv, '\$.plugin'), ' USING ', QUOTE(JSON_VALUE(Priv, '\$.authentication_string'))" <<<"$ROOTLINE" \
+  && grep -qF "IFNULL(JSON_LENGTH(Priv, '\$.auth_or'), 0) <= 1" <<<"$ROOTLINE" && grep -qF "FROM mysql.global_priv WHERE User = 'root' AND Host = 'localhost'" <<<"$ROOTLINE" \
+  && grep -qF "'DO 0')" <<<"$ROOTLINE" && [ "$(grep -o 'IDENTIFIED VIA' <<<"$ROOTLINE" | wc -l)" = 1 ]; then
+  ok "root: unix_socket nur ZUSÄTZLICH zum bisherigen Verfahren, sonst DO 0 (kein Zweig nimmt root etwas)"
+else bad "root-Zeile anders als erwartet"; fi
+if grep -qiE "DROP USER|SET PASSWORD|IDENTIFIED BY '" "$DB/init-seen.sql"; then bad "Init-Datei setzt/löscht Passwörter im Klartext"; else ok "Init-Datei ohne DROP USER/SET PASSWORD/Klartext"; fi
 if grep -q '^user=cockpit_backup$' "$DB/mysqldump.cnf" && grep -q '^max_allowed_packet=64M$' "$DB/mysqldump.cnf"; then ok "Datei: neues Konto, übrige Optionen bleiben"; else bad "Datei nicht wie erwartet"; fi
 [ "$(stat -c '%U:%G %a' "$DB/mysqldump.cnf")" = "root:root 600" ] && ok "Datei root:root 0600" || bad "Datei nicht root:root 0600"
 VOR="$(ls -1 "$DB"/mysqldump.cnf.vor-* 2>/dev/null | head -n 1)"
@@ -1398,6 +1427,15 @@ assert_rc "bootstrap ein zweites Mal" 0
 assert_out "schon eingerichtet gemeldet" "kein Neustart"
 [ "$(restarts)" = 1 ] && ok "kein weiterer Neustart" || bad "zweiter Aufruf startet neu"
 cmp -s "$DB/mysqldump.cnf" "$WORK/cnf-nach-boot" && ok "Datei unverändert" || bad "Datei verändert"
+
+echo "== db-access adopt nach bootstrap: liest weiter das Nextcloud-Konto (Zweitprüfung PR #105) =="
+cp -a "$DB/mysqldump.cnf" "$WORK/cnf-vor-adopt"; rm -f "$DB/runuser.log"
+db cgroup-run adopt
+assert_rc "adopt nach bootstrap" 0
+if grep -q '^user=nextDB$' "$DB/mysqldump.cnf" && grep -qF "password=\"$NCPASS\"" "$DB/mysqldump.cnf"; then ok "adopt schreibt das Nextcloud-Konto, kein leeres Konto"; else bad "adopt nach bootstrap: Datei ohne Nextcloud-Konto"; fi
+assert_file "adopt liest config.php (runuser)" "$DB/runuser.log"
+no_secret_out "adopt nach bootstrap ohne Passwort in der Ausgabe"
+cp -a "$WORK/cnf-vor-adopt" "$DB/mysqldump.cnf"
 
 echo "== db-access ensure nach bootstrap: root per Socket statt Nextcloud-Passwort =="
 rm -f "$DB/runuser.log"

@@ -112,7 +112,7 @@ Bare-metal Ubuntu VPS running:
   The dedicated read-only account `cockpit_backup@localhost` is the target; path A is `db-access bootstrap`
   (card t_58a51884): ONE restart of `mariadb.service` with `--init-file` (via `systemctl set-environment
   MYSQLD_OPTS`, file root:mysql 0640 under `/run`, deleted and unset right after the start, only the hash
-  inside) creates the account and gives `root@localhost` unix_socket in addition to its old method (OR).
+  inside) creates the account and gives `root@localhost` unix_socket in addition to its old method (OR; untouched unless root has exactly one native/ed25519 method).
   It costs a short database outage (Nextcloud, WordPress) — announce the time. After it, `ensure`/`restore`
   use root via the socket and never read the Nextcloud password again. Live state stays B until that
   run has happened. `cockpit-borg-action db-access status|check|ensure|adopt|restore|bootstrap`

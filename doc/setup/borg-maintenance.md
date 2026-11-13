@@ -265,12 +265,14 @@ Grenzen:
   Code nie aus. Das ist Lesen eines Geheimnisses (X1): der Lauf nennt es im Intent, und der Befund
   geht an Jochen. Nach einem `ensure` braucht das Backup das Nextcloud-Passwort nie wieder (nach `adopt` schon — siehe Befund unten); eine spätere
   Rotation des Backup-Passworts ist ein weiteres `ensure`, ein `restore` nach einer Rotation setzt
-  den Hash zurück — beide wieder mit dieser Anmeldung und damit wieder X1 im Intent.
+  den Hash zurück — vor `bootstrap` beide wieder mit dieser Anmeldung und damit wieder X1 im Intent,
+  nach `bootstrap` über root per Socket ohne X1. `adopt` liest `config.php` immer (es schreibt genau
+  dieses Konto in die Datei).
 * **Die Datenbank bekommt nur den Hash:** `ensure` rechnet den `mysql_native_password`-Hash im
   Helfer und setzt ihn per `IDENTIFIED BY PASSWORD '<hash>'`; der Klartext steht nur in der Datei.
   Scheitert eine Rotation nach dem `ALTER USER`, bekommt das Konto den alten Hash zurück — die
   alte Datei bleibt gültig (fail closed).
-* **Repo-Sperre:** `ensure`, `adopt` und `restore` halten `/run/lock/cockpit-borg.lock` bis zum Ende; der
+* **Repo-Sperre:** `ensure`, `adopt`, `restore` und `bootstrap` halten `/run/lock/cockpit-borg.lock` bis zum Ende; der
   Drop-in `cockpit-borg-lock.conf` lässt den Nachtlauf darauf warten, er fällt also nie zwischen
   `ALTER USER` und den Tausch der Datei. Belegt (Prüfung läuft) → rc=3, nichts verändert.
 * **Prüf-Haken nur in einer Kopie:** Unter `/usr/local/sbin/cockpit-borg-action` gelten immer die
@@ -308,14 +310,21 @@ Grenzen:
     Fehler aus und startet. Maßgeblich ist deshalb allein die Prüfung des neuen Kontos danach.
   * **Ein Neustart reicht:** `init_file` wird nur beim Start gelesen; `@@init_file` zeigt bis zum
     nächsten Start auf die gelöschte Datei, ohne Wirkung. (Der Auftrag rechnete mit zweien.)
-  * **root:** `ALTER USER IF EXISTS root@localhost IDENTIFIED VIA unix_socket OR <bisheriges
-    Verfahren> USING <bisheriger Hash>` (vorbereitete Anweisung in der Datei) — der OS-Nutzer root
+  * **root:** `ALTER USER root@localhost IDENTIFIED VIA unix_socket OR <bisheriges Verfahren> USING
+    <bisheriger Hash>` (vorbereitete Anweisung in der Datei, gelesen aus `mysql.global_priv`) — nur,
+    wenn root genau ein Verfahren hat (`auth_or` fehlt oder ist `[{}]`; so speichert MariaDB auch
+    ein einzelnes `IDENTIFIED VIA … USING`) und es `mysql_native_password`/`ed25519` mit Hash ist.
+    Sonst (anderes Plugin, schon Alternativen, root fehlt) `DO 0`: root verliert nie etwas, und die
+    Verwaltung bleibt beim Nextcloud-Konto (Probe: alle vier Fälle). Der OS-Nutzer root
     kommt per Socket hinein, wer root mit Passwort nutzt, weiter wie bisher; andere OS-Nutzer
     bekommen per Socket 1698. Nebenwirkung, gewollt: `/etc/mysql/debian-start` (ExecStartPost)
     scheitert seit langem an root (1045, „Upgrade failed“) und läuft ab diesem Start wieder, samt
     `mariadb-upgrade`, falls die Systemtabellen hinter der Version stehen.
   * **Fail closed:** Backup läuft oder Sperre belegt (rc=3); Datenbank läuft nicht, `MYSQLD_OPTS`
-    schon im Manager oder in einem Drop-in gesetzt (rc=67, nichts überschrieben); kommt die Datenbank
+    schon im Manager, in einem Drop-in oder einem `EnvironmentFile` gesetzt (oder dieses nicht lesbar):
+    rc=67, nichts überschrieben; lässt sich `MYSQLD_OPTS` nach dem Start nicht zurücknehmen, kein
+    Rückweg-Neustart (er scheiterte an der gelöschten Datei), rc=1 mit dem Handgriff
+    `systemctl unset-environment MYSQLD_OPTS`; kommt die Datenbank
     mit der Datei nicht hoch, startet `bootstrap` sie sofort normal (ohne Datei) neu und meldet rc=1;
     wirkt die Datei nicht, rc=1 — in allen Fällen bleibt `mysqldump.cnf` unverändert, und Datei und
     `MYSQLD_OPTS` sind weg (auch bei Abbruch, `trap EXIT`).
