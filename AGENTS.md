@@ -109,9 +109,15 @@ Bare-metal Ubuntu VPS running:
   Nextcloud password — every NC password rotation breaks the backup until `db-access adopt` runs again.
   With that account the hook (`--all-databases`) dumps only the database `nextcloud`; **WordPress
   (`wordpress`) is NOT in the borg archive** — run `wp db export` before any WordPress DB change.
-  The dedicated read-only account `cockpit_backup@localhost` via `db-access ensure` is the target and
-  arrives only with path A (MariaDB `--init-file`, card t_58a51884); `cockpit-borg-action db-access status|check|ensure|adopt|restore`
-  runs only inside a host-run unit (cgroup check), never through the executor. `repair` always needs the operator's approval:
+  The dedicated read-only account `cockpit_backup@localhost` is the target; path A is `db-access bootstrap`
+  (card t_58a51884): ONE restart of `mariadb.service` with `--init-file` (via `systemctl set-environment
+  MYSQLD_OPTS`, file root:mysql 0640 under `/run`, deleted and unset right after the start, only the hash
+  inside) creates the account and gives `root@localhost` unix_socket in addition to its old method (OR; untouched unless root has exactly one native/ed25519 method).
+  It costs a short database outage (Nextcloud, WordPress) — announce the time. After it, `ensure`/`restore`
+  use root via the socket and never read the Nextcloud password again. Live state stays B until that
+  run has happened. `cockpit-borg-action db-access status|check|ensure|adopt|restore|bootstrap`
+  runs only inside a host-run unit (cgroup check), never through the executor; `bootstrap` is not part of
+  the `backup-repair` exception (it needs the normal return path). `repair` always needs the operator's approval:
   the plan policy stops any plan that names it — a capability manifest or another
   code fence changes nothing — and the executor refuses a repair without the
   approval bound to exactly that job. A `host-run` plan does not pass the plan

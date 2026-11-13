@@ -193,7 +193,7 @@ das Backup über das Drop-in die paar Sekunden ab.
 | --- | --- | --- |
 | `/usr/local/sbin/cockpit-borg-action` | `deploy/helpers/cockpit-borg-action` | der einzige sudo-exponierte Einstieg; gepinnte Grammatik `status\|check\|repair` (dazu `db-access …` und `sources …`, nur aus einem Lauf der allgemeinen Tür) |
 | `/etc/borgmatic/cockpit-sources.patterns` (+ `.vor-<Zeit>`) | `sources connect` legt sie an, `sources add` ergänzt | zusätzliche Backup-Quellen als `R <pfad>`-Zeilen, 0644 root, kein Geheimnis; `config.yaml` nennt sie per `patterns_from` |
-| `/etc/borgmatic/mysqldump.cnf` (+ `.vor-<Zeit>`) | heute `db-access adopt` (Zwischenweg B), Ziel `db-access ensure` (Weg A, Karte t_58a51884) | Anmeldung des mysqldump-Hooks, 0600 root: heute das Nextcloud-Konto `nextDB` — an das NC-Passwort gekoppelt, gedumpt wird nur `nextcloud`, **nicht** `wordpress`; Ziel `cockpit_backup@localhost`. Die `.vor-`Dateien sind der Rückweg |
+| `/etc/borgmatic/mysqldump.cnf` (+ `.vor-<Zeit>`) | heute `db-access adopt` (Zwischenweg B), Ziel `db-access bootstrap` (Weg A, Karte t_58a51884), danach Rotation per `ensure` | Anmeldung des mysqldump-Hooks, 0600 root: heute das Nextcloud-Konto `nextDB` — an das NC-Passwort gekoppelt, gedumpt wird nur `nextcloud`, **nicht** `wordpress`; Ziel `cockpit_backup@localhost`. Die `.vor-`Dateien sind der Rückweg |
 | `/etc/sudoers.d/cockpit-executor` | `deploy/sudoers/cockpit-executor` | Zeile `cockpit-executor ALL=(root) NOPASSWD: /usr/local/sbin/cockpit-borg-action *` |
 | `/var/lib/wireguard-ops-cockpit/borg/last.unit`, `last.kind` | Laufzeit | zuletzt gestartete Wartungs-Unit und ihre Art, 0750 root — nur für die Anzeige; **der Laufzustand kommt aus systemd** (`systemctl is-active <unit>`) |
 | `/run/lock/cockpit-borg.lock` | Laufzeit | Sperre gegen zwei gleichzeitige Läufe auf demselben Repo: `check`/`repair` halten sie für die Dauer des Laufs, die Repo-Abfragen von `status` kurz (ist sie nach 60 s nicht frei, meldet `status` „belegt“ mit rc=0); das nächtliche Backup wartet auf sie |
@@ -236,7 +236,7 @@ meldete sich bis zum 26.10.2026 mit dem **Nextcloud-Konto** an. Nach dessen Pass
 28.10.2026, Karte t_30c9ea52):** Ziel ist ein eigenes Konto, entkoppelt von Nextcloud-
 und WordPress-Passwörtern. **Ist-Stand:** das ist noch nicht umgesetzt — live läuft Zwischenweg B
 (`adopt`, Nextcloud-Konto, nur DB `nextcloud`, WordPress nicht im Dump; siehe Befund unten), bis
-Weg A (Karte t_58a51884) da ist.
+Weg A (Karte t_58a51884, `db-access bootstrap`) einmal gelaufen ist.
 
 | Form | Wirkung |
 | --- | --- |
@@ -244,6 +244,7 @@ Weg A (Karte t_58a51884) da ist.
 | `cockpit-borg-action db-access check` | rc=0, wenn das Konto der Datei sich anmeldet und `mysqldump --all-databases --no-data` durchläuft (wie der Hook, nur das Schema) |
 | `cockpit-borg-action db-access ensure` | legt `cockpit_backup@localhost` an (oder setzt ihm ein neues Passwort), entzieht alles und gibt genau `SELECT, SHOW VIEW, TRIGGER, LOCK TABLES, SHOW DATABASES` auf `*.*` (der Hook dumpt alle Datenbanken, ohne `--events`, darum kein EVENT), prüft das neue Konto mit einer Arbeitsdatei, sichert die alte Datei als `mysqldump.cnf.vor-<UTC-Zeit>` (0600) und tauscht dann (0600 root). Übrige Zeilen der alten Datei außer `user`/`password` bleiben. |
 | `cockpit-borg-action db-access adopt` | **Zwischenweg B** (Jochen 28.10.2026): schreibt das aktuelle Nextcloud-DB-Konto aus `config.php` (gelesen als `www-data`, wie bei `ensure`) in die Datei; an der Datenbank ändert sich nichts. Prüft die neue Anmeldung und den Schema-Dump mit einer Arbeitsdatei, sichert die alte Datei als `.vor-<UTC-Zeit>` und tauscht (0600 root). Für den Fall, dass `ensure` kein Konto anlegen kann (siehe unten). |
+| `cockpit-borg-action db-access bootstrap` | **Weg A** (Jochen 28.10.2026): startet `mariadb.service` **einmal** mit `--init-file` neu (siehe „Weg A“ unten): die Datei legt `cockpit_backup@localhost` mit dem Hash und den Rechten von `ensure` an und gibt `root@localhost` zusätzlich `unix_socket` (das bisherige Verfahren von root bleibt als Alternative). Danach prüft es das neue Konto mit einer Arbeitsdatei, sichert die alte Datei als `.vor-<UTC-Zeit>` und tauscht (0600 root). Ist die Datei schon auf `cockpit_backup` und gültig: nichts verändert, kein Neustart. Kurzer DB-Ausfall (Nextcloud, WordPress). |
 | `cockpit-borg-action db-access restore` | spielt die jüngste `.vor-`Datei zurück. Gehört sie schon dem Backup-Konto (Stand vor einer Rotation), setzt `restore` das Konto zuerst auf ihren Hash — dafür braucht es wieder die Verwaltungs-Anmeldung (unten, X1). Gehört sie dem alten Nextcloud-Konto (Stand vor dem ersten `ensure`), bleibt `cockpit_backup` bestehen, ohne Wirkung. |
 
 Grenzen:
@@ -256,19 +257,22 @@ Grenzen:
   `/dev/urandom`) und die Verwaltungs-Anmeldung gehen nur über `printf` (bash-builtin) in eine
   Pipe bzw. ein `/dev/fd` — nie in argv, Umgebung, Protokoll oder Ausgabe. Das Protokoll der Tür
   schwärzt zusätzlich jede `password=`-Zuweisung.
-* **Die Verwaltungs-Anmeldung** ist das Nextcloud-DB-Konto aus `config.php`: auf
+* **Die Verwaltungs-Anmeldung** ist root per Socket, sobald `bootstrap` gelaufen ist (ohne
+  Geheimnis); vorher und als Rückfall das Nextcloud-DB-Konto aus `config.php`: auf
   diesem Host sind root (Socket und `debian.cnf`) und `mysql@localhost` passwortgeschützt
   (Inventar-Jobs 697b46d0, be3a0f57), ein anderes Konto mit `CREATE USER` gibt es nicht. Gelesen
   wird die Datei als `www-data` (`runuser`), weil sie www-data-beschreibbar war — root führt ihren
   Code nie aus. Das ist Lesen eines Geheimnisses (X1): der Lauf nennt es im Intent, und der Befund
   geht an Jochen. Nach einem `ensure` braucht das Backup das Nextcloud-Passwort nie wieder (nach `adopt` schon — siehe Befund unten); eine spätere
   Rotation des Backup-Passworts ist ein weiteres `ensure`, ein `restore` nach einer Rotation setzt
-  den Hash zurück — beide wieder mit dieser Anmeldung und damit wieder X1 im Intent.
+  den Hash zurück — vor `bootstrap` beide wieder mit dieser Anmeldung und damit wieder X1 im Intent,
+  nach `bootstrap` über root per Socket ohne X1. `adopt` liest `config.php` immer (es schreibt genau
+  dieses Konto in die Datei).
 * **Die Datenbank bekommt nur den Hash:** `ensure` rechnet den `mysql_native_password`-Hash im
   Helfer und setzt ihn per `IDENTIFIED BY PASSWORD '<hash>'`; der Klartext steht nur in der Datei.
   Scheitert eine Rotation nach dem `ALTER USER`, bekommt das Konto den alten Hash zurück — die
   alte Datei bleibt gültig (fail closed).
-* **Repo-Sperre:** `ensure`, `adopt` und `restore` halten `/run/lock/cockpit-borg.lock` bis zum Ende; der
+* **Repo-Sperre:** `ensure`, `adopt`, `restore` und `bootstrap` halten `/run/lock/cockpit-borg.lock` bis zum Ende; der
   Drop-in `cockpit-borg-lock.conf` lässt den Nachtlauf darauf warten, er fällt also nie zwischen
   `ALTER USER` und den Tausch der Datei. Belegt (Prüfung läuft) → rc=3, nichts verändert.
 * **Prüf-Haken nur in einer Kopie:** Unter `/usr/local/sbin/cockpit-borg-action` gelten immer die
@@ -292,6 +296,47 @@ Grenzen:
   bleibt an das Nextcloud-Passwort gekoppelt (jede Rotation braucht wieder `adopt`), und der Hook
   dumpt mit diesem Konto nur die Datenbank `nextcloud` — **nicht** `wordpress` (das war schon vor dem
   26.10. so). `adopt` ist Lesen desselben Geheimnisses wie bei `ensure` (X1 im Intent).
+* **Weg A (`bootstrap`, Karte t_58a51884, Werkstatt-Probe 13.11.2026 mit MariaDB 10.11.14 wie
+  der Host):** kein Konto darf hier Konten anlegen, also bekommt die Datenbank die nötigen Sätze
+  einmal beim Start. Ablauf: Arbeitsdatei mit neuem Konto (Klartext nur dort), Verzeichnis
+  `/run/cockpit-db-init.XXXXXX` (root:mysql 0750) mit `init.sql` (root:mysql 0640, nur der Hash),
+  `systemctl set-environment MYSQLD_OPTS=--init-file=…` (die Unit liest `$MYSQLD_OPTS` im
+  ExecStart), `systemctl restart mariadb.service`, sofort danach `unset-environment` und die Datei
+  löschen, dann Anmeldung und Schema-Dump des neuen Kontos prüfen und die Optionsdatei tauschen.
+  Belegt in der Probe:
+  * **root:root 0600 geht nicht:** mariadbd läuft als `mysql` und bricht den Start mit „Can't
+    create/write to file … Permission denied / Aborting“ ab — darum Gruppe `mysql`, 0640.
+  * **Ein SQL-Fehler in der Datei hält den Start nicht auf:** mariadbd führt die Sätze bis zum
+    Fehler aus und startet. Maßgeblich ist deshalb allein die Prüfung des neuen Kontos danach.
+  * **Ein Neustart reicht:** `init_file` wird nur beim Start gelesen; `@@init_file` zeigt bis zum
+    nächsten Start auf die gelöschte Datei, ohne Wirkung. (Der Auftrag rechnete mit zweien.)
+  * **root:** `ALTER USER root@localhost IDENTIFIED VIA unix_socket OR <bisheriges Verfahren> USING
+    <bisheriger Hash>` (vorbereitete Anweisung in der Datei, gelesen aus `mysql.global_priv`) — nur,
+    wenn root genau ein Verfahren hat (`auth_or` fehlt oder ist `[{}]`; so speichert MariaDB auch
+    ein einzelnes `IDENTIFIED VIA … USING`) und es `mysql_native_password`/`ed25519` mit Hash ist.
+    Sonst (anderes Plugin, schon Alternativen, root fehlt) `DO 0`: root verliert nie etwas, und die
+    Verwaltung bleibt beim Nextcloud-Konto (Probe: alle vier Fälle). Der OS-Nutzer root
+    kommt per Socket hinein, wer root mit Passwort nutzt, weiter wie bisher; andere OS-Nutzer
+    bekommen per Socket 1698. Nebenwirkung, gewollt: `/etc/mysql/debian-start` (ExecStartPost)
+    scheitert seit langem an root (1045, „Upgrade failed“) und läuft ab diesem Start wieder, samt
+    `mariadb-upgrade`, falls die Systemtabellen hinter der Version stehen.
+  * **Fail closed:** Backup läuft oder Sperre belegt (rc=3); Datenbank läuft nicht, `MYSQLD_OPTS`
+    schon im Manager, in einem Drop-in oder einem `EnvironmentFile` gesetzt (oder dieses nicht lesbar):
+    rc=67, nichts überschrieben; lässt sich `MYSQLD_OPTS` nach dem Start nicht zurücknehmen, kein
+    Rückweg-Neustart (er scheiterte an der gelöschten Datei), rc=1 mit dem Handgriff
+    `systemctl unset-environment MYSQLD_OPTS`; kommt die Datenbank
+    mit der Datei nicht hoch, startet `bootstrap` sie sofort normal (ohne Datei) neu und meldet rc=1;
+    wirkt die Datei nicht, rc=1 — in allen Fällen bleibt `mysqldump.cnf` unverändert, die Datei ist
+    weg und `MYSQLD_OPTS` zurückgenommen (auch bei Abbruch, `trap EXIT`) — ausser im oben genannten
+    Fall, dass `unset-environment` nicht greift (dann rc=1 mit dem Handgriff). Ein fehlendes
+    optionales `EnvironmentFile=-…` (`ignore_errors=yes`) hält nicht an.
+  * **Rückweg:** `db-access restore` (Datei auf `nextDB`, Stand Zwischenweg B). root zurück auf nur
+    Passwort: `ALTER USER root@localhost IDENTIFIED VIA mysql_native_password USING '<Hash aus SHOW
+    CREATE USER>'` per `mysql -u root` (Socket); `cockpit_backup` stört ohne Datei nicht.
+  * Danach nimmt die Verwaltungs-Anmeldung zuerst root per Socket — `ensure` (Rotation) und
+    `restore` lesen `config.php` dann nicht mehr (kein X1 mehr).
+  * Kein Teil der Ausnahme `backup-repair`: `bootstrap` startet die Datenbank neu und braucht den
+    normalen Rückweg (Backup höchstens 30 h alt) und den Maschinen-Snapshot.
 * Ohne Rückweg darf genau dieser Lauf trotzdem starten (Ausnahme `backup-repair`,
   `doc/setup/host-run.md`): `db-access ensure` (oder `adopt`), danach `systemctl start borgmatic.service`,
   Prüfungen `db-access check` und `! systemctl is-failed --quiet borgmatic.service`, Rückweg
