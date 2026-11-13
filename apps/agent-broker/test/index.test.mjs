@@ -11,11 +11,14 @@ const fakeOpencode = path.join(fakeRoot, "opencode");
 fs.writeFileSync(fakeOpencode, "#!/bin/sh\ncase \"$PWD\" in */agent-dead0000*) exit 3;; esac\nprintf 'argc=%s last=%s\\n' \"$#\" \"$(eval echo \\\"\\$$#\\\")\"\ncat\n", { mode: 0o755 });
 process.env.COCKPIT_OPENCODE_EXECUTABLE = fakeOpencode;
 process.env.COCKPIT_AGENT_WORKSPACE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-agent-run-"));
-const { assertSessionRootClean, cleanupStaleWorkspaces, createSessionWorkspace, removeSessionWorkspace, runAgent, validateRequest } = await import("../src/index.mjs");
+// The broker also checks opencode's global config directory: never the one of whoever runs the tests.
+process.env.XDG_CONFIG_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-agent-xdg-"));
+const { assertNoPlantedConfig, cleanupStaleWorkspaces, createSessionWorkspace, removeSessionWorkspace, runAgent, validateRequest } = await import("../src/index.mjs");
 const { PROMPT_LIMITS, promptLimit, promptLimitProblem } = await import("../src/prompt-limits.mjs");
 test.after(() => {
   fs.rmSync(process.env.COCKPIT_AGENT_WORKSPACE_ROOT, { recursive: true, force: true });
   fs.rmSync(fakeRoot, { recursive: true, force: true });
+  fs.rmSync(process.env.XDG_CONFIG_HOME, { recursive: true, force: true });
 });
 test("agent broker accepts only bounded roles and prompts", () => {
   assert.deepEqual(validateRequest({ requestId: "12345678", role: "planner", prompt: "inspect" }), { requestId: "12345678", role: "planner", prompt: "inspect" });
@@ -105,26 +108,42 @@ test("a child that ignores stdin does not crash the broker", async () => {
   assert.deepEqual(fs.readdirSync(process.env.COCKPIT_AGENT_WORKSPACE_ROOT), []);
 });
 
-// opencode searches project config and instructions from the workspace up to "/";
-// the session root is the one writable level above a workspace (t_62992d58).
-test("a planted project config in the session root stops every role before opencode starts", async () => {
-  for (const name of ["opencode.json", "opencode.jsonc", ".opencode", "AGENTS.md", "CLAUDE.md", "CONTEXT.md"]) {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-agent-planted-"));
-    if (name === ".opencode") fs.mkdirSync(path.join(root, name)); else fs.writeFileSync(path.join(root, name), "{}");
-    assert.throws(() => createSessionWorkspace({ requestId: "12345678", role: "safety", prompt: "review" }, root), new RegExp(`contains ${name.replace(".", "\\.")}`));
-    assert.deepEqual(fs.readdirSync(root), [name]);
-    fs.rmSync(root, { recursive: true });
+// opencode searches project config, instructions and skills from the workspace up
+// to "/" and loads agents, commands, skills and tools from its global config
+// directory (t_62992d58).
+test("planted opencode config above the workspace or in the global config directory stops every role", async () => {
+  const names = ["opencode.json", "opencode.jsonc", ".opencode", "AGENTS.md", "CLAUDE.md", "CONTEXT.md", ".claude", ".agents", ".git", ".gitconfig"];
+  for (const level of ["session root", "home"]) {
+    for (const name of names) {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-agent-planted-"));
+      const root = path.join(home, "sessions");
+      fs.mkdirSync(root);
+      const planted = path.join(level === "home" ? home : root, name);
+      if (name.startsWith(".") && name !== ".gitconfig") fs.mkdirSync(planted); else fs.writeFileSync(planted, "{}");
+      assert.throws(() => createSessionWorkspace({ requestId: "12345678", role: "safety", prompt: "review" }, root), (error) => error.message.includes(planted), `${level}: ${name}`);
+      assert.deepEqual(fs.readdirSync(root), level === "home" ? [] : [name]);
+      fs.rmSync(home, { recursive: true });
+    }
   }
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-agent-clean-"));
+  const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-agent-config-"));
+  // What the deploy places there, and what opencode itself writes, stays allowed.
+  for (const name of ["opencode.jsonc", ".gitignore", "package.json", "node_modules"]) fs.writeFileSync(path.join(configDir, name), "");
+  assert.doesNotThrow(() => assertNoPlantedConfig(root, configDir));
+  for (const name of ["opencode.json", "config.json", "AGENTS.md", "agent", "agents", "command", "commands", "mode", "modes", "plugin", "plugins", "tool", "tools", "skill", "skills"]) {
+    fs.mkdirSync(path.join(configDir, name));
+    assert.throws(() => assertNoPlantedConfig(root, configDir), (error) => error.message.includes(path.join(configDir, name)), name);
+    fs.rmSync(path.join(configDir, name), { recursive: true });
+  }
   fs.symlinkSync("/nonexistent", path.join(root, "AGENTS.md"));
-  assert.throws(() => assertSessionRootClean(root), /contains AGENTS\.md/);
-  fs.rmSync(root, { recursive: true });
-  const planted = path.join(process.env.COCKPIT_AGENT_WORKSPACE_ROOT, "opencode.json");
-  fs.writeFileSync(planted, "{}");
+  assert.throws(() => assertNoPlantedConfig(root, configDir), /AGENTS\.md/);
+  fs.rmSync(root, { recursive: true }); fs.rmSync(configDir, { recursive: true });
+  const tool = path.join(process.env.XDG_CONFIG_HOME, "opencode", "tools");
+  fs.mkdirSync(tool, { recursive: true });
   const result = await runAgent({ requestId: "87654323", role: "verifier", prompt: "verify" });
-  fs.rmSync(planted);
+  fs.rmSync(path.join(process.env.XDG_CONFIG_HOME, "opencode"), { recursive: true });
   assert.equal(result.ok, false);
-  assert.match(result.error, /agent workspace setup failed: .*contains opencode\.json/);
+  assert.match(result.error, /agent workspace setup failed: opencode would load .*opencode\/tools/);
   assert.deepEqual(fs.readdirSync(process.env.COCKPIT_AGENT_WORKSPACE_ROOT), []);
 });
 
@@ -140,6 +159,8 @@ test("the agent unit keeps the home and the opencode config read-only", () => {
   const home = env.HOME;
   assert.equal(home, "/var/lib/wireguard-ops-agent");
   assert.deepEqual([values("ProtectSystem"), values("ProtectHome")], [["strict"], ["true"]]);
+  // Other ways to make a path writable that the check below would not see.
+  for (const key of ["ReadWriteDirectories", "BindPaths", "LogsDirectory", "CacheDirectory", "ConfigurationDirectory"]) assert.deepEqual(values(key), [], key);
   const writable = [
     ...values("ReadWritePaths").flatMap((line) => line.split(/\s+/)),
     ...values("StateDirectory").flatMap((line) => line.split(/\s+/)).map((dir) => `/var/lib/${dir}`),
