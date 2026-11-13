@@ -839,8 +839,8 @@ log "9b) Claude Code installieren (Planer/Research, Version $CLAUDE_CODE_VERSION
 if npm install -g --silent "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION" && test -x "$NODE_DIR/bin/claude"; then
   chmod -R a+rX "$NODE_DIR/lib/node_modules/@anthropic-ai" 2>/dev/null || true
   # Nichts in sein Home schreiben: ein ~/.claude dort hielte jede Rolle an (assertNoPlantedConfig).
-  timeout 60 runuser -u cockpit-agent -- env HOME=/nonexistent CLAUDE_CONFIG_DIR=/nonexistent/claude DISABLE_AUTOUPDATER=1 "$NODE_DIR/bin/claude" --help 2>/dev/null | grep -q -- '--safe-mode' \
-    || echo "HINWEIS: claude als cockpit-agent nicht lauffähig oder ohne --safe-mode — Planer/Research bleiben im NOTBETRIEB."
+  CLAUDE_HELP="$(timeout 60 runuser -u cockpit-agent -- env HOME=/nonexistent CLAUDE_CONFIG_DIR=/nonexistent/claude DISABLE_AUTOUPDATER=1 "$NODE_DIR/bin/claude" --help 2>/dev/null || true)"
+  case "$CLAUDE_HELP" in *--safe-mode*) ;; *) echo "HINWEIS: claude als cockpit-agent nicht lauffähig oder ohne --safe-mode — Planer/Research bleiben im NOTBETRIEB." ;; esac
 else
   echo "HINWEIS: Claude Code $CLAUDE_CODE_VERSION nicht installiert — Planer/Research bleiben bei COCKPIT_PLAN_ENGINE=claude im NOTBETRIEB."
 fi

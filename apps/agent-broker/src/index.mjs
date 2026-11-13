@@ -162,7 +162,8 @@ export function claudeArgs(workspace, model) {
 // Claude's state belongs to the run like opencode's: CLAUDE_CONFIG_DIR below
 // the workspace, so no settings, credentials file or session one run leaves
 // reaches a later role. The login is the long-lived token from
-// `claude setup-token` in agent.env (CLAUDE_CODE_OAUTH_TOKEN); the subprocess
+// `claude setup-token` in claude.env, which only the agent unit loads
+// (CLAUDE_CODE_OAUTH_TOKEN); the subprocess
 // scrub keeps it out of the shell the model drives (needs bubblewrap; without
 // it Claude refuses to start and the run falls back, labelled NOTBETRIEB).
 // HOME too: Claude writes caches and its .claude.json there, and the
