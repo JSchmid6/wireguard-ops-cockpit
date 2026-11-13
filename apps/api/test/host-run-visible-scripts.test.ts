@@ -1641,3 +1641,117 @@ describe("hash-pinned scripts: the whole pipeline behind a group or function, | 
     expect(found(`${shown}\nprintf '%s\\n' "a;b" | tee /tmp/l\n${pin}\n${P}`)).toEqual([]);
   });
 });
+
+describe("hash-pinned scripts: nested ; in the pipeline, | # comment, wrapper options and quoted assignments before bash <(…), coproc, source over other fds, rbash, aliases (Nacharbeit 2, t_72c02efd)", () => {
+  const P = "/opt/x/run.sh";
+  const pin = `echo "${HASH}  ${P}" | sha256sum -c -`;
+  const found = (run: string) => hiddenPinnedScripts(manifest([{ name: "s1", run }]) as never).map(({ path }) => path);
+  const shown = `cat > ${P} <<'EOF'\necho gut\nEOF`;
+  const evil = `cp /tmp/boese ${P}`;
+  // Zweitprüfung t_219850ba (N1–N9): real bash runs the cp, the tool took it for
+  // content. Gegenprobe with bash: /opt/data/out/t_219850ba/e, /opt/data/out/t_72c02efd.
+  const forms = (q: string): Array<[string, string]> => {
+    const body = `${evil}\nX`;
+    const fn = `f() {\ncat <<${q}\n${body}\n}\n`;
+    return [
+      // N1: a ; && || in a substitution, subshell, group or block ends no pipeline
+      ["cat <<X | (cat;true) | bash", `cat <<${q} | (cat;true) | bash\n${body}`],
+      ["cat <<X | tee $(true; echo /dev/null) | bash", `cat <<${q} | tee $(true; echo /dev/null) | bash\n${body}`],
+      ["cat <<X | tee `true; echo /dev/null` | bash", `cat <<${q} | tee \`true; echo /dev/null\` | bash\n${body}`],
+      ["cat <<X | tee >(true; cat >/dev/null) | bash", `cat <<${q} | tee >(true; cat >/dev/null) | bash\n${body}`],
+      ["} | tee $(true;echo /dev/null) | bash", `{ cat <<${q}\n${body}\n} | tee $(true;echo /dev/null) | bash`],
+      ["} | (cat;true) | bash", `{ cat <<${q}\n${body}\n} | (cat;true) | bash`],
+      ["f | (cat;true) | bash", `${fn}f | (cat;true) | bash`],
+      ["f | tee $(:;echo /dev/null) | bash", `${fn}f | tee $(:;echo /dev/null) | bash`],
+      ["cat <<X | ( : ; bash )", `cat <<${q} | ( : ; bash )\n${body}`],
+      ["cat <<X | { :; bash; }", `cat <<${q} | { :; bash; }\n${body}`],
+      ["cat <<X | if :; then bash; fi", `cat <<${q} | if :; then bash; fi\n${body}`],
+      ["cat <<X | while :; do bash; break; done", `cat <<${q} | while :; do bash; break; done\n${body}`],
+      ["cat <<X | for i in 1; do bash; done", `cat <<${q} | for i in 1; do bash; done\n${body}`],
+      ["cat <<X | (true; (cat)) | bash", `cat <<${q} | (true; (cat)) | bash\n${body}`],
+      ["cat <<X | (true && cat) | bash", `cat <<${q} | (true && cat) | bash\n${body}`],
+      // N2: | at the line's end before a comment
+      ["} | # k⏎bash", `{ cat <<${q}\n${body}\n} | # k\nbash`],
+      ["cat <<X | # k⏎body⏎bash", `cat <<${q} | # k\n${body}\nbash`],
+      ["f | # k⏎bash", `${fn}f | # k\nbash`],
+      ["cat <<X |# k⏎body⏎bash", `cat <<${q} |# k\n${body}\nbash`],
+      // N3: a wrapper with option arguments in front of bash <(…)
+      ["env -u Z bash <(cat <<X)", `env -u Z bash <(cat <<${q})\n${body}`],
+      ["stdbuf -o L bash <(cat <<X)", `stdbuf -o L bash <(cat <<${q})\n${body}`],
+      ["setpriv bash <(cat <<X)", `setpriv bash <(cat <<${q})\n${body}`],
+      ["flock /tmp/l bash <(cat <<X)", `flock /tmp/l bash <(cat <<${q})\n${body}`],
+      ["sudo -u root bash <(cat <<X)", `sudo -u root bash <(cat <<${q})\n${body}`],
+      ["sudo -u root bash <(f)", `${fn}sudo -u root bash <(f)`],
+      ["nice -n 5 bash <(cat <<X)", `nice -n 5 bash <(cat <<${q})\n${body}`],
+      ["timeout -s KILL 9 bash <(cat <<X)", `timeout -s KILL 9 bash <(cat <<${q})\n${body}`],
+      // N4: quoted assignments in front of it
+      ["x=\"a b\" bash <(cat <<X)", `x="a b" bash <(cat <<${q})\n${body}`],
+      ["x=\"a b\" source <(cat <<X)", `x="a b" source <(cat <<${q})\n${body}`],
+      ["x=\"a b\" . <(cat <<X)", `x="a b" . <(cat <<${q})\n${body}`],
+      ["x=\"a b\" eval \"$(cat <<X)\"", `x="a b" eval "$(cat <<${q})"\n${body}`],
+      ["x='a;b' $(cat <<X)", `x='a;b' $(cat <<${q})\n${body}`],
+      ["x='a|b' $(cat <<X)", `x='a|b' $(cat <<${q})\n${body}`],
+      ["x='a;b' bash <(cat <<X)", `x='a;b' bash <(cat <<${q})\n${body}`],
+      ["x=\"a;b\" bash <(cat <<X)", `x="a;b" bash <(cat <<${q})\n${body}`],
+      // N5: coproc
+      ["coproc bash; cat <<X >&${COPROC[1]}", `coproc bash\ncat <<${q} >&\${COPROC[1]}\n${body}`],
+      ["coproc S { bash; }; cat <<X >&${S[1]}", `coproc S { bash; }\ncat <<${q} >&\${S[1]}\n${body}`],
+      ["coproc S {⏎bash⏎}", `coproc S {\nbash\n}\ncat <<${q} >&\${S[1]}\n${body}`],
+      // N6: source over another fd or path
+      ["source /dev/fd/3 3<<X", `source /dev/fd/3 3<<${q}\n${body}`],
+      [". /dev/fd/3 3<<X", `. /dev/fd/3 3<<${q}\n${body}`],
+      ["source /proc/self/fd/3 3<<X", `source /proc/self/fd/3 3<<${q}\n${body}`],
+      ["cat <<X | source //dev/stdin", `cat <<${q} | source //dev/stdin\n${body}`],
+      ["cat <<X | source /dev/./stdin", `cat <<${q} | source /dev/./stdin\n${body}`],
+      ["cat <<X | . /proc/thread-self/fd/0", `cat <<${q} | . /proc/thread-self/fd/0\n${body}`],
+      ["source //dev/stdin <<X", `source //dev/stdin <<${q}\n${body}`],
+      [". /proc/$$/fd/3 3<<X", `. /proc/$$/fd/3 3<<${q}\n${body}`],
+      // N7: rbash
+      ["cat <<X | rbash", `cat <<${q} | rbash\n${body}`],
+      ["rbash <<X", `rbash <<${q}\n${body}`],
+      ["} | rbash", `{ cat <<${q}\n${body}\n} | rbash`],
+      ["rbash <(cat <<X)", `rbash <(cat <<${q})\n${body}`],
+      // N8: aliases
+      ["shopt -s expand_aliases; alias b=bash; cat <<X | b", `shopt -s expand_aliases\nalias b=bash\ncat <<${q} | b\n${body}`],
+      // N9: a call the plan does not name, and a function that reads the body
+      ["g=f; $g | bash", `${fn}g=f; $g | bash`],
+      ["eval f | bash", `${fn}eval f | bash`],
+      ["$(echo f) | bash", `${fn}$(echo f) | bash`],
+      ["b() { bash; }; cat <<X | b", `b() { bash; }\ncat <<${q} | b\n${body}`],
+    ];
+  };
+  for (const q of ["X", "'X'"]) {
+    for (const [name, run] of forms(q)) {
+      it(`Nacharbeit 2: ${name} (${q === "X" ? "unquoted" : "quoted"})`, () => {
+        expect(found(`${shown}\n${run}\n${pin}\n${P}`)).toEqual([P]);
+      });
+      it(`Nacharbeit 2: ${name} (${q === "X" ? "unquoted" : "quoted"}, pin before)`, () => {
+        expect(found(`${shown}\n${pin}\n${run}\n${P}`)).toEqual([P]);
+      });
+    }
+  }
+
+  it("guard: pipelines into files, assignments, comments, blocks and functions without a shell stay free", () => {
+    const free = [
+      `cat <<'X' | tee /tmp/a | wc -l\nhallo\nX`,
+      `cat <<'X' | grep h | sort > /tmp/a\nhallo\nX`,
+      `{ cat <<'X'\nhallo\nX\n} > /tmp/a\nls | wc -l`,
+      `cat <<'X' > /tmp/a # a | b\nhallo\nX`,
+      `f() {\ncat <<'X'\nhallo\nX\n}\nf > /tmp/a`,
+      `cat <<'X' | (cd /tmp && cat > a)\nhallo\nX`,
+      `cat <<'X' | (cd /tmp; cat > a)\nhallo\nX`,
+      `x="$(date)"; echo "$x"`,
+      `echo "a; b $(date)"`,
+      `for f in a b; do echo $f; done | wc -l`,
+      `if true; then echo a; fi; ls | wc -l`,
+      `ls | grep -c x # zaehlen`,
+      `f() { echo hi; }\nf > /tmp/a`,
+      `diff <(sort /tmp/a) <(sort /tmp/b) || true`,
+      `grep -q bash /etc/shells`,
+    ];
+    for (const run of free) {
+      expect(found(`${shown}\n${run}\n${pin}\n${P}`)).toEqual([]);
+      expect(found(`${shown}\n${pin}\n${run}\n${P}`)).toEqual([]);
+    }
+  });
+});

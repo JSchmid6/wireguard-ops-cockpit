@@ -146,7 +146,7 @@ const DIGEST = /\b[0-9a-fA-F]{32,128}\b/;
 const CHECKSUM_ENTRY = /^\s*[0-9a-fA-F]{32,128}\s+\*?\S+\s*$/;
 const ABSOLUTE_PATH = /(?<![\w.~$-])\/[A-Za-z0-9._+@%/-]*[A-Za-z0-9_+@%-]/g;
 const RELATIVE_PATH = /(?<![\w/.~$-])\.\.?\/[A-Za-z0-9._+@%/-]*[A-Za-z0-9_+@%-]/g;
-const SHELL_WORDS = /^(?:sh|bash|dash|zsh|ksh|mksh|ash|fish|csh|tcsh|busybox|python[\d.]*|perl[\d.]*|ruby[\d.]*|node|nodejs|php[\d.]*|lua[\d.]*|Rscript|pwsh|awk|gawk|mawk|nawk|source|\.)$/;
+const SHELL_WORDS = /^(?:sh|bash|dash|zsh|ksh|mksh|ash|rbash|fish|csh|tcsh|busybox|python[\d.]*|perl[\d.]*|ruby[\d.]*|node|nodejs|php[\d.]*|lua[\d.]*|Rscript|pwsh|awk|gawk|mawk|nawk|source|\.)$/;
 const SCRIPT_FILE = /\.(?:sh|bash|zsh|ksh|fish|py|pl|rb|js|mjs|cjs|php|lua|ps1|awk|r)$/i;
 // Words in front of the command: keywords and wrappers that run what follows.
 // Their own option arguments (sudo -u root) are not skipped: "root" then is
@@ -209,17 +209,25 @@ function commandOf(words: string[]): string {
 // only assigns (VAR=$(…)), "$(" when the substitution itself is the command —
 // also behind wrappers, options or keywords only (sudo $(…), FOO=1 $(…), X5,
 // t_cee07772: the output runs as a command there).
-function enclosingOf(text: string): string {
-  const words = wordsOf(text);
-  if (!words.length) return "$(";
-  const assigning = /[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=["']?\S*$/.test(text);
+// Nacharbeit 2 (Zweitprüfung t_219850ba, Karte t_72c02efd): a shell named
+// anywhere before it reads it (N3: env -u Z bash <(…), sudo -u root bash <(…),
+// flock /l bash <(…)); fail safe, every word counts, not only the command word.
+// quotedStart: a separator inside quotes split the word before it (N4: x='a;b'
+// $(…), x='a|b' $(…)); the rest of a word is no command, fail safe "$(".
+const ASSIGNMENT_WORD = /(^|\s)([A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=)(?:\$?'[^']*'|"[^"]*"|[^\s'"])*/g;
+
+function enclosingOf(text: string, quotedStart = false): string {
+  if (quotedStart) return "$(";
   // X5 B7 (Zweitprüfung t_fa3d3327, Karte t_a533d05c): a word with an escape in
   // $'…' ($'\x62ash' <(…)) may name any command; fail safe, as in shellWords.
   if (/(?:^|\s)\$'[^']*\\/.test(text)) return "$(";
-  // X5 B8: a[0]=1 $(…) and x="a b" $(…) only assign before it; the output runs
-  // as a command. Quoted strings collapse first, so "a b" stays one word.
-  const bare = text.replace(/'[^']*'|"[^"]*"/g, "q").trim().split(/\s+/).filter((word) => word && !/^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=/.test(word));
-  if (!assigning && !commandOf(bare)) return "$(";
+  // X5 B8, N4: a[0]=1 $(…), x="a b" $(…) and x="a b" bash <(…) only assign
+  // before it. The value of an assignment collapses first, so "a b" stays one word.
+  const plain = text.replace(ASSIGNMENT_WORD, "$1$2q");
+  const words = wordsOf(plain).filter((word) => !/^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=/.test(word));
+  const assigning = /[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=["']?\S*$/.test(text);
+  const shell = shellWords({ text: plain }).find((word) => SHELL_NAME.test(word));
+  if (shell) return basename(shell);
   return commandOf(words) || (assigning ? "" : "$(");
 }
 
@@ -230,7 +238,7 @@ function enclosingOf(text: string): string {
 function splitLine(line: string): { segments: Segment[]; open: Array<string | null> } {
   const exec = line.match(/^\s*Exec[A-Za-z]*\s*=\s*[-@:+!|]*(.*)$/);
   const code = exec ? exec[1] : line;
-  const raw: Array<{ text: string; enclosing: string | null; sep: string; write: boolean; quoted: boolean }> = [];
+  const raw: Array<{ text: string; enclosing: string | null; sep: string; write: boolean; quoted: boolean; deep: boolean }> = [];
   const stack: Array<string | null> = [];
   // The opener of each open substitution or group, parallel to stack (>( for B6).
   const kinds: string[] = [];
@@ -242,8 +250,24 @@ function splitLine(line: string): { segments: Segment[]; open: Array<string | nu
   let double = false;
   let escaped = false;
   let backslashes = 0;
+  // N4 (t_72c02efd): the segment begins behind a separator inside quotes.
+  let quotedStart = false;
+  // N1 (t_72c02efd): depth of groups and blocks by their words ({ if while until
+  // for case select … } fi done esac). A ; in a substitution, subshell, group or
+  // block ends no pipeline; fail safe, any such word counts and a depth below
+  // zero stays deep for the rest of the line.
+  let blocks = 0;
   const top = (): string | null => (stack.length ? stack[stack.length - 1] : null);
-  const close = (sep: string) => { raw.push({ text: current, enclosing: top(), sep, write: kinds.includes(">("), quoted: single || double || escaped }); current = ""; };
+  const close = (sep: string) => {
+    for (const word of wordsOf(current)) {
+      if (/^(?:\{|if|while|until|for|case|select)$/.test(word)) blocks += blocks < 0 ? 0 : 1;
+      else if (/^(?:\}|fi|done|esac)$/.test(word)) blocks -= 1;
+    }
+    const quoted = single || double || escaped;
+    raw.push({ text: current, enclosing: top(), sep, write: kinds.includes(">("), quoted, deep: stack.length > 0 || blocks !== 0 });
+    quotedStart = quoted && /^(?:;|\||&|&&|\|\|)$/.test(sep);
+    current = "";
+  };
   for (let i = 0; i < code.length; i += 1) {
     const ch = code[i];
     escaped = !single && backslashes % 2 === 1;
@@ -253,7 +277,7 @@ function splitLine(line: string): { segments: Segment[]; open: Array<string | nu
     const two = code.slice(i, i + 2);
     if (two === "&&" || two === "||") { close(two); i += 1; continue; }
     if (two === "$(" || two === "<(" || two === ">(") {
-      const outer = enclosingOf(current);
+      const outer = enclosingOf(current, quotedStart);
       close(two);
       stack.push(outer);
       kinds.push(two);
@@ -261,7 +285,7 @@ function splitLine(line: string): { segments: Segment[]; open: Array<string | nu
       continue;
     }
     if (ch === "`") {
-      if (backtick) { close(ch); stack.pop(); kinds.pop(); } else { const outer = enclosingOf(current); close(ch); stack.push(outer); kinds.push(ch); }
+      if (backtick) { close(ch); stack.pop(); kinds.pop(); } else { const outer = enclosingOf(current, quotedStart); close(ch); stack.push(outer); kinds.push(ch); }
       backtick = !backtick;
       continue;
     }
@@ -278,7 +302,7 @@ function splitLine(line: string): { segments: Segment[]; open: Array<string | nu
     const next = item.sep === "|" ? raw[index + 1] : undefined;
     const joined = /^(?:\)|`)$/.test(raw[index - 1]?.sep ?? "") || /^(?:\$\(|`|<\(|>\()$/.test(item.sep);
     const segment = { text: item.text, words, command: commandOf(words), enclosing: item.enclosing, pipedInto: next ? commandOf(wordsOf(next.text)) : null, joined, sep: item.sep, pipe, write: item.write };
-    if (!item.quoted && /^(?:;|&|&&|\|\||)$/.test(item.sep) && !(item.sep === "&" && !item.text.trim() && raw[index - 1]?.sep === "|")) pipe += 1;
+    if (!item.quoted && !item.deep && /^(?:;|&|&&|\|\||)$/.test(item.sep) && !(item.sep === "&" && !item.text.trim() && raw[index - 1]?.sep === "|")) pipe += 1;
     return segment;
   }).filter((segment) => segment.words.length);
   return { segments, open: stack };
@@ -457,24 +481,30 @@ interface ScriptLine {
 
 // Commands that run a heredoc body as shell code (bash <<'X', sudo bash -s,
 // sudo -s, su, runuser, ssh, cat <<'X' | bash); "" is a segment of wrappers only.
-const HEREDOC_SHELL = /^(?:sh|bash|dash|zsh|ksh|mksh|ash|busybox|fish|csh|tcsh|su|runuser|ssh|)$/;
+const HEREDOC_SHELL = /^(?:sh|bash|dash|zsh|ksh|mksh|ash|rbash|busybox|fish|csh|tcsh|su|runuser|ssh|)$/;
 // A shell named anywhere in the segment (sudo -u root sh), bare or below /bin, /usr/bin.
-const SHELL_NAME = /^(?:\/(?:usr\/)?bin\/)?(?:sh|bash|dash|zsh|ksh|mksh|ash|busybox|fish|csh|tcsh)$/;
+const SHELL_NAME = /^(?:\/(?:usr\/)?bin\/)?(?:sh|bash|dash|zsh|ksh|mksh|ash|rbash|busybox|fish|csh|tcsh)$/;
 // source /dev/stdin and . - read the heredoc as shell code as well (B4, t_1748d6c1).
 const STDIN_FILE = /^(?:-|\/dev\/stdin|\/dev\/fd\/0|\/proc\/self\/fd\/0)$/;
+// N6 (Zweitprüfung t_219850ba, Karte t_72c02efd): source and . read a heredoc
+// through any fd or path to it (source /dev/fd/3 3<<X, /proc/self/fd/3,
+// //dev/stdin, /dev/./stdin, /proc/thread-self/fd/0). Fail safe, after
+// normalizing every path below /dev or /proc and every word with an expansion
+// counts; whether the body is local still needs the exact STDIN_FILE (localChain).
+const SOURCED_HEREDOC = /^(?:-|\/dev\/.*|\/proc\/.*|.*[$`].*)$/;
 
 // X5 (Zweitprüfung t_63a24b37, Karte t_cee07772): bash removes quotes and
 // backslashes before it looks a command up, as for base names (B6): b\ash,
 // ba''sh, \bash, $'bash' run bash. A word with an escape inside $'…'
 // ($'\x62ash') may name any command; fail safe, it counts as a shell.
-function shellWords(segment: Segment): string[] {
+function shellWords(segment: Pick<Segment, "text">): string[] {
   return segment.text.trim().split(/\s+/).map((word) => /\$'[^']*\\/.test(word) ? "bash" : word.replace(/\$(?=['"])/g, "").replace(/['"\\]/g, "")).filter(Boolean);
 }
 
 // Commands that run their substitution's output as shell code: a shell or source
 // reading <(…) (bash <(cat <<'X'), bash < <(…), source <(…)), eval $(…) and a
 // substitution in place of the command ($(cat <<'X'), sudo $(…)).
-const CODE_RUNNER = /^(?:sh|bash|dash|zsh|ksh|mksh|ash|busybox|fish|csh|tcsh|su|runuser|ssh|source|\.|eval|\$\()$/;
+const CODE_RUNNER = /^(?:sh|bash|dash|zsh|ksh|mksh|ash|rbash|busybox|fish|csh|tcsh|su|runuser|ssh|source|\.|eval|\$\()$/;
 
 function runsCode(enclosing: string | null): boolean {
   return enclosing !== null && CODE_RUNNER.test(enclosing.replace(/\$(?=['"])/g, "").replace(/['"\\]/g, ""));
@@ -486,7 +516,7 @@ function runsCode(enclosing: string | null): boolean {
 function readsShell(segment: Segment): boolean {
   const words = plainWords(shellWords(segment).map((word) => word.split("<")[0]).filter(Boolean));
   const command = commandOf(words);
-  if (/^(?:source|\.)$/.test(command)) return words.some((word) => STDIN_FILE.test(word));
+  if (/^(?:source|\.)$/.test(command)) return words.some((word) => SOURCED_HEREDOC.test(posix.normalize(word)));
   return HEREDOC_SHELL.test(command) || words.some((word) => SHELL_NAME.test(word));
 }
 
@@ -542,7 +572,7 @@ const STEP_ENVIRONMENT = /(?<![\w${])(?:PATH|ENV|BASH_ENV|SHELL|SHELLOPTS|BASHOP
 // expand_aliases) makes every later body of the step not local, like an exported
 // environment: bash <<'X' or cat <<'X' | bash then need not run the body. A
 // function with any other name (f() { … }) stays free.
-const REBIND = /(?:^|[\s;&|(])(?:alias|unalias|hash|enable)(?=\s|;|$)|expand_aliases|(?:^|[\s;&|(])(?:function\s+)?(?:[\w.\/-]*\/)?(?:sh|bash|dash|zsh|ksh|mksh|ash|busybox|fish|csh|tcsh|cat|tee|install|source|sudo|doas|su|runuser|setpriv|env|nice|ionice|chrt|timeout|stdbuf|systemd-run|systemd-cat|nohup|setsid|exec|command|builtin|time)\s*\(\s*\)|(?:^|[\s;&|(])function\s+(?:sh|bash|dash|zsh|ksh|mksh|ash|busybox|fish|csh|tcsh|cat|tee|install|source|sudo|doas|su|runuser|setpriv|env|nice|ionice|chrt|timeout|stdbuf|systemd-run|systemd-cat|nohup|setsid|exec|command|builtin|time)(?=[\s{(]|$)/;
+const REBIND = /(?:^|[\s;&|(])(?:alias|unalias|hash|enable)(?=\s|;|$)|expand_aliases|(?:^|[\s;&|(])(?:function\s+)?(?:[\w.\/-]*\/)?(?:sh|bash|dash|zsh|ksh|mksh|ash|rbash|busybox|fish|csh|tcsh|cat|tee|install|source|sudo|doas|su|runuser|setpriv|env|nice|ionice|chrt|timeout|stdbuf|systemd-run|systemd-cat|nohup|setsid|exec|command|builtin|time)\s*\(\s*\)|(?:^|[\s;&|(])function\s+(?:sh|bash|dash|zsh|ksh|mksh|ash|rbash|busybox|fish|csh|tcsh|cat|tee|install|source|sudo|doas|su|runuser|setpriv|env|nice|ionice|chrt|timeout|stdbuf|systemd-run|systemd-cat|nohup|setsid|exec|command|builtin|time)(?=[\s{(]|$)/;
 const EXPORT_EXPANSION = /(?:^|[\s;&|(])(?:export|declare|typeset)(?:\s+-[A-Za-z]+)*(?:\s+[A-Za-z_][A-Za-z0-9_]*(?:=\S*)?)*\s+["']?[$`]/;
 // The shell itself by positive list (S-B, S-D, t_c82f5ac2): only options that
 // keep the body as the code it runs — -s (also bundled), -e, -u, -x, -v, -o with
@@ -991,9 +1021,19 @@ function feedsShell(segments: Segment[], at: number): boolean {
   return runsCode(segments[at].enclosing) || segments.some((segment, k) => k > at && segment.pipe === segments[at].pipe && segments.slice(at, k).some((before) => before.sep === "|" || before.sep === ">(") && codeReader(segment));
 }
 
+// Nacharbeit 2 (Zweitprüfung t_219850ba, Karte t_72c02efd): a | at the line's end
+// also before a comment (N2: } | # k⏎bash), a coproc (N5: coproc bash, coproc S
+// { bash; } + cat <<X >&${COPROC[1]}), aliases (N8: shopt -s expand_aliases;
+// alias b=bash; cat <<X | b) and, in a step with functions, a call the plan does
+// not name (N9: g=f; $g | bash, eval f | bash, $(echo f) | bash).
 function shellReadsUnseen(line: string, segments: Segment[], open: Array<string | null>, functions: Set<string>): boolean {
   if (open.some(runsCode)) return true;
-  if (/(?<!\|)\|&?\s*$/.test(line)) return true;
+  if (/(?<!\|)\|&?\s*(?:#.*)?$/.test(line)) return true;
+  if (/(?:^|[\s;&|(])coproc(?=\s|$)/.test(line) || /expand_aliases/.test(line)) return true;
+  if (functions.size && segments.some((segment, at) => {
+    const command = commandOf(plainWords(shellWords(segment)));
+    return (/[$`]/.test(command) || command === "eval" || segment.enclosing === "$(") && feedsShell(segments, at);
+  })) return true;
   if (segments.some((segment) => segment.write && codeReader(segment))) return true;
   if (segments.some((segment, at) => functions.has(segment.command.replace(/\$(?=['"])/g, "").replace(/['"\\]/g, "")) && feedsShell(segments, at))) return true;
   for (const match of line.matchAll(CLOSER)) {
@@ -1157,7 +1197,9 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
         // then ends in cat, so localChain makes the body not local: its writes show
         // nothing, its overwrites and runs are read.
         for (; at < segments.length; at += 1) {
-          shell = readsShell(segments[at]) || runsCode(segments[at].enclosing);
+          // Fail safe, a function of the step reads its input as it likes
+          // (b() { bash; }; cat <<X | b, t_72c02efd).
+          shell = readsShell(segments[at]) || runsCode(segments[at].enclosing) || functions.has(segments[at].command.replace(/\$(?=['"])/g, "").replace(/['"\\]/g, ""));
           // Nachtrag t_a533d05c (B5): the chain follows the whole pipeline, also
           // into substitutions behind the pipe (| source <(cat), | eval "$(cat)").
           if (shell || segments[at + 1]?.pipe !== segments[at].pipe) break;

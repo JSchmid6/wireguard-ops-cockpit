@@ -191,24 +191,42 @@ Die Regel im Einzelnen (`hiddenPinnedScripts` in `apps/api/src/host-run.ts`):
   nicht nur ihr erster Befehl (`} | tee /dev/null | bash`, `} | cat | bash`, `f | tee /dev/null | bash`,
   `} | { bash; }`, `} | tee >(bash)`, `f | (bash)`), mit jeder Umleitung am Schließer (`} 2>"/tmp/a b" | bash`,
   `} 2>$(…) | bash`), und dort auch ein Befehl, der eine Ersetzung als Code ausführt (`} | source <(cat)`,
-  `| eval "$(cat)"`). Die Pipeline endet für die Regel nur an `;`, `&`, `&&`, `||` außerhalb von Quotes und ohne
-  Backslash davor (`tr '\n' ';' | xargs -0 bash -c` geht weiter), `|&` setzt sie fort. Den Funktionsaufruf liest
+  `| eval "$(cat)"`). Die Pipeline endet für die Regel nur an `;`, `&`, `&&`, `||` außerhalb von Quotes, ohne
+  Backslash davor (`tr '\n' ';' | xargs -0 bash -c` geht weiter) und auf oberster Ebene: nicht in `( … )`, `$( … )`,
+  Backticks, `<( … )`, `>( … )`, `{ … }` und nicht in `if`/`while`/`until`/`for`/`case`/`select`-Blöcken
+  (13.11.2026, N1 aus t_219850ba, Karte t_72c02efd: `cat <<X | (cat;true) | bash`, `| tee $(true; echo …) | bash`,
+  `| ( : ; bash )`, `| { :; bash; }`, `| if :; then bash; fi`, `| while :; do bash; break; done`; fail-safe zählt dafür
+  jedes dieser Wörter, und ein Schließer zu viel lässt die Zeile bis zu ihrem Ende eine Pipeline sein); `|&` setzt sie fort. Den Funktionsaufruf liest
   sie wie bash (`\f`, `'f'`). Ebenso folgt die Kette eines einfachen Heredocs der ganzen Pipeline bis in
   Ersetzungen dahinter (`cat <<X | source <(cat)`, `| . <(cat)`, `| eval "$(cat)"`, `| bash <(cat)`; der Körper
-  ist dann nicht lokal). Fail-safe blind macht außerdem: ein `|` am Zeilenende (auch `|&`, nicht `||`) — bash
-  setzt die Pipeline nach den Heredoc-Körpern fort (`} |`⏎`bash`, `cat <<X |`⏎Körper⏎`X`⏎`bash`) —, jedes `>( … )`
+  ist dann nicht lokal). Fail-safe blind macht außerdem: ein `|` am Zeilenende (auch `|&`, nicht `||`, auch vor einem
+  Kommentar, N2: `} | # k`⏎`bash`) — bash setzt die Pipeline nach den Heredoc-Körpern fort (`} |`⏎`bash`,
+  `cat <<X |`⏎Körper⏎`X`⏎`bash`) —, jedes `coproc` (N5: `coproc bash`, `coproc S { bash; }` + `cat <<X >&${COPROC[1]}`),
+  `expand_aliases` (N8: `shopt -s expand_aliases; alias b=bash; cat <<X | b`), in einem Schritt mit Funktionen ein
+  Aufruf, den der Plan nicht nennt, vor einem Code-Leser (N9: `g=f; $g | bash`, `eval f | bash`, `$(echo f) | bash`), jedes `>( … )`
   auf der Zeile, das eine Shell, `source` oder `eval` liest (`exec > >(bash)`, `exec 1> >(sh)`,
   `exec {fd}> >(bash)`, `exec > >(eval "$(cat)")`; auch wenn der Pin davor steht). Vor einer Ersetzung gilt ein
-  Wort mit einem Escape in `$'…'` fail-safe als Shell (`$'\x62ash' <(cat <<X)`, `$'\x62ash' < <(…)`), und
+  Wort mit einem Escape in `$'…'` fail-safe als Shell (`$'\x62ash' <(cat <<X)`, `$'\x62ash' < <(…)`), ebenso
+  jedes Wort davor, das eine Shell nennt, nicht nur das Befehlswort (N3: `env -u Z bash <(…)`, `stdbuf -o L bash <(…)`,
+  `flock /tmp/l bash <(…)`, `sudo -u root bash <(…)`, `setpriv bash <(…)`), und
   Zuweisungen mit Index oder gequotetem Wert sind Zuweisungen, nicht der Befehl: `a[0]=1 $(cat <<X)`,
-  `x="a b" $(…)`, `a[1]+=x $(…)` führen die Ausgabe als Befehl aus (`a[0]=$(…)` bleibt eine Zuweisung).
+  `x="a b" $(…)`, `a[1]+=x $(…)`, `x="a b" bash <(…)`, `x="a b" source <(…)`, `x="a b" eval "$(…)"` (N4; `a[0]=$(…)`
+  bleibt eine Zuweisung). Hat ein Trenner in Quotes das Wort vor der Ersetzung zerschnitten (`x='a;b' $(…)`,
+  `x='a|b' $(…)`), steht die Ersetzung fail-safe an Befehlsstelle (N4). Ein Heredoc, den eine Funktion des Schritts
+  liest (`b() { bash; }` + `cat <<X | b`), ist fail-safe ein Shell-Körper. `source`/`.` lesen den Heredoc auch über
+  einen anderen fd oder Pfad (N6: `source /dev/fd/3 3<<X`, `source /proc/self/fd/3 3<<X`, `| source //dev/stdin`,
+  `| source /dev/./stdin`, `| . /proc/thread-self/fd/0`): Die Regel normalisiert den Pfad, und fail-safe zählt jeder
+  Pfad unter `/dev` oder `/proc` und jedes Wort mit `$` oder Backtick; lokal ist der Körper dann nur bei `-`,
+  `/dev/stdin`, `/dev/fd/0`, `/proc/self/fd/0`. `rbash` ist eine Shell wie `bash` (N7: auf Ubuntu ein Link darauf).
   Ehrliche Grenze: Kommt der Code über einen Wert, den
-  der Plan nicht zeigt (`$BASH <<X`, `x=$(cat <<X)` + `bash -c "$x"`), oder über eine Datei ohne Pin
-  (`cat > /tmp/s <<X` + `bash /tmp/s`), sieht die Regel keinen Shell-Körper; das liest der Türsteher (X5),
+  der Plan nicht zeigt (`$BASH <<X`, `x=$(cat <<X)` + `bash -c "$x"`, in einem Schritt ohne Funktionen auch `$g <<X`),
+  oder über eine Datei ohne Pin (`cat > /tmp/s <<X` + `bash /tmp/s`), sieht die Regel keinen Shell-Körper; das liest der Türsteher (X5),
   wie jedes Skript ohne Hash. In der Pipeline hinter Gruppe oder Funktion und in `>( … )` zählt dagegen
   fail-safe auch ein Befehl, den erst ein Wert nennt (`} | xargs $SH -c`, `f | $BASH`, `exec > >($X)`). Preis: Ein Schritt
   mit `} | bash`, `) | bash` (auch `echo $(…) | bash`), einer Funktion, die in eine Shell geht, einem `|` am
-  Zeilenende oder einem `>(bash)` zeigt danach kein festgenageltes Skript mehr; der Planer schreibt die Pipe auf
+  Zeilenende oder einem `>(bash)` — seit N1–N9 auch einem `coproc`, `expand_aliases` oder einem Aufruf über einen Wert
+  neben einer Funktion — zeigt danach kein festgenageltes Skript mehr, und ein Pfad in einer Ersetzung hinter einem
+  Trenner in Quotes (`echo "a; $(cat /p)"`) oder neben einem Shell-Wort (`grep bash <(cat /p)`) zählt als ausgeführt; der Planer schreibt die Pipe auf
   eine Zeile und den Inhalt per Heredoc direkt in die Datei. Ein Heredoc endet nur an einer Zeile, die
   genau sein Begrenzer ist; bei `<<-` fallen nur führende Tabs weg (H1, t_b4b11e32: ` X` oder `EOF ` beenden
   nichts). Bei einem Shell-Körper mit `<<-` (`bash <<-'X'`) gilt das für **jede** Zeile des Körpers, auch für die
@@ -418,7 +436,7 @@ Plan anders verbirgt (Skript von anderswo ohne Pin, Pfad aus nicht gezeigten Wer
 Riegels („content this plan does not show“) und X5 des Türstehers. Die Regel ist eine Planer-Hilfe, kein
 Schloss: Sie lehnt nur zusätzlich ab, der Türsteher liest jeden Lauf weiterhin selbst. Tests:
 `apps/api/test/host-run-visible-scripts.test.ts` (alle Fälle der Probe aus t_740ac6ee, der Gegenprobe
-aus t_af29564c, der Befunde B1–B6 aus t_1748d6c1, R-A, R-B, H1–H4 aus t_b4b11e32, S-A–S-D, H-c, H-e aus t_c82f5ac2, T-A–T-D aus t_683da1d6, U-A, U-B aus t_f7778d43 und V-A–V-C samt Hinweisen aus t_cdad398e, W-A, W-B und Hinweis M aus t_ebbf1e40, X-A und Hinweis Arithmetik aus t_6024cbc7, Hinweis B1 aus t_0bc8fac5, R1 aus t_42ae4123, X5 aus t_63a24b37 (Karte t_cee07772), B1–B8 aus t_fa3d3327 (Karte t_a533d05c), plus die aufgezeichneten Pläne vom 10.10.2026 als Fehlalarm-Gegenprobe).
+aus t_af29564c, der Befunde B1–B6 aus t_1748d6c1, R-A, R-B, H1–H4 aus t_b4b11e32, S-A–S-D, H-c, H-e aus t_c82f5ac2, T-A–T-D aus t_683da1d6, U-A, U-B aus t_f7778d43 und V-A–V-C samt Hinweisen aus t_cdad398e, W-A, W-B und Hinweis M aus t_ebbf1e40, X-A und Hinweis Arithmetik aus t_6024cbc7, Hinweis B1 aus t_0bc8fac5, R1 aus t_42ae4123, X5 aus t_63a24b37 (Karte t_cee07772), B1–B8 aus t_fa3d3327 (Karte t_a533d05c), N1–N9 aus t_219850ba (Karte t_72c02efd), plus die aufgezeichneten Pläne vom 10.10.2026 als Fehlalarm-Gegenprobe).
 
 ## 2a. Backup-Riegel: Backups löschen nur mit Freigabe
 
