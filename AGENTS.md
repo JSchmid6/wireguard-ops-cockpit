@@ -47,7 +47,7 @@ POST /api/runbooks {"prompt":"...","sessionId":"..."}
 
 ## System Architecture
 
-Bare-metal Ubuntu VPS (161.97.86.86) running:
+Bare-metal Ubuntu VPS running:
 
 | Service | Location | Admin via | DB |
 |---|---|---|---|
@@ -86,7 +86,7 @@ Bare-metal Ubuntu VPS (161.97.86.86) running:
 
 ### GitLab
 - Admin: `gitlab-ctl status|restart|tail`
-- API: PAT `glpat-CN...` with api scope
+- API: personal access token with api scope (kept outside the repository)
 - Container Registry: `registry.wejos.de`, JWT auth via GitLab
 
 ### Hermes Agent
@@ -177,7 +177,7 @@ Bare-metal Ubuntu VPS (161.97.86.86) running:
 - Retain a generated capability by digest only after independent post-execution verification, and only when its manifest declares `"retain": true` (operations expected to recur); one-off repairs stay in the job history and audit only.
 - Hermes authenticates with a dedicated route-scoped `automation` bearer token. Never place an administrator password in agent scripts, prompts, shared cookie jars, or model environments; automation tokens cannot approve their own work.
 - Research uses a dedicated, tool-budgeted read-only prompt contract and returns factual evidence instead of a runbook or capability manifest. It reports sandbox denials rather than bypassing them. Change planning and bounded execution remain separate stages.
-- Planner/research and safety-review models are independently configurable. Production currently uses `opencode/big-pickle` for planning/research and `deepseek/deepseek-v4-pro` for safety review; changing models must not change authority or execution boundaries.
+- Planner/research and safety-review models are independently configurable. The models are host configuration (the cockpit's env files on each host; the deploy writes defaults only on first install) and are deliberately not recorded here; changing models must not change authority or execution boundaries.
 - The isolated broker runs planner/research/safety/verifier with OpenCode's `plan` agent and only the bounded runner with `build`; all broker calls use `--pure` to exclude external plugins.
 - The OpenCode `plan` profile allows external-directory reads because systemd supplies the real read-only/NoNewPrivileges boundary. Secret-like files retain their separate restriction; the unattended planner must not block on redundant read prompts. `plan` denies only the edit tool, not bash: every role, the runner (`build`) too, can write whatever the unit lets `cockpit-agent` write, so that boundary is the unit, not the agent profile.
 - Change circuit breaking is scoped to a fingerprint of the planner/safety models and execution contracts. Runtime repairs do not erase audit history, while unchanged runtimes still stop after repeated failures.
