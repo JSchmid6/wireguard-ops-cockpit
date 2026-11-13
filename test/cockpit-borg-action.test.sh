@@ -1350,7 +1350,10 @@ assert_err "Grund nennt das EnvironmentFile" "(EnvironmentFile)"
 printf 'OTHER=1\n' > "$DB/envfile"; printf '%s (ignore_errors=no)\n' "$DB/nicht-da" >> "$WORK/mariadb-unit-envfiles"
 boot cgroup-run
 assert_rc "nicht lesbares EnvironmentFile: abgewiesen" 67
-rm -f "$WORK/mariadb-unit-envfiles" "$DB/envfile"
+printf '%s (ignore_errors=no)\n%s (ignore_errors=yes)\n' "$DB/envfile" "$DB/optional-fehlt" > "$WORK/mariadb-unit-envfiles"
+: > "$DB/init-noop"; boot cgroup-run; rm -f "$DB/init-noop"
+assert_err "fehlendes optionales EnvironmentFile (-…) hält nicht an (Lauf kommt bis zum Neustart)" "die Init-Datei hat nicht (ganz) gewirkt"
+rm -f "$WORK/mariadb-unit-envfiles" "$DB/envfile" "$DB/restart.log" "$DB/init-"*
 [ "$(restarts)" = 0 ] && ok "kein Neustart bei abgewiesenen Vorbedingungen" || bad "Neustart trotz abgewiesener Vorbedingung"
 cnf_unchanged "Vorbedingungen: Datei unverändert"
 assert_no_file "Vorbedingungen: kein Konto angelegt" "$DB/created-hash"

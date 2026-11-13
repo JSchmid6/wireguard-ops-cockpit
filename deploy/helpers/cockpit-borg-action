@@ -1122,9 +1122,12 @@ db_bootstrap() {
   fi
   # EnvironmentFile= zeigt `show -p Environment` nicht (Zweitprüfung PR #105):
   # jede genannte Datei, die MYSQLD_OPTS setzt oder nicht lesbar ist, hält an.
-  while read -r envf _; do
+  # Eine fehlende Datei mit ignore_errors=yes (EnvironmentFile=-…) setzt nichts.
+  local envrest
+  while read -r envf envrest; do
     [ -n "$envf" ] || continue
     envf="${envf#-}"
+    if [ ! -e "$envf" ] && [[ "$envrest" == *ignore_errors=yes* ]]; then continue; fi
     if [ ! -r "$envf" ] || grep -qE '^[[:space:]]*(export[[:space:]]+)?MYSQLD_OPTS=' "$envf"; then
       die "$DB_UNIT liest $envf (EnvironmentFile), das MYSQLD_OPTS setzt oder nicht lesbar ist — die Init-Datei käme womöglich nicht an; nichts verändert." 67
     fi

@@ -326,8 +326,10 @@ Grenzen:
     Rückweg-Neustart (er scheiterte an der gelöschten Datei), rc=1 mit dem Handgriff
     `systemctl unset-environment MYSQLD_OPTS`; kommt die Datenbank
     mit der Datei nicht hoch, startet `bootstrap` sie sofort normal (ohne Datei) neu und meldet rc=1;
-    wirkt die Datei nicht, rc=1 — in allen Fällen bleibt `mysqldump.cnf` unverändert, und Datei und
-    `MYSQLD_OPTS` sind weg (auch bei Abbruch, `trap EXIT`).
+    wirkt die Datei nicht, rc=1 — in allen Fällen bleibt `mysqldump.cnf` unverändert, die Datei ist
+    weg und `MYSQLD_OPTS` zurückgenommen (auch bei Abbruch, `trap EXIT`) — ausser im oben genannten
+    Fall, dass `unset-environment` nicht greift (dann rc=1 mit dem Handgriff). Ein fehlendes
+    optionales `EnvironmentFile=-…` (`ignore_errors=yes`) hält nicht an.
   * **Rückweg:** `db-access restore` (Datei auf `nextDB`, Stand Zwischenweg B). root zurück auf nur
     Passwort: `ALTER USER root@localhost IDENTIFIED VIA mysql_native_password USING '<Hash aus SHOW
     CREATE USER>'` per `mysql -u root` (Socket); `cockpit_backup` stört ohne Datei nicht.
