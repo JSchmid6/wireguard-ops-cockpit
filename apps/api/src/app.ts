@@ -2778,10 +2778,13 @@ export async function createApp(options: AppOptions = {}) {
         updateHermesJob(job.id, "blocked_runner_busy", runnerBusyExplanation(intent, executedSteps, message), preservedOutput);
         return;
       }
+      // Only what passed the start mark reached the host; a refusal before it
+      // (state steps, no runner broker, a malformed typed plan) changed nothing.
+      const started = typeof preservedOutput.executionStartedAt === "string";
       updateHermesJob(job.id, "failed_execution", explanation({
-        phase: "finished", intent, completed: executedSteps,
-        reason: executedSteps.length ? `The execution started and then failed: ${message}` : message,
-        neededToContinue: executedSteps.length
+        phase: "finished", intent, completed: started ? executedSteps : executedSteps.filter((step) => step !== "Runner execution"),
+        reason: started ? `The execution started and then failed: ${message}` : message,
+        neededToContinue: started
           ? ["The execution may have changed the host: inspect its result and log before retrying."]
           : ["Inspect the preserved proposal, session, and job evidence."],
         recommendedAction: "Resolve the reported prerequisite before retrying.",

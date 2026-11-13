@@ -613,6 +613,10 @@ describe("host door: uninterruptible steps through the API", () => {
     expect(flow.agentCalls.some((call) => call.role === "runner")).toBe(false);
     expect(job.status).not.toBe("completed");
     expect(JSON.stringify(job.output)).toContain("state steps (package)");
+    // A refusal before the start is not reported as a run that may have changed the host.
+    expect(typeof job.output?.executionStartedAt).toBe("undefined");
+    expect(JSON.stringify(job.output)).not.toContain("The execution started and then failed");
+    expect(JSON.stringify(job.output)).not.toContain("may have changed the host");
   });
 
   // The runner (build) runs only under its own identity (t_cb81637b): with the
@@ -627,6 +631,8 @@ describe("host door: uninterruptible steps through the API", () => {
     expect(job.status).not.toBe("completed");
     expect(JSON.stringify(job.output)).toContain("the runner needs its own broker identity (COCKPIT_RUNNER_BROKER_SOCKET)");
     expect(typeof job.output?.executionStartedAt).toBe("undefined");
+    expect(JSON.stringify(job.output)).not.toContain("The execution started and then failed");
+    expect(JSON.stringify(job.output)).not.toContain("may have changed the host");
   });
 });
 

@@ -199,9 +199,10 @@ unchanged):
    create ends the job with 67, phase `snapshot`, nothing changed.
    `state.json` names the snapshot (`snapshot`) for the activation.
 2. Deploy script, pre-activation verification or scheduling fail →
-   `restore`, `systemctl daemon-reload`, `reload nginx` (when active), restart
-   the four services only if one is down (in `defer` mode the old code is still
-   the running one), then the full verification against the previous commit.
+   `restore`, `systemctl daemon-reload`, `reload nginx` (when active), stop the
+   units the restore removed (point 5), restart the services only if one is
+   down (in `defer` mode the old code is still the running one), then the full
+   verification against the previous commit.
    The job keeps its failure code; `last-result.json` carries `rollback`
    (`result`, `verification` or `error`), `state.json` is the restored one plus
    `rollback` (failed commit, snapshot, phase).
@@ -211,6 +212,31 @@ unchanged):
    not prove the previous stand), exit 68.
 4. A rollback that cannot restore or verify says so loudly
    (`rollback incomplete: …`) and leaves the snapshot in place for the operator.
+5. Units the update added (Kanban t_b049f75b, B1 of t_15055863): after the
+   restore and `daemon-reload` the rollback asks systemd for the `LoadState` of
+   every service in `COCKPIT_SELF_UPDATE_SERVICES` and of every
+   `/etc/systemd/system/*.service` the restore reports as removed. A unit that
+   is `not-found` belongs to the failed stand: it is stopped and
+   `reset-failed`, listed in `rollback.removed_units`, and neither restarted
+   nor verified; its broker socket is dropped from the check as well
+   (`<dir>/cockpit-<role>/<x>.sock` belongs to `wireguard-ops-cockpit-<role>`;
+   a socket of any other form is always checked). A removed unit that is still
+   active after the stop makes the rollback incomplete. An unreadable
+   `LoadState` counts as present, so the unit stays restarted and verified.
+
+**Honest limit, the rollout that brings a new unit.** A rollback runs with the
+runner that is running at that moment. The deploy phase (point 2) runs with the
+runner installed *before* the update, the activation (point 3) with the newly
+installed one. So when the update that introduces this rule (PR #98, which also
+adds `wireguard-ops-cockpit-runner`) fails in its deploy phase, the old rollback
+removes the new unit file but leaves the runner broker that the deploy started
+with `enable --now` running as a `not-found` orphan; the rollback itself still
+verifies, because the old service list does not contain the runner. The
+operator clears it with
+`systemctl stop wireguard-ops-cockpit-runner && systemctl reset-failed wireguard-ops-cockpit-runner`.
+From the next update on, both phases use this rule. In either case the
+`multi-user.target.wants` link of a removed unit stays behind dangling (the
+snapshot footprint does not cover `*.wants`); systemd ignores it.
 
 `restore` puts back bytes, modes, owners and symlinks (`cp -a`), removes what
 the update added below the globs, and swaps directories in by rename after the
@@ -590,7 +616,11 @@ under the state directory — never a bare exit code.
   deploy script, rollback after a failing deploy (checkout and state back, no
   restart), failing snapshot stops before the deploy, rollback after a failing
   activation (restart, previous commit verified, `rolled-back`), a rollback
-  that cannot verify or restore is reported, never hidden.
+  that cannot verify or restore is reported, never hidden. S17f: the update adds
+  a unit whose broker already runs, the activation fails and the restore removes
+  the unit file (the stub answers rc 5 for a unit without a file); the rollback
+  stops the orphan, restarts and verifies only the remaining units and sockets
+  and ends `rolled-back` (red against the rollback before t_b049f75b).
 - `sudo bash test/cockpit-self-update-snapshot.test.sh` — the snapshot helper
   against a fixture root: byte-, mode- and owner-exact restore of a changed
   footprint (changed, added, removed files, new helper and unit), secrets and

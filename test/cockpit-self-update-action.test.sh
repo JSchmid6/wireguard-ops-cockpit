@@ -220,9 +220,24 @@ case "\${1:-}" in
     if [ -e "$FIX/docker-tag" ] && [ ! -e "$FIX/web-stale" ]; then cp "$FIX/docker-tag" "$FIX/docker-running"; fi
     # S17d: one failing restart (the activation), the rollback's restart works
     if [ -e "$FIX/restart-fail-once" ]; then rm -f "$FIX/restart-fail-once"; exit 1; fi
+    # S17f: with a unit directory, a unit without a file is not found (rc 5 like systemctl)
+    if [ -d "$FIX/units" ]; then
+      for unit in "\${@:2}"; do
+        [ -e "$FIX/units/\$unit" ] || { echo "Failed to restart \$unit.service: Unit \$unit.service not found." >&2; exit 5; }
+      done
+    fi
     exit "\${FIX_RESTART_RC:-0}"
     ;;
+  stop)
+    echo "stop: \$*" >> "$FIX/record.log"
+    rm -f "$FIX/running/\${2:-}"
+    exit 0 ;;
   is-active)
+    # S17f: a unit without a file is active only while its orphan still runs
+    if [ -d "$FIX/units" ] && [ ! -e "$FIX/units/\${3:-}" ]; then
+      [ -e "$FIX/running/\${3:-}" ] && exit 0
+      exit 3
+    fi
     # S18: services still starting — the first N checks fail, then they are
     # up; the late broker socket comes up only with the call named in
     # late-sock-at (the last service check of the successful try), so the
@@ -241,7 +256,12 @@ case "\${1:-}" in
       if [ "\$left" -gt 0 ]; then echo "\$((left - 1))" > "$FIX/isactive-fail-left"; exit 3; fi
     fi
     exit "\${FIX_ISACTIVE_RC:-0}" ;;
-  show) echo "Thu 2026-09-25 18:00:00 UTC"; exit 0 ;;
+  show)
+    if [ -d "$FIX/units" ] && [ "\${2:-}" = "-p" ] && [ "\${3:-}" = "LoadState" ]; then
+      [ -e "$FIX/units/\${5:-}" ] && echo loaded || echo not-found
+      exit 0
+    fi
+    echo "Thu 2026-09-25 18:00:00 UTC"; exit 0 ;;
   *) exit 0 ;;
 esac
 EOF
@@ -913,6 +933,8 @@ case "\$1" in
     mkdir -p "\$dir"
     git -C "$CLONE" rev-parse HEAD > "\$dir/head"
     cp "$FIX/state/state.json" "\$dir/state.json"
+    # S17f: the unit files at create time (like the helper's glob over the units)
+    if [ -d "$FIX/units" ]; then ls "$FIX/units" > "\$dir/units"; fi
     echo "{\"ok\": true, \"bytes\": 42, \"checkout_head\": \"\$(cat "\$dir/head")\", \"rotated\": []}"
     ;;
   restore)
@@ -920,7 +942,18 @@ case "\$1" in
     [ -d "\$dir" ] || exit 65
     git -C "$CLONE" checkout --quiet --detach "\$(cat "\$dir/head")"
     cp "\$dir/state.json" "$FIX/state/state.json"
-    echo '{"ok": true}'
+    # S17f: unit files the update added go, reported like the helper does
+    removed=""
+    if [ -f "\$dir/units" ] && [ -d "$FIX/units" ]; then
+      for file in "$FIX/units"/*; do
+        [ -e "\$file" ] || continue
+        unit="\$(basename "\$file")"
+        grep -qx "\$unit" "\$dir/units" && continue
+        rm -f "\$file"
+        removed="\$removed\"/etc/systemd/system/\$unit.service\","
+      done
+    fi
+    echo "{\"ok\": true, \"removed\": [\${removed%,}]}"
     ;;
   *) exit 64 ;;
 esac
@@ -989,6 +1022,37 @@ check "S17d failing restart -> 68" "$([ "$rc" -eq 68 ] && echo 0 || echo 1)" "rc
 expect_json "S17d activation rolled back" "$FIX/state/last-result.json" "activation.status" "rolled-back"
 expect_json "S17d rollback verified" "$FIX/state/last-result.json" "activation.rollback.result" "ok"
 expect_json "S17d state back on the previous commit" "$FIX/state/state.json" "deployed_commit" "$B17"
+
+# f) the update adds a unit (a new broker, started by the deploy's enable --now),
+#    the activation fails and the restore removes the unit file again: the
+#    rollback stops the orphan, restarts and verifies only the units and sockets
+#    the restored stand has (B1 of t_15055863)
+mkdir -p "$FIX/units" "$FIX/running" "$FIX/run/cockpit-new"
+: > "$FIX/units/fixture-svc-a"
+: > "$FIX/units/fixture-svc-b"
+"$HELPER" "$C9" "$H9" > /dev/null 2> "$FIX/s17f.err"; rc=$?
+check "S17f deploy rc=0" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "rc=$rc $(head -c 300 "$FIX/s17f.err")"
+: > "$FIX/units/wireguard-ops-cockpit-new"
+: > "$FIX/running/wireguard-ops-cockpit-new"
+: > "$FIX/record.log"
+: > "$FIX/restart-fail-once"
+COCKPIT_SELF_UPDATE_SERVICES="fixture-svc-a fixture-svc-b wireguard-ops-cockpit-new" \
+COCKPIT_SELF_UPDATE_SOCKETS="$FIX/sock-a.sock $FIX/sock-b.sock $FIX/run/cockpit-new/new.sock" \
+  "$RUNNER" activate "$C9" > "$FIX/s17f-act.out" 2>&1; rc=$?
+rm -f "$FIX/restart-fail-once"
+check "S17f failing activation -> 68" "$([ "$rc" -eq 68 ] && echo 0 || echo 1)" "rc=$rc $(tail -c 300 "$FIX/s17f-act.out")"
+check "S17f restore removed the new unit file" "$([ -e "$FIX/units/wireguard-ops-cockpit-new" ] && echo 1 || echo 0)" ""
+expect_json "S17f activation rolled back" "$FIX/state/last-result.json" "activation.status" "rolled-back"
+expect_json "S17f rollback ok" "$FIX/state/last-result.json" "activation.rollback.result" "ok"
+expect_json "S17f rollback verified the services" "$FIX/state/last-result.json" "activation.rollback.verification.services" "ok"
+expect_json "S17f rollback verified the sockets" "$FIX/state/last-result.json" "activation.rollback.verification.sockets" "ok"
+expect_json "S17f rollback names the removed unit" "$FIX/state/last-result.json" "activation.rollback.removed_units" "['wireguard-ops-cockpit-new']"
+check "S17f removed unit stopped" "$(grep -q "stop: stop wireguard-ops-cockpit-new" "$FIX/record.log" && echo 0 || echo 1)" "$(cat "$FIX/record.log")"
+check "S17f no orphan left running" "$([ -e "$FIX/running/wireguard-ops-cockpit-new" ] && echo 1 || echo 0)" ""
+check "S17f rollback restart without the removed unit" \
+  "$(grep "restart:" "$FIX/record.log" | tail -1 | grep -q "fixture-svc-a fixture-svc-b$" && echo 0 || echo 1)" "$(cat "$FIX/record.log")"
+expect_json "S17f state back on the previous commit" "$FIX/state/state.json" "deployed_commit" "$B17"
+rm -rf "$FIX/units" "$FIX/running" "$FIX/run"
 
 # e) restore itself fails -> loud, snapshot named, exit stays the failure code
 : > "$FIX/snap-restore-fails"
