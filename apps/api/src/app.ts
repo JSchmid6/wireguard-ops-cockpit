@@ -98,7 +98,6 @@ import {
   type UpdateTarget,
 } from "./update-review.js";
 import {
-  backupGuardHits,
   buildHostRunReviewPrompt,
   hostRunManifestHash,
   hostRunPlannerContract,
@@ -350,40 +349,11 @@ export function evaluatePlanPolicy(plan: string, safetyVerdict: string): PlanPol
       : "green";
   const rollback = sectionValue(plan, "Rollback");
   const rollbackAvailable = Boolean(rollback && !/^none\.?$/i.test(rollback));
-  const executableScript = typedPlanScript(plan);
 
-  // These are intentionally few hard boundaries. Contextual classification
-  // remains the Safety LLM's job.
-  const hardBoundaries: Array<[RegExp, string]> = [
-    [/\b(rm\s+-rf|mkfs|wipefs|shred)\b/i, "destructive data operation"],
-    [/\b(iptables|nft|ufw|useradd|userdel|usermod|groupadd|groupdel|visudo)\b/i, "network or identity boundary"],
-    [/\b(mysql|mariadb)\b.{0,80}\b(nextcloud|oc_)/i, "direct Nextcloud database access"],
-    [/(?:>|tee\b|sed\s+-i\b)[^\n]*(?:\/etc\/sudoers|NOPASSWD)/i, "sudo authority change"],
-      // The agent's own key material. Never a legitimate runbook target in any
-      // direction — a write extends the agent's rights (the NEWKEYBAD fixture
-      // probes exactly this), a read is exfiltration. Matched as a bare path
-      // mention because the fixture hides the write behind variables:
-      // FILE="/home/hermes/.hermes/.env"; echo "$LINE" >> "$FILE".
-      [/(?:\/home\/hermes|~|\$HOME)\/\.hermes\/\.?env\b/i, "agent environment (API keys)"],
-      [/(?:\/home\/hermes|~|\$HOME)\/\.hermes\/credentials/i, "agent credential store"],
-      // The Cockpit's own secrets: execution authority (api.env, executor.env)
-      // and the hoster API (contabo.env). The latter can roll the whole
-      // machine back — for an agent on an external model the most powerful
-      // capability in the system. Same rule as the agent's credentials: never
-      // a runbook target, in either direction.
-      [/\/etc\/wireguard-ops-cockpit\b/i, "cockpit secrets (execution authority, hoster API)"],
-
-  ];
-  const hit = hardBoundaries.find(([pattern]) => pattern.test(executableScript));
-  if (hit) {
-    return {
-      zone: "red", allowed: false, status: "blocked_user_approval",
-      reason: `The plan crosses a protected boundary: ${hit[1]}.`,
-      evidence: [hit[1]],
-      neededToContinue: ["Explicit operator approval or a lower-impact alternative."],
-      rollbackAvailable,
-    };
-  }
+  // No text-pattern boundaries here (Jochen 08./13.11.2026, card t_abe2651b):
+  // classification is the independent safety review's job on the whole plan;
+  // secrets and identities are held by the executor's sandbox and the
+  // capability manifest's scopes, not by a regex over the plan text.
   if (safetyVerdict === "blocked" || safetyVerdict === "not_run") {
     return {
       zone: "red", allowed: false, status: "blocked_policy",
@@ -2323,10 +2293,6 @@ export async function createApp(options: AppOptions = {}) {
 
   async function runHostRun(envelope: ExecutionEnvelope, manifest: HostRunManifest): Promise<string> {
     if (!config.executorBrokerSocket || !config.executorBrokerSecret) throw new Error("executor broker is not configured");
-    // Backup bolt (host-run.ts): the policy already stops such a run for the
-    // operator; this is the second check before the helper, which asks a third time.
-    const backup = backupGuardHits(manifest);
-    if (backup.length > 0 && !envelope.operatorApproved) throw new Error(`the host run touches the backups and runs only with the operator's approval (${backup[0].where} ${backup[0].reason})`);
     // Risk bolt (host-run.ts): a declared risk beyond "contained" waits for the operator too.
     const risks = hostRunRisksNeedingApproval(manifest);
     if (risks.length > 0 && !envelope.operatorApproved) throw new Error(`the host run declares risk ${risks.join(", ")} and runs only with the operator's approval`);
@@ -2916,8 +2882,24 @@ export async function createApp(options: AppOptions = {}) {
     if (breaker && typeof breaker === "object" && !job.output?.envelope) {
       return decideBreakerOverride(job, jobOwnerId, actor, body.decision, body.reason.trim(), intent, breaker, reply);
     }
+    let reviewedEnvelope = job.output?.envelope as ExecutionEnvelope | undefined;
+    let renewedAfterExpiry: { previousExpiresAt: string; notAfter: string } | null = null;
     if (body.decision === "approved") {
-      const envelopeErrors = envelopeErrorsFor(job, job.output?.envelope as ExecutionEnvelope | undefined, jobOwnerId, intent, true);
+      let envelopeErrors = envelopeErrorsFor(job, reviewedEnvelope, jobOwnerId, intent, true);
+      // Freigabe nach Ablauf (13.11.2026, t_36523a6a): Ist allein die Frist
+      // abgelaufen, gibt Jochens Sitzung den Job trotzdem frei — derselbe
+      // Inhalt, neu signiert, dann freigegeben —, solange er jünger als
+      // REACTIVATION_MAX_AGE_HOURS ist. Vorher hieß das „Neu bestellen lassen“:
+      // James bestellte neu, die neue Prüfung stoppte erneut, Jochen klickte
+      // zweimal für dieselbe Entscheidung. Jede andere Abweichung bleibt ein Stopp.
+      const notAfter = Date.parse(job.createdAt) + REACTIVATION_MAX_AGE_HOURS * 3_600_000;
+      if (reviewedEnvelope && envelopeErrors.length === 1 && envelopeErrors[0] === "execution envelope expired"
+        && !reviewedEnvelope.operatorApproved && Date.now() < notAfter) {
+        const previousExpiresAt = reviewedEnvelope.expiresAt;
+        reviewedEnvelope = renewExecutionEnvelope(reviewedEnvelope, config.executionEnvelopeSecret, config.approvalTtlMinutes, new Date(notAfter));
+        envelopeErrors = envelopeErrorsFor(job, reviewedEnvelope, jobOwnerId, intent, true);
+        renewedAfterExpiry = { previousExpiresAt, notAfter: new Date(notAfter).toISOString() };
+      }
       if (envelopeErrors.length > 0) {
         const blocked = updateHermesJob(job.id, "blocked_policy", explanation({
           phase: "finished", intent, reason: "The approved execution envelope is expired or no longer matches the reviewed action.",
@@ -2931,6 +2913,9 @@ export async function createApp(options: AppOptions = {}) {
         const expired = envelopeErrors.includes("execution envelope expired");
         return reply.code(409).send({ message: expired ? "execution envelope expired" : "execution envelope validation failed", envelopeErrors, job: blocked });
       }
+    }
+    if (renewedAfterExpiry) {
+      database.createAudit({ actorId: actor.id, action: "hermes.change.approved_after_expiry", targetType: "job", targetId: job.id, details: renewedAfterExpiry });
     }
     database.createAudit({
       actorId: actor.id, action: `hermes.change.${body.decision}`, targetType: "job", targetId: job.id,
@@ -2981,8 +2966,8 @@ export async function createApp(options: AppOptions = {}) {
       rollbackAvailable: Boolean((job.output?.policy as Record<string, unknown> | undefined)?.rollbackAvailable),
     }), {
       ...job.output,
-      envelope: approveExecutionEnvelope(job.output?.envelope as ExecutionEnvelope, config.executionEnvelopeSecret, config.approvalTtlMinutes),
-      approval: { decision: "approved", reason: body.reason?.trim() || null, actorId: actor.id },
+      envelope: approveExecutionEnvelope(reviewedEnvelope as ExecutionEnvelope, config.executionEnvelopeSecret, config.approvalTtlMinutes),
+      approval: { decision: "approved", reason: body.reason?.trim() || null, actorId: actor.id, ...(renewedAfterExpiry ? { afterExpiry: renewedAfterExpiry } : {}) },
     });
 
     void (async () => {
@@ -4385,7 +4370,7 @@ Follow these rules:
     const visible = (jobId: string | null) => actor.role === "admin" || (jobId !== null && database.getJobOwnerId(jobId) === actor.id);
     for (const job of database.listJobsByStatus("hermes-change", "blocked_user_approval")) {
       if (!visible(job.id)) continue;
-      cards.push(hermesJobCard(job, now, webUrl));
+      cards.push(hermesJobCard(job, now, webUrl, REACTIVATION_MAX_AGE_HOURS));
     }
     for (const approval of database.listApprovalsForActor(actor.id, "pending")) {
       cards.push(approvalCard(approval, database.getJob(approval.jobId), config.approvalTtlMinutes, now, webUrl));

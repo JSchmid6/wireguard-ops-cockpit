@@ -39,6 +39,10 @@ StateDirectoryMode=0700
 ReadWritePaths=/run/cockpit-agent
 # Defence in depth on top of the runner's own 0750 home: not even visible here.
 InaccessiblePaths=-/var/lib/wireguard-ops-runner -/run/cockpit-runner
+# The Cockpit's own secrets (execution envelope, hoster API) are out of every
+# role's reach by structure, not by a text filter on the plan (card t_abe2651b).
+# systemd reads EnvironmentFile= above before it builds this namespace.
+InaccessiblePaths=-/etc/wireguard-ops-cockpit
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 [Install]

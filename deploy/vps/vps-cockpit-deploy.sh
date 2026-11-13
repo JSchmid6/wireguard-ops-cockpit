@@ -108,9 +108,12 @@ readonly TABLE=(
   "deploy/systemd/email-archive-auto-deploy.service|$UNITS/email-archive-auto-deploy.service|644"
   "deploy/systemd/email-archive-auto-deploy.timer|$UNITS/email-archive-auto-deploy.timer|644"
   "deploy/vps/wireguard-ops-cockpit-web.service|$UNITS/wireguard-ops-cockpit-web.service|644"
-  # The agent unit keeps its home read-only; opencode then needs this file in its config
-  # directory (it writes it on start otherwise and fails). The config itself is not
-  # installed here (the VPS keeps its own); the read-only home protects it.
+  # The opencode config every role loads (secret-free, same file as Lab0/box) and the
+  # .gitignore opencode would otherwise write into its read-only config directory at
+  # start (it fails on a read-only directory). Root-owned: the table installs root:root,
+  # the directory (0700 cockpit-agent) keeps it unreadable for everyone else. Lab0/box
+  # use root:cockpit-agent-client 0640; the VPS file was agent-owned 0600 before.
+  "deploy/config/opencode-agent.jsonc|$ROOT/var/lib/wireguard-ops-agent/.config/opencode/opencode.jsonc|644"
   "deploy/config/opencode-config-dir.gitignore|$ROOT/var/lib/wireguard-ops-agent/.config/opencode/.gitignore|644"
   # The runner's config comes from the repository (no secrets in it; root-owned in a
   # home its unit keeps read-only), with the same .gitignore.
@@ -119,11 +122,6 @@ readonly TABLE=(
   # The general host door (doc/setup/host-run.md): its root helper and the
   # boot-time continuation of runs that asked for a reboot.
   "deploy/helpers/cockpit-host-run|$LIB/cockpit-host-run.mjs|755"
-  # Backups löschen nur mit Freigabe: die eine Erkennung, die der Helfer importiert.
-  "deploy/helpers/cockpit-backup-guard.mjs|$LIB/cockpit-backup-guard.mjs|644"
-  # …und die festen Grenzen des Aufräum-Diensts auf Lab0, die der Riegel importiert
-  # (der Dienst selbst läuft nur auf Lab0, doc/setup/borg-retention.md).
-  "deploy/helpers/cockpit-borg-retention-rules.mjs|$LIB/cockpit-borg-retention-rules.mjs|644"
   # Zustandsschritte nie mittendrin abbrechen: die eine Erkennung, die der Helfer importiert.
   "deploy/helpers/cockpit-state-steps.mjs|$LIB/cockpit-state-steps.mjs|644"
   "deploy/systemd/wireguard-ops-cockpit-host-run-resume.service|$UNITS/wireguard-ops-cockpit-host-run-resume.service|644"
@@ -229,6 +227,45 @@ install_runtime() {
     return 70
   fi
   log "pinned Node v$version installed at $dir"
+}
+
+# Leftover opencode config the agent broker refuses (assertNoPlantedConfig in
+# apps/agent-broker/src/index.mjs, the same names; a test compares the lists): from
+# the session root up to / and in the agent's global config directory. With one of
+# them in place the broker stops EVERY role, planner and doorkeeper too, so the
+# Cockpit could neither repair nor roll itself back. Checked before anything is
+# installed: the deploy stops with 71 and the running stand stays as it is. Root
+# moves the named paths aside (not delete: they may be someone's notes) and
+# deploys again.
+# >>> planted-config-preflight
+readonly PLANTED_PROJECT_NAMES=(opencode.json opencode.jsonc .opencode AGENTS.md CLAUDE.md CONTEXT.md .claude .agents .git .gitconfig .npmrc)
+readonly PLANTED_GLOBAL_NAMES=(opencode.json config.json config AGENTS.md agent agents command commands mode modes plugin plugins tool tools skill skills)
+planted_config_preflight() { # planted_config_preflight <host root> <agent home>
+  local root="$1" home="$2" dir name found=()
+  dir="$home/sessions"
+  while :; do
+    for name in "${PLANTED_PROJECT_NAMES[@]}"; do
+      if [ -e "$root${dir%/}/$name" ] || [ -L "$root${dir%/}/$name" ]; then found+=("${dir%/}/$name"); fi
+    done
+    [ "$dir" = / ] && break
+    dir="$(dirname -- "$dir")"
+  done
+  for name in "${PLANTED_GLOBAL_NAMES[@]}"; do
+    if [ -e "$root$home/.config/opencode/$name" ] || [ -L "$root$home/.config/opencode/$name" ]; then found+=("$home/.config/opencode/$name"); fi
+  done
+  if [ -e "$root$home/.config/git" ] || [ -L "$root$home/.config/git" ]; then found+=("$home/.config/git"); fi
+  [ "${#found[@]}" -eq 0 ] && return 0
+  printf 'opencode would load %s into every role\n' "${found[@]}"
+  return 1
+}
+# <<< planted-config-preflight
+
+check_planted_config() {
+  local report
+  if report="$(planted_config_preflight "$ROOT" /var/lib/wireguard-ops-agent)"; then return 0; fi
+  printf '%s\n' "$report" | while IFS= read -r line; do log "FAILED: $line"; done
+  log "FAILED: the agent broker would refuse every role with these in place; move them aside as root, then deploy again"
+  return 71
 }
 
 self_update_env() { # the runner's configuration on this host
@@ -366,6 +403,7 @@ trap rollback ERR
 
 log "deploying $REPO_COMMIT over $OLD (restart mode: ${COCKPIT_RESTART_MODE:-now}, backup $BACKUP)"
 git checkout -q -B main "$REPO_COMMIT"
+check_planted_config
 install_runtime
 build
 save_targets

@@ -13,9 +13,8 @@ und mindestens 52 px hoch.
 
 | Karte | Quelle | Freigeben | Ablehnen |
 |---|---|---|---|
-| Änderung von James | `hermes-change`-Job in `blocked_user_approval` (Türsteher-Befund, Update-Prüfer-Stopp, Plan-Policy) | `POST /api/hermes/jobs/:id/approval` | derselbe Weg mit `rejected` |
+| Änderung von James | `hermes-change`-Job in `blocked_user_approval` (Türsteher-Befund — auch Backups löschen oder eine Aufbewahrung unter der Untergrenze als X4 —, Risiko-Riegel, Update-Prüfer-Stopp, Plan-Policy) | `POST /api/hermes/jobs/:id/approval` | derselbe Weg mit `rejected` |
 | Notfall-Durchlass | `hermes-change`-Job am offenen Circuit Breaker (`output.breaker`, noch ohne Plan): der Grund nennt die zählenden Jobs und wann der Breaker schließt; Frist = `breaker.approvalExpiresAt` | derselbe Weg: genau dieser Job wird geplant und geprüft wie jeder andere, nur der Breaker entfällt (Audit `hermes.change.breaker_override`) | derselbe Weg mit `rejected` |
-| Backup-Riegel | derselbe Job, wenn der Riegel (`cockpit-backup-guard.mjs`) angeschlagen hat — also auch ein `cockpit-borg-retention set` unter der Untergrenze, den James bestellt | wie oben | wie oben |
 | Freigabe | offener Eintrag in `approvals` (Runbook- und Agentenpläne) | `POST /api/approvals/:id/decision` | derselbe Weg mit `rejected` |
 | Aufräum-Dienst | Lab0-Dienst `angehalten` nach einer Anomalie (Archive fehlen, die er nicht selbst entfernt hat), solange er für genau diese Anomalie keine Freigabe trägt (nach `freigeben` bleibt er bis zum Ende seines Laufs `angehalten`) | `POST /api/borg/retention/resume` (Grund ≥ 10 Zeichen, wie bisher) | `POST /api/inbox/retention/:anomalyId/keep`: der Dienst bleibt angehalten, die Karte verschwindet, ein Audit hält den Grund fest |
 
@@ -23,7 +22,7 @@ Eine Einstellung unter der Untergrenze, die Jochen selbst im Bereich „Backup r
 fragt dort direkt nach seiner Freigabe — sie wartet auf niemanden und erscheint deshalb nicht als
 Karte.
 
-Auf der Startseite zeigt jede Karte nur **die Art** (Änderung von James, Backup-Riegel, Freigabe,
+Auf der Startseite zeigt jede Karte nur **die Art** (Änderung von James, Freigabe,
 Aufräum-Dienst), **die Frist** als Countdown, **die Absicht in einem Satz** und einen Knopf
 **Details**. Erst „Details" öffnet einen Dialog (auf dem Handy bildschirmfüllend und selbst
 scrollend, ab 40rem Breite ein Fenster in der Mitte; „✕", Escape oder ein Tipp daneben schließen
@@ -46,10 +45,27 @@ ihn). Der Dialog zeigt alles, was vorher direkt auf der Karte stand, und mehr:
 Nichts offen: groß **„Nichts wartet auf dich"**, darunter eine Zeile mit dem letzten Lauf, dem Alter
 des letzten Backups (aus `borg.status`, ohne neue Messung zu erzwingen) und dem freien Platz auf `/`.
 
-## Abgelaufene Frist: „Neu bestellen lassen"
+## Abgelaufene Frist: trotzdem freigeben (bis 72 h)
 
-Ein abgelaufener Envelope ist nicht mehr freigebbar (das prüft der Server ohnehin). Die Karte sagt
-das deutlich und bietet statt Freigeben **Neu bestellen lassen**:
+Seit 13.11.2026 (Karte t_36523a6a, Jochen: „Warum muss ich das immer freigeben?") bleibt ein Job,
+dessen Envelope **nur** abgelaufen ist, freigebbar, solange er jünger als 72 h ist
+(`REACTIVATION_MAX_AGE_HOURS`). Die Karte trägt dann `approvableAfterExpiry: true` und bietet
+**Freigeben (Frist erneuern)** mit Pflichtgrund. `POST /api/hermes/jobs/:id/approval` (nur Jochens
+Sitzung, Automation 403 wie immer) prüft den Envelope vollständig; ist der einzige Fehler
+„execution envelope expired“ und war er nie freigegeben, signiert sie **denselben Inhalt** mit neuer
+Frist neu (`renewExecutionEnvelope`) und gibt ihn in derselben Entscheidung frei — Audit
+`hermes.change.approved_after_expiry` (alte Frist, `notAfter`) vor `hermes.change.approved`, im Job
+`output.approval.afterExpiry`. Jede andere Abweichung (Signatur, Bindung, Plan, Prüfung, Policy,
+Manifest) bleibt ein Stopp. Vorher hieß ein Ablauf „Neu bestellen lassen“: James bestellte neu, die
+neue Prüfung stoppte am selben Befund, Jochen klickte zweimal für dieselbe Entscheidung (lab0-Job
+dc8d47e3, 13.11.2026). Was der Host seit der Prüfung geändert hat, fangen die Prüfungen beim Lauf ab:
+Self-Update vergleicht den geprüften Diff-Hash (65 bei Drift), der Tür-Helfer prüft Netz und
+Snapshot beim Start.
+
+## Abgelaufene Frist: „Neu bestellen lassen" (älter als 72 h)
+
+Ist der Job älter als 72 h, ist der abgelaufene Envelope nicht mehr freigebbar (das prüft der
+Server ohnehin). Die Karte sagt das deutlich und bietet statt Freigeben **Neu bestellen lassen**:
 
 `POST /api/inbox/jobs/:id/reorder` (nur Jochens Sitzung, nie ein Automation-Token; nur wenn der
 Envelope wirklich abgelaufen ist) schließt den alten Job endgültig (`blocked_policy`, mit
@@ -97,7 +113,7 @@ gibt einem abgelaufenen Job eine neue Frist. **Reaktivieren ist kein Freigeben:*
   Job bleibt in `blocked_user_approval`; freigeben kann weiter nur Jochen über
   `POST /api/hermes/jobs/:id/approval`. Diese Route weist jedes Automation-Token mit 403 ab —
   auch eines, dem jemand ihren Scope gegeben hat.
-- Türsteher und Riegel laufen **nicht** erneut: Sie haben genau diesen Plan geprüft, und der
+- Türsteher und Risiko-Riegel laufen **nicht** erneut: Sie haben genau diesen Plan geprüft, und der
   Envelope bindet ihr Urteil per Hash. Was sie nicht sehen können, ist ein Host, der sich seit der
   Prüfung verändert hat. Deshalb die Grenze: höchstens **3** Reaktivierungen und nie über **72 h**
   seit Anlage des Jobs (die letzte Frist wird an dieser Grenze abgeschnitten). Mit der Live-Frist
@@ -160,7 +176,7 @@ Bis zu diesem Stand suchte `POST /api/hermes/jobs/:id/approval` die Laufzeit-Sit
 Kennung des **freigebenden** Admins. James' Jobs liegen aber in Sitzungen seines
 Automation-Kontos — eine Freigabe durch Jochen endete deshalb in `blocked_prerequisite`
 („executor runtime is unavailable"), ohne dass etwas lief. Jetzt sucht die Route die Sitzung des
-Auftraggebers (`jobOwnerId`), an den auch der Envelope gebunden ist. Schloss, Türsteher und Riegel
+Auftraggebers (`jobOwnerId`), an den auch der Envelope gebunden ist. Schloss, Türsteher und Risiko-Riegel
 bleiben unverändert: Der Envelope wird genauso geprüft wie vorher.
 
 ## Eigene Bestellung zurückziehen (James, seit 18.10.2026)

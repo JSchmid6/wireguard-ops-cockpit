@@ -2,6 +2,6 @@
 # cockpit-borg-retention — der sudo-Einstieg des Aufräum-Diensts auf Lab0
 # (doc/setup/borg-retention.md). Die ganze Logik steht in
 # /usr/local/lib/wireguard-ops-cockpit/cockpit-borg-retention.mjs; hier wird nur
-# der gepinnte Node-Lauf gestartet, damit der Backup-Riegel (cockpit-backup-guard.mjs)
-# und sudoers einen festen Namen unter /usr/local/sbin sehen.
+# der gepinnte Node-Lauf gestartet, damit sudoers einen festen Namen unter
+# /usr/local/sbin sieht.
 exec /opt/node-v22.23.4-linux-x64/bin/node /usr/local/lib/wireguard-ops-cockpit/cockpit-borg-retention.mjs "$@"

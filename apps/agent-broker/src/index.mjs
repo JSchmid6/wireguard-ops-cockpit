@@ -67,20 +67,29 @@ export function cleanupStaleWorkspaces(root = workspaceRoot, now = Date.now()) {
 // safety and verifier. The unit keeps the home read-only, so the session root is
 // the one such level the agent identity can still write; the other checks catch
 // what a run left behind before the home was read-only (t_62992d58). Fail closed.
-const projectConfigNames = ["opencode.json", "opencode.jsonc", ".opencode", "AGENTS.md", "CLAUDE.md", "CONTEXT.md", ".claude", ".agents", ".git", ".gitconfig"];
-const globalConfigNames = ["opencode.json", "config.json", "AGENTS.md", "agent", "agents", "command", "commands", "mode", "modes", "plugin", "plugins", "tool", "tools", "skill", "skills"];
+// `config` is opencode's legacy global config (TOML, merged like opencode.json);
+// git (opencode's snapshots) also reads ~/.config/git, npm (opencode's package
+// installs) ~/.npmrc. The deploys check the same names before they activate a
+// stand (planted_config_preflight), so both lists are exported for that test.
+export const projectConfigNames = ["opencode.json", "opencode.jsonc", ".opencode", "AGENTS.md", "CLAUDE.md", "CONTEXT.md", ".claude", ".agents", ".git", ".gitconfig", ".npmrc"];
+export const globalConfigNames = ["opencode.json", "config.json", "config", "AGENTS.md", "agent", "agents", "command", "commands", "mode", "modes", "plugin", "plugins", "tool", "tools", "skill", "skills"];
 
 function present(file) {
   try { fs.lstatSync(file); return true; } catch (error) { if (error.code === "ENOENT") return false; throw error; }
 }
 
-export function assertNoPlantedConfig(root = workspaceRoot, configDir = path.join(process.env.XDG_CONFIG_HOME || path.join(process.env.HOME || "/nonexistent", ".config"), "opencode")) {
+// The config directories come from HOME alone: opencode gets HOME and no
+// XDG_CONFIG_HOME (runAgent), so an XDG_CONFIG_HOME in the broker's own
+// environment would point the check at a directory opencode never reads.
+export function assertNoPlantedConfig(root = workspaceRoot, home = process.env.HOME || "/nonexistent") {
   const found = [];
   for (let dir = path.resolve(root); ; dir = path.dirname(dir)) {
     found.push(...projectConfigNames.map((name) => path.join(dir, name)).filter(present));
     if (path.dirname(dir) === dir) break;
   }
-  found.push(...globalConfigNames.map((name) => path.join(configDir, name)).filter(present));
+  const configHome = path.join(home, ".config");
+  found.push(...globalConfigNames.map((name) => path.join(configHome, "opencode", name)).filter(present));
+  if (present(path.join(configHome, "git"))) found.push(path.join(configHome, "git"));
   if (found.length) throw new Error(`opencode would load ${found.join(", ")} into every role; refusing to start an agent until root removes it`);
 }
 
@@ -138,6 +147,12 @@ export function runAgent(request) {
         // knows the production models. Providers whose key comes from the
         // environment (agent.env) need no auth.json.
         OPENCODE_DISABLE_MODELS_FETCH: "1",
+        // opencode installs packages with npm's config (core npm-config.ts reads
+        // the environment); npm's default cache ~/.npm lies in the read-only
+        // home, so an install would fail. The cache belongs to the run like
+        // opencode's own (card t_2a2d8e5b): what one run puts there never
+        // reaches a later role.
+        npm_config_cache: path.join(sessionStateDirs(workspace).XDG_CACHE_HOME, "npm"),
         NODE_ENV: "production",
       },
       stdio: ["pipe", "pipe", "pipe"],

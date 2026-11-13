@@ -13,7 +13,7 @@ import { request } from "./lib";
  */
 
 interface Finding {
-  source: "doorkeeper" | "update-review" | "backup-bolt";
+  source: "doorkeeper" | "update-review" | "retention";
   title: string;
   guarantee: string;
   location: string;
@@ -23,13 +23,15 @@ interface Finding {
 
 export interface InboxCard {
   id: string;
-  kind: "hermes-change" | "backup-bolt" | "approval" | "retention-anomaly";
+  kind: "hermes-change" | "approval" | "retention-anomaly";
   title: string;
   reason: string;
   findings: Finding[];
   createdAt: string;
   expiresAt: string | null;
   expired: boolean;
+  // Abgelaufen, aber noch freigebbar: die Freigabe erneuert die Frist (≤ 72 h nach Anlage).
+  approvableAfterExpiry?: boolean;
   link: string;
   intent?: string;
   jobId?: string;
@@ -51,7 +53,6 @@ interface InboxView {
 
 const KIND_LABELS: Record<InboxCard["kind"], string> = {
   "hermes-change": "Änderung von James",
-  "backup-bolt": "Backup-Riegel",
   approval: "Freigabe",
   "retention-anomaly": "Aufräum-Dienst",
 };
@@ -59,7 +60,7 @@ const KIND_LABELS: Record<InboxCard["kind"], string> = {
 const SOURCE_LABELS: Record<Finding["source"], string> = {
   doorkeeper: "Türsteher",
   "update-review": "Update-Prüfer",
-  "backup-bolt": "Backup-Riegel",
+  retention: "Aufräum-Dienst",
 };
 
 const POLL_MS = 30_000;
@@ -139,6 +140,10 @@ function Card({ card, now, highlighted, onDone }: { card: InboxCard; now: number
   const closeRef = useRef<HTMLButtonElement>(null);
   const left = card.expiresAt ? countdown(card.expiresAt, now) : null;
   const expired = card.expired || refusedAsExpired || (card.expiresAt !== null && left === null);
+  // Nur die Frist ist abgelaufen: Freigeben geht trotzdem, der Server erneuert
+  // die Frist mit demselben Inhalt. Lehnt er doch als abgelaufen ab (älter als
+  // 72 h), bleibt nur „Neu bestellen lassen“.
+  const approvableExpired = expired && card.approvableAfterExpiry === true && !refusedAsExpired;
   const trimmed = reason.trim();
   // Der Aufräum-Dienst verlangt für die Freigabe mindestens 10 Zeichen (borg-retention.ts).
   const minLength = card.kind === "retention-anomaly" ? 10 : 1;
@@ -240,15 +245,21 @@ function Card({ card, now, highlighted, onDone }: { card: InboxCard; now: number
               <p className="inbox-expired-note">
                 {card.kind === "approval"
                   ? "Die Frist ist abgelaufen: Diese Freigabe gilt nicht mehr. Plane den Lauf unter „Mehr“ neu; hier kannst du sie nur noch ablehnen."
-                  : "Die Frist ist abgelaufen: Diese Freigabe gilt nicht mehr. Lass James die Änderung neu bestellen — dann wird sie frisch geprüft."}
+                  : approvableExpired
+                    ? "Die Frist ist abgelaufen, der geprüfte Plan ist unverändert: Du kannst ihn trotzdem freigeben — die Frist wird dabei erneuert."
+                    : "Die Frist ist abgelaufen: Diese Freigabe gilt nicht mehr. Lass James die Änderung neu bestellen — dann wird sie frisch geprüft."}
               </p>
             ) : null}
             <label className="inbox-reason-field">
-              {expired && card.kind !== "approval" ? "Notiz an James (optional)" : `Grund (Pflicht${minLength > 1 ? `, mind. ${minLength} Zeichen` : ""})`}
+              {expired && card.kind !== "approval" && !approvableExpired ? "Notiz an James (optional)" : `Grund (Pflicht${minLength > 1 ? `, mind. ${minLength} Zeichen` : ""})`}
               <textarea value={reason} rows={2} onChange={(event) => setReason(event.target.value)} />
             </label>
             <div className="inbox-actions">
-              {expired && card.jobId && card.kind !== "approval" ? (
+              {approvableExpired ? (
+                <button className="inbox-button inbox-button-primary" disabled={busy || !reasonOk} onClick={() => act("approve")}>
+                  Freigeben (Frist erneuern)
+                </button>
+              ) : expired && card.jobId && card.kind !== "approval" ? (
                 <button className="inbox-button inbox-button-primary" disabled={busy} onClick={() => act("reorder")}>
                   Neu bestellen lassen
                 </button>

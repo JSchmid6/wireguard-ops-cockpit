@@ -66,8 +66,8 @@ const hostRun = {
   rollback: ["downgrade the upgraded packages to the versions in /var/log/apt/history.log"],
   risk: ["contained"],
 };
-// Plus a borg repair: a repair can delete archives, so the backup bolt sends
-// it to the operator whatever the doorkeeper says.
+// Plus a borg repair: a repair can delete archives, so the doorkeeper flags it
+// (X4) and the operator decides.
 const hostRunWithRepair = { ...hostRun, steps: [...hostRun.steps, { name: "repair", run: "/usr/local/sbin/cockpit-borg-action repair" }] };
 const planWith = (...manifests: Array<{ version: string }>) => [
   ...manifests.map((manifest) => "```" + (manifest.version.startsWith("cockpit-capability") ? "capability" : "host-run") + "\n" + JSON.stringify(manifest) + "\n```"),
@@ -466,20 +466,26 @@ describe("host door through the API", () => {
     expect(verifier[0]).toContain("that is your sandbox, not evidence against the handoff");
   });
 
-  it("keeps a run that deletes backups for the operator although the doorkeeper passed it", async () => {
+  // Grundsatz 4 (card t_abe2651b): deleting backups goes to the operator as
+  // the doorkeeper's X4 finding on the whole plan, not through a text bolt.
+  it("sends a run that deletes backups to the operator through the doorkeeper's X4 finding", async () => {
     const prune = { ...hostRun, name: "free space", purpose: "free space on Lab0", steps: [
       { name: "space", run: "df -h /" },
       { name: "delete", run: "borg delete --glob-archives 'vmd61162-2025-*' ssh://borg@10.0.0.5/media/RAID/backup_VServer/borg" },
     ] };
-    const flow = await setup({ plan: planWith(prune), doorkeeper: "VERDICT: pass\nNOTES: the operator asked for it" });
+    const finding = [
+      "VERDICT: flag", "FINDING: deletes backup archives", "CLASS: X4", "WHERE: S2:L1",
+      "CODE: borg delete --glob-archives 'vmd61162-2025-*' ssh://borg@10.0.0.5/media/RAID/backup_VServer/borg",
+      "PATH: removes the 2025 archives from the borg repository; the snapshot does not restore Lab0's data", "SEVERITY: high",
+    ].join("\n");
+    const flow = await setup({ plan: planWith(prune), doorkeeper: finding });
     const job = await flow.submit();
 
     expect(job.status).toBe("blocked_user_approval");
     const policy = job.output?.policy as { reason: string; evidence: string[] };
-    expect(policy.reason).toContain("touches the backups");
-    expect(policy.evidence.join("\n")).toContain("BACKUP [backup] S2:L1");
+    expect(policy.reason).toContain("S2:L1 deletes backup archives");
     expect((job.output?.envelope as Record<string, unknown>).gatePassed).toBeUndefined();
-    expect(flow.doorkeeperPrompts[0]).toContain("[backup-approval:backup]");
+    expect(flow.doorkeeperPrompts[0]).toContain("The same holds for deleting backups or shortening their retention");
     expect(flow.executorCalls.some((call) => call.payload.action === "host.run")).toBe(false);
 
     const approved = await flow.app.inject({ method: "POST", url: `/api/hermes/jobs/${job.id}/approval`, headers: { cookie: flow.cookie }, payload: { decision: "approved", reason: "read the finding, this exact plan is fine" } });
@@ -514,7 +520,8 @@ describe("host door through the API", () => {
   });
 
   it("runs James' job after Jochen's admin approval, in the session James owns", async () => {
-    const flow = await setup({ ownedByAutomation: true, plan: planWith(hostRunWithRepair), doorkeeper: "VERDICT: pass\nNOTES: routine" });
+    const finding = ["VERDICT: flag", "FINDING: borg repair", "CLASS: X4", "WHERE: S3:L1", "CODE: REPAIRLINE", "PATH: a repair can delete corrupt archives", "SEVERITY: high"].join("\n");
+    const flow = await setup({ ownedByAutomation: true, plan: planWith(hostRunWithRepair), doorkeeper: finding.replace("REPAIRLINE", hostRunWithRepair.steps[2].run) });
     const job = await flow.submit();
     expect(job.status).toBe("blocked_user_approval");
 

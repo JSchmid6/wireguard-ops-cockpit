@@ -191,6 +191,40 @@ esac
 free_kb=$(df -Pk /opt | awk 'NR==2{print $4}')
 [ "$free_kb" -ge 5000000 ] || die "Weniger als 5 GB frei unter /opt (${free_kb} KB). Erst Platz schaffen."
 
+# Altlasten, die der Agent-Broker verweigert (assertNoPlantedConfig, dieselben Namen;
+# ein Test vergleicht die Listen und diesen Block mit dem VPS-Deploy): von der
+# Session-Wurzel bis / und im globalen Konfigordner des Agenten. Liegt eine davon da,
+# stoppt der Broker JEDE Rolle, auch Planer und Türsteher — das Cockpit könnte sich
+# weder reparieren noch zurückrollen. Geprüft, bevor irgendetwas installiert wird:
+# der laufende Stand bleibt, root verschiebt die genannten Pfade (nicht löschen) und
+# deployt erneut.
+# >>> planted-config-preflight
+readonly PLANTED_PROJECT_NAMES=(opencode.json opencode.jsonc .opencode AGENTS.md CLAUDE.md CONTEXT.md .claude .agents .git .gitconfig .npmrc)
+readonly PLANTED_GLOBAL_NAMES=(opencode.json config.json config AGENTS.md agent agents command commands mode modes plugin plugins tool tools skill skills)
+planted_config_preflight() { # planted_config_preflight <host root> <agent home>
+  local root="$1" home="$2" dir name found=()
+  dir="$home/sessions"
+  while :; do
+    for name in "${PLANTED_PROJECT_NAMES[@]}"; do
+      if [ -e "$root${dir%/}/$name" ] || [ -L "$root${dir%/}/$name" ]; then found+=("${dir%/}/$name"); fi
+    done
+    [ "$dir" = / ] && break
+    dir="$(dirname -- "$dir")"
+  done
+  for name in "${PLANTED_GLOBAL_NAMES[@]}"; do
+    if [ -e "$root$home/.config/opencode/$name" ] || [ -L "$root$home/.config/opencode/$name" ]; then found+=("$home/.config/opencode/$name"); fi
+  done
+  if [ -e "$root$home/.config/git" ] || [ -L "$root$home/.config/git" ]; then found+=("$home/.config/git"); fi
+  [ "${#found[@]}" -eq 0 ] && return 0
+  printf 'opencode would load %s into every role\n' "${found[@]}"
+  return 1
+}
+# <<< planted-config-preflight
+if ! planted_report="$(planted_config_preflight "" "$AGENT_DIR")"; then
+  printf '%s\n' "$planted_report" >&2
+  die "Der Agent-Broker würde mit diesen Altlasten jede Rolle verweigern. Als root beiseite schieben, dann erneut deployen. Nichts geändert."
+fi
+
 mkdir -p "$SECRETS_DIR"; chmod 700 "$SECRETS_DIR"
 
 # ---------------------------------------------------------------------------
@@ -718,17 +752,12 @@ for f in deploy/helpers/cockpit-self-update-snapshot deploy/lab0/homeserver-cock
 done
 
 # Die eine Tür (doc/setup/host-run.md), wie auf dem VPS (vps-cockpit-deploy.sh, Tabelle):
-# Root-Helfer, Backup-Riegel daneben und die Unit, die Läufe nach einem Neustart
-# fortsetzt. Der Riegel importiert die Grenzen-Datei aus dem Aufräum-Block unten —
-# beide liegen nach diesem Schritt im selben Verzeichnis (Claude, 02.10.2026).
+# Root-Helfer und die Unit, die Läufe nach einem Neustart fortsetzt.
 [ -f "$COCKPIT_DIR/deploy/helpers/cockpit-host-run" ] \
   || die "deploy/helpers/cockpit-host-run fehlt im Checkout ($REPO_COMMIT) — Skript mit REPO_COMMIT=<merge-sha> erneut ausführen."
 install -m 755 -o root -g root "$COCKPIT_DIR/deploy/helpers/cockpit-host-run" \
   /usr/local/lib/wireguard-ops-cockpit/cockpit-host-run.mjs
-install -m 644 -o root -g root "$COCKPIT_DIR/deploy/helpers/cockpit-backup-guard.mjs" \
-  /usr/local/lib/wireguard-ops-cockpit/cockpit-backup-guard.mjs
-# Der Riegel importiert die Grenzen-Datei des Aufräum-Dienstes — auf jeder Rolle, auch
-# ohne den Dienst (box), sonst bricht der Root-Helfer mit ERR_MODULE_NOT_FOUND ab.
+# Die festen Grenzen des Aufräum-Dienstes (cockpit-borg-retention.mjs importiert sie).
 install -m 644 -o root -g root "$COCKPIT_DIR/deploy/helpers/cockpit-borg-retention-rules.mjs" \
   /usr/local/lib/wireguard-ops-cockpit/cockpit-borg-retention-rules.mjs
 # Zustandsschritte nie mittendrin abbrechen: die eine Erkennung, die der Helfer
@@ -1025,12 +1054,12 @@ Rückbau (nur bei Bedarf, als root):
   systemctl disable --now wireguard-ops-cockpit-api wireguard-ops-cockpit-ttyd wireguard-ops-cockpit-agent wireguard-ops-cockpit-runner wireguard-ops-cockpit-executor
   # Tür (doc/setup/host-run.md):
   #   systemctl disable wireguard-ops-cockpit-host-run-resume.service
-  #   rm -f /usr/local/lib/wireguard-ops-cockpit/cockpit-host-run.mjs /usr/local/lib/wireguard-ops-cockpit/cockpit-backup-guard.mjs \
+  #   rm -f /usr/local/lib/wireguard-ops-cockpit/cockpit-host-run.mjs \
   #         /usr/local/lib/wireguard-ops-cockpit/cockpit-state-steps.mjs \
   #         /usr/local/lib/wireguard-ops-cockpit/cockpit-host-snapshot /etc/wireguard-ops-cockpit/instance-role.env \
   #         /etc/systemd/system/wireguard-ops-cockpit-host-run-resume.service
   #   rm -rf /var/lib/wireguard-ops-cockpit-host-snapshots   # Host-Snapshots der Tür (Rückweg, nur nach Prüfung)
-  #   (cockpit-borg-retention-rules.mjs nimmt der Aufräum-Block unten mit — Riegel und Dienst teilen sie.)
+  #   (cockpit-borg-retention-rules.mjs nimmt der Aufräum-Block unten mit.)
   # Aufräum-Dienst (nur mit Jochens Freigabe abschalten — doc/setup/borg-retention.md):
   #   systemctl disable --now cockpit-borg-retention.timer
   #   rm -f /usr/local/sbin/cockpit-borg-retention /usr/local/lib/wireguard-ops-cockpit/cockpit-borg-retention*.mjs \
