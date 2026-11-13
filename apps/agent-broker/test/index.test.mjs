@@ -174,13 +174,14 @@ test("the agent unit keeps the home and the opencode config read-only", () => {
   for (const target of [env.COCKPIT_AGENT_WORKSPACE_ROOT, `${home}/.local/share/opencode`, `${home}/.local/state/opencode`, `${home}/.cache/opencode`, "/run/cockpit-agent"]) {
     assert.ok(writable.some((dir) => covers(dir, target)), `${target} must be writable for the agent unit`);
   }
-  // The deploys: Lab0/box installs the config root-owned, both place the .gitignore
+  // The deploys: Lab0/box and the VPS install the config root-owned, both place the .gitignore
   // opencode would otherwise write into its read-only config directory at start.
   const lab0 = fs.readFileSync(new URL("deploy/lab0/homeserver-cockpit-deploy.sh", repo), "utf8");
   assert.match(lab0, /install -m 640 -o root -g cockpit-agent-client \\\n\s+"\$COCKPIT_DIR\/deploy\/config\/opencode-agent\.jsonc" "\$AGENT_DIR\/\.config\/opencode\/opencode\.jsonc"/);
   assert.match(lab0, /"\$COCKPIT_DIR\/deploy\/config\/opencode-config-dir\.gitignore" "\$AGENT_DIR\/\.config\/opencode\/\.gitignore"/);
   assert.doesNotMatch(lab0, /-o cockpit-agent[^\n]*\.config/);
   const vps = fs.readFileSync(new URL("deploy/vps/vps-cockpit-deploy.sh", repo), "utf8");
+  assert.match(vps, /"deploy\/config\/opencode-agent\.jsonc\|\$ROOT\/var\/lib\/wireguard-ops-agent\/\.config\/opencode\/opencode\.jsonc\|644"/);
   assert.match(vps, /"deploy\/config\/opencode-config-dir\.gitignore\|\$ROOT\/var\/lib\/wireguard-ops-agent\/\.config\/opencode\/\.gitignore\|644"/);
   // The exact bytes opencode 1.18 writes (config.ts ensureGitignore).
   assert.equal(fs.readFileSync(new URL("deploy/config/opencode-config-dir.gitignore", repo), "utf8"), ["node_modules", "package.json", "package-lock.json", "bun.lock", ".gitignore"].join("\n"));
