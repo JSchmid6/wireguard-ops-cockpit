@@ -31,7 +31,7 @@ This first pass keeps the trust boundaries explicit:
 ## Repository structure
 
 - `apps/api/` - Fastify control API, SQLite storage, auth, sessions, audits, approvals, runbooks, agents
-- `apps/agent-broker/` - isolated Planner/Safety/Runner/Verifier process broker under `cockpit-agent`
+- `apps/agent-broker/` - isolated Planner/Research/Safety/Verifier process broker under `cockpit-agent`, and the same code as the Runner broker under its own identity `cockpit-runner`
 - `apps/executor-broker/` - HMAC-authenticated typed capability executor under `cockpit-executor`
 - `apps/web/` - React cockpit UI shell
 - `packages/domain/` - shared domain types

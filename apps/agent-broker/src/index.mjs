@@ -15,9 +15,24 @@ const staleWorkspaceAgeMs = 24 * 60 * 60 * 1000;
 const allowedRoles = new Set(Object.keys(PROMPT_LIMITS));
 const requestLineLimit = 1048576;
 
-export function validateRequest(value) {
+// Which roles this broker instance serves (comma-separated). Production runs two
+// instances under two identities: the agent unit serves planner, research,
+// safety and verifier, the runner unit only the runner (build), so a runner run
+// reaches neither the plan roles' workspaces nor their socket or processes
+// (card t_cb81637b). Unset means every role (tests, a single-broker setup).
+export function parseServedRoles(value) {
+  if (value === undefined || value.trim() === "") return new Set(allowedRoles);
+  const roles = value.split(",").map((role) => role.trim()).filter(Boolean);
+  for (const role of roles) if (!allowedRoles.has(role)) throw new Error(`COCKPIT_AGENT_BROKER_ROLES names an unknown role: ${role}`);
+  if (!roles.length) throw new Error("COCKPIT_AGENT_BROKER_ROLES names no role");
+  return new Set(roles);
+}
+const servedRoles = parseServedRoles(process.env.COCKPIT_AGENT_BROKER_ROLES);
+
+export function validateRequest(value, roles = servedRoles) {
   if (!value || typeof value !== "object") throw new Error("request must be an object");
   if (!allowedRoles.has(value.role)) throw new Error("invalid agent role");
+  if (!roles.has(value.role)) throw new Error(`this broker does not serve the ${value.role} role`);
   // Bounds and wording in prompt-limits.mjs: the API reads the same file.
   const problem = promptLimitProblem(value.role, value.prompt);
   if (problem) throw new Error(problem);
@@ -87,7 +102,20 @@ export function createSessionWorkspace(request, root = workspaceRoot) {
   const architecture = fs.readFileSync(new URL("system-architecture.md", contextRoot), "utf8");
   const role = fs.readFileSync(new URL(`${request.role}.md`, contextRoot), "utf8");
   fs.writeFileSync(path.join(workspace, "AGENTS.md"), `${common.trim()}\n\n${architecture.trim()}\n\n${role.trim()}\n`, { mode: 0o600 });
+  for (const dir of Object.values(sessionStateDirs(workspace))) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   return workspace;
+}
+
+// opencode's state belongs to the run, not to the identity (card t_cb81637b):
+// session database, auth.json, logs, locks, the models catalog, downloaded tools
+// and its temp directory live below the workspace and go with it. What one run
+// writes there (a models.json with other endpoints, an auth.json, a tool in
+// cache/bin) never reaches a later role. The name is none opencode loads as
+// project config (assertNoPlantedConfig); without git opencode takes no
+// snapshots of the workspace.
+export function sessionStateDirs(workspace) {
+  const base = path.join(workspace, ".run-state");
+  return { XDG_DATA_HOME: path.join(base, "data"), XDG_STATE_HOME: path.join(base, "state"), XDG_CACHE_HOME: path.join(base, "cache"), TMPDIR: path.join(base, "tmp") };
 }
 
 export function runAgent(request) {
@@ -113,11 +141,18 @@ export function runAgent(request) {
         PATH: process.env.PATH,
         DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY,
         OPENCODE_CONFIG: opencodeConfig,
+        ...sessionStateDirs(workspace),
+        // With an empty cache opencode would fetch the 6 MB models catalog on every
+        // run (measured 13.11.2026); the catalog built into the pinned release
+        // knows the production models. Providers whose key comes from the
+        // environment (agent.env) need no auth.json.
+        OPENCODE_DISABLE_MODELS_FETCH: "1",
         // opencode installs packages with npm's config (core npm-config.ts reads
         // the environment); npm's default cache ~/.npm lies in the read-only
-        // home, so an install would fail. opencode's own cache is writable and
-        // already holds the installed packages themselves.
-        npm_config_cache: path.join(process.env.HOME || "/nonexistent", ".cache", "opencode", "npm"),
+        // home, so an install would fail. The cache belongs to the run like
+        // opencode's own (card t_2a2d8e5b): what one run puts there never
+        // reaches a later role.
+        npm_config_cache: path.join(sessionStateDirs(workspace).XDG_CACHE_HOME, "npm"),
         NODE_ENV: "production",
       },
       stdio: ["pipe", "pipe", "pipe"],

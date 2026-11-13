@@ -22,8 +22,10 @@
 #     service units, the web unit, the host-run resume unit, the self-update unit template, self-update.env,
 #     the two drop-ins (API brokers, and the borg lock barrier in the package's
 #     borgmatic.service.d), and this script. Besides the table it writes only
-#     state.json (with the built web image id), the web image, the web unit's enable link and a backup directory
-#     that it removes on success.
+#     state.json (with the built web image id), the web image, the enable links of the web
+#     and runner units, the runner's system account (cockpit-runner, group
+#     cockpit-runner-client, no sudo; created once, never removed by a rollback) and a
+#     backup directory that it removes on success.
 #   * It never switches the running web container: the web unit does that when it
 #     is restarted, which the runner does together with the four services at the
 #     activation (defer), or this script does at the end (mode now).
@@ -33,7 +35,7 @@
 #     and the script exits non-zero with the original error code.
 #
 # Harness hooks (VPS_DEPLOY_ROOT, _REPO, _ORIGIN, _SYSTEMCTL, _VISUDO, _DOCKER,
-# _BUILD, _NODE_DIST) redirect host paths and tools for
+# _BUILD, _NODE_DIST, _ACCOUNTS) redirect host paths and tools for
 # test/vps-cockpit-deploy.test.sh. The self-update runner starts this script with
 # a fixed, clean environment (PATH, HOME, REPO_COMMIT, COCKPIT_RESTART_MODE), so
 # they never apply on that path.
@@ -47,6 +49,8 @@ readonly ORIGIN="${VPS_DEPLOY_ORIGIN:-https://github.com/JSchmid6/wireguard-ops-
 readonly SYSTEMCTL="${VPS_DEPLOY_SYSTEMCTL:-systemctl}"
 readonly VISUDO="${VPS_DEPLOY_VISUDO:-visudo}"
 readonly DOCKER="${VPS_DEPLOY_DOCKER:-docker}"
+# getent/groupadd/useradd run through this command when set (harness only).
+readonly ACCOUNTS="${VPS_DEPLOY_ACCOUNTS:-}"
 readonly LIB="$ROOT/usr/local/lib/wireguard-ops-cockpit"
 readonly SBIN="$ROOT/usr/local/sbin"
 readonly UNITS="$ROOT/etc/systemd/system"
@@ -59,7 +63,7 @@ readonly WEB_URL=http://10.0.0.1:8080
 # below $NODE_BASE when the host lacks it (see install_runtime).
 readonly NODE_BASE="$ROOT/opt"
 readonly NODE_DIST="${VPS_DEPLOY_NODE_DIST:-https://nodejs.org/dist}"
-readonly SERVICES=(wireguard-ops-cockpit-api wireguard-ops-cockpit-agent wireguard-ops-cockpit-executor wireguard-ops-cockpit-ttyd wireguard-ops-cockpit-web)
+readonly SERVICES=(wireguard-ops-cockpit-api wireguard-ops-cockpit-agent wireguard-ops-cockpit-runner wireguard-ops-cockpit-executor wireguard-ops-cockpit-ttyd wireguard-ops-cockpit-web)
 readonly COMPOSE=("$DOCKER" compose --env-file .env -f docker-compose.vps.yml)
 WEB_IMAGE=""      # the compose image name of the web service
 WEB_BEFORE=""     # its image id before this deploy (the rollback target)
@@ -96,6 +100,8 @@ readonly TABLE=(
   # (nach-gitlab-backup.conf) bleiben liegen, und der Rückfall entfernt nur sie.
   "deploy/systemd/borgmatic-cockpit-borg-lock.conf|$UNITS/borgmatic.service.d/cockpit-borg-lock.conf|644"
   "deploy/systemd/wireguard-ops-cockpit-agent.service|$UNITS/wireguard-ops-cockpit-agent.service|644"
+  # The runner (opencode build) under its own identity, home and socket (card t_cb81637b).
+  "deploy/systemd/wireguard-ops-cockpit-runner.service|$UNITS/wireguard-ops-cockpit-runner.service|644"
   "deploy/systemd/wireguard-ops-cockpit-executor.service|$UNITS/wireguard-ops-cockpit-executor.service|644"
   "deploy/systemd/wireguard-ops-cockpit-ttyd.service|$UNITS/wireguard-ops-cockpit-ttyd.service|644"
   "deploy/systemd/wireguard-ops-cockpit-self-update@.service|$UNITS/wireguard-ops-cockpit-self-update@.service|644"
@@ -109,6 +115,10 @@ readonly TABLE=(
   # use root:cockpit-agent-client 0640; the VPS file was agent-owned 0600 before.
   "deploy/config/opencode-agent.jsonc|$ROOT/var/lib/wireguard-ops-agent/.config/opencode/opencode.jsonc|644"
   "deploy/config/opencode-config-dir.gitignore|$ROOT/var/lib/wireguard-ops-agent/.config/opencode/.gitignore|644"
+  # The runner's config comes from the repository (no secrets in it; root-owned in a
+  # home its unit keeps read-only), with the same .gitignore.
+  "deploy/config/opencode-agent.jsonc|$ROOT/var/lib/wireguard-ops-runner/.config/opencode/opencode.jsonc|644"
+  "deploy/config/opencode-config-dir.gitignore|$ROOT/var/lib/wireguard-ops-runner/.config/opencode/.gitignore|644"
   # The general host door (doc/setup/host-run.md): its root helper and the
   # boot-time continuation of runs that asked for a reboot.
   "deploy/helpers/cockpit-host-run|$LIB/cockpit-host-run.mjs|755"
@@ -221,12 +231,13 @@ install_runtime() {
 
 # Leftover opencode config the agent broker refuses (assertNoPlantedConfig in
 # apps/agent-broker/src/index.mjs, the same names; a test compares the lists): from
-# the session root up to / and in the agent's global config directory. With one of
-# them in place the broker stops EVERY role, planner and doorkeeper too, so the
-# Cockpit could neither repair nor roll itself back. Checked before anything is
-# installed: the deploy stops with 71 and the running stand stays as it is. Root
-# moves the named paths aside (not delete: they may be someone's notes) and
-# deploys again.
+# the session root up to / and in the global config directory, for each broker
+# home (the plan roles' and the runner's, card t_2a2d8e5b). With one of them in
+# place that broker stops EVERY role it serves, planner and doorkeeper or the
+# runner, so the Cockpit could neither repair nor roll itself back. Checked before
+# the checkout: the deploy stops with 71, touches nothing and the running stand
+# stays as it is. Root moves the named paths aside (not delete: they may be
+# someone's notes) and deploys again.
 # >>> planted-config-preflight
 readonly PLANTED_PROJECT_NAMES=(opencode.json opencode.jsonc .opencode AGENTS.md CLAUDE.md CONTEXT.md .claude .agents .git .gitconfig .npmrc)
 readonly PLANTED_GLOBAL_NAMES=(opencode.json config.json config AGENTS.md agent agents command commands mode modes plugin plugins tool tools skill skills)
@@ -251,10 +262,14 @@ planted_config_preflight() { # planted_config_preflight <host root> <agent home>
 # <<< planted-config-preflight
 
 check_planted_config() {
-  local report
-  if report="$(planted_config_preflight "$ROOT" /var/lib/wireguard-ops-agent)"; then return 0; fi
-  printf '%s\n' "$report" | while IFS= read -r line; do log "FAILED: $line"; done
-  log "FAILED: the agent broker would refuse every role with these in place; move them aside as root, then deploy again"
+  local report="" part home
+  for home in /var/lib/wireguard-ops-agent /var/lib/wireguard-ops-runner; do
+    part="$(planted_config_preflight "$ROOT" "$home")" || report+="$part"$'\n'
+  done
+  [ -z "$report" ] && return 0
+  # Both homes share the levels from /var/lib up: name each path once.
+  printf '%s' "$report" | awk '!seen[$0]++' | while IFS= read -r line; do log "FAILED: $line"; done
+  log "FAILED: the agent or runner broker would refuse every role with these in place; move them aside as root, then deploy again"
   return 71
 }
 
@@ -274,9 +289,24 @@ save_targets() { # every target: its bytes, or the fact that it did not exist
   done
 }
 
+account() { # getent/groupadd/useradd, through the harness hook when set
+  if [ -n "$ACCOUNTS" ]; then "$ACCOUNTS" "$@"; else "$@"; fi
+}
+
+ensure_runner_identity() {
+  # The runner's own system identity: its own group, no other group, no sudo, no
+  # login, no home created here (the unit keeps it read-only, StateDirectory adds
+  # sessions/). The API reaches its socket through SupplementaryGroups in the
+  # brokers drop-in. Idempotent; a rollback leaves the account (it grants nothing).
+  account getent group cockpit-runner-client >/dev/null || account groupadd --system cockpit-runner-client
+  account getent passwd cockpit-runner >/dev/null \
+    || account useradd --system --no-create-home -d /var/lib/wireguard-ops-runner -s /usr/sbin/nologin -g cockpit-runner-client cockpit-runner
+}
+
 install_table() {
   local entry source rest target mode
   "$VISUDO" -cf deploy/sudoers/cockpit-executor >/dev/null
+  ensure_runner_identity
   for entry in "${TABLE[@]}"; do
     source="${entry%%|*}"; rest="${entry#*|}"; target="${rest%|*}"; mode="${rest##*|}"
     install -D -o root -g root -m "$mode" "$source" "$target"
@@ -287,6 +317,9 @@ install_table() {
   "$VISUDO" -c >/dev/null
   "$SYSTEMCTL" daemon-reload
   "$SYSTEMCTL" enable --quiet wireguard-ops-cockpit-web.service
+  # Started by the restart of SERVICES (now or at the activation) and pulled in by the
+  # API (Requires= in brokers.conf); nothing switches before that.
+  "$SYSTEMCTL" enable --quiet wireguard-ops-cockpit-runner.service
   # Runs once per boot: continues host runs that stopped for a reboot step.
   "$SYSTEMCTL" enable --quiet wireguard-ops-cockpit-host-run-resume.service
   # The runner requires the unit to be active. Start it only when it is not: that is the
@@ -344,6 +377,9 @@ rollback() {
     if [ ! -e "$UNITS/wireguard-ops-cockpit-host-run-resume.service" ]; then
       rm -f -- "$UNITS/multi-user.target.wants/wireguard-ops-cockpit-host-run-resume.service" || step_failed=1
     fi
+    if [ ! -e "$UNITS/wireguard-ops-cockpit-runner.service" ]; then
+      rm -f -- "$UNITS/multi-user.target.wants/wireguard-ops-cockpit-runner.service" || step_failed=1
+    fi
     "$SYSTEMCTL" daemon-reload || { log "rollback: daemon-reload FAILED"; step_failed=1; }
   fi
   if [ -n "$WEB_IMAGE" ]; then
@@ -368,11 +404,13 @@ rollback() {
   [ "$step_failed" = 0 ] && log "rollback complete; running services were not restarted" || log "rollback INCOMPLETE — see the lines above"
   exit "$code"
 }
+# Before the checkout and the ERR trap: a refusal leaves the working tree the
+# services run from untouched and needs no rollback (no rebuild of the old stand).
+check_planted_config || { code=$?; rm -rf -- "$BACKUP"; exit "$code"; }
 trap rollback ERR
 
 log "deploying $REPO_COMMIT over $OLD (restart mode: ${COCKPIT_RESTART_MODE:-now}, backup $BACKUP)"
 git checkout -q -B main "$REPO_COMMIT"
-check_planted_config
 install_runtime
 build
 save_targets

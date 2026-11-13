@@ -44,7 +44,7 @@ import { generateRunbookSafetyReview, type SafetyReviewRunner } from "./safety-r
 import { activationAction, activationReason, capabilityExecution, hostRunExecution, selfUpdateVerifierNote, typedActionsExecution, type TypedActionOutput, type TypedExecution } from "./self-update-activation.js";
 import { boundedVerifierPrompt } from "./verifier-prompt.js";
 import { BREAKER_WINDOW_MS, OPERATION_PATTERN, breakerKeyFor, breakerReason, evaluateBreaker } from "./circuit-breaker.js";
-import { runBrokerAgent } from "./agent-broker.js";
+import { brokerSocketForRole, runBrokerAgent } from "./agent-broker.js";
 import { runDynamicCapability, runExecutorAction, type ExecutorActionKind } from "./executor-broker.js";
 import { borgStatusRequestDigest, createBorgStatusService } from "./borg-status.js";
 import { createRetentionService, decideRetentionChange, readApproval, retentionRequestDigest, retentionTarget } from "./borg-retention.js";
@@ -1640,6 +1640,7 @@ export async function createApp(options: AppOptions = {}) {
     security: {
       modelDiversity: config.opencodeModel !== config.safetyOpencodeModel,
       agentIsolation: Boolean(config.agentBrokerSocket && existsSync(config.agentBrokerSocket)),
+      runnerIsolation: Boolean(config.runnerBrokerSocket && existsSync(config.runnerBrokerSocket)),
       typedExecutor: Boolean(config.executorBrokerSocket && existsSync(config.executorBrokerSocket)),
       warning: config.opencodeModel === config.safetyOpencodeModel
         ? "Planner and safety reviewer use the same configured model; role isolation remains, but correlated errors are more likely."
@@ -1968,7 +1969,7 @@ export async function createApp(options: AppOptions = {}) {
     model = config.opencodeModel,
   ): Promise<string> {
     if (config.agentBrokerSocket) {
-      return await runBrokerAgent(config.agentBrokerSocket, role, buildBrokerAgentPrompt(agent, prompt));
+      return await runBrokerAgent(brokerSocketForRole(config, role), role, buildBrokerAgentPrompt(agent, prompt));
     }
     executeAgentPlan(createAgentPlan(actor, agent, session.id, prompt, 30_000), actor, agent, windowSuffix, model);
     const logFile = `/tmp/opencode-${session.id.substring(0,8)}-${agent.id}${windowSuffix}.log`;
@@ -2008,12 +2009,18 @@ export async function createApp(options: AppOptions = {}) {
   // (packages, GitLab, migrations, docker compose, switching over —
   // cockpit-state-steps.mjs): those run only through the host door, which never
   // ends them. A plan whose script names one is refused before the runner starts.
-  async function runIsolatedRunner(actor: UserSummary, session: { id: string }, planner: AgentManifest, proposalPath: string, planText: string): Promise<string> {
+  function assertRunnerCanStart(planText: string): void {
     // Der ganze Plantext, nicht nur der erste Skriptblock: der Runner bekommt ihn ganz.
     const kinds = stateStepKinds(planText);
     if (kinds.length > 0) {
       throw new Error(`the plan's script contains state steps (${kinds.join(", ")}) that the runner role could be ended in; such steps run only through the host door (a host-run manifest), which never ends them`);
     }
+    // Isolated: the runner only behind its own identity's broker (t_cb81637b).
+    if (config.agentBrokerSocket) brokerSocketForRole(config, "runner");
+  }
+
+  async function runIsolatedRunner(actor: UserSummary, session: { id: string }, planner: AgentManifest, proposalPath: string, planText: string): Promise<string> {
+    assertRunnerCanStart(planText);
     return await runIsolatedAgent(actor, session, planner, "runner", isolatedRunnerPrompt(proposalPath, planText), "-runner", 10 * 60_000);
   }
 
@@ -2707,6 +2714,8 @@ export async function createApp(options: AppOptions = {}) {
       const typed = await executeTypedCapabilities(planText, envelope, manifest, updateReview?.outcome.bindings ?? [], hostRun);
       const typedResult = typed?.result ?? null;
       // The isolated runner acts on the host itself: its failure is a real one.
+      // What refuses it before it starts (state steps, no runner broker) is not.
+      if (!typedResult) assertRunnerCanStart(planText);
       if (!typedResult) markExecutionStarted(job.id);
       const runnerRaw = typedResult || await runIsolatedRunner(actor, session, planner, proposalPath, planText);
       const result = typedResult || filterSensitiveContent(extractRunnerHandoff(runnerRaw));
@@ -2735,10 +2744,13 @@ export async function createApp(options: AppOptions = {}) {
         updateHermesJob(job.id, "blocked_runner_busy", runnerBusyExplanation(intent, executedSteps, message), preservedOutput);
         return;
       }
+      // Only what passed the start mark reached the host; a refusal before it
+      // (state steps, no runner broker, a malformed typed plan) changed nothing.
+      const started = typeof preservedOutput.executionStartedAt === "string";
       updateHermesJob(job.id, "failed_execution", explanation({
-        phase: "finished", intent, completed: executedSteps,
-        reason: executedSteps.length ? `The execution started and then failed: ${message}` : message,
-        neededToContinue: executedSteps.length
+        phase: "finished", intent, completed: started ? executedSteps : executedSteps.filter((step) => step !== "Runner execution"),
+        reason: started ? `The execution started and then failed: ${message}` : message,
+        neededToContinue: started
           ? ["The execution may have changed the host: inspect its result and log before retrying."]
           : ["Inspect the preserved proposal, session, and job evidence."],
         recommendedAction: "Resolve the reported prerequisite before retrying.",
@@ -2967,6 +2979,7 @@ export async function createApp(options: AppOptions = {}) {
         const hostRun = running.output?.hostRun as HostRunManifest | null | undefined;
         const typed = await executeTypedCapabilities(reviewedPlan, envelope, manifest, reviewedUpdates, hostRun);
         const typedResult = typed?.result ?? null;
+        if (!typedResult) assertRunnerCanStart(reviewedPlan);
         if (!typedResult) markExecutionStarted(job.id);
         const raw = typedResult || await runIsolatedRunner(actor, session, planner, proposalPath, reviewedPlan);
         const result = typedResult || filterSensitiveContent(extractRunnerHandoff(raw));

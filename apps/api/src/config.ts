@@ -27,6 +27,9 @@ export interface AppConfig {
   maxFailedChangesPerHour: number;
   maxFailedChangesPerHourGlobal?: number;
   agentBrokerSocket: string | null;
+  // The runner's own broker (separate identity, card t_cb81637b). With the agent
+  // broker configured and this one missing, the API starts no runner at all.
+  runnerBrokerSocket?: string | null;
   executorBrokerSocket: string | null;
   executorBrokerSecret: string | null;
   nodeEnv: string;
@@ -86,6 +89,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     maxFailedChangesPerHour: positiveCount(env.COCKPIT_MAX_FAILED_CHANGES_PER_HOUR, 3),
     maxFailedChangesPerHourGlobal: positiveCount(env.COCKPIT_MAX_FAILED_CHANGES_PER_HOUR_GLOBAL, 10),
     agentBrokerSocket: env.COCKPIT_AGENT_BROKER_SOCKET?.trim() || null,
+    runnerBrokerSocket: env.COCKPIT_RUNNER_BROKER_SOCKET?.trim() || null,
     executorBrokerSocket: env.COCKPIT_EXECUTOR_BROKER_SOCKET?.trim() || null,
     executorBrokerSecret: env.COCKPIT_EXECUTOR_BROKER_SECRET?.trim() || null,
     nodeEnv,

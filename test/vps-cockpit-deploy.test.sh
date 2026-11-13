@@ -18,7 +18,7 @@
 # (real tarball, checksum against a SHASUMS256.txt fixture, before the build),
 # not downloaded again when it is there, and 70 + rollback on a checksum mismatch,
 # a failed download or a .node-version that is not one clean x.y.z. Leftover opencode
-# config the agent broker refuses stops the deploy with 71 before anything is installed.
+# config the agent or runner broker refuses stops the deploy with 71 before the checkout.
 #
 # Everything lives below one fresh mktemp directory under /tmp; the harness
 # refuses to run otherwise. Call as root (install -o root):
@@ -96,6 +96,14 @@ echo "visudo \$*" >> "$FIX/calls.log"
 [ "\$1" = "-c" ] && [ -e "$FIX/fail-visudo" ] && rm -f "$FIX/fail-visudo" && exit 1
 exit 0
 EOF
+# getent/groupadd/useradd for the runner's account (card t_cb81637b): logged, never
+# the host's real account database; "runner-exists" simulates a host that has it.
+cat > "$FIX/stub/accounts" <<EOF
+#!/bin/bash
+echo "accounts \$*" >> "$FIX/calls.log"
+if [ "\$1" = getent ]; then [ -e "$FIX/runner-exists" ] && exit 0; exit 2; fi
+exit 0
+EOF
 chmod 755 "$FIX/stub/"*
 
 # --- the pinned Node runtime: fixture host tree and a nodejs.org-like release ---
@@ -128,7 +136,7 @@ targets() { grep -oE '^  "[^"|]+\|[^"|]+\|' "$SCRIPT" | cut -d'|' -f2 | sed -E \
   -e 's#\$UNITS#/etc/systemd/system#' -e 's#\$SUDOERS#/etc/sudoers.d/cockpit-executor#' -e 's#^\$ROOT##'; }
 fresh_host() { # fresh_host [ohne-runtime] — half the targets with old bytes, the other half absent; repo at A
   rm -rf "$FIX/root" "$FIX/repo" "$FIX/calls.log" "$FIX/fail-visudo" "$FIX/fail-build" "$FIX/fail-webbuild" "$FIX/web-active" \
-    "$FIX/web-built" "$FIX/web-swapped" "$FIX/web-stale" "$FIX/fail-webps"
+    "$FIX/web-built" "$FIX/web-swapped" "$FIX/web-stale" "$FIX/fail-webps" "$FIX/runner-exists"
   mkdir -p "$FIX/root/var/lib/wireguard-ops-cockpit"; chmod 750 "$FIX/root/var/lib/wireguard-ops-cockpit"
   # A host that already carries the pinned runtime (the normal case) unless the
   # case is about installing it.
@@ -151,6 +159,7 @@ deploy() { # deploy <sha> [mode]
   env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root REPO_COMMIT="$1" COCKPIT_RESTART_MODE="${2:-now}" \
     VPS_DEPLOY_ROOT="$FIX/root" VPS_DEPLOY_REPO="$FIX/repo" VPS_DEPLOY_ORIGIN="$FIX/origin.git" \
     VPS_DEPLOY_SYSTEMCTL="$FIX/stub/systemctl" VPS_DEPLOY_VISUDO="$FIX/stub/visudo" VPS_DEPLOY_DOCKER="$FIX/stub/docker" \
+    VPS_DEPLOY_ACCOUNTS="$FIX/stub/accounts" \
     VPS_DEPLOY_NODE_DIST="file://$FIX/dist" \
     VPS_DEPLOY_BUILD="[ -x $FIX/root/opt/node-v$NODE_V-linux-x64/bin/node ] || { echo 'build: the pinned runtime is missing (bin/with-runtime would exit 69)' >&2; exit 69; }; [ ! -e $FIX/fail-build ] || [ \"\$(git rev-parse HEAD)\" != $B ]" \
     bash "$FIX/repo/deploy/vps/vps-cockpit-deploy.sh" > "$FIX/out.log" 2>&1
@@ -177,6 +186,14 @@ check "Erfolg: nach dem Neustart läuft das gebaute Abbild (geprüft)" 'grep -q 
 check "Erfolg: Sicherungsordner entfernt" '[ -z "$(ls -d "$FIX"/root/var/lib/wireguard-ops-cockpit/self-update/deploy-backup.* 2>/dev/null)" ]'
 check "Erfolg: Datenordner des Dienstes bleibt 750" '[ "$(parent_mode)" = 750 ]'
 check "Erfolg: Wiederaufnahme der Host-Läufe beim Hochfahren aktiviert" 'grep -q "^systemctl enable --quiet wireguard-ops-cockpit-host-run-resume.service" "$FIX/calls.log"'
+# Runner unter eigener Identität (t_cb81637b): eigene Gruppe, eigener Nutzer ohne
+# weitere Gruppe und ohne Login, Unit aktiviert, mit den übrigen Diensten neu gestartet.
+check "Runner: Gruppe cockpit-runner-client angelegt" 'grep -qx "accounts groupadd --system cockpit-runner-client" "$FIX/calls.log"'
+check "Runner: Nutzer cockpit-runner nur in seiner Gruppe, ohne Login" 'grep -qx "accounts useradd --system --no-create-home -d /var/lib/wireguard-ops-runner -s /usr/sbin/nologin -g cockpit-runner-client cockpit-runner" "$FIX/calls.log" && ! grep -q "accounts useradd.*-G" "$FIX/calls.log"'
+check "Runner: Unit und Konfiguration installiert" '[ -s "$FIX/root/etc/systemd/system/wireguard-ops-cockpit-runner.service" ] && [ -s "$FIX/root/var/lib/wireguard-ops-runner/.config/opencode/opencode.jsonc" ] && [ -s "$FIX/root/var/lib/wireguard-ops-runner/.config/opencode/.gitignore" ]'
+check "Runner: Konfiguration root-eigen, nicht für den Runner schreibbar" '[ "$(stat -c "%U %a" "$FIX/root/var/lib/wireguard-ops-runner/.config/opencode/opencode.jsonc")" = "root 644" ] && [ "$(stat -c %U "$FIX/root/var/lib/wireguard-ops-runner")" = root ]'
+check "Runner: Unit aktiviert" 'grep -q "^systemctl enable --quiet wireguard-ops-cockpit-runner.service" "$FIX/calls.log"'
+check "Runner: Neustart und self-update.env nennen den Runner" 'grep -q "^systemctl restart .*wireguard-ops-cockpit-runner" "$FIX/calls.log" && grep -q "COCKPIT_SELF_UPDATE_SERVICES=.*wireguard-ops-cockpit-runner" "$FIX/root/etc/wireguard-ops-cockpit/self-update.env"'
 # R2: das Drop-in für borgmatic.service. Das Verzeichnis gehört dem Paket, nicht
 # uns: hier wird nur die eigene Datei geschrieben.
 check "R2: Drop-in borgmatic.service.d/cockpit-borg-lock.conf installiert" '[ "$(cat "$FIX/root/etc/systemd/system/borgmatic.service.d/cockpit-borg-lock.conf")" = "B deploy/systemd/borgmatic-cockpit-borg-lock.conf" ]'
@@ -194,6 +211,7 @@ check "Rückfall: kein state.json geschrieben" '[ ! -e "$FIX/root/var/lib/wiregu
 check "Rückfall: Datenordner des Dienstes bleibt 750" '[ "$(parent_mode)" = 750 ]'
 check "Rückfall: Drop-in wieder weg (lag vorher nicht da)" '[ ! -e "$FIX/root/etc/systemd/system/borgmatic.service.d/cockpit-borg-lock.conf" ]'
 check "Rückfall: fremdes Drop-in unberührt" '[ "$(cat "$FIX/root/etc/systemd/system/borgmatic.service.d/nach-gitlab-backup.conf")" = "FREMD nach-gitlab-backup.conf" ]'
+check "Rückfall: Aktivierungslink des Runners weg, wenn seine Unit vorher fehlte" '[ -e "$FIX/root/etc/systemd/system/wireguard-ops-cockpit-runner.service" ] || [ ! -e "$FIX/root/etc/systemd/system/multi-user.target.wants/wireguard-ops-cockpit-runner.service" ]'
 
 # 3: the web build fails after the install -> files restored, web tag back on the old image
 fresh_host; : > "$FIX/fail-webbuild"; code=0; deploy "$B" now || code=$?
@@ -214,6 +232,10 @@ fresh_host; : > "$FIX/web-active"; code=0; deploy "$B" defer || code=$?
 check "Defer: Exit 0, installiert, kein Neustart" '[ "$code" = 0 ] && [ "$(count_B)" -gt 20 ] && ! grep -q "^systemctl restart" "$FIX/calls.log"'
 check "Defer: aktive Web-Unit nicht erneut gestartet (nichts schaltet vor der Aktivierung)" '! grep -q "^systemctl start" "$FIX/calls.log"'
 check "Defer: state.json verbucht das gebaute Web-Abbild für die Aktivierung" 'grep -q "\"id\": \"sha256:neu\"" "$FIX/root/var/lib/wireguard-ops-cockpit/self-update/state.json"'
+
+# 6b: the runner's account exists already -> nothing created, deploy succeeds
+fresh_host; : > "$FIX/runner-exists"; code=0; deploy "$B" defer || code=$?
+check "Runner vorhanden: Exit 0, kein groupadd/useradd" '[ "$code" = 0 ] && grep -q "^accounts getent passwd cockpit-runner" "$FIX/calls.log" && ! grep -qE "^accounts (groupadd|useradd)" "$FIX/calls.log"'
 
 # 7: restart now, but the web unit leaves the old container running -> exit 68, said so
 fresh_host; : > "$FIX/web-active"; : > "$FIX/web-stale"; code=0; deploy "$B" now || code=$?
@@ -257,11 +279,19 @@ check ".node-version unsauber: Exit 70, kein Pfad/URL daraus gebaut" '[ "$code" 
 check ".node-version unsauber: Rückfall auf A" '[ "$(git -C "$FIX/repo" rev-parse HEAD)" = "$A" ]'
 
 # 14: leftover opencode config the broker refuses (here /AGENTS.md of the host) -> 71
-# before anything is installed: the running stand keeps working (t_b4ec0027)
-fresh_host; : > "$FIX/root/AGENTS.md"; (cd "$FIX/root" && find . -type f -exec sha256sum {} + | sort) > "$FIX/vorher.sums"; code=0; deploy "$B" now || code=$?
-check "Altlast: Exit 71, Pfad genannt" '[ "$code" = 71 ] && grep -q "FAILED: opencode would load /AGENTS.md into every role" "$FIX/out.log"'
-check "Altlast: Host-Dateien bytegenau, kein Neustart, kein state.json" '[ "$(after_sums)" = "$(cat "$FIX/vorher.sums")" ] && ! grep -q "^systemctl restart" "$FIX/calls.log" && [ ! -e "$FIX/root/var/lib/wireguard-ops-cockpit/self-update/state.json" ]'
-check "Altlast: Rückfall auf A, vor dem Bau abgebrochen" '[ "$(git -C "$FIX/repo" rev-parse HEAD)" = "$A" ] && ! grep -q "^docker compose" "$FIX/calls.log" && grep -q "rollback complete" "$FIX/out.log"'
+# before anything is installed: the running stand keeps working (t_b4ec0027). Since
+# t_2a2d8e5b the check runs before the checkout: nothing to roll back, no rebuild.
+# calls.log exists, so "no call" below is a real check, not a missing file (N4).
+fresh_host; : > "$FIX/root/AGENTS.md"; : > "$FIX/calls.log"; (cd "$FIX/root" && find . -type f -exec sha256sum {} + | sort) > "$FIX/vorher.sums"; code=0; deploy "$B" now || code=$?
+check "Altlast: Exit 71, Pfad genannt (einmal, obwohl beide Homes darunter liegen)" '[ "$code" = 71 ] && [ "$(grep -c "FAILED: opencode would load /AGENTS.md into every role" "$FIX/out.log")" = 1 ]'
+check "Altlast: Host-Dateien bytegenau, kein Aufruf, kein state.json" '[ "$(after_sums)" = "$(cat "$FIX/vorher.sums")" ] && [ ! -s "$FIX/calls.log" ] && [ ! -e "$FIX/root/var/lib/wireguard-ops-cockpit/self-update/state.json" ]'
+check "Altlast: vor dem Checkout abgebrochen, kein Rückfall nötig, keine Sicherung liegen gelassen" '[ "$(git -C "$FIX/repo" rev-parse HEAD)" = "$A" ] && ! grep -q "deploying \|rollback" "$FIX/out.log" && [ -z "$(ls -A "$FIX/root/var/lib/wireguard-ops-cockpit/self-update" 2>/dev/null | grep deploy-backup)" ]'
+
+# 15: the same for the runner's home (t_2a2d8e5b): its broker would refuse the runner
+fresh_host; mkdir -p "$FIX/root/var/lib/wireguard-ops-runner/.config/opencode/tools"; : > "$FIX/calls.log"
+(cd "$FIX/root" && find . -type f -exec sha256sum {} + | sort) > "$FIX/vorher.sums"; code=0; deploy "$B" now || code=$?
+check "Altlast Runner-Home: Exit 71, Pfad genannt" '[ "$code" = 71 ] && grep -q "FAILED: opencode would load /var/lib/wireguard-ops-runner/.config/opencode/tools into every role" "$FIX/out.log"'
+check "Altlast Runner-Home: nichts angefasst, Stand A" '[ "$(after_sums)" = "$(cat "$FIX/vorher.sums")" ] && [ ! -s "$FIX/calls.log" ] && [ "$(git -C "$FIX/repo" rev-parse HEAD)" = "$A" ]'
 
 echo
 [ "$fails" = 0 ] && echo "alles grün" || { echo "$fails rot"; exit 1; }

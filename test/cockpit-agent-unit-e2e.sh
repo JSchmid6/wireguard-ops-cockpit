@@ -1,15 +1,18 @@
 #!/bin/bash
 # ============================================================================
-# cockpit-agent-unit-e2e.sh — Schreibgrenze der Agent-Unit auf echtem systemd
+# cockpit-agent-unit-e2e.sh — Schreibgrenzen der Agent- und der Runner-Unit auf echtem systemd
 # (Wegwerf-Container).
 #
 # Geprüft wird der AUSGELIEFERTE Stand:
 #   deploy/systemd/wireguard-ops-cockpit-agent.service (Härtung, Schreibpfade)
-#   deploy/lab0/homeserver-cockpit-deploy.sh, Block agent-opencode-config
+#   deploy/systemd/wireguard-ops-cockpit-runner.service (eigene Identität, t_cb81637b)
+#   deploy/lab0/homeserver-cockpit-deploy.sh, Blöcke agent-/runner-opencode-config
 #
-# In der Unit laufen alle Rollen als cockpit-agent, auch der Runner mit den
-# build-Werkzeugen. Was er schreiben kann, lädt der nächste Türsteher-/Verifier-
-# Lauf (opencode-Konfiguration, Agenten-Definitionen, AGENTS.md, .opencode).
+# In der Agent-Unit laufen die Plan-Rollen als cockpit-agent, der Runner mit den
+# build-Werkzeugen als cockpit-runner in seiner eigenen Unit. Was eine Identität
+# schreiben kann, lädt ihr nächster Lauf (opencode-Konfiguration, Agenten-
+# Definitionen, AGENTS.md, .opencode); was der Runner von der Agent-Unit erreicht
+# (Home, Arbeitsordner, Socket, Prozesse), lesen oder glauben Türsteher und Verifier.
 # Der Test ersetzt nur ExecStart durch eine Probe und versucht als die Unit
 # genau diese Schreibwege (Einzelheiten im Innenteil).
 #
@@ -52,7 +55,7 @@ docker run -d --name "$NAME" \
   --privileged --cgroupns=host \
   -v /sys/fs/cgroup:/sys/fs/cgroup:rw --tmpfs /run --tmpfs /tmp \
   --mount "type=bind,source=$REPO_HOST,target=/pkg,readonly" \
-  ubuntu:24.04 /bin/bash -c 'apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq systemd-sysv util-linux >/dev/null 2>&1; exec /sbin/init' >>"$LOG" 2>&1
+  ubuntu:24.04 /bin/bash -c 'apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq systemd-sysv util-linux python3 >/dev/null 2>&1; exec /sbin/init' >>"$LOG" 2>&1
 if [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null)" != "true" ]; then
   echo "FEHLER: Container $NAME startet nicht." | tee -a "$LOG"
   docker logs "$NAME" >>"$LOG" 2>&1 || true

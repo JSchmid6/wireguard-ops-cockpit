@@ -101,7 +101,7 @@ async function setup(overrides: Partial<AppConfig> = {}, slot: { pollMs?: number
     return { ok: true, output: "VERIFICATION_STATUS: passed\nEVIDENCE: no upgradable packages\nREASON: done" };
   });
   const app = await createApp({
-    config: config(dir, { executorBrokerSocket: path.join(dir, "executor.sock"), executorBrokerSecret: BROKER_SECRET, agentBrokerSocket: path.join(dir, "agent.sock"), ...overrides }),
+    config: config(dir, { executorBrokerSocket: path.join(dir, "executor.sock"), executorBrokerSecret: BROKER_SECRET, agentBrokerSocket: path.join(dir, "agent.sock"), runnerBrokerSocket: path.join(dir, "agent.sock"), ...overrides }),
     hostRunReviewRunner: async () => host.doorkeeper,
     hostRunPollMs: 10,
     hostRunSlotPollMs: slot.pollMs ?? 10,

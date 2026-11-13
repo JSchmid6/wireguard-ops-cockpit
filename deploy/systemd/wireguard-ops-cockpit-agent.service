@@ -14,6 +14,9 @@ Environment=PATH=/opt/node-v22.23.4-linux-x64/bin:/usr/local/bin:/usr/bin:/bin
 Environment=COCKPIT_AGENT_BROKER_SOCKET=/run/cockpit-agent/agent.sock
 Environment=COCKPIT_AGENT_WORKSPACE_ROOT=/var/lib/wireguard-ops-agent/sessions
 Environment=COCKPIT_OPENCODE_CONFIG=/var/lib/wireguard-ops-agent/.config/opencode/opencode.jsonc
+# The plan roles only. The runner (build) has its own identity, home and socket
+# (wireguard-ops-cockpit-runner.service, card t_cb81637b).
+Environment=COCKPIT_AGENT_BROKER_ROLES=planner,research,safety,verifier
 EnvironmentFile=/etc/wireguard-ops-cockpit/agent.env
 RuntimeDirectory=cockpit-agent
 RuntimeDirectoryMode=0770
@@ -25,12 +28,17 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-# Writable are only the session workspaces and opencode's own state, never the
-# home: the config, agent definitions, AGENTS.md and .opencode there are what
-# every later role (safety, verifier) loads, and the runner (build) runs here too.
-StateDirectory=wireguard-ops-agent/sessions wireguard-ops-agent/.local/share/opencode wireguard-ops-agent/.local/state/opencode wireguard-ops-agent/.cache/opencode
+# Processes of other users (the runner identity) are invisible here.
+ProtectProc=invisible
+# Writable are only the session workspaces, never the home: the config, agent
+# definitions, AGENTS.md and .opencode there are what every later role (safety,
+# verifier) loads. opencode's own state lives in each workspace and goes with it
+# (the broker sets XDG_DATA/STATE/CACHE_HOME and TMPDIR per run).
+StateDirectory=wireguard-ops-agent/sessions
 StateDirectoryMode=0700
 ReadWritePaths=/run/cockpit-agent
+# Defence in depth on top of the runner's own 0750 home: not even visible here.
+InaccessiblePaths=-/var/lib/wireguard-ops-runner -/run/cockpit-runner
 # The Cockpit's own secrets (execution envelope, hoster API) are out of every
 # role's reach by structure, not by a text filter on the plan (card t_abe2651b).
 # systemd reads EnvironmentFile= above before it builds this namespace.

@@ -167,7 +167,7 @@ COCKPIT_SELF_UPDATE_VERIFY_RETRIES=6
 COCKPIT_SELF_UPDATE_VERIFY_DELAY=2
 EOF
 
-for svc in api agent executor ttyd; do
+for svc in api agent runner executor ttyd; do
   cat > "/etc/systemd/system/wireguard-ops-cockpit-$svc.service" <<EOF
 [Unit]
 Description=e2e dummy $svc
@@ -178,11 +178,11 @@ WantedBy=multi-user.target
 EOF
 done
 systemctl daemon-reload
-systemctl enable --now wireguard-ops-cockpit-api wireguard-ops-cockpit-agent wireguard-ops-cockpit-executor wireguard-ops-cockpit-ttyd >/dev/null 2>&1
+systemctl enable --now wireguard-ops-cockpit-api wireguard-ops-cockpit-agent wireguard-ops-cockpit-runner wireguard-ops-cockpit-executor wireguard-ops-cockpit-ttyd >/dev/null 2>&1
 sleep 1
 check "Fixture-Dienste aktiv" "$(systemctl is-active --quiet wireguard-ops-cockpit-api && echo 0 || echo 1)" ""
 
-install -d -m 0755 /run/cockpit-agent /run/cockpit-executor
+install -d -m 0755 /run/cockpit-agent /run/cockpit-runner /run/cockpit-executor
 cat > /root/mksock.py <<'EOF'
 import socket
 import sys
@@ -194,10 +194,10 @@ for path in sys.argv[2:]:
     server.listen(1)
 time.sleep(int(sys.argv[1]))
 EOF
-python3 /root/mksock.py 3600 /run/cockpit-agent/agent.sock /run/cockpit-executor/executor.sock &
+python3 /root/mksock.py 3600 /run/cockpit-agent/agent.sock /run/cockpit-runner/runner.sock /run/cockpit-executor/executor.sock &
 echo $! > /root/mksock.pid
 sleep 0.5
-check "Fixture-Broker-Sockets vorhanden" "$([ -S /run/cockpit-agent/agent.sock ] && [ -S /run/cockpit-executor/executor.sock ] && echo 0 || echo 1)" ""
+check "Fixture-Broker-Sockets vorhanden" "$([ -S /run/cockpit-agent/agent.sock ] && [ -S /run/cockpit-runner/runner.sock ] && [ -S /run/cockpit-executor/executor.sock ] && echo 0 || echo 1)" ""
 
 cat > /root/e2e-servers.py <<'EOF'
 import threading

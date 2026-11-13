@@ -151,9 +151,13 @@ FILE_AREAS = (
      lambda path: path.startswith(("apps/executor-broker/", "apps/agent-broker/")) or path in (
          "apps/api/src/executor-broker.ts", "apps/api/src/agent-broker.ts", "apps/api/src/hermes-security.ts",
          # The opencode config every role loads, the doorkeeper and the verifier too, and
-         # the unit whose write boundary keeps it out of a run's reach.
+         # the unit whose write boundary keeps it out of a run's reach; the runner's own
+         # unit and the drop-in that routes the runner to it keep the runner out of the
+         # plan roles' identity (t_cb81637b).
          "apps/api/src/safety-review.ts", "deploy/config/opencode-agent.jsonc",
-         "deploy/systemd/wireguard-ops-cockpit-agent.service")),
+         "deploy/systemd/wireguard-ops-cockpit-agent.service",
+         "deploy/systemd/wireguard-ops-cockpit-runner.service",
+         "deploy/systemd/wireguard-ops-cockpit-api-brokers.conf")),
     ("host-door", ("G2", "G5", "G6", "G9", "G10"), "the general door host.run: lock check, doorkeeper, risk bolt, safety net, log redaction",
      lambda path: path in HOST_DOOR_FILES),
     ("capability-sandbox", ("G5",), "dynamic capability sandbox and protected paths",
@@ -235,8 +239,8 @@ ACTIVATION_JOBS_POLL = int(env("COCKPIT_SELF_UPDATE_ACTIVATION_JOBS_POLL", "15")
 ACTIVATION_JOBS_SILENT = int(env("COCKPIT_SELF_UPDATE_ACTIVATION_JOBS_SILENT", "4"))
 VERIFY_RETRIES = int(env("COCKPIT_SELF_UPDATE_VERIFY_RETRIES", "12"))
 VERIFY_DELAY = int(env("COCKPIT_SELF_UPDATE_VERIFY_DELAY", "5"))
-SERVICES = env("COCKPIT_SELF_UPDATE_SERVICES", "wireguard-ops-cockpit-api wireguard-ops-cockpit-agent wireguard-ops-cockpit-executor wireguard-ops-cockpit-ttyd").split()
-SOCKETS = env("COCKPIT_SELF_UPDATE_SOCKETS", "/run/cockpit-agent/agent.sock /run/cockpit-executor/executor.sock").split()
+SERVICES = env("COCKPIT_SELF_UPDATE_SERVICES", "wireguard-ops-cockpit-api wireguard-ops-cockpit-agent wireguard-ops-cockpit-runner wireguard-ops-cockpit-executor wireguard-ops-cockpit-ttyd").split()
+SOCKETS = env("COCKPIT_SELF_UPDATE_SOCKETS", "/run/cockpit-agent/agent.sock /run/cockpit-runner/runner.sock /run/cockpit-executor/executor.sock").split()
 RUN_PATH = env("COCKPIT_SELF_UPDATE_RUN_PATH", "/usr/local/lib/wireguard-ops-cockpit/cockpit-self-update-run")
 WG_IP = env("COCKPIT_SELF_UPDATE_WG_IP", "10.0.0.5")
 API_HEALTH_URL = env("COCKPIT_SELF_UPDATE_API_HEALTH_URL", "http://127.0.0.1:3001/api/health")
@@ -900,8 +904,11 @@ def web_image_check(after_activation):
     return "pending-activation"
 
 
-def verify_phase(retries, delay, include_web, after_activation):
-    """Runs the verification checks; raises Failure(68, ...) with the first breach."""
+def verify_phase(retries, delay, include_web, after_activation, services=None, sockets=None):
+    """Runs the verification checks; raises Failure(68, ...) with the first breach.
+    services/sockets: the rollback narrows them to the units the restored stand has."""
+    services = SERVICES if services is None else services
+    sockets = SOCKETS if sockets is None else sockets
     checks = {}
     revision = git("rev-parse", "HEAD", timeout=30)
     if revision.returncode != 0 or revision.stdout.strip() != ACTIVE_SHA:
@@ -912,7 +919,7 @@ def verify_phase(retries, delay, include_web, after_activation):
     # try that finds them up.
     missing = []
     for _ in range(retries):
-        missing = [name for name in SERVICES if run([SYSTEMCTL, "is-active", "--quiet", name], timeout=15).returncode != 0]
+        missing = [name for name in services if run([SYSTEMCTL, "is-active", "--quiet", name], timeout=15).returncode != 0]
         if not missing:
             break
         time.sleep(delay)
@@ -921,7 +928,7 @@ def verify_phase(retries, delay, include_web, after_activation):
     checks["services"] = "ok"
     missing = []
     for _ in range(retries):
-        missing = [path for path in SOCKETS if not socket_ok(path)]
+        missing = [path for path in sockets if not socket_ok(path)]
         if not missing:
             break
         time.sleep(delay)
@@ -986,6 +993,46 @@ def take_snapshot(sha):
             "rotated": record.get("rotated") or []}
 
 
+def socket_owner(path):
+    """The service a broker socket belongs to: <dir>/cockpit-<role>/<x>.sock ->
+    wireguard-ops-cockpit-<role>; None for any other path (always verified)."""
+    parent = os.path.basename(os.path.dirname(path))
+    if parent.startswith("cockpit-") and len(parent) > len("cockpit-"):
+        return "wireguard-ops-cockpit-" + parent[len("cockpit-"):]
+    return None
+
+
+def unit_gone(name):
+    """True when systemd, after the daemon-reload, has no unit file for name.
+    An unreadable answer counts as present: the unit stays restarted and verified."""
+    shown = run([SYSTEMCTL, "show", "-p", "LoadState", "--value", name], timeout=15)
+    return shown.returncode == 0 and shown.stdout.strip() == "not-found"
+
+
+def removed_units(restore_stdout):
+    """Service names whose unit file the restore removed (the update added them)."""
+    try:
+        record = json.loads(restore_stdout)
+    except ValueError:
+        return []
+    paths = record.get("removed") if isinstance(record, dict) else None
+    return [os.path.basename(path)[:-len(".service")] for path in (paths or [])
+            if isinstance(path, str) and os.path.dirname(path) == "/etc/systemd/system"
+            and path.endswith(".service")]
+
+
+def clear_units(names):
+    """Stops units the restored stand no longer has and clears their failed state.
+    Returns the names still active afterwards."""
+    left = []
+    for name in names:
+        run([SYSTEMCTL, "stop", name], timeout=120)
+        run([SYSTEMCTL, "reset-failed", name], timeout=15)
+        if run([SYSTEMCTL, "is-active", "--quiet", name], timeout=15).returncode == 0:
+            left.append(name)
+    return left
+
+
 def roll_back(snapshot, previous, failed_sha, phase, restart):
     """Put the snapshot back and prove the previous commit runs again. Never raises."""
     global ACTIVE_SHA
@@ -1007,10 +1054,24 @@ def roll_back(snapshot, previous, failed_sha, phase, restart):
                 if done.returncode != 0:
                     outcome["error"] = "reload of %s failed: %s" % (unit, done.stderr.strip()[-300:])
                     return outcome
-        down = [name for name in SERVICES if run([SYSTEMCTL, "is-active", "--quiet", name], timeout=15).returncode != 0]
+        # Units the update added (e.g. a new broker) left with their files: the
+        # restored stand neither restarts nor verifies them, and a still running
+        # one is stopped instead of staying behind as an orphan.
+        candidates = SERVICES + [name for name in removed_units(put.stdout) if name not in SERVICES]
+        dropped = [name for name in candidates if unit_gone(name)]
+        services = [name for name in SERVICES if name not in dropped]
+        sockets = [path for path in SOCKETS if socket_owner(path) not in dropped]
+        if dropped:
+            log("units without a file on the restored stand, stopping: %s" % " ".join(dropped))
+            outcome["removed_units"] = dropped
+            left = clear_units(dropped)
+            if left:
+                outcome["error"] = "units the restore removed are still active: %s" % " ".join(left)
+                return outcome
+        down = [name for name in services if run([SYSTEMCTL, "is-active", "--quiet", name], timeout=15).returncode != 0]
         if restart or down:
-            log("restarting %s on the restored files" % " ".join(SERVICES))
-            again = run([SYSTEMCTL, "restart"] + SERVICES, timeout=300)
+            log("restarting %s on the restored files" % " ".join(services))
+            again = run([SYSTEMCTL, "restart"] + services, timeout=300)
             if again.returncode != 0:
                 outcome["error"] = "service restart after the restore failed: %s" % again.stderr.strip()[-300:]
                 return outcome
@@ -1023,7 +1084,8 @@ def roll_back(snapshot, previous, failed_sha, phase, restart):
         ACTIVE_SHA = previous or ""
         try:
             outcome["verification"] = verify_phase(retries=VERIFY_RETRIES * 2, delay=VERIFY_DELAY,
-                                                   include_web=True, after_activation=True)
+                                                   include_web=True, after_activation=True,
+                                                   services=services, sockets=sockets)
         except Failure as exc:
             outcome["error"] = "the restored stand does not verify: %s" % exc.message
             return outcome

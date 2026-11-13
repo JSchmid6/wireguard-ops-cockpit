@@ -199,9 +199,10 @@ unchanged):
    create ends the job with 67, phase `snapshot`, nothing changed.
    `state.json` names the snapshot (`snapshot`) for the activation.
 2. Deploy script, pre-activation verification or scheduling fail →
-   `restore`, `systemctl daemon-reload`, `reload nginx` (when active), restart
-   the four services only if one is down (in `defer` mode the old code is still
-   the running one), then the full verification against the previous commit.
+   `restore`, `systemctl daemon-reload`, `reload nginx` (when active), stop the
+   units the restore removed (point 5), restart the services only if one is
+   down (in `defer` mode the old code is still the running one), then the full
+   verification against the previous commit.
    The job keeps its failure code; `last-result.json` carries `rollback`
    (`result`, `verification` or `error`), `state.json` is the restored one plus
    `rollback` (failed commit, snapshot, phase).
@@ -211,6 +212,31 @@ unchanged):
    not prove the previous stand), exit 68.
 4. A rollback that cannot restore or verify says so loudly
    (`rollback incomplete: …`) and leaves the snapshot in place for the operator.
+5. Units the update added (Kanban t_b049f75b, B1 of t_15055863): after the
+   restore and `daemon-reload` the rollback asks systemd for the `LoadState` of
+   every service in `COCKPIT_SELF_UPDATE_SERVICES` and of every
+   `/etc/systemd/system/*.service` the restore reports as removed. A unit that
+   is `not-found` belongs to the failed stand: it is stopped and
+   `reset-failed`, listed in `rollback.removed_units`, and neither restarted
+   nor verified; its broker socket is dropped from the check as well
+   (`<dir>/cockpit-<role>/<x>.sock` belongs to `wireguard-ops-cockpit-<role>`;
+   a socket of any other form is always checked). A removed unit that is still
+   active after the stop makes the rollback incomplete. An unreadable
+   `LoadState` counts as present, so the unit stays restarted and verified.
+
+**Honest limit, the rollout that brings a new unit.** A rollback runs with the
+runner that is running at that moment. The deploy phase (point 2) runs with the
+runner installed *before* the update, the activation (point 3) with the newly
+installed one. So when the update that introduces this rule (PR #98, which also
+adds `wireguard-ops-cockpit-runner`) fails in its deploy phase, the old rollback
+removes the new unit file but leaves the runner broker that the deploy started
+with `enable --now` running as a `not-found` orphan; the rollback itself still
+verifies, because the old service list does not contain the runner. The
+operator clears it with
+`systemctl stop wireguard-ops-cockpit-runner && systemctl reset-failed wireguard-ops-cockpit-runner`.
+From the next update on, both phases use this rule. In either case the
+`multi-user.target.wants` link of a removed unit stays behind dangling (the
+snapshot footprint does not cover `*.wants`); systemd ignores it.
 
 `restore` puts back bytes, modes, owners and symlinks (`cp -a`), removes what
 the update added below the globs, and swaps directories in by rename after the
@@ -560,7 +586,7 @@ finding names a concrete way **past** one of its guards, or a weakening of it:
 | G5 Sandbox and safety net | the special doors' sandbox is not broader; `host.run` has none by design, but before every run with `mutates: true` the net of the instance role, otherwise no step runs: role `vps` a return path — the last successfully finished borg backup at most 30 h old (a later failed run does not take it away; without it only the two typed exceptions of `doc/setup/host-run.md` run, emergency shutdown and backup repair, recognized by fixed forms only) — and a machine snapshot; role `lab0` (the borg target, no hoster) a complete local host snapshot (`/etc`, packages, unit states) plus the data lock: the run unit mounts `/media` (borg repository), `/home`, `/mnt`, `/srv` read-only and the run confirms it in its mount table before the first step and after a reboot (Jochen, 17.10.2026: on Lab0 this replaces borg freshness and the machine snapshot); role `box` (Proxmox host, t_88f1e802) the same host snapshot plus a Proxmox snapshot of every guest (VM and container); a guest that cannot be snapshotted stops the run; no data lock (the guests' snapshots are their way back). The role comes only from the root-owned `instance-role.env` the deploy installs; missing, foreign-writable or unknown → no step runs (16.10.2026). Snapshot revert/delete stays the operator's decision (at the door through the doorkeeper's X4, on box also for deleting or rolling back a guest snapshot). |
 | G6 Secrets | redaction of outputs, logs and prompts; the host-run log redacted line by line and 0600. The doorkeeper's unredacted material is intended. |
 | G7, G8 | unchanged (self-update path, dependencies). |
-| G9 Doorkeeper | isolated safety review; a pass only with complete material (a file larger than one pass is complete only when all its hunk parts were reviewed); incomplete or unreadable review and findings without evidence stop without a pass; its finding classes (secrets/egress, authority, exposure, loss of the way back, false read-only claim, hidden code, injection) do not narrow. Its own instructions are not writable by the agent identity it shares with the runner: the agent unit keeps the home with the opencode config, agent definitions, tools and global `AGENTS.md` read-only, and the broker refuses to start while project config lies above the workspace or extra config in the global config directory (card t_62992d58; honest limit: opencode's shared state and cache, a concurrent workspace and the broker socket stay writable for that identity, and a run can leave a process behind, `doc/services/execution-control-model.md`). |
+| G9 Doorkeeper | isolated safety review; a pass only with complete material (a file larger than one pass is complete only when all its hunk parts were reviewed); incomplete or unreadable review and findings without evidence stop without a pass; its finding classes (secrets/egress, authority, exposure, loss of the way back, false read-only claim, hidden code, injection) do not narrow. Its own instructions are not writable by the agent identity: the agent unit keeps the home with the opencode config, agent definitions, tools and global `AGENTS.md` read-only, and the broker refuses to start while project config lies above the workspace or extra config in the global config directory (card t_62992d58). opencode's state lives per run in the workspace, and the runner (`build`) runs as its own identity `cockpit-runner` with its own home, workspaces and socket, which the agent broker does not serve and the API never routes it past (card t_cb81637b; honest limit: the plan roles planner, research, safety and verifier still share `cockpit-agent`, so a planner or research run can write a concurrent workspace, the session root or the socket directory of that unit and leave a process behind, `doc/services/execution-control-model.md`). |
 | G10 Backups and declared risk | deleting, pruning or compacting backups, shortening their retention or switching them off (borg/borgmatic, `borgmatic.timer`, Lab0's retention service below its minimum or bypassed, vzdump backups and guest snapshots on box) only with `operatorApproved` (Grundsatz 4). Since 13.11.2026 (card t_abe2651b, operator decision 08./13.11.2026: text filters are out) the doorkeeper recognizes it on the whole plan: its instructions make every such run an X4 finding, and a finding goes to the operator. Structurally the VPS's borg key is append-only on Lab0, Lab0 and box take a host snapshot before every mutating run, and the retention service keeps its fixed bounds (`cockpit-borg-retention-rules.mjs`). A finding: weakening the X4 rule in the doorkeeper's instructions, a doorkeeper finding that runs without the operator, the VPS key beyond append-only, the snapshot before a mutating run removed on Lab0 or box, the retention bounds widened. The former deterministic backup bolt (`cockpit-backup-guard.mjs`) is removed. Risk bolt under the same guarantee (incident 23.10.2026): a manifest declaring `exposure`, `data_loss` or `identity_or_secret` starts only with `operatorApproved`, even on a pass, asked at three places (`hostRunRisksNeedingApproval` in the policy, `runHostRun`, the root helper incl. resume); an unknown risk class makes the manifest invalid. |
 
 The runner marks changes to the door's files as focus area `host-door`
@@ -599,7 +625,11 @@ under the state directory — never a bare exit code.
   deploy script, rollback after a failing deploy (checkout and state back, no
   restart), failing snapshot stops before the deploy, rollback after a failing
   activation (restart, previous commit verified, `rolled-back`), a rollback
-  that cannot verify or restore is reported, never hidden.
+  that cannot verify or restore is reported, never hidden. S17f: the update adds
+  a unit whose broker already runs, the activation fails and the restore removes
+  the unit file (the stub answers rc 5 for a unit without a file); the rollback
+  stops the orphan, restarts and verifies only the remaining units and sockets
+  and ends `rolled-back` (red against the rollback before t_b049f75b).
 - `sudo bash test/cockpit-self-update-snapshot.test.sh` — the snapshot helper
   against a fixture root: byte-, mode- and owner-exact restore of a changed
   footprint (changed, added, removed files, new helper and unit), secrets and

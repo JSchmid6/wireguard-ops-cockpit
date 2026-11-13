@@ -7,15 +7,17 @@ process.env.NODE_ENV = "test";
 // A stand-in for opencode: reports its arguments, then echoes stdin.
 const fakeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-agent-fake-"));
 const fakeOpencode = path.join(fakeRoot, "opencode");
-// A session whose requestId starts with dead0000 exits without reading stdin.
-fs.writeFileSync(fakeOpencode, "#!/bin/sh\ncase \"$PWD\" in */agent-dead0000*) exit 3;; esac\nprintf 'argc=%s last=%s\\n' \"$#\" \"$(eval echo \\\"\\$$#\\\")\"\ncat\n", { mode: 0o755 });
+// A session whose requestId starts with dead0000 exits without reading stdin;
+// one with 5a7e0000 reports its opencode state environment (npm's cache too) and writes a catalog
+// into its cache the way opencode does.
+fs.writeFileSync(fakeOpencode, "#!/bin/sh\ncase \"$PWD\" in */agent-dead0000*) exit 3;; */agent-5a7e0000*) env | grep -E '^(XDG_[A-Z]+_HOME|TMPDIR|OPENCODE_DISABLE_MODELS_FETCH|npm_config_cache)=' | sort; mkdir -p \"$XDG_CACHE_HOME/opencode\"; echo '{}' > \"$XDG_CACHE_HOME/opencode/models.json\"; exit 0;; esac\nprintf 'argc=%s last=%s\\n' \"$#\" \"$(eval echo \\\"\\$$#\\\")\"\ncat\n", { mode: 0o755 });
 process.env.COCKPIT_OPENCODE_EXECUTABLE = fakeOpencode;
 process.env.COCKPIT_AGENT_WORKSPACE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-agent-run-"));
 // The broker also checks opencode's global config directory below HOME: never the one of whoever runs the tests.
 process.env.HOME = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-agent-home-"));
 // The check derives it from HOME alone, like opencode, which gets no XDG_CONFIG_HOME.
 process.env.XDG_CONFIG_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-agent-xdg-"));
-const { assertNoPlantedConfig, cleanupStaleWorkspaces, globalConfigNames, projectConfigNames, createSessionWorkspace, removeSessionWorkspace, runAgent, validateRequest } = await import("../src/index.mjs");
+const { assertNoPlantedConfig, cleanupStaleWorkspaces, createSessionWorkspace, globalConfigNames, parseServedRoles, projectConfigNames, removeSessionWorkspace, runAgent, sessionStateDirs, validateRequest } = await import("../src/index.mjs");
 const { PROMPT_LIMITS, promptLimit, promptLimitProblem } = await import("../src/prompt-limits.mjs");
 test.after(() => {
   fs.rmSync(process.env.COCKPIT_AGENT_WORKSPACE_ROOT, { recursive: true, force: true });
@@ -27,6 +29,25 @@ test("agent broker accepts only bounded roles and prompts", () => {
   assert.deepEqual(validateRequest({ requestId: "12345678", role: "planner", prompt: "inspect" }), { requestId: "12345678", role: "planner", prompt: "inspect" });
   assert.deepEqual(validateRequest({ requestId: "12345678", role: "research", prompt: "inspect" }), { requestId: "12345678", role: "research", prompt: "inspect" });
   assert.throws(() => validateRequest({ requestId: "12345678", role: "root", prompt: "inspect" }), /invalid agent role/);
+});
+
+// Two instances under two identities: the agent unit serves the plan roles, the
+// runner unit only the runner (t_cb81637b). Unset serves every role.
+test("a broker instance serves only the roles it is configured for", () => {
+  assert.deepEqual([...parseServedRoles(undefined)].sort(), ["planner", "research", "runner", "safety", "verifier"]);
+  assert.deepEqual([...parseServedRoles(" ")].sort(), ["planner", "research", "runner", "safety", "verifier"]);
+  const plan = parseServedRoles("planner,research,safety,verifier");
+  const runner = parseServedRoles("runner");
+  for (const role of ["planner", "research", "safety", "verifier"]) {
+    assert.equal(validateRequest({ requestId: "12345678", role, prompt: "x" }, plan).role, role);
+    assert.throws(() => validateRequest({ requestId: "12345678", role, prompt: "x" }, runner), new RegExp(`^Error: this broker does not serve the ${role} role$`));
+  }
+  assert.equal(validateRequest({ requestId: "12345678", role: "runner", prompt: "x" }, runner).role, "runner");
+  assert.throws(() => validateRequest({ requestId: "12345678", role: "runner", prompt: "x" }, plan), /^Error: this broker does not serve the runner role$/);
+  assert.throws(() => validateRequest({ requestId: "12345678", role: "root", prompt: "x" }, plan), /invalid agent role/);
+  assert.throws(() => parseServedRoles("runner,root"), /unknown role: root/);
+  assert.throws(() => parseServedRoles("constructor"), /unknown role: constructor/);
+  assert.throws(() => parseServedRoles(","), /names no role/);
 });
 
 test("only the safety and verifier roles get the larger budget", () => {
@@ -81,6 +102,46 @@ test("startup cleanup removes stale bounded workspaces but preserves unrelated d
   assert.equal(fs.existsSync(stale), false);
   assert.equal(fs.existsSync(unrelated), true);
   fs.rmSync(root, { recursive: true });
+});
+
+// opencode's state belongs to the run (t_cb81637b): session database, auth.json,
+// models catalog, downloaded tools and temp files live in the workspace and go
+// with it; no catalog fetch per run.
+test("opencode state lives in the run's workspace and goes with it", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-agent-state-"));
+  const workspace = createSessionWorkspace({ requestId: "12345678", role: "safety", prompt: "x" }, root);
+  const dirs = sessionStateDirs(workspace);
+  assert.deepEqual(Object.keys(dirs).sort(), ["TMPDIR", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"]);
+  for (const dir of Object.values(dirs)) {
+    assert.ok(dir.startsWith(`${workspace}${path.sep}`), dir);
+    assert.equal(fs.statSync(dir).mode & 0o777, 0o700, dir);
+  }
+  // Not a name opencode loads as project config: a left-over one never stops a start.
+  const level = fs.mkdtempSync(path.join(root, "level-"));
+  fs.mkdirSync(path.join(level, ".run-state"));
+  assert.doesNotThrow(() => assertNoPlantedConfig(level, fs.mkdtempSync(path.join(root, "cfg-"))));
+  fs.rmSync(root, { recursive: true });
+  const result = await runAgent({ requestId: "5a7e0000-1", role: "safety", prompt: "x" });
+  assert.equal(result.ok, true, result.error);
+  const env = Object.fromEntries(result.output.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
+  assert.equal(env.OPENCODE_DISABLE_MODELS_FETCH, "1");
+  for (const key of ["XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "TMPDIR"]) {
+    assert.ok(env[key].startsWith(`${process.env.COCKPIT_AGENT_WORKSPACE_ROOT}/agent-5a7e0000-1-safety-`), key);
+    assert.ok(env[key].includes("/.run-state/"), key);
+  }
+  // npm's cache belongs to the run as well (card t_2a2d8e5b): the home is read-only.
+  assert.equal(env.npm_config_cache, path.join(env.XDG_CACHE_HOME, "npm"));
+  // The config directory stays the identity's (read-only in the unit): not passed on.
+  assert.equal(env.XDG_CONFIG_HOME, undefined);
+  // The catalog the run wrote is gone with its workspace.
+  assert.deepEqual(fs.readdirSync(process.env.COCKPIT_AGENT_WORKSPACE_ROOT), []);
+  // The runner (build) gets the same per-run state and npm cache in its own workspace.
+  const runner = await runAgent({ requestId: "5a7e0000-2", role: "runner", prompt: "x" });
+  assert.equal(runner.ok, true, runner.error);
+  const runnerEnv = Object.fromEntries(runner.output.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
+  assert.ok(runnerEnv.XDG_CACHE_HOME.startsWith(`${process.env.COCKPIT_AGENT_WORKSPACE_ROOT}/agent-5a7e0000-2-runner-`));
+  assert.equal(runnerEnv.npm_config_cache, path.join(runnerEnv.XDG_CACHE_HOME, "npm"));
+  assert.deepEqual(fs.readdirSync(process.env.COCKPIT_AGENT_WORKSPACE_ROOT), []);
 });
 
 test("agent process exit removes its complete session workspace", async () => {
@@ -164,42 +225,105 @@ test("planted opencode config above the workspace or in the global config direct
   assert.deepEqual(fs.readdirSync(process.env.COCKPIT_AGENT_WORKSPACE_ROOT), []);
 });
 
-// The unit is the boundary: every role, the runner with build tools too, runs as
-// cockpit-agent in it. What that identity can write, the next safety/verifier run
-// loads: the config, agent definitions and AGENTS.md below the home, and .opencode
-// or opencode.json in the home itself (t_62992d58).
-test("the agent unit keeps the home and the opencode config read-only", () => {
-  const repo = new URL("../../../", import.meta.url);
-  const unit = fs.readFileSync(new URL("deploy/systemd/wireguard-ops-cockpit-agent.service", repo), "utf8");
+// The units are the boundary (t_62992d58, t_cb81637b): the plan roles run as
+// cockpit-agent in the agent unit, the runner (build tools) as cockpit-runner in
+// its own unit. Whatever an identity can write, its next role loads: the config,
+// agent definitions and AGENTS.md below the home, .opencode or opencode.json in
+// the home itself. And whatever the runner can reach of the agent unit (home,
+// workspaces, socket), safety and verifier would load or trust.
+const repo = new URL("../../../", import.meta.url);
+function unitFile(name) {
+  const unit = fs.readFileSync(new URL(`deploy/systemd/${name}`, repo), "utf8");
   const values = (key) => unit.split("\n").filter((line) => line.startsWith(`${key}=`)).map((line) => line.slice(key.length + 1));
   const env = Object.fromEntries(values("Environment").map((entry) => [entry.slice(0, entry.indexOf("=")), entry.slice(entry.indexOf("=") + 1)]));
-  const home = env.HOME;
-  assert.equal(home, "/var/lib/wireguard-ops-agent");
-  assert.deepEqual([values("ProtectSystem"), values("ProtectHome")], [["strict"], ["true"]]);
-  // Other ways to make a path writable that the check below would not see.
-  for (const key of ["ReadWriteDirectories", "BindPaths", "LogsDirectory", "CacheDirectory", "ConfigurationDirectory"]) assert.deepEqual(values(key), [], key);
   const writable = [
     ...values("ReadWritePaths").flatMap((line) => line.split(/\s+/)),
     ...values("StateDirectory").flatMap((line) => line.split(/\s+/)).map((dir) => `/var/lib/${dir}`),
   ].map((entry) => entry.replace(/^-/, ""));
-  const covers = (dir, target) => target === dir || target.startsWith(`${dir}/`);
-  for (const target of [home, env.COCKPIT_OPENCODE_CONFIG, `${home}/.config/opencode/agent/plan.md`, `${home}/.config/opencode/AGENTS.md`, `${home}/.opencode`, `${home}/opencode.json`, `${home}/.claude/CLAUDE.md`]) {
-    assert.deepEqual(writable.filter((dir) => covers(dir, target)), [], `${target} must not be writable for the agent unit`);
+  const inaccessible = values("InaccessiblePaths").flatMap((line) => line.split(/\s+/)).map((entry) => entry.replace(/^-/, ""));
+  return { unit, values, env, writable, inaccessible };
+}
+const covers = (dir, target) => target === dir || target.startsWith(`${dir}/`);
+
+for (const [name, home, socketDir, roles] of [
+  ["wireguard-ops-cockpit-agent.service", "/var/lib/wireguard-ops-agent", "/run/cockpit-agent", "planner,research,safety,verifier"],
+  ["wireguard-ops-cockpit-runner.service", "/var/lib/wireguard-ops-runner", "/run/cockpit-runner", "runner"],
+]) {
+  test(`${name} keeps the home and the opencode config read-only and serves only its roles`, () => {
+    const { values, env, writable } = unitFile(name);
+    assert.equal(env.HOME, home);
+    assert.equal(env.COCKPIT_AGENT_BROKER_ROLES, roles);
+    assert.deepEqual([...parseServedRoles(env.COCKPIT_AGENT_BROKER_ROLES)].join(","), roles);
+    assert.equal(env.COCKPIT_AGENT_BROKER_SOCKET, `${socketDir}/${path.basename(socketDir).replace("cockpit-", "")}.sock`);
+    assert.equal(env.COCKPIT_AGENT_WORKSPACE_ROOT, `${home}/sessions`);
+    assert.equal(env.COCKPIT_OPENCODE_CONFIG, `${home}/.config/opencode/opencode.jsonc`);
+    assert.deepEqual([values("ProtectSystem"), values("ProtectHome"), values("ProtectProc"), values("NoNewPrivileges"), values("PrivateTmp")], [["strict"], ["true"], ["invisible"], ["true"], ["true"]]);
+    assert.deepEqual(values("RuntimeDirectory"), [path.basename(socketDir)]);
+    // Other ways to make a path writable that the check below would not see.
+    for (const key of ["ReadWriteDirectories", "BindPaths", "LogsDirectory", "CacheDirectory", "ConfigurationDirectory", "SupplementaryGroups"]) assert.deepEqual(values(key), [], key);
+    for (const target of [home, env.COCKPIT_OPENCODE_CONFIG, `${home}/.config/opencode/agent/plan.md`, `${home}/.config/opencode/AGENTS.md`, `${home}/.opencode`, `${home}/opencode.json`, `${home}/.claude/CLAUDE.md`,
+      // opencode's shared state of earlier releases: now per run in the workspace.
+      // npm's cache of PR #101 too: it moved into the run's cache (card t_2a2d8e5b).
+      `${home}/.local/share/opencode/auth.json`, `${home}/.cache/opencode/models.json`, `${home}/.cache/opencode/bin/rg`, `${home}/.cache/opencode/npm`]) {
+      assert.deepEqual(writable.filter((dir) => covers(dir, target)), [], `${target} must not be writable for ${name}`);
+    }
+    // What must stay writable, or no role starts: the workspaces (with opencode's state) and the socket.
+    assert.deepEqual(writable.sort(), [env.COCKPIT_AGENT_WORKSPACE_ROOT, socketDir].sort());
+    // The Cockpit's own secrets are out of every role's reach, the runner's too (card t_abe2651b).
+    assert.ok(values("InaccessiblePaths").includes("-/etc/wireguard-ops-cockpit"), name);
+  });
+}
+
+test("the runner unit and the agent unit share no identity, home, workspace or socket", () => {
+  const agent = unitFile("wireguard-ops-cockpit-agent.service");
+  const runner = unitFile("wireguard-ops-cockpit-runner.service");
+  assert.deepEqual([agent.values("User"), agent.values("Group")], [["cockpit-agent"], ["cockpit-agent-client"]]);
+  assert.deepEqual([runner.values("User"), runner.values("Group")], [["cockpit-runner"], ["cockpit-runner-client"]]);
+  // Neither can write anything of the other, and the other's home and socket are not even mounted.
+  for (const [self, other] of [[agent, runner], [runner, agent]]) {
+    for (const target of [other.env.HOME, other.env.COCKPIT_AGENT_WORKSPACE_ROOT, path.dirname(other.env.COCKPIT_AGENT_BROKER_SOCKET)]) {
+      assert.deepEqual(self.writable.filter((dir) => covers(dir, target) || covers(target, dir)), [], target);
+      assert.ok(self.inaccessible.some((dir) => covers(dir, target)), `${target} must be inaccessible`);
+    }
   }
-  assert.ok(covers(`${home}/.config`, env.COCKPIT_OPENCODE_CONFIG));
-  // What must stay writable, or no role starts: the workspaces and opencode's own state.
-  for (const target of [env.COCKPIT_AGENT_WORKSPACE_ROOT, `${home}/.cache/opencode/npm`, `${home}/.local/share/opencode`, `${home}/.local/state/opencode`, `${home}/.cache/opencode`, "/run/cockpit-agent"]) {
-    assert.ok(writable.some((dir) => covers(dir, target)), `${target} must be writable for the agent unit`);
-  }
-  // The deploys: Lab0/box and the VPS install the config root-owned, both place the .gitignore
-  // opencode would otherwise write into its read-only config directory at start.
+  // The API reaches both sockets, and routes the runner to its own.
+  const dropIn = fs.readFileSync(new URL("deploy/systemd/wireguard-ops-cockpit-api-brokers.conf", repo), "utf8");
+  assert.match(dropIn, /^Requires=.*\bwireguard-ops-cockpit-runner\.service\b/m);
+  assert.match(dropIn, /^After=.*\bwireguard-ops-cockpit-runner\.service\b/m);
+  assert.match(dropIn, /^SupplementaryGroups=.*\bcockpit-runner-client\b/m);
+  assert.match(dropIn, new RegExp(`^Environment=COCKPIT_RUNNER_BROKER_SOCKET=${runner.env.COCKPIT_AGENT_BROKER_SOCKET}$`, "m"));
+});
+
+test("the deploys create the runner identity and install its unit and root-owned config", () => {
   const lab0 = fs.readFileSync(new URL("deploy/lab0/homeserver-cockpit-deploy.sh", repo), "utf8");
   assert.match(lab0, /install -m 640 -o root -g cockpit-agent-client \\\n\s+"\$COCKPIT_DIR\/deploy\/config\/opencode-agent\.jsonc" "\$AGENT_DIR\/\.config\/opencode\/opencode\.jsonc"/);
   assert.match(lab0, /"\$COCKPIT_DIR\/deploy\/config\/opencode-config-dir\.gitignore" "\$AGENT_DIR\/\.config\/opencode\/\.gitignore"/);
-  assert.doesNotMatch(lab0, /-o cockpit-agent[^\n]*\.config/);
+  assert.match(lab0, /install -m 640 -o root -g cockpit-runner-client \\\n\s+"\$COCKPIT_DIR\/deploy\/config\/opencode-agent\.jsonc" "\$RUNNER_DIR\/\.config\/opencode\/opencode\.jsonc"/);
+  assert.match(lab0, /"\$COCKPIT_DIR\/deploy\/config\/opencode-config-dir\.gitignore" "\$RUNNER_DIR\/\.config\/opencode\/\.gitignore"/);
+  assert.doesNotMatch(lab0, /-o cockpit-(agent|runner)[^\n]*\.config/);
+  assert.match(lab0, /^RUNNER_DIR="\/var\/lib\/wireguard-ops-runner"$/m);
+  assert.match(lab0, /^id -u cockpit-runner >\/dev\/null 2>&1 \|\| useradd --system -m -d "\$RUNNER_DIR" -s \/usr\/sbin\/nologin -g cockpit-runner-client cockpit-runner$/m);
+  // The runner joins no other group (never cockpit-agent-client or the executor's).
+  assert.doesNotMatch(lab0, /usermod[^\n]*cockpit-runner\b(?!-client)/);
+  assert.doesNotMatch(lab0, /-G[^\n]*cockpit-runner\b(?!-client)/);
+  assert.match(lab0, /install -m 644 "\$COCKPIT_DIR\/deploy\/systemd\/wireguard-ops-cockpit-runner\.service"/);
+  assert.match(lab0, /\[ -S \/run\/cockpit-runner\/runner\.sock \]/);
+  assert.match(lab0, /^APT_PACKAGES=\(.*\bripgrep\b.*\)$/m);
   const vps = fs.readFileSync(new URL("deploy/vps/vps-cockpit-deploy.sh", repo), "utf8");
   assert.match(vps, /"deploy\/config\/opencode-agent\.jsonc\|\$ROOT\/var\/lib\/wireguard-ops-agent\/\.config\/opencode\/opencode\.jsonc\|644"/);
   assert.match(vps, /"deploy\/config\/opencode-config-dir\.gitignore\|\$ROOT\/var\/lib\/wireguard-ops-agent\/\.config\/opencode\/\.gitignore\|644"/);
+  assert.match(vps, /"deploy\/systemd\/wireguard-ops-cockpit-runner\.service\|\$UNITS\/wireguard-ops-cockpit-runner\.service\|644"/);
+  assert.match(vps, /"deploy\/config\/opencode-agent\.jsonc\|\$ROOT\/var\/lib\/wireguard-ops-runner\/\.config\/opencode\/opencode\.jsonc\|644"/);
+  assert.match(vps, /^readonly SERVICES=\(.*\bwireguard-ops-cockpit-runner\b.*\)$/m);
+  assert.match(vps, /useradd --system --no-create-home -d \/var\/lib\/wireguard-ops-runner -s \/usr\/sbin\/nologin -g cockpit-runner-client cockpit-runner/);
+  // The self-update runner restarts and checks it like the other brokers.
+  const run = fs.readFileSync(new URL("deploy/helpers/cockpit-self-update-run", repo), "utf8");
+  assert.match(run, /^SERVICES = env\("COCKPIT_SELF_UPDATE_SERVICES", "[^"]*\bwireguard-ops-cockpit-runner\b[^"]*"\)/m);
+  assert.match(run, /^SOCKETS = env\("COCKPIT_SELF_UPDATE_SOCKETS", "[^"]*\/run\/cockpit-runner\/runner\.sock[^"]*"\)/m);
+  // No sudo for either identity.
+  for (const file of fs.readdirSync(new URL("deploy/sudoers/", repo))) {
+    assert.doesNotMatch(fs.readFileSync(new URL(`deploy/sudoers/${file}`, repo), "utf8"), /cockpit-(agent|runner)/, file);
+  }
   // The exact bytes opencode 1.18 writes (config.ts ensureGitignore).
   assert.equal(fs.readFileSync(new URL("deploy/config/opencode-config-dir.gitignore", repo), "utf8"), ["node_modules", "package.json", "package-lock.json", "bun.lock", ".gitignore"].join("\n"));
 });
@@ -223,11 +347,15 @@ test("the deploys refuse the same leftover config as the broker before they inst
   assert.deepEqual(list("PLANTED_PROJECT_NAMES"), projectConfigNames);
   assert.deepEqual(list("PLANTED_GLOBAL_NAMES"), globalConfigNames);
   const vpsScript = fs.readFileSync(new URL("deploy/vps/vps-cockpit-deploy.sh", repo), "utf8");
-  assert.match(vpsScript, /git checkout -q -B main "\$REPO_COMMIT"\ncheck_planted_config\ninstall_runtime\nbuild\nsave_targets\n/);
+  // VPS: before the ERR trap and the checkout, so a refusal needs no rollback (N1 of t_dc170a06).
+  assert.match(vpsScript, /\ncheck_planted_config \|\| \{ code=\$\?; rm -rf -- "\$BACKUP"; exit "\$code"; \}\ntrap rollback ERR\n(?:.*\n){0,2}git checkout -q -B main "\$REPO_COMMIT"\ninstall_runtime\nbuild\nsave_targets\n/);
+  // Both broker homes: the plan roles' and the runner's (card t_2a2d8e5b).
+  assert.match(vpsScript, /for home in \/var\/lib\/wireguard-ops-agent \/var\/lib\/wireguard-ops-runner; do\n\s+part="\$\(planted_config_preflight "\$ROOT" "\$home"\)"/);
   const lab0Script = fs.readFileSync(new URL("deploy/lab0/homeserver-cockpit-deploy.sh", repo), "utf8");
-  assert.ok(lab0Script.indexOf("planted_config_preflight \"\" \"$AGENT_DIR\"") < lab0Script.indexOf('log "1) Pakete installieren"'));
+  assert.match(lab0Script, /for planted_home in "\$AGENT_DIR" "\$RUNNER_DIR"; do\n\s+planted_part="\$\(planted_config_preflight "" "\$planted_home"\)"/);
+  assert.ok(lab0Script.indexOf("planted_config_preflight \"\" \"$planted_home\"") < lab0Script.indexOf('log "1) Pakete installieren"'));
   // The block itself, against a host root: clean, then each kind of leftover.
-  const run = (root) => spawnSync("bash", ["-c", `set -euo pipefail\n${vps}\nplanted_config_preflight "$1" /var/lib/wireguard-ops-agent`, "check", root], { encoding: "utf8" });
+  const run = (root, home = "/var/lib/wireguard-ops-agent") => spawnSync("bash", ["-c", `set -euo pipefail\n${vps}\nplanted_config_preflight "$1" "$2"`, "check", root, home], { encoding: "utf8" });
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-deploy-root-"));
   const home = path.join(root, "var/lib/wireguard-ops-agent");
   fs.mkdirSync(path.join(home, ".config/opencode"), { recursive: true });
@@ -237,6 +365,17 @@ test("the deploys refuse the same leftover config as the broker before they inst
     fs.mkdirSync(path.dirname(path.join(root, planted)), { recursive: true });
     fs.symlinkSync("/nonexistent", path.join(root, planted));
     const result = run(root);
+    assert.equal(result.status, 1, planted);
+    assert.equal(result.stdout, `opencode would load /${planted} into every role\n`, planted);
+    fs.rmSync(path.join(root, planted));
+  }
+  // The runner's home, the same way (card t_2a2d8e5b).
+  const runnerHome = "/var/lib/wireguard-ops-runner";
+  assert.equal(run(root, runnerHome).status, 0);
+  for (const planted of ["var/lib/wireguard-ops-runner/.npmrc", "var/lib/wireguard-ops-runner/sessions/AGENTS.md", "var/lib/wireguard-ops-runner/.config/opencode/tools", "var/lib/wireguard-ops-runner/.config/git"]) {
+    fs.mkdirSync(path.dirname(path.join(root, planted)), { recursive: true });
+    fs.symlinkSync("/nonexistent", path.join(root, planted));
+    const result = run(root, runnerHome);
     assert.equal(result.status, 1, planted);
     assert.equal(result.stdout, `opencode would load /${planted} into every role\n`, planted);
     fs.rmSync(path.join(root, planted));
