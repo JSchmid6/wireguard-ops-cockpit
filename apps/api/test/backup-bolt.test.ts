@@ -153,6 +153,93 @@ describe("backup bolt: changes in a diff", () => {
       .toEqual(["apps/api/src/test/host-run-shim.ts"]);
   });
 
+  // Finding B1 rest (second review t_72eb02d2, probe /opt/data/out/t_72eb02d2/sonde/):
+  // rootDir "src" stops only TypeScript sources. A shim as .mjs with a .d.mts
+  // under a test root built with tsc rc=0, and backupGuardHits returned [] at
+  // run time; app.ts changed only its `from` line.
+  const sondeAppFrom = (specifier: string) => section("apps/api/src/app.ts", [
+    "index c62d04daddd1bd2c201ab45c0fbb8d51cda62113..a00d8c174b47ceecc34bc91896bb20f862b47d5c 100644",
+    "@@ -117,7 +117,7 @@ import {",
+    "   verifyHostRunFindings,",
+    "   type HostRunManifest,",
+    "   type HostRunReviewOutcome,",
+    "-} from \"./host-run.js\";",
+    `+} from "${specifier}";`,
+    " ",
+    " interface AppOptions {",
+    "   config?: AppConfig;",
+  ]);
+  const sondeShim = (dir: string, up: string) => [
+    section(`${dir}/host-run-shim.d.mts`, [
+      "new file mode 100644",
+      "@@ -0,0 +1,3 @@",
+      `+import type { BackupGuardHit } from "${up}apps/api/src/host-run.js";`,
+      `+export * from "${up}apps/api/src/host-run.js";`,
+      "+export declare function backupGuardHits(manifest: unknown): BackupGuardHit[];",
+    ]),
+    section(`${dir}/host-run-shim.mjs`, [
+      "new file mode 100644",
+      "@@ -0,0 +1,2 @@",
+      `+export * from "${up}apps/api/dist/host-run.js";`,
+      "+export function backupGuardHits() { return []; }",
+    ]),
+  ];
+
+  it("a JavaScript shim with its declaration file under a test root is read like code (.mjs + .d.mts)", () => {
+    for (const [dir, up, from] of [
+      ["test", "../", "../../../test/host-run-shim.mjs"],
+      ["apps/api/test", "../../../", "../test/host-run-shim.mjs"],
+      ["packages/domain/test", "../../../", "../../../packages/domain/test/host-run-shim.mjs"],
+    ]) {
+      expect(check([sondeAppFrom(from), ...sondeShim(dir, up)]), dir).toEqual({
+        changes: [`${dir}/host-run-shim.d.mts: backupGuardHits`, `${dir}/host-run-shim.mjs: backupGuardHits`],
+        unreadable: [],
+      });
+    }
+    // Every shape that can ship next to a declaration, and names without a known extension.
+    for (const path of ["test/s.js", "test/s.cjs", "test/s.jsx", "test/s.d.ts", "test/s.d.cts", "test/s.d.json.ts",
+      "apps/api/test/x/s.mjs", "packages/tmux-adapter/test/s.test.mjs", "test/s", "test/s.node"]) {
+      expect(check([section(path, ["@@ -0,0 +1 @@", "+export function backupGuardHits() { return []; }"])]).changes, path)
+        .toEqual([`${path}: backupGuardHits`]);
+    }
+    // Fail closed: such a file without its section is unreadable, not exempt.
+    expect(check([], { files: [{ path: "test/host-run-shim.mjs" }], filesTotal: 1 }).unreadable).toEqual(["test/host-run-shim.mjs"]);
+    // TypeScript sources and data under a test root stay unread: tsc refuses them (TS6059).
+    for (const path of ["test/s.ts", "test/s.mts", "test/s.cts", "test/s.tsx", "apps/api/test/fixtures/x.json", "test/x.test.sh"]) {
+      expect(check([section(path, ["@@ -1 +1 @@", "-backupGuardHits", "+x"])]).changes, path).toEqual([]);
+    }
+  });
+
+  it("a tsconfig, jsconfig or package.json in the same update voids the test exemption", () => {
+    const tsTest = section("test/host-run-shim.ts", ["@@ -0,0 +1 @@", "+export function backupGuardHits() { return []; }"]);
+    expect(check([tsTest]).changes).toEqual([]);
+    for (const config of ["apps/api/tsconfig.json", "packages/domain/tsconfig.json", "tsconfig.base.json",
+      "apps/api/tsconfig.build.json", "apps/api/jsconfig.json", "package.json", "apps/api/package.json"]) {
+      const widen = section(config, ["@@ -6 +6 @@", "-    \"rootDir\": \"src\"", "+    \"rootDir\": \"../..\""]);
+      expect(check([widen, tsTest]).changes, config).toEqual(["test/host-run-shim.ts: backupGuardHits"]);
+      // Also when the config sits in another diff of the same update.
+      expect(backupBoltChanges([diff([widen]), diff([tsTest])], supplementary).changes, config)
+        .toEqual(["test/host-run-shim.ts: backupGuardHits"]);
+    }
+  });
+
+  it("a name written with escapes or across a line continuation is the same name", () => {
+    for (const line of ["+export function backupGuard\\u0048its() { return []; }",
+      "+export function \\u{62}ackupGuardHits() { return []; }",
+      "+export { noop as \"backupGuard\\x48its\" };"]) {
+      expect(check([section("apps/api/src/shim.ts", ["@@ -0,0 +1 @@", line])]).changes, line).toEqual(["apps/api/src/shim.ts: backupGuardHits"]);
+    }
+    const continued = section("apps/api/src/shim.mjs", ["@@ -0,0 +1,2 @@", "+export { noop as \"backupGuard\\", "+Hits\" };"]);
+    expect(check([continued]).changes).toEqual(["apps/api/src/shim.mjs: backupGuardHits"]);
+    // A changed line continued by an unchanged one counts, unchanged lines alone do not.
+    const intoContext = section("apps/api/src/shim.mjs", ["@@ -1,2 +1,2 @@", "-export { noop as \"x\\", "+export { noop as \"backupGuard\\", " Hits\" };"]);
+    expect(check([intoContext]).changes).toEqual(["apps/api/src/shim.mjs: backupGuardHits"]);
+    const contextOnly = section("apps/api/src/shim.mjs", ["@@ -1,3 +1,3 @@", " const a = \"backupGuard\\", " Hits\";", "-x", "+y"]);
+    expect(check([contextOnly]).changes).toEqual([]);
+    // An escaped backslash does not continue the line.
+    expect(check([section("apps/api/src/shim.mjs", ["@@ -0,0 +1,2 @@", "+const a = \"backupGuard\\\\", "+Hits\";"])]).changes).toEqual([]);
+  });
+
   it("a header line is not a changed line, a changed line beginning with -- is", () => {
     expect(check([section("apps/api/src/app.ts", ["@@ -1 +1 @@", "-x", "+y"])]).changes).toEqual([]);
     expect(check([section("apps/api/src/app.ts", ["@@ -1,2 +1 @@", "--- backupGuardHits", "+y"])]).changes).toEqual(["apps/api/src/app.ts: backupGuardHits"]);

@@ -17,8 +17,11 @@
 //    app.ts and update-review.ts also hold code outside the bolt (a hash pin,
 //    the plan policy), so a path rule would be too wide there. A changed line
 //    (+/-) or the function context of a hunk (`@@ … @@ <context>`) naming one
-//    of these code names is a bolt change. Documentation and lockfiles are not
-//    read for names, and tests only where they cannot ship (TEST_ROOT).
+//    of these code names is a bolt change. A name counts also when written
+//    with escapes (\u0048, \u{48}, \x48) or across a backslash line
+//    continuation; JavaScript and TypeScript read those as the same name.
+//    Documentation and lockfiles are not read for names, and tests only where
+//    they cannot ship (TEST_ROOT).
 // 3. Fail closed: a file the names rule must read and cannot (the runner cut
 //    or left out its section, or clipped the file list) is reported as
 //    unreadable; the update then stops for the agent and no second review lifts
@@ -73,13 +76,40 @@ export const BACKUP_BOLT_SYMBOLS: string[] = [
 ];
 
 const SYMBOL = new RegExp(`\\b(?:${BACKUP_BOLT_SYMBOLS.join("|")})\\b`);
-// Tests that cannot ship (finding B1, card t_834fb98c): the root harnesses and
-// the test folders of packages that build only src/ (rootDir "src", so shipped
-// code cannot import from there). A test/ folder or *.test.* file anywhere else
-// — under src/, deploy/ or ops/ — is built or installed and is read like code:
-// a shim there could redefine backupGuardHits while app.ts changes only its
-// `from` line.
+// Tests that cannot ship (finding B1, cards t_834fb98c, t_a1e77c69): in the
+// root test/ and in the test folders of packages that build only src/, only
+// TypeScript sources and data stay unread. rootDir "src" keeps shipped code from
+// importing a .ts/.mts/.cts/.tsx there (tsc fails, TS6059), but it does not
+// cover JavaScript with a declaration file: a test/shim.mjs next to a
+// test/shim.d.mts builds (the pattern host-run.ts uses for deploy/helpers), and
+// on Lab0 and box the API runs from the checkout, so test/ lies next to dist.
+// JavaScript (.js/.mjs/.cjs/.jsx), declaration files (.d.*) and anything
+// without a known extension are therefore read like code there. A test/ folder
+// or *.test.* file anywhere else — under src/, deploy/ or ops/ — is built or
+// installed and is read like code as well.
 const TEST_ROOT = /^(?:test|apps\/api\/test|packages\/[^/]+\/test)\//;
+const TEST_ROOT_UNSHIPPED = /^(?![^/]*\.d\.)[^/]*\.(?:ts|mts|cts|tsx|json|md|txt|sh)$/;
+// The exemption rests on rootDir/include of the packages and on their build
+// and import maps. A diff that changes a tsconfig, jsconfig or package.json
+// could widen them (rootDir "..", include "../../test", allowJs, "imports"),
+// so with such a file in the same update no test file is exempt.
+const BUILD_CONFIG = /(?:^|\/)(?:[tj]sconfig[^/]*\.json|package\.json)$/;
+
+function unshippedTest(path: string): boolean {
+  return TEST_ROOT.test(path) && TEST_ROOT_UNSHIPPED.test(path.slice(path.lastIndexOf("/") + 1));
+}
+
+// Escapes JavaScript resolves in identifiers and string export names.
+function unescapeNames(text: string): string {
+  const char = (hex: string, raw: string) => {
+    const code = Number.parseInt(hex, 16);
+    return code <= 0x10ffff ? String.fromCodePoint(code) : raw;
+  };
+  return text
+    .replace(/\\u\{([0-9a-fA-F]+)\}/g, (raw, hex: string) => char(hex, raw))
+    .replace(/\\u([0-9a-fA-F]{4})/g, (raw, hex: string) => char(hex, raw))
+    .replace(/\\x([0-9a-fA-F]{2})/g, (raw, hex: string) => char(hex, raw));
+}
 
 export interface BackupBoltDiff {
   files: Array<{ path: string }>;
@@ -101,22 +131,51 @@ export function isBackupBoltFile(path: string): boolean {
 }
 
 // The code names a file section changes: on +/- lines after the first hunk
-// header and in the hunk headers' function context.
+// header and in the hunk headers' function context. Each side of a hunk (old:
+// context and -, new: context and +) is read in logical lines: a line ending in
+// a backslash continues on the next one of the same side, and a logical line
+// counts when one of its parts is a changed line.
 function changedSymbols(text: string): string[] {
   const found = new Set<string>();
+  const sides: Record<"-" | "+", { text: string; changed: boolean }> = {
+    "-": { text: "", changed: false },
+    "+": { text: "", changed: false },
+  };
+  const scan = (value: string) => {
+    const match = unescapeNames(value).match(SYMBOL);
+    if (match) found.add(match[0]);
+  };
+  const flush = (side: "-" | "+") => {
+    if (sides[side].changed) scan(sides[side].text);
+    sides[side] = { text: "", changed: false };
+  };
+  const push = (side: "-" | "+", line: string, changed: boolean) => {
+    const logical = sides[side];
+    logical.text += line;
+    logical.changed ||= changed;
+    // An odd number of trailing backslashes continues the line.
+    if ((/\\*$/.exec(line)?.[0].length ?? 0) % 2 === 1) logical.text = logical.text.slice(0, -1);
+    else flush(side);
+  };
   let inHunk = false;
   for (const line of text.split("\n")) {
     if (line.startsWith("@@")) {
+      flush("-");
+      flush("+");
       inHunk = true;
-      const context = line.replace(/^@@[^@]*@@/, "");
-      const match = context.match(SYMBOL);
-      if (match) found.add(match[0]);
+      scan(line.replace(/^@@[^@]*@@/, ""));
       continue;
     }
-    if (!inHunk || !(line.startsWith("+") || line.startsWith("-"))) continue;
-    const match = line.slice(1).match(SYMBOL);
-    if (match) found.add(match[0]);
+    if (!inHunk) continue;
+    if (line.startsWith("-")) push("-", line.slice(1), true);
+    else if (line.startsWith("+")) push("+", line.slice(1), true);
+    else if (line.startsWith(" ")) {
+      push("-", line.slice(1), false);
+      push("+", line.slice(1), false);
+    }
   }
+  flush("-");
+  flush("+");
   return [...found];
 }
 
@@ -125,6 +184,7 @@ function changedSymbols(text: string): string[] {
 export function backupBoltChanges(diffs: BackupBoltDiff[], supplementary: (path: string) => boolean): BackupBoltChange {
   const changes: string[] = [];
   const unreadable: string[] = [];
+  const buildConfigChanged = diffs.some((diff) => diff.files.some(({ path }) => BUILD_CONFIG.test(path)));
   for (const diff of diffs) {
     if (diff.filesTotal > diff.files.length) unreadable.push(`file list clipped (${diff.files.length} of ${diff.filesTotal} files)`);
     for (const { path } of diff.files) {
@@ -132,7 +192,7 @@ export function backupBoltChanges(diffs: BackupBoltDiff[], supplementary: (path:
         changes.push(path);
         continue;
       }
-      if (supplementary(path) || TEST_ROOT.test(path)) continue;
+      if (supplementary(path) || (!buildConfigChanged && unshippedTest(path))) continue;
       const sections = diff.excerpt.filter((section) => section.path === path);
       if (sections.length === 0 || diff.partialFiles.includes(path) || diff.omittedFiles.includes(path)) {
         unreadable.push(path);

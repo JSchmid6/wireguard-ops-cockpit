@@ -539,14 +539,26 @@ enforces it (`applyBackupBolt` in `update-review.ts`, last step of
      `app.ts`), `SECOND_REVIEW_STOP_GUARANTEES`, `stopsDespiteSecondReview` (the
      G10 exception of the second review) or this rule's own names
      (`backupBoltChanges`, `applyBackupBolt`, `backupBolt`) is a bolt change.
-     Documentation and lockfiles are not read for names, and tests only where
-     they cannot ship (finding B1, card t_834fb98c): under the root `test/` and
-     under `apps/api/test/`, `packages/*/test/`, whose package builds only
-     `src/` (`rootDir: "src"`, so shipped code cannot import from there).
-     Everything else is read — also a `test/` folder or a `*.test.*` file under
-     `src/`, `deploy/` or `ops/`: such a file is built or installed, and a
-     shim there could redefine `backupGuardHits` while `app.ts` changes only
-     its `from` line.
+     A name counts also when written with escapes (`\u0048`, `\u{48}`,
+     `\x48`) or across a backslash line continuation, as JavaScript reads it
+     (card t_a1e77c69). Documentation and lockfiles are not read for names,
+     and tests only where they cannot ship (finding B1, cards t_834fb98c,
+     t_a1e77c69): TypeScript sources (`.ts`, `.mts`, `.cts`, `.tsx`) and data
+     (`.json`, `.md`, `.txt`, `.sh`) under the root `test/` and under
+     `apps/api/test/`, `packages/*/test/`, whose package builds only `src/`
+     (`rootDir: "src"`: tsc refuses to import a TypeScript source from there,
+     TS6059). `rootDir` does not cover JavaScript with a declaration file: a
+     `test/shim.mjs` next to a `test/shim.d.mts` builds (the pattern
+     `host-run.ts` uses for `deploy/helpers/*.mjs`), and on Lab0 and box the
+     API runs from the checkout with `test/` next to `dist/`. So JavaScript
+     (`.js`, `.mjs`, `.cjs`, `.jsx`), declaration files (`.d.*`) and files
+     without one of these extensions are read under the test roots too, and a
+     `tsconfig*.json`, `jsconfig*.json` or `package.json` anywhere in the same
+     update voids the exemption (it could widen `rootDir`, `include`, `allowJs`
+     or an import map). Everything else is read — also a `test/` folder or a
+     `*.test.*` file under `src/`, `deploy/` or `ops/`: such a file is built or
+     installed, and a shim there could redefine `backupGuardHits` while
+     `app.ts` changes only its `from` line.
   3. *Fail closed*: a code file whose diff section the runner cut or left out,
      or a clipped file list, makes the check unreadable. A plan that would run
      then stops for James (`blocked_prerequisite`, split the update), and no
