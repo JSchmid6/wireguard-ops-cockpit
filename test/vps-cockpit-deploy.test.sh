@@ -18,7 +18,7 @@
 # (real tarball, checksum against a SHASUMS256.txt fixture, before the build),
 # not downloaded again when it is there, and 70 + rollback on a checksum mismatch,
 # a failed download or a .node-version that is not one clean x.y.z. Leftover opencode
-# config the agent broker refuses stops the deploy with 71 before anything is installed.
+# config the agent or runner broker refuses stops the deploy with 71 before the checkout.
 #
 # Everything lives below one fresh mktemp directory under /tmp; the harness
 # refuses to run otherwise. Call as root (install -o root):
@@ -279,11 +279,19 @@ check ".node-version unsauber: Exit 70, kein Pfad/URL daraus gebaut" '[ "$code" 
 check ".node-version unsauber: Rückfall auf A" '[ "$(git -C "$FIX/repo" rev-parse HEAD)" = "$A" ]'
 
 # 14: leftover opencode config the broker refuses (here /AGENTS.md of the host) -> 71
-# before anything is installed: the running stand keeps working (t_b4ec0027)
-fresh_host; : > "$FIX/root/AGENTS.md"; (cd "$FIX/root" && find . -type f -exec sha256sum {} + | sort) > "$FIX/vorher.sums"; code=0; deploy "$B" now || code=$?
-check "Altlast: Exit 71, Pfad genannt" '[ "$code" = 71 ] && grep -q "FAILED: opencode would load /AGENTS.md into every role" "$FIX/out.log"'
-check "Altlast: Host-Dateien bytegenau, kein Neustart, kein state.json" '[ "$(after_sums)" = "$(cat "$FIX/vorher.sums")" ] && ! grep -q "^systemctl restart" "$FIX/calls.log" && [ ! -e "$FIX/root/var/lib/wireguard-ops-cockpit/self-update/state.json" ]'
-check "Altlast: Rückfall auf A, vor dem Bau abgebrochen" '[ "$(git -C "$FIX/repo" rev-parse HEAD)" = "$A" ] && ! grep -q "^docker compose" "$FIX/calls.log" && grep -q "rollback complete" "$FIX/out.log"'
+# before anything is installed: the running stand keeps working (t_b4ec0027). Since
+# t_2a2d8e5b the check runs before the checkout: nothing to roll back, no rebuild.
+# calls.log exists, so "no call" below is a real check, not a missing file (N4).
+fresh_host; : > "$FIX/root/AGENTS.md"; : > "$FIX/calls.log"; (cd "$FIX/root" && find . -type f -exec sha256sum {} + | sort) > "$FIX/vorher.sums"; code=0; deploy "$B" now || code=$?
+check "Altlast: Exit 71, Pfad genannt (einmal, obwohl beide Homes darunter liegen)" '[ "$code" = 71 ] && [ "$(grep -c "FAILED: opencode would load /AGENTS.md into every role" "$FIX/out.log")" = 1 ]'
+check "Altlast: Host-Dateien bytegenau, kein Aufruf, kein state.json" '[ "$(after_sums)" = "$(cat "$FIX/vorher.sums")" ] && [ ! -s "$FIX/calls.log" ] && [ ! -e "$FIX/root/var/lib/wireguard-ops-cockpit/self-update/state.json" ]'
+check "Altlast: vor dem Checkout abgebrochen, kein Rückfall nötig, keine Sicherung liegen gelassen" '[ "$(git -C "$FIX/repo" rev-parse HEAD)" = "$A" ] && ! grep -q "deploying \|rollback" "$FIX/out.log" && [ -z "$(ls -A "$FIX/root/var/lib/wireguard-ops-cockpit/self-update" 2>/dev/null | grep deploy-backup)" ]'
+
+# 15: the same for the runner's home (t_2a2d8e5b): its broker would refuse the runner
+fresh_host; mkdir -p "$FIX/root/var/lib/wireguard-ops-runner/.config/opencode/tools"; : > "$FIX/calls.log"
+(cd "$FIX/root" && find . -type f -exec sha256sum {} + | sort) > "$FIX/vorher.sums"; code=0; deploy "$B" now || code=$?
+check "Altlast Runner-Home: Exit 71, Pfad genannt" '[ "$code" = 71 ] && grep -q "FAILED: opencode would load /var/lib/wireguard-ops-runner/.config/opencode/tools into every role" "$FIX/out.log"'
+check "Altlast Runner-Home: nichts angefasst, Stand A" '[ "$(after_sums)" = "$(cat "$FIX/vorher.sums")" ] && [ ! -s "$FIX/calls.log" ] && [ "$(git -C "$FIX/repo" rev-parse HEAD)" = "$A" ]'
 
 echo
 [ "$fails" = 0 ] && echo "alles grün" || { echo "$fails rot"; exit 1; }

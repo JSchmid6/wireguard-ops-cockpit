@@ -193,8 +193,9 @@ free_kb=$(df -Pk /opt | awk 'NR==2{print $4}')
 
 # Altlasten, die der Agent-Broker verweigert (assertNoPlantedConfig, dieselben Namen;
 # ein Test vergleicht die Listen und diesen Block mit dem VPS-Deploy): von der
-# Session-Wurzel bis / und im globalen Konfigordner des Agenten. Liegt eine davon da,
-# stoppt der Broker JEDE Rolle, auch Planer und Türsteher — das Cockpit könnte sich
+# Session-Wurzel bis / und im globalen Konfigordner, je Broker-Home (Planrollen und
+# Runner, Karte t_2a2d8e5b). Liegt eine davon da, stoppt der Broker JEDE seiner
+# Rollen, auch Planer und Türsteher bzw. den Runner — das Cockpit könnte sich
 # weder reparieren noch zurückrollen. Geprüft, bevor irgendetwas installiert wird:
 # der laufende Stand bleibt, root verschiebt die genannten Pfade (nicht löschen) und
 # deployt erneut.
@@ -220,9 +221,14 @@ planted_config_preflight() { # planted_config_preflight <host root> <agent home>
   return 1
 }
 # <<< planted-config-preflight
-if ! planted_report="$(planted_config_preflight "" "$AGENT_DIR")"; then
-  printf '%s\n' "$planted_report" >&2
-  die "Der Agent-Broker würde mit diesen Altlasten jede Rolle verweigern. Als root beiseite schieben, dann erneut deployen. Nichts geändert."
+planted_report=""
+for planted_home in "$AGENT_DIR" "$RUNNER_DIR"; do
+  planted_part="$(planted_config_preflight "" "$planted_home")" || planted_report+="$planted_part"$'\n'
+done
+if [ -n "$planted_report" ]; then
+  # Beide Homes teilen die Ebenen ab /var/lib: jeden Pfad einmal nennen.
+  printf '%s' "$planted_report" | awk '!seen[$0]++' >&2
+  die "Agent- oder Runner-Broker würden mit diesen Altlasten jede Rolle verweigern. Als root beiseite schieben, dann erneut deployen. Nichts geändert."
 fi
 
 mkdir -p "$SECRETS_DIR"; chmod 700 "$SECRETS_DIR"

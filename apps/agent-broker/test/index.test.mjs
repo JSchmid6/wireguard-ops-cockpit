@@ -347,11 +347,15 @@ test("the deploys refuse the same leftover config as the broker before they inst
   assert.deepEqual(list("PLANTED_PROJECT_NAMES"), projectConfigNames);
   assert.deepEqual(list("PLANTED_GLOBAL_NAMES"), globalConfigNames);
   const vpsScript = fs.readFileSync(new URL("deploy/vps/vps-cockpit-deploy.sh", repo), "utf8");
-  assert.match(vpsScript, /git checkout -q -B main "\$REPO_COMMIT"\ncheck_planted_config\ninstall_runtime\nbuild\nsave_targets\n/);
+  // VPS: before the ERR trap and the checkout, so a refusal needs no rollback (N1 of t_dc170a06).
+  assert.match(vpsScript, /\ncheck_planted_config \|\| \{ code=\$\?; rm -rf -- "\$BACKUP"; exit "\$code"; \}\ntrap rollback ERR\n(?:.*\n){0,2}git checkout -q -B main "\$REPO_COMMIT"\ninstall_runtime\nbuild\nsave_targets\n/);
+  // Both broker homes: the plan roles' and the runner's (card t_2a2d8e5b).
+  assert.match(vpsScript, /for home in \/var\/lib\/wireguard-ops-agent \/var\/lib\/wireguard-ops-runner; do\n\s+part="\$\(planted_config_preflight "\$ROOT" "\$home"\)"/);
   const lab0Script = fs.readFileSync(new URL("deploy/lab0/homeserver-cockpit-deploy.sh", repo), "utf8");
-  assert.ok(lab0Script.indexOf("planted_config_preflight \"\" \"$AGENT_DIR\"") < lab0Script.indexOf('log "1) Pakete installieren"'));
+  assert.match(lab0Script, /for planted_home in "\$AGENT_DIR" "\$RUNNER_DIR"; do\n\s+planted_part="\$\(planted_config_preflight "" "\$planted_home"\)"/);
+  assert.ok(lab0Script.indexOf("planted_config_preflight \"\" \"$planted_home\"") < lab0Script.indexOf('log "1) Pakete installieren"'));
   // The block itself, against a host root: clean, then each kind of leftover.
-  const run = (root) => spawnSync("bash", ["-c", `set -euo pipefail\n${vps}\nplanted_config_preflight "$1" /var/lib/wireguard-ops-agent`, "check", root], { encoding: "utf8" });
+  const run = (root, home = "/var/lib/wireguard-ops-agent") => spawnSync("bash", ["-c", `set -euo pipefail\n${vps}\nplanted_config_preflight "$1" "$2"`, "check", root, home], { encoding: "utf8" });
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-deploy-root-"));
   const home = path.join(root, "var/lib/wireguard-ops-agent");
   fs.mkdirSync(path.join(home, ".config/opencode"), { recursive: true });
@@ -361,6 +365,17 @@ test("the deploys refuse the same leftover config as the broker before they inst
     fs.mkdirSync(path.dirname(path.join(root, planted)), { recursive: true });
     fs.symlinkSync("/nonexistent", path.join(root, planted));
     const result = run(root);
+    assert.equal(result.status, 1, planted);
+    assert.equal(result.stdout, `opencode would load /${planted} into every role\n`, planted);
+    fs.rmSync(path.join(root, planted));
+  }
+  // The runner's home, the same way (card t_2a2d8e5b).
+  const runnerHome = "/var/lib/wireguard-ops-runner";
+  assert.equal(run(root, runnerHome).status, 0);
+  for (const planted of ["var/lib/wireguard-ops-runner/.npmrc", "var/lib/wireguard-ops-runner/sessions/AGENTS.md", "var/lib/wireguard-ops-runner/.config/opencode/tools", "var/lib/wireguard-ops-runner/.config/git"]) {
+    fs.mkdirSync(path.dirname(path.join(root, planted)), { recursive: true });
+    fs.symlinkSync("/nonexistent", path.join(root, planted));
+    const result = run(root, runnerHome);
     assert.equal(result.status, 1, planted);
     assert.equal(result.stdout, `opencode would load /${planted} into every role\n`, planted);
     fs.rmSync(path.join(root, planted));

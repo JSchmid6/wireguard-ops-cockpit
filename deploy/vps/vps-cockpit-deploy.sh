@@ -231,12 +231,13 @@ install_runtime() {
 
 # Leftover opencode config the agent broker refuses (assertNoPlantedConfig in
 # apps/agent-broker/src/index.mjs, the same names; a test compares the lists): from
-# the session root up to / and in the agent's global config directory. With one of
-# them in place the broker stops EVERY role, planner and doorkeeper too, so the
-# Cockpit could neither repair nor roll itself back. Checked before anything is
-# installed: the deploy stops with 71 and the running stand stays as it is. Root
-# moves the named paths aside (not delete: they may be someone's notes) and
-# deploys again.
+# the session root up to / and in the global config directory, for each broker
+# home (the plan roles' and the runner's, card t_2a2d8e5b). With one of them in
+# place that broker stops EVERY role it serves, planner and doorkeeper or the
+# runner, so the Cockpit could neither repair nor roll itself back. Checked before
+# the checkout: the deploy stops with 71, touches nothing and the running stand
+# stays as it is. Root moves the named paths aside (not delete: they may be
+# someone's notes) and deploys again.
 # >>> planted-config-preflight
 readonly PLANTED_PROJECT_NAMES=(opencode.json opencode.jsonc .opencode AGENTS.md CLAUDE.md CONTEXT.md .claude .agents .git .gitconfig .npmrc)
 readonly PLANTED_GLOBAL_NAMES=(opencode.json config.json config AGENTS.md agent agents command commands mode modes plugin plugins tool tools skill skills)
@@ -261,10 +262,14 @@ planted_config_preflight() { # planted_config_preflight <host root> <agent home>
 # <<< planted-config-preflight
 
 check_planted_config() {
-  local report
-  if report="$(planted_config_preflight "$ROOT" /var/lib/wireguard-ops-agent)"; then return 0; fi
-  printf '%s\n' "$report" | while IFS= read -r line; do log "FAILED: $line"; done
-  log "FAILED: the agent broker would refuse every role with these in place; move them aside as root, then deploy again"
+  local report="" part home
+  for home in /var/lib/wireguard-ops-agent /var/lib/wireguard-ops-runner; do
+    part="$(planted_config_preflight "$ROOT" "$home")" || report+="$part"$'\n'
+  done
+  [ -z "$report" ] && return 0
+  # Both homes share the levels from /var/lib up: name each path once.
+  printf '%s' "$report" | awk '!seen[$0]++' | while IFS= read -r line; do log "FAILED: $line"; done
+  log "FAILED: the agent or runner broker would refuse every role with these in place; move them aside as root, then deploy again"
   return 71
 }
 
@@ -399,11 +404,13 @@ rollback() {
   [ "$step_failed" = 0 ] && log "rollback complete; running services were not restarted" || log "rollback INCOMPLETE — see the lines above"
   exit "$code"
 }
+# Before the checkout and the ERR trap: a refusal leaves the working tree the
+# services run from untouched and needs no rollback (no rebuild of the old stand).
+check_planted_config || { code=$?; rm -rf -- "$BACKUP"; exit "$code"; }
 trap rollback ERR
 
 log "deploying $REPO_COMMIT over $OLD (restart mode: ${COCKPIT_RESTART_MODE:-now}, backup $BACKUP)"
 git checkout -q -B main "$REPO_COMMIT"
-check_planted_config
 install_runtime
 build
 save_targets
