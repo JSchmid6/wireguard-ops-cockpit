@@ -199,7 +199,10 @@ Die Regel im Einzelnen (`hiddenPinnedScripts` in `apps/api/src/host-run.ts`):
   bleiben lokal). In der Opener-Kette gilt ein Wort mit `$` oder Backtick nicht als Wort (T-D:
   `bash -s $o`, `su $u`, `su "$u"`, `runuser $u`, `sudo -u $u` — die Shell zerlegt es erst beim Lauf in
   Optionen), ausser dem Wert einer Zuweisung (`LANG=$L bash`); ebenso fremd ist ein Segment, das eine
-  Substitution von seinem Befehl abtrennt (`env $(…) bash <<'X'`, `bash <<'X' $(…)`). Vor der
+  Substitution von seinem Befehl abtrennt (`env $(…) bash <<'X'`, `bash <<'X' $(…)`). Dasselbe gilt für ein
+  Wort mit Klammern oder einem Glob-Zeichen (13.11.2026, U-B aus t_f7778d43: `bash -s {-c,true}`, `bash -s {-n,}`,
+  `{-l,}`, `{--rcfile,/srv/rc}`, `su {-c,true}`, `bash -s -[c] true` — bash macht daraus erst beim Lauf
+  Optionen); fail-safe auch gequotet, ausser dem einzelnen Schlüsselwort `{` und dem Wert einer Zuweisung. Vor der
   Pipe nur `cat` ohne Datei (außer `-`) und `tee` ohne andere Optionen als `-a`, `-i`, `-p`. Nicht hier sind deshalb auch `sudo -R`/`--chroot`/`-h`,
   `systemd-run -M`/`--machine`/`-H`/`--host` sowie dessen `-p`/`--property` und `-E`/`--setenv` (sie können
   `RootDirectory=`, `BindPaths=` oder `BASH_ENV=` setzen), `systemd-run --user`/`--capsule`/`-C` (eine andere
@@ -240,10 +243,37 @@ Die Regel im Einzelnen (`hiddenPinnedScripts` in `apps/api/src/host-run.ts`):
   hier nicht gelisteten Option, die einen Wert nimmt, oder mit `sudo -s` (`su -s /bin/bash root <<'X'`), gilt als
   fremd, ebenso jeder Körper nach einem `export PATH=…` im selben Schritt und jede Opener-Zeile mit einer
   Substitution (`FOO=$(…) bash <<'X'`); der Planer schreibt ihn dann schlichter (`bash <<'X'`,
-  `sudo -u root bash <<'X'`) bzw. setzt die Variable im Körper selbst. Bekannte Grenze (t_683da1d6, nicht
-  lockerer als main auf oberster Ebene): Ein `&` erst auf einer späteren Zeile (`{ bash <<'X'` … `X` /
-  `} &`, `( bash <<'X'` … `) &`) schickt den Körper in den Hintergrund, ohne dass die Regel das sieht;
-  auf oberster Ebene ist `{ cat > /p <<'EOF'` … `} &` auf main ebenso frei. Der Türsteher liest es (X5).
+  `sudo -u root bash <<'X'`) bzw. setzt die Variable im Körper selbst.
+  **Der Körper muss den Schreibvorgang erreichen** (13.11.2026, U-A aus t_f7778d43): Eine Shell liest ihren
+  Körper von stdin. Eine Zeile davor, die stdin liest (`head -n 1 >/dev/null`, `cat >/dev/null`, `sed -n 1p`,
+  `read`, `ssh other true`), frisst die folgenden Zeilen, und `exit`, `exec`, `return` beenden nur den Körper.
+  Pin und Aufruf danach laufen dann auf der alten Datei weiter. Ein Schreibvorgang in einem Körper zeigt den
+  Inhalt deshalb nur, wenn drei Dinge gelten, alle per Positivliste:
+  1. Jede Zeile davor im selben Körper und in jedem umschließenden Körper vor dessen Opener steht auf der
+     Liste: Leerzeile, Kommentar, `set -e`/`-u`/`-x`/`-o pipefail` (auch gebündelt), `cd`, `mkdir`, `chmod`,
+     `chown`, `umask`, `install -d`, Zuweisungen ohne `$`, Schreibvorgänge mit eigenem Heredoc (`cat`, `tee`,
+     `install`). Jedes andere Programm zählt nur mit `</dev/null`. Builtins und Schlüsselwörter zählen nie, auch
+     nicht mit `</dev/null`: `exit`, `exec`, `return`, `eval`, `trap`, `source`, `read`, `kill` (auch `/bin/kill`),
+     `set +e`, `if`, `{`, Funktionen. Ebenso zählen `ssh` und eine verschachtelte Shell nie, und ebenso ein
+     Befehlswort mit Klammern oder `$`. Keine Negativliste: Jedes unbekannte Werkzeug kann stdin lesen. Damit
+     sind `if false; then`, `false &&` und eine nie aufgerufene Funktion im Körper mit erledigt.
+  2. Ein Fehler vor dem Schreiben beendet den ganzen Schritt (Schritte laufen mit `bash -eo pipefail`,
+     `cockpit-host-run` Z. 507). Deshalb fängt die Opener-Zeile keinen Fehler ab: kein `||`, `&&`, `!`, kein
+     `if`/`while`, keine Gruppe `{ … }`/`( … )` und keine Funktion um sie herum, kein `set +e`/`set +o pipefail`
+     davor. Eine Pipe hinter der Shell ist nur unter `pipefail` erlaubt. Ein verschachtelter Körper muss seinen
+     Eltern-Körper scheitern lassen: Dort ist `set -e` an, oder der Opener ist dessen letzter Befehl.
+  3. Scheitert der Schreibvorgang selbst, endet der Körper mit ihm. Davor ist im Körper `set -e` an (oder `-e`
+     an der Shell, `bash -euo pipefail <<'X'`), oder er ist der letzte Befehl des Körpers.
+  Ohne 2 und 3 übersprängen `kill $$`, `set -e` mit `false` oder einem scheiternden `mkdir`, ein beendendes
+  Programm mit `</dev/null` oder eine schreibgeschützte Datei hinter `bash <<'X' || true` den Schreibvorgang.
+  Damit ist auch die frühere Grenze zu `{ bash <<'X'` … `} &` bzw. `( bash <<'X'` … `) &` geschlossen. Reale
+  Pläne bleiben frei, auch mit `set -euo pipefail`, `mkdir -p`/`cd` und `apt-get … </dev/null` vor dem Heredoc.
+  Preis: Steht im Körper ohne `set -e` noch ein Befehl hinter dem Schreibvorgang, gilt das Skript als nicht
+  gezeigt; der Planer setzt dann `set -euo pipefail` an den Anfang des Körpers. Ehrliche Grenze, gleich wie main
+  auf oberster Ebene: Ein Programm mit `</dev/null` läuft als root. Es kann alles, was ein Programm vor einem
+  Schreibvorgang auf oberster Ebene auch kann, zum Beispiel einen Prozess starten, der die Datei nach dem
+  Schreiben ersetzt. Das liest der Türsteher (X5). In einem Körper ohne bekanntes Verzeichnis (T-B) zählt eine
+  relative Ausführung (`./run.sh`) fail-safe über den Basisnamen.
 - **Geschrieben** zählt nur der letzte Schreibvorgang vor der Ausführung, und nur, wenn er den Inhalt
   zeigt: `cat >`/`tee` mit Heredoc, `install … /dev/stdin <ziel>` mit Heredoc, `echo`/`printf` ohne
   `$`/Backticks, eine Kopie eines so geschriebenen Skripts. Ein Heredoc zeigt den Inhalt nur, wenn sein
@@ -295,7 +325,7 @@ Plan anders verbirgt (Skript von anderswo ohne Pin, Pfad aus nicht gezeigten Wer
 Riegels („content this plan does not show“) und X5 des Türstehers. Die Regel ist eine Planer-Hilfe, kein
 Schloss: Sie lehnt nur zusätzlich ab, der Türsteher liest jeden Lauf weiterhin selbst. Tests:
 `apps/api/test/host-run-visible-scripts.test.ts` (alle Fälle der Probe aus t_740ac6ee, der Gegenprobe
-aus t_af29564c, der Befunde B1–B6 aus t_1748d6c1, R-A, R-B, H1–H4 aus t_b4b11e32, S-A–S-D, H-c, H-e aus t_c82f5ac2 und T-A–T-D aus t_683da1d6, plus die aufgezeichneten Pläne vom 10.10.2026 als Fehlalarm-Gegenprobe).
+aus t_af29564c, der Befunde B1–B6 aus t_1748d6c1, R-A, R-B, H1–H4 aus t_b4b11e32, S-A–S-D, H-c, H-e aus t_c82f5ac2, T-A–T-D aus t_683da1d6 und U-A, U-B aus t_f7778d43, plus die aufgezeichneten Pläne vom 10.10.2026 als Fehlalarm-Gegenprobe).
 
 ## 2a. Backup-Riegel: Backups löschen nur mit Freigabe
 

@@ -405,7 +405,8 @@ interface ScriptLine {
   // quoted, or the body holds neither $ nor backticks (B5, t_1748d6c1).
   heredoc: boolean;
   // Every shell body around the line has a quoted delimiter and runs on this host
-  // in this root (B1, t_1748d6c1); top-level lines are trusted.
+  // in this root (B1, t_1748d6c1), and the line is sure to run in it (U-A,
+  // t_f7778d43, shellScopeTrust); top-level lines are trusted.
   trusted: boolean;
   parts: Array<{ segment: Segment; cwd: string | null }>;
 }
@@ -589,7 +590,10 @@ function loginArgv0(spec: LocalWrapper, option: WrapperOption): boolean {
 // elsewhere. A word with $ or a backtick is not read as a word at all (T-D,
 // t_683da1d6: bash -s $o, su $u split into options at run time), except the value
 // of an assignment; nor is a segment that a substitution splits off its command
-// (env $(…) bash <<'X', bash <<'X' $(…), segmentsOf cuts there).
+// (env $(…) bash <<'X', bash <<'X' $(…), segmentsOf cuts there). The same holds
+// for a word with braces or a glob character (U-B, t_f7778d43: bash -s {-c,true},
+// su {-c,true}, bash -s -[c] expand to options at run time); fail safe, quoted or
+// not, except the lone keyword { and the value of an assignment.
 // The redirections must leave the body as the shell's stdin (S-A, t_c82f5ac2;
 // T-C, t_683da1d6): the heredoc's segment holds no other stdin redirection, fd 0
 // redirection or heredoc, a segment behind the pipe none at all, and a segment in
@@ -603,7 +607,7 @@ function localChain(chain: Segment[]): "here" | "moved" | null {
   const local = chain.every((segment, index) => {
     if (segment.joined || (index === 0 ? stdinReplaced(segment) : segment.text.includes("<") || STDIN_FD.test(segment.text))) return false;
     const words = commandWords(segment);
-    if (words.some((word) => /[$`]/.test(word) && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(word))) return false;
+    if (words.some((word) => (/[$`*?[\]]/.test(word) || (/[{}]/.test(word) && word !== "{")) && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(word))) return false;
     // In front of the pipe only cat without files and options but - and -u (H-e:
     // cat -n, -E, -v change the text), and tee with -a, -i, -p, which passes its input on.
     if (index < chain.length - 1) return !segment.text.includes(">") && ((words[0] === "cat" && words.slice(1).every((word) => word === "-" || word === "-u")) || (words[0] === "tee" && words.slice(1).every((word) => !word.startsWith("-") || /^-[aip]+$/.test(word))));
@@ -652,6 +656,132 @@ function localChain(chain: Segment[]): "here" | "moved" | null {
   return local ? (moved ? "moved" : "here") : null;
 }
 
+// U-A (Zweitprüfung t_f7778d43): a shell body reads its code from stdin, so a
+// line in it that reads stdin (head, cat, sed, ssh, read) eats the lines after
+// it, and exit, exec, return end only the body — the pin and the call behind it
+// still run, on the old file. A write in a body therefore shows its content only
+// when the body is sure to reach it, by positive list:
+// - every line before it in the body, and in every body around it before that
+//   body's opener, is listed (bodySafe): blank, comment, set -e/-u/-x/-o pipefail,
+//   cd, mkdir, chmod, chown, umask, install -d, assignments without $, a write with
+//   its own heredoc, or another program (not a shell builtin or keyword, not
+//   ssh/kill/read) with stdin from /dev/null. if, &&, functions, a nested shell
+//   are not on it;
+// - a failure before it ends the whole step (the runner's bash -e, Z. 507): the
+//   opener line neither tolerates a failure (||, &&, !, if, a group, a function,
+//   set +e before) nor masks it (a pipe without pipefail), and a nested body's
+//   opener fails its parent body, which fails the step in turn;
+// - its own failure ends the body with it: set -e is on in the body before it
+//   (or as an option of the shell), or it is the body's last command.
+// Without the last two, kill $$, set -e + false or an unwritable file behind
+// "bash <<'X' || true" would skip the write and leave the old file to the pin.
+interface ShellScope {
+  parent: ShellScope | null;
+  // The parent's line that opens this body.
+  opener: ScopeLine | null;
+  // Quoted delimiter, local chain, no exported environment, not in the background,
+  // and an opener line that passes a failure on.
+  plain: boolean;
+  lines: ScopeLine[];
+  clean: boolean;
+  errexit: boolean;
+  pipefail: boolean;
+}
+interface ScopeLine { line: ScriptLine; clean: boolean; safe: boolean; errexit: boolean; ends: boolean }
+
+// Commands that may come before a write in a body without stdin redirected.
+const BODY_LISTED = /^(?:cd|mkdir|chmod|chown|umask)$/;
+// Builtins and keywords steer the shell itself (exit, exec, eval, trap, read,
+// source, set, shopt, printf -v …) and ssh reads stdin on its own: never listed,
+// not even with </dev/null. echo, true, false, test and pwd stay out of it.
+const SHELL_BUILTINS = /^(?:\.|:|\[|\[\[|\]\]|alias|bg|bind|break|builtin|caller|command|compgen|complete|compopt|continue|coproc|declare|dirs|disown|enable|eval|exec|exit|export|fc|fg|getopts|hash|help|history|jobs|kill|let|local|logout|mapfile|popd|printf|pushd|read|readarray|readonly|return|set|shift|shopt|source|suspend|times|trap|type|typeset|ulimit|unalias|unset|wait|if|then|else|elif|fi|case|esac|for|select|while|until|do|done|in|function|time|\{|\}|!|ssh)$/;
+const PLAIN_COMMAND = /^[A-Za-z0-9_.\/+@%-]+$/;
+const DEV_NULL_STDIN = /(?:^|\s)0*<\s*\/dev\/null(?=\s|$)/;
+
+function heredocWrite(segment: Segment): boolean {
+  const words = commandWords(segment);
+  return /^(?:cat|tee|install)$/.test(words[0] ?? "") && (segment.text.match(HEREDOC_OPENER) || []).length === 1 && !stdinReplaced(segment);
+}
+
+// The flags of set -e/-u/-x/-o pipefail; null when the words are anything else.
+function setFlags(words: string[]): { errexit: boolean; pipefail: boolean } | null {
+  const flags = { errexit: false, pipefail: false };
+  for (let i = 0; i < words.length; i += 1) {
+    const letters = words[i].match(/^-([euxo]+)$/)?.[1];
+    if (!letters) return null;
+    if (letters.includes("e")) flags.errexit = true;
+    if (letters.includes("o")) {
+      const name = words[i + 1] ?? "";
+      if (!/^(?:pipefail|errexit|nounset|xtrace)$/.test(name)) return null;
+      if (name === "pipefail") flags.pipefail = true;
+      if (name === "errexit") flags.errexit = true;
+      i += 1;
+    }
+  }
+  return flags;
+}
+
+function bodySafe(segment: Segment): boolean {
+  const words = commandWords(segment);
+  if (!words.length) return false;
+  if (words.every((word) => LOCAL_ASSIGNMENT.test(word))) return !/[$`]/.test(segment.text);
+  const command = words[0];
+  if (command === "set") return setFlags(words.slice(1)) !== null;
+  if (BODY_LISTED.test(command)) return true;
+  if (command === "install" && words.slice(1).some((word) => /^-[A-Za-z]*d|^--directory$/.test(word))) return true;
+  if (heredocWrite(segment)) return true;
+  if (!PLAIN_COMMAND.test(command) || SHELL_BUILTINS.test(basename(command))) return false;
+  const rest = segment.text.replace(DEV_NULL_STDIN, " ");
+  return DEV_NULL_STDIN.test(segment.text) && !rest.includes("<") && !STDIN_FD.test(rest);
+}
+
+// Does the line end with the write or the shell it opens, so that its status is
+// the line's (no ||, no !, no background)?
+function lineEnds(line: string, segments: Segment[]): boolean {
+  const last = segments[segments.length - 1];
+  return Boolean(last) && !/\|\||(?:^|\s)!\s|(?<![&>|<])&(?![&>])/.test(line) && (heredocWrite(last) || readsShell(last));
+}
+
+// The opener line passes a failure of its body on: no ||, &&, ! or group, no
+// keyword in front, and a pipe behind the shell only under pipefail.
+function openerPassesFailure(line: string, segments: Segment[], start: number, at: number, pipefail: boolean): boolean {
+  if (/\|\||&&/.test(line) || /(?:^|[^$<>])\(/.test(line) || /(?:^|[\s;&|])[{!}](?:\s|;|$)/.test(line)) return false;
+  if (segments.slice(0, at + 1).some((segment) => KEYWORDS.test(segment.words[0] ?? "") || /^(?:for|case|select|function|until|while|if)$/.test(segment.words[0] ?? ""))) return false;
+  return start <= at && (segments[at].pipedInto === null || pipefail);
+}
+
+// The shell's own -e / -o errexit / -o pipefail at the opener (bash -euo pipefail <<'X').
+function shellFlags(segment: Segment): { errexit: boolean; pipefail: boolean } {
+  const words = commandWords(segment);
+  const at = words.findIndex((word) => SHELL_NAME.test(word));
+  const flags = { errexit: false, pipefail: false };
+  if (at < 0) return flags;
+  for (let i = at + 1; i < words.length && /^-[A-Za-z]+$/.test(words[i]); i += 1) {
+    if (words[i].includes("e")) flags.errexit = true;
+    if (words[i].endsWith("o")) {
+      if (words[i + 1] === "errexit") flags.errexit = true;
+      if (words[i + 1] === "pipefail") flags.pipefail = true;
+      i += 1;
+    }
+  }
+  return flags;
+}
+
+function shellScopeTrust(scopes: ShellScope[]): void {
+  const known = new Map<ShellScope, boolean>();
+  const fails = (entry: ScopeLine, scope: ShellScope) => entry.errexit || (entry === scope.lines[scope.lines.length - 1] && entry.ends);
+  const ok = (scope: ShellScope): boolean => {
+    if (!known.has(scope)) {
+      const opener = scope.opener;
+      known.set(scope, scope.plain && (scope.parent === null || (opener !== null && ok(scope.parent) && opener.clean && fails(opener, scope.parent))));
+    }
+    return known.get(scope)!;
+  };
+  for (const scope of scopes) {
+    for (const entry of scope.lines) entry.line.trusted = ok(scope) && entry.clean && entry.safe && fails(entry, scope);
+  }
+}
+
 // Lines of all steps and checks in order; heredoc bodies are marked, whole-line
 // comments and heredoc terminators dropped, a line ending in a backslash joined
 // with the next (outside content bodies; the first line's number stays), and each
@@ -665,13 +795,22 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
     ...manifest.checks.map((check, index) => ({ prefix: `C${index + 1}`, text: check.run })),
   ];
   const out: ScriptLine[] = [];
+  const scopes: ShellScope[] = [];
   for (const { prefix, text } of scripts) {
     let cwd: string | null = null;
     let environment = false;
+    // U-A: the step's own bash -e and pipefail (Z. 507) until a set + or shopt -o
+    // turns them off, and the depth of groups, blocks and functions at top level;
+    // fail safe, a count that goes below zero is unknown for the rest of the step.
+    let errexit = true;
+    let pipefail = true;
+    let depth = 0;
     // cwd: the directory after the body; inside: the one its first line runs in
     // (null after a wrapper that changes it, T-B, t_683da1d6); started: the body
-    // has begun (bodies of one line follow one after the other).
-    const open: Array<{ delimiter: string; tabs: boolean; shell: boolean; cwd: string | null; inside: string | null; started: boolean; trusted: boolean }> = [];
+    // has begun (bodies of one line follow one after the other); scope: the
+    // shell body (U-A, null for content).
+    type Open = { delimiter: string; tabs: boolean; shell: boolean; cwd: string | null; inside: string | null; started: boolean; scope: ShellScope | null };
+    const open: Open[] = [];
     const rows = text.split("\n");
     // H1: a heredoc ends only at a line that is exactly its delimiter; <<- strips leading tabs only.
     const ends = (row: string | undefined, here: { delimiter: string; tabs: boolean } | undefined) => Boolean(here) && row !== undefined && (here!.tabs ? row.replace(/^\t+/, "") : row) === here!.delimiter;
@@ -708,13 +847,29 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
         }
         return part;
       });
-      const trusted = inner ? inner.trusted : true;
+      const scope = inner?.scope ?? null;
+      const scriptLine: ScriptLine = { where, text: line, body: false, heredoc: false, trusted: !inner, parts };
+      let entry: ScopeLine | null = null;
+      if (scope && segments.length) {
+        const safe = segments.every(bodySafe);
+        entry = { line: scriptLine, clean: scope.clean, safe, errexit: scope.errexit, ends: lineEnds(line, segments) };
+        scope.lines.push(entry);
+        scope.clean &&= safe;
+        for (const segment of segments) {
+          const words = commandWords(segment);
+          if (words[0] !== "set") continue;
+          const flags = setFlags(words.slice(1));
+          if (!flags) { scope.errexit = false; scope.pipefail = false; continue; }
+          scope.errexit ||= flags.errexit;
+          scope.pipefail ||= flags.pipefail;
+        }
+      }
       // The segment each heredoc belongs to, in order of the line.
       const owners = segments.flatMap((segment, at) => [...segment.text.matchAll(/(?<!<)<<-?\s*(['"]?)[A-Za-z_][\w-]*\1/g)].map(() => at));
       // H-a (t_c82f5ac2): a shell sent to the background (bash <<'X' &) runs beside
       // the pin and the call that follow; fail safe, a lone & anywhere on the line counts.
       const background = /(?<![&>|<])&(?![&>])/.test(line);
-      const bodies: Array<{ delimiter: string; tabs: boolean; shell: boolean; cwd: string | null; inside: string | null; started: boolean; trusted: boolean }> = [];
+      const bodies: Open[] = [];
       // H-c (t_c82f5ac2): cat > /p <<'EOF' </srv/evil.sh writes the file, not the body.
       let literal = openers.length > 0 && !segments.some((segment) => segment.text.match(HEREDOC_OPENER) && stdinReplaced(segment));
       let from = index + 1;
@@ -735,15 +890,32 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
           if (shell || segments[at].pipedInto === null) break;
         }
         const local = shell ? localChain(segments.slice(start, at + 1)) : null;
-        bodies.push({ ...here, shell, cwd, inside: local === "moved" ? null : cwd, started: false, trusted: trusted && quoted && local !== null && !environment && !background });
+        let body: ShellScope | null = null;
+        if (shell) {
+          const passes = scope ? openerPassesFailure(line, segments, start, at, scope.pipefail) : errexit && depth === 0 && openerPassesFailure(line, segments, start, at, pipefail);
+          const flags = shellFlags(segments[at]);
+          body = { parent: scope, opener: entry, plain: quoted && local !== null && !environment && !background && passes, lines: [], clean: true, errexit: flags.errexit, pipefail: flags.pipefail };
+          scopes.push(body);
+        }
+        bodies.push({ ...here, shell, cwd, inside: local === "moved" ? null : cwd, started: false, scope: body });
       }
-      out.push({ where, text: line, body: false, heredoc: literal, trusted, parts });
+      if (!inner) {
+        // set +e, set +o pipefail, shopt -u -o errexit: the step goes on after a failure.
+        if (segments.some((segment) => (segment.command === "set" && segment.words.some((word) => word.startsWith("+"))) || (segment.command === "shopt" && segment.words.includes("-o")))) { errexit = false; pipefail = false; }
+        const words = line.split(/[\s;&|]+/);
+        depth += words.filter((word) => /^(?:if|while|until|for|case|select|function|\{)$/.test(word)).length + (line.match(/\(/g) || []).length;
+        depth -= words.filter((word) => /^(?:fi|done|esac|\})$/.test(word)).length + (line.match(/\)/g) || []).length;
+        if (depth < 0) depth = Number.POSITIVE_INFINITY;
+      }
+      scriptLine.heredoc = literal;
+      out.push(scriptLine);
       // The first heredoc's body comes first, so it goes on top of the stack.
       open.push(...bodies.reverse());
       const first = open[open.length - 1];
       if (bodies.length && !first.started) { first.started = true; if (first.shell) cwd = first.inside; }
     }
   }
+  shellScopeTrust(scopes);
   return out;
 }
 
@@ -897,7 +1069,11 @@ export function hiddenPinnedScripts(manifest: Pick<HostRunManifest, "steps" | "c
     }
     for (const { segment, cwd } of line.parts) {
       if (!runs(segment)) continue;
-      for (const path of [...pathsIn(segment.text, cwd), ...namedInPath(segment.text, pinned.keys())]) {
+      // In an unknown directory (a body behind env -C, T-B) a relative path counts
+      // by its base name, fail safe (Hinweis t_f7778d43: cd /opt/x … ./run.sh).
+      const relative = cwd ? [] : (segment.text.match(RELATIVE_PATH) || []).map(basename);
+      const byName = [...pinned.keys()].filter((path) => relative.includes(basename(path)));
+      for (const path of [...pathsIn(segment.text, cwd), ...namedInPath(segment.text, pinned.keys()), ...byName]) {
         const pinnedAt = pinned.get(path);
         if (!pinnedAt || seen.has(path)) continue;
         const written = state.get(path);

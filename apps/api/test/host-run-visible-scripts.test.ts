@@ -965,3 +965,163 @@ describe("hash-pinned scripts: wrapper options by positive list, directory, fd 0
     expect(hidden(`cat - > ${P} <<'EOF'\necho hi\nEOF\n${pin}\n${P}`)).toEqual([]);
   });
 });
+
+// Befunde U-A, U-B der Zweitprüfung t_f7778d43 (PR #86), Nacharbeit t_53bfc494:
+// /opt/data/out/t_f7778d43/zweitpruefung-pr86-r5.md, Sonden probe14–probe16.
+describe("hash-pinned scripts: the body must reach the write, braces and globs at the opener (Befund t_f7778d43)", () => {
+  const P = "/opt/x/run.sh";
+  const pin = `echo "${HASH}  ${P}" | sha256sum -c -`;
+  const body = `cat > ${P} <<'EOF'\necho hi\nEOF`;
+  const hidden = (run: string) => hiddenPinnedScripts(manifest([{ name: "s1", run }]) as never);
+  const found = (run: string) => hidden(run).map(({ path }) => path);
+  // A line in the body in front of the write, behind both openers of the finding.
+  const before = (opener: string, pre: string, tail = "") => found(`${opener}\n${pre}\n${body}\n${tail}X\n${pin}\n${P}`);
+  const openers = ["bash <<'X'", "cat <<'X' | sudo bash"];
+
+  const stoppers = [
+    "head -n 1 >/dev/null",
+    "cat >/dev/null",
+    "sed -n 1p >/dev/null",
+    "ssh other true",
+    "read -r _",
+    "read -r _; read -r _; read -r _",
+    "read -r _ || true",
+    "exit 0",
+    "exec true",
+    "exec 0<&-",
+    "exec </srv/evil.sh",
+    "return 0 2>/dev/null || exit 0",
+    "kill $$",
+    "set -e; false",
+    // Builtins and keywords stay foreign with </dev/null as well.
+    "exit 0 </dev/null",
+    "eval exit </dev/null",
+    "command exit </dev/null",
+    "builtin exit </dev/null",
+    "source /srv/x.sh </dev/null",
+    ". /srv/x.sh </dev/null",
+    "trap 'exit 0' ERR",
+    "/bin/kill -9 $$ </dev/null",
+    "ssh -n other true </dev/null",
+    "{exit,0} </dev/null",
+    "$X </dev/null",
+    "set +e",
+    "PATH=/srv/bin",
+    "X=$(head -n 1)",
+    "mkdir -p $(cat)",
+    "bash <<'Y'\ntrue\nY",
+    // Control flow in the body (hint): the write may never run.
+    "if false; then\ntrue",
+    "f() {",
+  ];
+  for (const opener of openers) {
+    for (const pre of stoppers) {
+      it(`U-A: a line in front of the write in the body keeps it from being shown: ${opener} / ${JSON.stringify(pre)}`, () => {
+        expect(before(opener, pre, /^(?:if|f\(\))/.test(pre) ? "fi\n}\n" : "")).toEqual([P]);
+      });
+    }
+  }
+
+  it("U-A: the same on the write line itself and in front of a nested body's opener", () => {
+    expect(found(`bash <<'X'\nhead -n 1 >/dev/null; ${body}\nX\n${pin}\n${P}`)).toEqual([P]);
+    expect(found(`bash <<'X'\nfalse && ${body}\nX\n${pin}\n${P}`)).toEqual([P]);
+    expect(found(`bash <<'X'\nset -e\nhead -n 1 >/dev/null\nbash <<'Y'\n${body}\nY\nX\n${pin}\n${P}`)).toEqual([P]);
+  });
+
+  const tolerated = [
+    "bash <<'X' || true",
+    "bash <<'X' && true",
+    "! bash <<'X'",
+    "if bash <<'X'; then",
+    "while bash <<'X'; do",
+    "{ bash <<'X'",
+    "( bash <<'X'",
+    "cat <<'X' | sudo bash || true",
+  ];
+  for (const opener of tolerated) {
+    it(`U-A: an opener line that catches a failure does not show the write: ${opener}`, () => {
+      expect(found(`${opener}\nset -e\nmkdir -p /opt/x\n${body}\nX\n${pin}\n${P}`)).toEqual([P]);
+    });
+  }
+
+  it("U-A: a failure caught around the opener on another line, or after set +e, does not show the write", () => {
+    expect(found(`f() {\nbash <<'X'\n${body}\nX\n}\nf || true\n${pin}\n${P}`)).toEqual([P]);
+    expect(found(`{\nbash <<'X'\n${body}\nX\n} || true\n${pin}\n${P}`)).toEqual([P]);
+    expect(found(`if true; then\nbash <<'X'\n${body}\nX\nfi\n${pin}\n${P}`)).toEqual([P]);
+    expect(found(`set +e\nbash <<'X'\n${body}\nX\n${pin}\n${P}`)).toEqual([P]);
+    expect(found(`set +o pipefail\nbash <<'X' | tee /var/log/x\n${body}\nX\n${pin}\n${P}`)).toEqual([P]);
+    expect(found(`case a in a) true;; esac\nbash <<'X'\n${body}\nX\n${pin}\n${P}`)).toEqual([P]);
+  });
+
+  it("U-A: the write's own failure must end the body (set -e, or the write is its last command)", () => {
+    expect(found(`bash <<'X'\n${body}\ntrue\nX\n${pin}\n${P}`)).toEqual([P]);
+    expect(found(`bash <<'X'\ncat > ${P} <<'EOF' || true\necho hi\nEOF\nX\n${pin}\n${P}`)).toEqual([P]);
+    // || true is no listed command either, even under set -e.
+    expect(found(`bash <<'X'\nset -e\ncat > ${P} <<'EOF' || true\necho hi\nEOF\nX\n${pin}\n${P}`)).toEqual([P]);
+    // A nested body that fails must fail its parent as well.
+    expect(found(`bash <<'X'\nbash <<'Y'\n${body}\nY\ntrue\nX\n${pin}\n${P}`)).toEqual([P]);
+    expect(found(`bash <<'X'\nset -e\nbash <<'Y' | tee /var/log/y\n${body}\nY\nX\n${pin}\n${P}`)).toEqual([P]);
+  });
+
+  it("U-A: an unknown directory counts a relative run by its base name (hint T-B)", () => {
+    expect(found(`${body}\n${pin}\nsudo -i <<'X'\n./run.sh\nX`)).toEqual([]);
+    expect(found(`${pin}\nsudo -i <<'X'\n./run.sh\nX`)).toEqual([P]);
+    expect(found(`${pin}\nsudo -i <<'X'\ncd x\nbash ../x/run.sh\nX`)).toEqual([P]);
+  });
+
+  const guards = [
+    "set -euo pipefail\nmkdir -p /opt/x\ncd /opt/x",
+    "set -e\nset -u\nset -x\nset -o pipefail",
+    "# comment\n\numask 022\ninstall -d -m 0755 /opt/x\nchown root:root /opt/x\nchmod 0755 /opt/x",
+    "MODE=0755\nNAME='x'",
+    "cat > /etc/x.conf <<'C'\na=1\nC\ntee /etc/y.conf >/dev/null <<'C'\nb=2\nC",
+    "apt-get update -q </dev/null\nsystemctl stop x.service </dev/null\necho start </dev/null",
+  ];
+  for (const opener of openers) {
+    for (const pre of guards) {
+      it(`U-A guard: listed lines in front of the write keep it shown: ${opener} / ${JSON.stringify(pre)}`, () => {
+        expect(before(opener, pre)).toEqual([]);
+        if (pre.startsWith("set -e")) expect(before(opener, pre, "chmod 0755 /opt/x/run.sh\n")).toEqual([]);
+      });
+    }
+  }
+
+  it("U-A guard: set -e in the body or at the shell keeps a write with commands after it shown", () => {
+    expect(found(`bash <<'X'\nset -euo pipefail\nmkdir -p /opt/x\n${body}\nchmod 0755 ${P}\nsystemctl daemon-reload </dev/null\nX\n${pin}\n${P}`)).toEqual([]);
+    expect(found(`bash -euo pipefail <<'X'\n${body}\nchmod 0755 ${P}\nX\n${pin}\n${P}`)).toEqual([]);
+    expect(found(`cat <<'X' | sudo bash -e\n${body}\nchmod 0755 ${P}\nX\n${pin}\n${P}`)).toEqual([]);
+  });
+
+  it("U-A guard: a pipe or ; behind the opener under the step's pipefail, nested bodies as the parent's last command", () => {
+    expect(found(`bash <<'X' 2>&1 | tee -a /var/log/x\n${body}\nX\n${pin}\n${P}`)).toEqual([]);
+    expect(found(`cat <<'A' >/dev/null; bash <<'B'\nfoo\nA\n${body}\nB\n${pin}\n${P}`)).toEqual([]);
+    expect(found(`sudo bash -s <<'X'\nsudo -u root bash <<'Y'\n${body}\nY\nX\n${pin}\n${P}`)).toEqual([]);
+    expect(found(`bash <<'X'\nset -e\nbash <<'Y'\n${body}\nY\ntrue\nX\n${pin}\n${P}`)).toEqual([]);
+    expect(found(`while IFS= read -r l; do echo "$l"; done </etc/hosts\nf() { true; }\nbash <<'X'\n${body}\nX\n${pin}\n${P}`)).toEqual([]);
+  });
+
+  const braces = [
+    "bash -s {-c,true} <<'X'",
+    "bash -s {-n,} <<'X'",
+    "bash -s {-l,} <<'X'",
+    "bash -s {--rcfile,/srv/rc} <<'X'",
+    "sudo -u root bash -s {-c,true} <<'X'",
+    "cat <<'X' | bash -s {-c,true}",
+    "su {-c,true} <<'X'",
+    "bash -s {1..2} <<'X'",
+    "bash -s -[c] true <<'X'",
+    "bash -s -? <<'X'",
+    "bash -s /srv/* <<'X'",
+    "sudo {-u,root} bash <<'X'",
+  ];
+  for (const opener of braces) {
+    it(`U-B: a word with braces or a glob in the opener chain is not read as a word: ${opener}`, () => {
+      expect(found(`${opener}\n${body}\nX\n${pin}\n${P}`)).toEqual([P]);
+    });
+  }
+
+  it("U-B guard: the value of an assignment and plain options stay local", () => {
+    expect(found(`OPTS={a,b} bash <<'X'\n${body}\nX\n${pin}\n${P}`)).toEqual([]);
+    expect(found(`systemd-run --pipe --unit=x-1 --same-dir bash <<'X'\n${body}\nX\n${pin}\n${P}`)).toEqual([]);
+  });
+});
