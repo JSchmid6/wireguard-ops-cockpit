@@ -70,13 +70,13 @@ describe("deploy: ttyd", () => {
   it("takes the apt package where apt has a candidate (Ubuntu: VPS, Lab0)", () => {
     const out = runBlock("1.7.4-1", 'echo "$TTYD_FROM_APT ${APT_PACKAGES[*]}"');
     expect(out.status).toBe(0);
-    expect(out.stdout.trim()).toBe("yes ca-certificates curl git tmux nginx openssl python3 sudo ripgrep ttyd");
+    expect(out.stdout.trim()).toBe("yes ca-certificates curl git tmux nginx openssl python3 sudo ripgrep bubblewrap ttyd");
   });
 
   it("leaves ttyd out of the apt list without a candidate (Debian trixie)", () => {
     const out = runBlock("(none)", 'echo "$TTYD_FROM_APT ${APT_PACKAGES[*]}"');
     expect(out.status).toBe(0);
-    expect(out.stdout.trim()).toBe("no ca-certificates curl git tmux nginx openssl python3 sudo ripgrep");
+    expect(out.stdout.trim()).toBe("no ca-certificates curl git tmux nginx openssl python3 sudo ripgrep bubblewrap");
   });
 
   it("installs the downloaded binary when its sha256 matches", () => {

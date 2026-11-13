@@ -76,7 +76,8 @@ async function setup(overrides: Partial<AppConfig> = {}, slot: { pollMs?: number
 
   // The host run's outcome, switched per test step.
   // busy: so many starts the helper still refuses because another run holds the host.
-  const host: { status: "success" | "failed"; doorkeeper: string; busy: number; busyMessage: string; plan: string } = {
+  // engine: what the broker reports for the planner (t_936d9b0f); unset like an older broker.
+  const host: { status: "success" | "failed"; doorkeeper: string; busy: number; busyMessage: string; plan: string; engine?: Record<string, unknown> } = {
     status: "failed", doorkeeper: "VERDICT: pass\nNOTES: routine apt maintenance", busy: 0, busyMessage: "another host run is active: 3e06625f-0000", plan,
   };
   const executorCalls = await listen(path.join(dir, "executor.sock"), (request) => {
@@ -97,7 +98,7 @@ async function setup(overrides: Partial<AppConfig> = {}, slot: { pollMs?: number
     } }) };
   });
   const agentCalls = await listen(path.join(dir, "agent.sock"), (request) => {
-    if (request.role === "planner") return { ok: true, output: host.plan };
+    if (request.role === "planner") return { ok: true, output: host.plan, ...(host.engine ? { engine: host.engine } : {}) };
     return { ok: true, output: "VERIFICATION_STATUS: passed\nEVIDENCE: no upgradable packages\nREASON: done" };
   });
   const app = await createApp({
@@ -447,5 +448,23 @@ describe("change circuit breaker through the API", () => {
     expect(Date.parse(envelope.expiresAt)).toBeLessThanOrEqual(Date.parse(queue.notAfter));
     expect(flow.explanationOf(job).reason).toContain("queue limit");
     expect(flow.inspect.hasAudit("hermes.change.failed", job.id)).toBe(false);
+  }, 15_000);
+
+  // Planner on Claude through the subscription, DeepSeek only as NOTBETRIEB
+  // (card t_936d9b0f): the engine stays on the job through every later update.
+  it("keeps which engine planned on the job, and marks a DeepSeek stand-in NOTBETRIEB", async () => {
+    const flow = await setup();
+    flow.host.status = "success";
+    flow.host.engine = { name: "claude", model: "claude-sonnet-5-5" };
+    const claude = await flow.submit({ operation: "apt-claude" });
+    expect(claude.status).toBe("completed");
+    expect(claude.output?.agentEngine).toEqual({ planner: { name: "claude", model: "claude-sonnet-5-5" } });
+    expect(claude.output?.notbetrieb).toBeUndefined();
+
+    flow.host.engine = { name: "opencode", model: "deepseek/deepseek-v4-pro", notbetrieb: true, reason: "Not logged in · Please run /login" };
+    const fallback = await flow.submit({ operation: "apt-fallback" });
+    expect(fallback.status).toBe("completed");
+    expect(fallback.output?.agentEngine).toEqual({ planner: flow.host.engine });
+    expect(fallback.output?.notbetrieb).toBe("NOTBETRIEB: planner ran on deepseek/deepseek-v4-pro (opencode) because Claude failed: Not logged in · Please run /login");
   }, 15_000);
 });

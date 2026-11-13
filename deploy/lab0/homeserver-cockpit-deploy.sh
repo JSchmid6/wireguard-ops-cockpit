@@ -132,6 +132,9 @@ set -euo pipefail
 REPO_URL="https://github.com/JSchmid6/wireguard-ops-cockpit.git"
 REPO_COMMIT="${REPO_COMMIT:-49ed9f376d253071afc0fdea1730612b9ebe5f70}"
 OPENCODE_VERSION="${OPENCODE_VERSION:-1.18.31}"   # VPS-validierte Serie (VPS: 1.18.30)
+# Claude Code für Planer/Research über das Abo (Karte t_936d9b0f); aktiv erst mit
+# COCKPIT_PLAN_ENGINE=claude und CLAUDE_CODE_OAUTH_TOKEN in agent.env.
+CLAUDE_CODE_VERSION="${CLAUDE_CODE_VERSION:-2.1.311}"   # dist-tag stable am 13.11.2026
 NODE_DIR="/opt/node-v22.23.4-linux-x64"
 NODE_SHA256="1805bcd35e6815559bd2eb97db438d3fdb0eb3a5e6a977b7c1badca76337e9ce"
 COCKPIT_DIR="/opt/wireguard-ops-cockpit"
@@ -498,7 +501,8 @@ ttyd_present() {
 
 # ripgrep: opencode keeps its cache per run (Kanban t_cb81637b); without rg on the PATH its
 # grep/glob tools would download ripgrep from GitHub into that empty cache on every run.
-APT_PACKAGES=(ca-certificates curl git tmux nginx openssl python3 sudo ripgrep)
+# bubblewrap: Claude Code hält damit seinen Login aus der Shell der Rolle (CLAUDE_CODE_SUBPROCESS_ENV_SCRUB).
+APT_PACKAGES=(ca-certificates curl git tmux nginx openssl python3 sudo ripgrep bubblewrap)
 TTYD_FROM_APT="$(ttyd_apt_candidate)"
 if [ "$TTYD_FROM_APT" = "yes" ]; then APT_PACKAGES+=(ttyd); fi
 # <<< ttyd-logik
@@ -826,6 +830,15 @@ timeout 60 runuser -u cockpit-agent -- env HOME="$AGENT_DIR" "$NODE_DIR/bin/open
 timeout 60 runuser -u cockpit-runner -- env HOME="$RUNNER_DIR" "$NODE_DIR/bin/opencode" --version >/dev/null 2>&1 \
   || die "opencode --version schlägt als cockpit-runner fehl (runuser-Test)."
 ln -sfn "$NODE_DIR/bin/opencode" /usr/local/bin/opencode
+# Claude Code: Planer und Research laufen damit, sobald agent.env es einschaltet
+# (apps/agent-broker/src/index.mjs claudeSettings); ohne Schalter liegt es nur da.
+log "9b) Claude Code installieren (Planer/Research, Version $CLAUDE_CODE_VERSION)"
+npm install -g --silent "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
+test -x "$NODE_DIR/bin/claude" || die "claude-Binary nicht gefunden ($NODE_DIR/bin/claude)."
+chmod -R a+rX "$NODE_DIR/lib/node_modules/@anthropic-ai" 2>/dev/null || true
+# Nichts in sein Home schreiben: ein ~/.claude dort hielte jede Rolle an (assertNoPlantedConfig).
+timeout 60 runuser -u cockpit-agent -- env HOME=/nonexistent CLAUDE_CONFIG_DIR=/nonexistent/claude DISABLE_AUTOUPDATER=1 "$NODE_DIR/bin/claude" --version >/dev/null 2>&1 \
+  || die "claude --version schlägt als cockpit-agent fehl (runuser-Test)."
 # BEGIN agent-opencode-config (test/cockpit-agent-unit-e2e-inner.sh runs exactly these lines)
 # The config of every agent role belongs to root; the agent identity, which also
 # runs the runner with build tools, only reads it. The unit keeps the home

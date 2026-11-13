@@ -17,7 +17,7 @@ process.env.COCKPIT_AGENT_WORKSPACE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(),
 process.env.HOME = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-agent-home-"));
 // The check derives it from HOME alone, like opencode, which gets no XDG_CONFIG_HOME.
 process.env.XDG_CONFIG_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-agent-xdg-"));
-const { assertNoPlantedConfig, cleanupStaleWorkspaces, createSessionWorkspace, globalConfigNames, parseServedRoles, projectConfigNames, removeSessionWorkspace, runAgent, sessionStateDirs, validateRequest } = await import("../src/index.mjs");
+const { assertNoPlantedConfig, cleanReason, cleanupStaleWorkspaces, parseClaudeResult, createSessionWorkspace, globalConfigNames, parseServedRoles, projectConfigNames, removeSessionWorkspace, runAgent, sessionStateDirs, validateRequest } = await import("../src/index.mjs");
 const { PROMPT_LIMITS, promptLimit, promptLimitProblem } = await import("../src/prompt-limits.mjs");
 test.after(() => {
   fs.rmSync(process.env.COCKPIT_AGENT_WORKSPACE_ROOT, { recursive: true, force: true });
@@ -381,4 +381,63 @@ test("the deploys refuse the same leftover config as the broker before they inst
     fs.rmSync(path.join(root, planted));
   }
   fs.rmSync(root, { recursive: true });
+});
+
+// Planner and research on Claude through the subscription, DeepSeek (opencode)
+// only as NOTBETRIEB (card t_936d9b0f). A stand-in for `claude -p`: a session
+// whose requestId starts with c1a0de00 answers like Claude's JSON result and
+// reports what it got; one with c1a0fa11 is logged out.
+test("planner and research run on Claude; a Claude failure falls back to opencode labelled NOTBETRIEB", async () => {
+  const fakeClaude = path.join(fakeRoot, "claude");
+  fs.writeFileSync(fakeClaude, `#!/bin/sh
+case "$PWD" in
+  */agent-c1a0fa11*) echo '{"type":"result","subtype":"success","is_error":true,"result":"Not logged in · Please run /login"}'; exit 1;;
+esac
+prompt=$(cat)
+test -d "$HOME" || exit 4
+info="args=$* home=$HOME config=$CLAUDE_CONFIG_DIR scrub=$CLAUDE_CODE_SUBPROCESS_ENV_SCRUB token=\${CLAUDE_CODE_OAUTH_TOKEN:+set} deepseek=\${DEEPSEEK_API_KEY:+set} prompt=$prompt"
+node -e 'process.stdout.write(JSON.stringify({type:"result",subtype:"success",is_error:false,result:process.argv[1],modelUsage:{"claude-sonnet-5-5":{}}}))' "$info"
+`, { mode: 0o755 });
+  const saved = { ...process.env };
+  Object.assign(process.env, { COCKPIT_PLAN_ENGINE: "claude", COCKPIT_CLAUDE_EXECUTABLE: fakeClaude, CLAUDE_CODE_OAUTH_TOKEN: "test-token", DEEPSEEK_API_KEY: "test-key" });
+  try {
+    for (const role of ["planner", "research"]) {
+      const result = await runAgent({ requestId: "c1a0de00-1", role, prompt: "plan it" });
+      assert.equal(result.ok, true, result.error);
+      assert.deepEqual(result.engine, { name: "claude", model: "claude-sonnet-5-5" });
+      assert.match(result.output, /^args=-p --safe-mode --strict-mcp-config --no-session-persistence --model sonnet --tools Bash,Read,Grep,Glob,WebFetch,WebSearch --allowedTools Bash,Read,Grep,Glob,WebFetch,WebSearch --append-system-prompt-file \S+\/AGENTS\.md --output-format json /);
+      // Claude's state belongs to the run; the token reaches it, the DeepSeek key does not.
+      const state = `${process.env.COCKPIT_AGENT_WORKSPACE_ROOT}/agent-c1a0de00-1-${role}-[^/]+/\\.run-state`;
+      assert.match(result.output, new RegExp(` home=${state}/home config=${state}/claude `));
+      assert.match(result.output, / scrub=1 token=set deepseek= prompt=plan it$/);
+      assert.deepEqual(fs.readdirSync(process.env.COCKPIT_AGENT_WORKSPACE_ROOT), []);
+    }
+    // Logged out (expired token, subscription window, outage): opencode answers, labelled.
+    const fallback = await runAgent({ requestId: "c1a0fa11-1", role: "planner", prompt: "plan it" });
+    assert.equal(fallback.ok, true, fallback.error);
+    assert.deepEqual(fallback.engine, { name: "opencode", model: "default", notbetrieb: true, reason: "Not logged in · Please run /login" });
+    assert.match(fallback.output, /^argc=\d+ last=--print-logs\nplan it$/);
+    // Safety and verifier never go to Claude, and are no NOTBETRIEB.
+    for (const role of ["safety", "verifier"]) {
+      const review = await runAgent({ requestId: "c1a0de00-2", role, prompt: "review" });
+      assert.equal(review.ok, true, review.error);
+      assert.deepEqual(review.engine, { name: "opencode", model: "default" });
+    }
+    // Without the switch the planner stays on opencode.
+    delete process.env.COCKPIT_PLAN_ENGINE;
+    const plain = await runAgent({ requestId: "c1a0de00-3", role: "planner", prompt: "plan it" });
+    assert.deepEqual(plain.engine, { name: "opencode", model: "default" });
+  } finally {
+    for (const key of ["COCKPIT_PLAN_ENGINE", "COCKPIT_CLAUDE_EXECUTABLE", "CLAUDE_CODE_OAUTH_TOKEN", "DEEPSEEK_API_KEY"]) {
+      if (key in saved) process.env[key] = saved[key]; else delete process.env[key];
+    }
+  }
+});
+
+test("Claude's result is parsed for the answer and the model that answered; reasons carry no token", () => {
+  assert.deepEqual(parseClaudeResult('{"subtype":"success","is_error":false,"result":"ok","modelUsage":{"claude-sonnet-5-5":{}}}'), { ok: true, output: "ok", model: "claude-sonnet-5-5" });
+  assert.deepEqual(parseClaudeResult('{"subtype":"error_max_turns","is_error":true,"result":""}'), { ok: false, reason: "claude ended with error_max_turns" });
+  assert.equal(parseClaudeResult("").ok, false);
+  assert.equal(parseClaudeResult('{"subtype":"success","is_error":false,"result":"  "}').ok, false);
+  assert.equal(cleanReason(`bad token sk-ant-oat01-${"a".repeat(40)}\n next`), "bad token […] next");
 });

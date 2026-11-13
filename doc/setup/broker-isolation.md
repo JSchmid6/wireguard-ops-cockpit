@@ -14,7 +14,7 @@ Never add `cockpit-agent` or `cockpit-runner` to `cockpit-executor-client` or gr
 ## Secret placement
 
 - `/etc/wireguard-ops-cockpit/api.env`: envelope and executor-client secrets; no provider key
-- `/etc/wireguard-ops-cockpit/agent.env`: provider key and model selection only (read by both the agent and the runner unit)
+- `/etc/wireguard-ops-cockpit/agent.env`: provider keys (`DEEPSEEK_API_KEY`, optionally `CLAUDE_CODE_OAUTH_TOKEN`) and engine/model selection only (read by both the agent and the runner unit; the runner never uses Claude, `doc/setup/plan-engine-claude.md`)
 - `/etc/wireguard-ops-cockpit/executor.env`: executor broker secret only
 - `/home/hermes/.hermes/credentials/cockpit.token`: Hermes-owned route-scoped bearer token; Control stores only its SHA-256 hash
 - `/etc/wireguard-ops-cockpit/admin-recovery.env`: root-only recovery login, never sourced into an agent service

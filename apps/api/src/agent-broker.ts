@@ -26,7 +26,31 @@ export function brokerSocketForRole(
   return config.runnerBrokerSocket;
 }
 
+// Which engine answered (broker index.mjs runInWorkspace): Claude through the
+// subscription for planner/research when switched on, otherwise opencode.
+// notbetrieb: Claude failed and opencode (DeepSeek) stood in (card t_936d9b0f).
+export interface AgentEngine {
+  name: string;
+  model: string;
+  notbetrieb?: true;
+  reason?: string;
+}
+
+function brokerEngine(value: unknown): AgentEngine | null {
+  if (!value || typeof value !== "object") return null;
+  const engine = value as Record<string, unknown>;
+  if (typeof engine.name !== "string" || typeof engine.model !== "string") return null;
+  return {
+    name: engine.name.slice(0, 40), model: engine.model.slice(0, 120),
+    ...(engine.notbetrieb === true ? { notbetrieb: true as const, reason: typeof engine.reason === "string" ? engine.reason.slice(0, 300) : "unknown" } : {}),
+  };
+}
+
 export async function runBrokerAgent(socketPath: string, role: AgentBrokerRole, prompt: string): Promise<string> {
+  return (await runBrokerAgentWithEngine(socketPath, role, prompt)).output;
+}
+
+export async function runBrokerAgentWithEngine(socketPath: string, role: AgentBrokerRole, prompt: string): Promise<{ output: string; engine: AgentEngine | null }> {
   // The same check as the broker's, before the socket: the error names bound and length.
   const problem = promptLimitProblem(role, prompt);
   if (problem) throw new Error(problem);
@@ -43,9 +67,9 @@ export async function runBrokerAgent(socketPath: string, role: AgentBrokerRole, 
     connection.on("error", reject);
     connection.on("close", () => {
       try {
-        const parsed = JSON.parse(response) as { ok?: boolean; output?: string; error?: string };
+        const parsed = JSON.parse(response) as { ok?: boolean; output?: string; error?: string; engine?: unknown };
         if (!parsed.ok || typeof parsed.output !== "string") reject(new Error(parsed.error || "agent broker failed"));
-        else resolve(parsed.output);
+        else resolve({ output: parsed.output, engine: brokerEngine(parsed.engine) });
       } catch (error) { reject(error); }
     });
   });
