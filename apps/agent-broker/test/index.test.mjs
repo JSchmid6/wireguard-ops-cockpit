@@ -11,14 +11,17 @@ const fakeOpencode = path.join(fakeRoot, "opencode");
 fs.writeFileSync(fakeOpencode, "#!/bin/sh\ncase \"$PWD\" in */agent-dead0000*) exit 3;; esac\nprintf 'argc=%s last=%s\\n' \"$#\" \"$(eval echo \\\"\\$$#\\\")\"\ncat\n", { mode: 0o755 });
 process.env.COCKPIT_OPENCODE_EXECUTABLE = fakeOpencode;
 process.env.COCKPIT_AGENT_WORKSPACE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-agent-run-"));
-// The broker also checks opencode's global config directory: never the one of whoever runs the tests.
+// The broker also checks opencode's global config directory below HOME: never the one of whoever runs the tests.
+process.env.HOME = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-agent-home-"));
+// The check derives it from HOME alone, like opencode, which gets no XDG_CONFIG_HOME.
 process.env.XDG_CONFIG_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-agent-xdg-"));
-const { assertNoPlantedConfig, cleanupStaleWorkspaces, createSessionWorkspace, removeSessionWorkspace, runAgent, validateRequest } = await import("../src/index.mjs");
+const { assertNoPlantedConfig, cleanupStaleWorkspaces, globalConfigNames, projectConfigNames, createSessionWorkspace, removeSessionWorkspace, runAgent, validateRequest } = await import("../src/index.mjs");
 const { PROMPT_LIMITS, promptLimit, promptLimitProblem } = await import("../src/prompt-limits.mjs");
 test.after(() => {
   fs.rmSync(process.env.COCKPIT_AGENT_WORKSPACE_ROOT, { recursive: true, force: true });
   fs.rmSync(fakeRoot, { recursive: true, force: true });
   fs.rmSync(process.env.XDG_CONFIG_HOME, { recursive: true, force: true });
+  fs.rmSync(process.env.HOME, { recursive: true, force: true });
 });
 test("agent broker accepts only bounded roles and prompts", () => {
   assert.deepEqual(validateRequest({ requestId: "12345678", role: "planner", prompt: "inspect" }), { requestId: "12345678", role: "planner", prompt: "inspect" });
@@ -112,36 +115,50 @@ test("a child that ignores stdin does not crash the broker", async () => {
 // to "/" and loads agents, commands, skills and tools from its global config
 // directory (t_62992d58).
 test("planted opencode config above the workspace or in the global config directory stops every role", async () => {
-  const names = ["opencode.json", "opencode.jsonc", ".opencode", "AGENTS.md", "CLAUDE.md", "CONTEXT.md", ".claude", ".agents", ".git", ".gitconfig"];
+  const names = ["opencode.json", "opencode.jsonc", ".opencode", "AGENTS.md", "CLAUDE.md", "CONTEXT.md", ".claude", ".agents", ".git", ".gitconfig", ".npmrc"];
+  assert.deepEqual(projectConfigNames, names);
   for (const level of ["session root", "home"]) {
     for (const name of names) {
       const home = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-agent-planted-"));
       const root = path.join(home, "sessions");
       fs.mkdirSync(root);
       const planted = path.join(level === "home" ? home : root, name);
-      if (name.startsWith(".") && name !== ".gitconfig") fs.mkdirSync(planted); else fs.writeFileSync(planted, "{}");
+      if (name.startsWith(".") && name !== ".gitconfig" && name !== ".npmrc") fs.mkdirSync(planted); else fs.writeFileSync(planted, "{}");
       assert.throws(() => createSessionWorkspace({ requestId: "12345678", role: "safety", prompt: "review" }, root), (error) => error.message.includes(planted), `${level}: ${name}`);
       assert.deepEqual(fs.readdirSync(root), level === "home" ? [] : [name]);
       fs.rmSync(home, { recursive: true });
     }
   }
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-agent-clean-"));
-  const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-agent-config-"));
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-agent-config-"));
+  const configDir = path.join(home, ".config", "opencode");
+  fs.mkdirSync(configDir, { recursive: true });
   // What the deploy places there, and what opencode itself writes, stays allowed.
   for (const name of ["opencode.jsonc", ".gitignore", "package.json", "node_modules"]) fs.writeFileSync(path.join(configDir, name), "");
-  assert.doesNotThrow(() => assertNoPlantedConfig(root, configDir));
-  for (const name of ["opencode.json", "config.json", "AGENTS.md", "agent", "agents", "command", "commands", "mode", "modes", "plugin", "plugins", "tool", "tools", "skill", "skills"]) {
+  assert.doesNotThrow(() => assertNoPlantedConfig(root, home));
+  const globalNames = ["opencode.json", "config.json", "config", "AGENTS.md", "agent", "agents", "command", "commands", "mode", "modes", "plugin", "plugins", "tool", "tools", "skill", "skills"];
+  assert.deepEqual(globalConfigNames, globalNames);
+  for (const name of globalNames) {
     fs.mkdirSync(path.join(configDir, name));
-    assert.throws(() => assertNoPlantedConfig(root, configDir), (error) => error.message.includes(path.join(configDir, name)), name);
+    assert.throws(() => assertNoPlantedConfig(root, home), (error) => error.message.includes(path.join(configDir, name)), name);
     fs.rmSync(path.join(configDir, name), { recursive: true });
   }
+  // git (opencode's snapshots) reads ~/.config/git/config, e.g. core.fsmonitor: code.
+  fs.mkdirSync(path.join(home, ".config", "git"));
+  assert.throws(() => assertNoPlantedConfig(root, home), (error) => error.message.includes(path.join(home, ".config", "git")));
+  fs.rmSync(path.join(home, ".config", "git"), { recursive: true });
   fs.symlinkSync("/nonexistent", path.join(root, "AGENTS.md"));
-  assert.throws(() => assertNoPlantedConfig(root, configDir), /AGENTS\.md/);
-  fs.rmSync(root, { recursive: true }); fs.rmSync(configDir, { recursive: true });
-  const tool = path.join(process.env.XDG_CONFIG_HOME, "opencode", "tools");
+  assert.throws(() => assertNoPlantedConfig(root, home), /AGENTS\.md/);
+  fs.rmSync(root, { recursive: true }); fs.rmSync(home, { recursive: true });
+  // The default is HOME's config directory; XDG_CONFIG_HOME in the broker's own
+  // environment neither hides it nor counts, because opencode never gets it.
+  fs.mkdirSync(path.join(process.env.XDG_CONFIG_HOME, "opencode", "tools"), { recursive: true });
+  assert.doesNotThrow(() => assertNoPlantedConfig(fs.mkdtempSync(path.join(process.env.HOME, "clean-"))));
+  fs.rmSync(path.join(process.env.XDG_CONFIG_HOME, "opencode"), { recursive: true });
+  const tool = path.join(process.env.HOME, ".config", "opencode", "tools");
   fs.mkdirSync(tool, { recursive: true });
   const result = await runAgent({ requestId: "87654323", role: "verifier", prompt: "verify" });
-  fs.rmSync(path.join(process.env.XDG_CONFIG_HOME, "opencode"), { recursive: true });
+  fs.rmSync(path.join(process.env.HOME, ".config"), { recursive: true });
   assert.equal(result.ok, false);
   assert.match(result.error, /agent workspace setup failed: opencode would load .*opencode\/tools/);
   assert.deepEqual(fs.readdirSync(process.env.COCKPIT_AGENT_WORKSPACE_ROOT), []);
@@ -171,7 +188,7 @@ test("the agent unit keeps the home and the opencode config read-only", () => {
   }
   assert.ok(covers(`${home}/.config`, env.COCKPIT_OPENCODE_CONFIG));
   // What must stay writable, or no role starts: the workspaces and opencode's own state.
-  for (const target of [env.COCKPIT_AGENT_WORKSPACE_ROOT, `${home}/.local/share/opencode`, `${home}/.local/state/opencode`, `${home}/.cache/opencode`, "/run/cockpit-agent"]) {
+  for (const target of [env.COCKPIT_AGENT_WORKSPACE_ROOT, `${home}/.cache/opencode/npm`, `${home}/.local/share/opencode`, `${home}/.local/state/opencode`, `${home}/.cache/opencode`, "/run/cockpit-agent"]) {
     assert.ok(writable.some((dir) => covers(dir, target)), `${target} must be writable for the agent unit`);
   }
   // The deploys: Lab0/box and the VPS install the config root-owned, both place the .gitignore
@@ -185,4 +202,44 @@ test("the agent unit keeps the home and the opencode config read-only", () => {
   assert.match(vps, /"deploy\/config\/opencode-config-dir\.gitignore\|\$ROOT\/var\/lib\/wireguard-ops-agent\/\.config\/opencode\/\.gitignore\|644"/);
   // The exact bytes opencode 1.18 writes (config.ts ensureGitignore).
   assert.equal(fs.readFileSync(new URL("deploy/config/opencode-config-dir.gitignore", repo), "utf8"), ["node_modules", "package.json", "package-lock.json", "bun.lock", ".gitignore"].join("\n"));
+});
+
+// Leftovers stop every role, planner and doorkeeper too, so the Cockpit could no
+// longer repair or roll itself back: both deploys refuse them before they install
+// a stand, with the broker's names (t_b4ec0027).
+test("the deploys refuse the same leftover config as the broker before they install", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const repo = new URL("../../../", import.meta.url);
+  const block = (file) => {
+    const text = fs.readFileSync(new URL(file, repo), "utf8");
+    const start = text.indexOf("# >>> planted-config-preflight");
+    const end = text.indexOf("# <<< planted-config-preflight");
+    assert.ok(start >= 0 && end > start, file);
+    return text.slice(start, end);
+  };
+  const vps = block("deploy/vps/vps-cockpit-deploy.sh");
+  assert.equal(block("deploy/lab0/homeserver-cockpit-deploy.sh"), vps);
+  const list = (name) => vps.match(new RegExp(`${name}=\\(([^)]*)\\)`))[1].trim().split(/\s+/);
+  assert.deepEqual(list("PLANTED_PROJECT_NAMES"), projectConfigNames);
+  assert.deepEqual(list("PLANTED_GLOBAL_NAMES"), globalConfigNames);
+  const vpsScript = fs.readFileSync(new URL("deploy/vps/vps-cockpit-deploy.sh", repo), "utf8");
+  assert.match(vpsScript, /git checkout -q -B main "\$REPO_COMMIT"\ncheck_planted_config\ninstall_runtime\nbuild\nsave_targets\n/);
+  const lab0Script = fs.readFileSync(new URL("deploy/lab0/homeserver-cockpit-deploy.sh", repo), "utf8");
+  assert.ok(lab0Script.indexOf("planted_config_preflight \"\" \"$AGENT_DIR\"") < lab0Script.indexOf('log "1) Pakete installieren"'));
+  // The block itself, against a host root: clean, then each kind of leftover.
+  const run = (root) => spawnSync("bash", ["-c", `set -euo pipefail\n${vps}\nplanted_config_preflight "$1" /var/lib/wireguard-ops-agent`, "check", root], { encoding: "utf8" });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-deploy-root-"));
+  const home = path.join(root, "var/lib/wireguard-ops-agent");
+  fs.mkdirSync(path.join(home, ".config/opencode"), { recursive: true });
+  for (const name of ["opencode.jsonc", ".gitignore", "package.json"]) fs.writeFileSync(path.join(home, ".config/opencode", name), "");
+  assert.equal(run(root).status, 0, run(root).stdout);
+  for (const planted of ["AGENTS.md", "var/.claude", "var/lib/wireguard-ops-agent/.npmrc", "var/lib/wireguard-ops-agent/sessions/.opencode", "var/lib/wireguard-ops-agent/.config/opencode/config", "var/lib/wireguard-ops-agent/.config/git"]) {
+    fs.mkdirSync(path.dirname(path.join(root, planted)), { recursive: true });
+    fs.symlinkSync("/nonexistent", path.join(root, planted));
+    const result = run(root);
+    assert.equal(result.status, 1, planted);
+    assert.equal(result.stdout, `opencode would load /${planted} into every role\n`, planted);
+    fs.rmSync(path.join(root, planted));
+  }
+  fs.rmSync(root, { recursive: true });
 });

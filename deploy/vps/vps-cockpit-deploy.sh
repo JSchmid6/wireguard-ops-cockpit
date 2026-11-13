@@ -224,6 +224,45 @@ install_runtime() {
   log "pinned Node v$version installed at $dir"
 }
 
+# Leftover opencode config the agent broker refuses (assertNoPlantedConfig in
+# apps/agent-broker/src/index.mjs, the same names; a test compares the lists): from
+# the session root up to / and in the agent's global config directory. With one of
+# them in place the broker stops EVERY role, planner and doorkeeper too, so the
+# Cockpit could neither repair nor roll itself back. Checked before anything is
+# installed: the deploy stops with 71 and the running stand stays as it is. Root
+# moves the named paths aside (not delete: they may be someone's notes) and
+# deploys again.
+# >>> planted-config-preflight
+readonly PLANTED_PROJECT_NAMES=(opencode.json opencode.jsonc .opencode AGENTS.md CLAUDE.md CONTEXT.md .claude .agents .git .gitconfig .npmrc)
+readonly PLANTED_GLOBAL_NAMES=(opencode.json config.json config AGENTS.md agent agents command commands mode modes plugin plugins tool tools skill skills)
+planted_config_preflight() { # planted_config_preflight <host root> <agent home>
+  local root="$1" home="$2" dir name found=()
+  dir="$home/sessions"
+  while :; do
+    for name in "${PLANTED_PROJECT_NAMES[@]}"; do
+      if [ -e "$root${dir%/}/$name" ] || [ -L "$root${dir%/}/$name" ]; then found+=("${dir%/}/$name"); fi
+    done
+    [ "$dir" = / ] && break
+    dir="$(dirname -- "$dir")"
+  done
+  for name in "${PLANTED_GLOBAL_NAMES[@]}"; do
+    if [ -e "$root$home/.config/opencode/$name" ] || [ -L "$root$home/.config/opencode/$name" ]; then found+=("$home/.config/opencode/$name"); fi
+  done
+  if [ -e "$root$home/.config/git" ] || [ -L "$root$home/.config/git" ]; then found+=("$home/.config/git"); fi
+  [ "${#found[@]}" -eq 0 ] && return 0
+  printf 'opencode would load %s into every role\n' "${found[@]}"
+  return 1
+}
+# <<< planted-config-preflight
+
+check_planted_config() {
+  local report
+  if report="$(planted_config_preflight "$ROOT" /var/lib/wireguard-ops-agent)"; then return 0; fi
+  printf '%s\n' "$report" | while IFS= read -r line; do log "FAILED: $line"; done
+  log "FAILED: the agent broker would refuse every role with these in place; move them aside as root, then deploy again"
+  return 71
+}
+
 self_update_env() { # the runner's configuration on this host
   printf '%s\n' "# Managed by vps-cockpit-deploy.sh — the runner's settings on the VPS." \
     "COCKPIT_SELF_UPDATE_DEPLOY_SH=/usr/local/lib/wireguard-ops-cockpit/vps-cockpit-deploy.sh" \
@@ -338,6 +377,7 @@ trap rollback ERR
 
 log "deploying $REPO_COMMIT over $OLD (restart mode: ${COCKPIT_RESTART_MODE:-now}, backup $BACKUP)"
 git checkout -q -B main "$REPO_COMMIT"
+check_planted_config
 install_runtime
 build
 save_targets
