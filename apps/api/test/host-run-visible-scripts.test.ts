@@ -1125,3 +1125,142 @@ describe("hash-pinned scripts: the body must reach the write, braces and globs a
     expect(found(`systemd-run --pipe --unit=x-1 --same-dir bash <<'X'\n${body}\nX\n${pin}\n${P}`)).toEqual([]);
   });
 });
+
+// Befunde V-A, V-B, V-C und Hinweise der Zweitprüfung t_cdad398e (PR #86), Nacharbeit t_4b1ccb4a:
+// /opt/data/out/t_cdad398e/zweitpruefung-pr86-r6.md, Sonde probe17, echte bash in bash-gegenprobe.txt.
+describe("hash-pinned scripts: the line of a nested opener, the form of a write, nested shells (Befund t_cdad398e)", () => {
+  const P = "/opt/x/run.sh";
+  const pin = `echo "${HASH}  ${P}" | sha256sum -c -`;
+  const body = `cat > ${P} <<'EOF'\necho hi\nEOF`;
+  const hidden = (run: string) => hiddenPinnedScripts(manifest([{ name: "s1", run }]) as never);
+  const found = (run: string) => hidden(run).map(({ path }) => path);
+  const outer = (opener: string, inner: string) => found(`${opener}\n${inner}\nX\n${pin}\n${P}`);
+  const openers = ["bash <<'X'", "cat <<'X' | sudo bash"];
+
+  // V-A: bash reads the whole line with heredoc Y first, then runs what stands in
+  // front of the opener; exit, exec, read, cat … end or drain the parent body.
+  const front = ["exit 0", "exec true", "exec 0<&-", "read -r _", "head -n 1 >/dev/null", "cat >/dev/null", "kill $$", "false", "return 0 2>/dev/null || exit 0", "sh -c true </dev/null"];
+  for (const opener of openers) {
+    for (const pre of front) {
+      it(`V-A: a segment in front of a nested opener on its line keeps the write from being shown: ${opener} / ${pre}`, () => {
+        expect(outer(opener, `${pre}; bash <<'Y'\n${body}\nY`)).toEqual([P]);
+        expect(outer(opener, `set -e\n${pre}; bash <<'Y'\n${body}\nY\ntrue`)).toEqual([P]);
+        expect(outer(opener, `${pre}; cat <<'Y' | bash\n${body}\nY`)).toEqual([P]);
+      });
+    }
+  }
+
+  it("V-A guard: listed segments in front of a nested opener keep it trusted", () => {
+    for (const opener of openers) {
+      expect(outer(opener, `set -e; bash <<'Y'\n${body}\nY`)).toEqual([]);
+      expect(outer(opener, `mkdir -p /opt/x; cd /opt/x; bash <<'Y'\n${body}\nY`)).toEqual([]);
+      expect(outer(opener, `cat <<'A' >/dev/null; bash <<'Y'\nfoo\nA\n${body}\nY`)).toEqual([]);
+    }
+  });
+
+  // V-B: cat /proc/$$/fd/0 >/dev/null <<'E2' drains the body's stdin pipe (rc 0, old file).
+  const writes = [
+    "cat /proc/$$/fd/0 >/dev/null <<'E2'\nE2",
+    "cat /proc/self/fd/0 >/dev/null <<'E2'\nE2",
+    "cat /dev/stdin >/dev/null <<'E2'\nE2",
+    "cat /srv/x >/dev/null <<'E2'\nE2",
+    "cat -n >/dev/null <<'E2'\nE2",
+    "cat >/dev/stdin <<'E2'\ntrue\nE2",
+    "cat >/proc/$PPID/fd/0 <<'E2'\ntrue\nE2",
+    "cat >&0 <<'E2'\ntrue\nE2",
+    "cat > $F <<'E2'\nE2",
+    "tee /proc/$$/fd/0 >/dev/null <<'E2'\nE2",
+    "tee /dev/stdin <<'E2'\nE2",
+    "tee --output-error=warn /etc/x <<'E2'\nE2",
+    "tee /etc/{a,b} <<'E2'\nE2",
+    "install -m 0644 /proc/self/fd/0 /etc/x <<'E2'\nE2",
+    "install -m 0644 /srv/x /etc/x <<'E2'\nE2",
+    "install -s --strip-program=/srv/x /dev/stdin /etc/x <<'E2'\nE2",
+    "install -m 0644 /dev/stdin /etc/x /etc/y <<'E2'\nE2",
+  ];
+  for (const opener of openers) {
+    for (const pre of writes) {
+      it(`V-B: a heredoc write in a form that does not show its content is not listed: ${opener} / ${JSON.stringify(pre)}`, () => {
+        expect(outer(opener, `${pre}\n${body}`)).toEqual([P]);
+      });
+    }
+  }
+
+  it("V-B guard: cat, tee and install in the form that shows the content stay listed", () => {
+    for (const opener of openers) {
+      expect(outer(opener, `cat > /etc/x.conf <<'C'\na=1\nC\n${body}`)).toEqual([]);
+      expect(outer(opener, `cat - >> /etc/x.conf <<'C'\na=1\nC\n${body}`)).toEqual([]);
+      expect(outer(opener, `tee -a /etc/y.conf >/dev/null <<'C'\nb=2\nC\n${body}`)).toEqual([]);
+      expect(outer(opener, `install -D -m 0644 -o root /dev/stdin /etc/z.conf <<'C'\nc=3\nC\n${body}`)).toEqual([]);
+      expect(outer(opener, `install --mode=0644 /dev/stdin /etc/z.conf <<'C'\nc=3\nC\n${body}`)).toEqual([]);
+    }
+  });
+
+  // V-C: host-run.md says a nested shell never counts; sh -c '…' </dev/null did.
+  const nested = [
+    "sh -c 'cat /proc/$PPID/fd/0 >/dev/null' </dev/null",
+    "sh -c true </dev/null",
+    "bash -c true </dev/null",
+    "/bin/sh -c true </dev/null",
+    "busybox sh -c true </dev/null",
+    "python3 -c pass </dev/null",
+    "perl -e 1 </dev/null",
+    "env sh -c true </dev/null",
+    "env true </dev/null",
+    "xargs true </dev/null",
+    "sudo true </dev/null",
+    "doas true </dev/null",
+    "su -c true root </dev/null",
+    "runuser -u root true </dev/null",
+    "setsid true </dev/null",
+    "nohup true </dev/null",
+    "timeout 5 true </dev/null",
+    "nice true </dev/null",
+    "systemd-run --pipe true </dev/null",
+    "find / -maxdepth 0 -exec sh -c true ';' </dev/null",
+  ];
+  for (const opener of openers) {
+    for (const pre of nested) {
+      it(`V-C: a nested shell or a starter never counts in front of the write, not even with </dev/null: ${opener} / ${pre}`, () => {
+        expect(outer(opener, `${pre}\n${body}`)).toEqual([P]);
+      });
+    }
+  }
+
+  it("V-C guard: an ordinary program with </dev/null stays listed", () => {
+    expect(outer("bash <<'X'", `apt-get update -q </dev/null\nsystemctl stop x.service </dev/null\n${body}`)).toEqual([]);
+  });
+
+  // Hint: an opener or writer rebound earlier in the step need not run the body.
+  const rebinds = [
+    ["bash() { cat >/dev/null; }", "bash <<'X'"],
+    ["function bash { true; }", "bash <<'X'"],
+    ["hash -p /bin/true bash", "bash <<'X'"],
+    ["shopt -s expand_aliases; alias bash=true", "bash <<'X'"],
+    ["shopt -s expand_aliases\nalias bash=true", "bash <<'X'"],
+    ["sudo() { true; }", "sudo bash <<'X'"],
+    ["cat() { true; }", "cat <<'X' | bash"],
+    ["enable -n echo", "bash <<'X'"],
+  ];
+  for (const [pre, opener] of rebinds) {
+    it(`hint: a rebound opener makes later bodies not local: ${pre.replace("\n", "⏎")} / ${opener}`, () => {
+      expect(found(`${pre}\n${opener}\n${body}\nX\n${pin}\n${P}`)).toEqual([P]);
+    });
+  }
+
+  it("hint: a rebound cat or tee in front of a write at top level shows nothing", () => {
+    expect(found(`cat() { true; }\n${body}\n${pin}\n${P}`)).toEqual([P]);
+    expect(found(`hash -p /bin/true cat\n${body}\n${pin}\n${P}`)).toEqual([P]);
+    expect(found(`tee() { true; }\ntee ${P} >/dev/null <<'EOF'\necho hi\nEOF\n${pin}\n${P}`)).toEqual([P]);
+  });
+
+  it("hint guard: a function with another name stays free", () => {
+    expect(found(`retry() { "$@" || "$@"; }\nbash <<'X'\n${body}\nX\n${pin}\n${P}`)).toEqual([]);
+    expect(found(`f() { true; }\n${body}\n${pin}\n${P}`)).toEqual([]);
+  });
+
+  it("hint: the ) of a case pattern is no closing parenthesis", () => {
+    expect(found(`case a in a)\nbash <<'X'\n${body}\nX\n;; esac\n${pin}\n${P}`)).toEqual([P]);
+    expect(found(`case b in a)\nbash <<'X'\n${body}\nX\n;; esac\n${pin}\n${P}`)).toEqual([P]);
+  });
+});

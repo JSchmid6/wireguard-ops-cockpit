@@ -237,7 +237,13 @@ Die Regel im Einzelnen (`hiddenPinnedScripts` in `apps/api/src/host-run.ts`):
   aus der Umgebung), exportiert sie eine Funktion (`export -f cat`), einen Namen, den der Plan nicht zeigt
   (`export $(cat /srv/env)`, `export "${n}H_ENV=…"`; der Wert eines benannten Exports wie
   `export STAMP=$(date)` bleibt frei), oder schaltet sie `set -a`/`allexport` ein, ist jeder spätere Körper
-  des Schritts nicht lokal (S-D, t_683da1d6): Die Umgebung erreicht jede spätere Shell. Jedes andere Wort (auch `ssh`, `docker exec`,
+  des Schritts nicht lokal (S-D, t_683da1d6): Die Umgebung erreicht jede spätere Shell. Ebenso, wenn eine
+  Zeile des Schritts den Namen eines Openers oder Schreibers umbindet (13.11.2026, Hinweis aus t_cdad398e):
+  eine Funktion namens `bash`, `sh`, `sudo`, `cat`, `tee`, `install` oder eines lokalen Wrappers (`bash() {…}`,
+  `function sudo {…}`, `cat() { true; }`), `alias`, `unalias`, `hash`, `enable` oder `expand_aliases`; dann
+  läuft `bash <<'X'` bzw. `cat <<'X' | bash` nicht den Körper. Dasselbe gilt für einen Schreibvorgang auf
+  oberster Ebene nach einer solchen Zeile (`cat() { true; }` vor `cat > /p <<'EOF'`, auch auf main frei). Eine
+  Funktion mit anderem Namen (`retry() {…}`, `f() {…}`) bleibt frei. Jedes andere Wort (auch `ssh`, `docker exec`,
   `pct exec`, `chroot`, ein unbekanntes Werkzeug) macht den Körper fremd. Dort zählt jeder Schreibvorgang als
   nicht gezeigt; Überschreiben und Ausführen liest die Regel dort weiter. Preis: Ein lokaler Opener mit einer
   hier nicht gelisteten Option, die einen Wert nimmt, oder mit `sudo -s` (`su -s /bin/bash root <<'X'`), gilt als
@@ -251,17 +257,36 @@ Die Regel im Einzelnen (`hiddenPinnedScripts` in `apps/api/src/host-run.ts`):
   Inhalt deshalb nur, wenn drei Dinge gelten, alle per Positivliste:
   1. Jede Zeile davor im selben Körper und in jedem umschließenden Körper vor dessen Opener steht auf der
      Liste: Leerzeile, Kommentar, `set -e`/`-u`/`-x`/`-o pipefail` (auch gebündelt), `cd`, `mkdir`, `chmod`,
-     `chown`, `umask`, `install -d`, Zuweisungen ohne `$`, Schreibvorgänge mit eigenem Heredoc (`cat`, `tee`,
-     `install`). Jedes andere Programm zählt nur mit `</dev/null`. Builtins und Schlüsselwörter zählen nie, auch
-     nicht mit `</dev/null`: `exit`, `exec`, `return`, `eval`, `trap`, `source`, `read`, `kill` (auch `/bin/kill`),
-     `set +e`, `if`, `{`, Funktionen. Ebenso zählen `ssh` und eine verschachtelte Shell nie, und ebenso ein
-     Befehlswort mit Klammern oder `$`. Keine Negativliste: Jedes unbekannte Werkzeug kann stdin lesen. Damit
+     `chown`, `umask`, `install -d`, Zuweisungen ohne `$`, Schreibvorgänge mit eigenem Heredoc in der Form, die
+     den Inhalt zeigt (13.11.2026, V-B aus t_cdad398e): `cat` ohne Operanden außer `-`/`-u`, `tee` nur mit
+     `-a`/`-i`/`-p` und schlichten Zielen, `install` nur mit `-m`/`-o`/`-g`/`-D`/`-C`/`-p`/`-v`/`-T` (bzw.
+     `--mode=`, `--owner=`, `--group=`) und genau `/dev/stdin <ziel>`; das Segment enthält kein `$`, keinen
+     Backtick, keine Umleitung auf fd 0 und keinen Pfad unter `/proc/` oder `/dev/` außer `/dev/null` (und
+     `/dev/stdin` als Quelle von `install`). Sonst leert `cat /proc/$$/fd/0 >/dev/null <<'E'` die stdin-Pipe des
+     Körpers, und `cat >/dev/stdin <<'E'` schreibt in sie. Jedes andere Programm zählt nur mit `</dev/null`.
+     Builtins und Schlüsselwörter zählen nie, auch nicht mit `</dev/null`: `exit`, `exec`, `return`, `eval`,
+     `trap`, `source`, `read`, `kill` (auch `/bin/kill`), `set +e`, `if`, `{`, Funktionen. Ebenso zählen `ssh`
+     und eine verschachtelte Shell nie, auch nicht mit `</dev/null` (13.11.2026, V-C aus t_cdad398e:
+     `sh -c 'cat /proc/$PPID/fd/0 >/dev/null' </dev/null` leert den Körper): kein Befehl aus `SHELL_WORDS`
+     (Shells, `busybox`, `python`, `perl`, `ruby`, `node`, `php`, `lua`, `awk` …), kein Starter (`env`, `xargs`,
+     `sudo`, `doas`, `su`, `runuser`, `setpriv`, `setsid`, `nohup`, `timeout`, `nice`, `ionice`, `chrt`, `stdbuf`,
+     `systemd-run`, `systemd-cat`, `nsenter`, `chroot`, `unshare`, `flock`, `script`, `watch`, `parallel`) und
+     kein Segment, in dem irgendwo ein Shell-Name steht (`find … -exec sh`). Ebenso zählt ein Befehlswort mit
+     Klammern oder `$` nie. Keine Negativliste: Jedes unbekannte Werkzeug kann stdin lesen. Damit
      sind `if false; then`, `false &&` und eine nie aufgerufene Funktion im Körper mit erledigt.
   2. Ein Fehler vor dem Schreiben beendet den ganzen Schritt (Schritte laufen mit `bash -eo pipefail`,
      `cockpit-host-run` Z. 507). Deshalb fängt die Opener-Zeile keinen Fehler ab: kein `||`, `&&`, `!`, kein
      `if`/`while`, keine Gruppe `{ … }`/`( … )` und keine Funktion um sie herum, kein `set +e`/`set +o pipefail`
-     davor. Eine Pipe hinter der Shell ist nur unter `pipefail` erlaubt. Ein verschachtelter Körper muss seinen
-     Eltern-Körper scheitern lassen: Dort ist `set -e` an, oder der Opener ist dessen letzter Befehl.
+     davor (auf oberster Ebene nach der Tiefenzählung; nach einem `case` ist die Tiefe fail-safe für den Rest des
+     Schritts unbekannt, weil das `)` eines Musters keine Klammer schließt, Hinweis aus t_cdad398e). Eine Pipe
+     hinter der Shell ist nur unter `pipefail` erlaubt. Ein verschachtelter Körper muss seinen
+     Eltern-Körper scheitern lassen: Dort ist `set -e` an, oder der Opener ist dessen letzter Befehl. Was auf
+     der Zeile eines verschachtelten Openers vor ihm steht, muss selbst auf der Liste aus 1 stehen (13.11.2026,
+     V-A aus t_cdad398e): bash liest die ganze Zeile samt Heredoc und führt erst dann `exit 0`, `exec true`,
+     `exec 0<&-`, `read -r _`, `cat >/dev/null`, `kill $$` oder `false` vor `bash <<'Y'` aus; der Eltern-Körper
+     endet oder ist leer, bevor die innere Shell startet. `set -e; bash <<'Y'` und `mkdir -p /opt/x; cd /opt/x;
+     bash <<'Y'` bleiben frei; `set -e` auf derselben Zeile gilt für die Frage „Opener ist letzter Befehl“ erst
+     ab der nächsten Zeile.
   3. Scheitert der Schreibvorgang selbst, endet der Körper mit ihm. Davor ist im Körper `set -e` an (oder `-e`
      an der Shell, `bash -euo pipefail <<'X'`), oder er ist der letzte Befehl des Körpers.
   Ohne 2 und 3 übersprängen `kill $$`, `set -e` mit `false` oder einem scheiternden `mkdir`, ein beendendes
@@ -325,7 +350,7 @@ Plan anders verbirgt (Skript von anderswo ohne Pin, Pfad aus nicht gezeigten Wer
 Riegels („content this plan does not show“) und X5 des Türstehers. Die Regel ist eine Planer-Hilfe, kein
 Schloss: Sie lehnt nur zusätzlich ab, der Türsteher liest jeden Lauf weiterhin selbst. Tests:
 `apps/api/test/host-run-visible-scripts.test.ts` (alle Fälle der Probe aus t_740ac6ee, der Gegenprobe
-aus t_af29564c, der Befunde B1–B6 aus t_1748d6c1, R-A, R-B, H1–H4 aus t_b4b11e32, S-A–S-D, H-c, H-e aus t_c82f5ac2, T-A–T-D aus t_683da1d6 und U-A, U-B aus t_f7778d43, plus die aufgezeichneten Pläne vom 10.10.2026 als Fehlalarm-Gegenprobe).
+aus t_af29564c, der Befunde B1–B6 aus t_1748d6c1, R-A, R-B, H1–H4 aus t_b4b11e32, S-A–S-D, H-c, H-e aus t_c82f5ac2, T-A–T-D aus t_683da1d6, U-A, U-B aus t_f7778d43 und V-A–V-C samt Hinweisen aus t_cdad398e, plus die aufgezeichneten Pläne vom 10.10.2026 als Fehlalarm-Gegenprobe).
 
 ## 2a. Backup-Riegel: Backups löschen nur mit Freigabe
 

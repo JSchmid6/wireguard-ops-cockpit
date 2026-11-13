@@ -475,6 +475,12 @@ const STEP_ENVIRONMENT = /(?<![\w${])(?:PATH|ENV|BASH_ENV|SHELL|SHELLOPTS|BASHOP
 // expansion (export $(cat /srv/env), export "${n}H_ENV=…") and set -a/allexport,
 // after which every assignment and sourced file is exported. The value of a
 // named export (export FOO=$(date)) stays free.
+// Hint of t_cdad398e: a line that rebinds the name of an opener or a writer
+// (bash() { … }, function sudo, cat() { true; }, alias, hash -p, enable,
+// expand_aliases) makes every later body of the step not local, like an exported
+// environment: bash <<'X' or cat <<'X' | bash then need not run the body. A
+// function with any other name (f() { … }) stays free.
+const REBIND = /(?:^|[\s;&|(])(?:alias|unalias|hash|enable)(?=\s|;|$)|expand_aliases|(?:^|[\s;&|(])(?:function\s+)?(?:[\w.\/-]*\/)?(?:sh|bash|dash|zsh|ksh|mksh|ash|busybox|fish|csh|tcsh|cat|tee|install|source|sudo|doas|su|runuser|setpriv|env|nice|ionice|chrt|timeout|stdbuf|systemd-run|systemd-cat|nohup|setsid|exec|command|builtin|time)\s*\(\s*\)|(?:^|[\s;&|(])function\s+(?:sh|bash|dash|zsh|ksh|mksh|ash|busybox|fish|csh|tcsh|cat|tee|install|source|sudo|doas|su|runuser|setpriv|env|nice|ionice|chrt|timeout|stdbuf|systemd-run|systemd-cat|nohup|setsid|exec|command|builtin|time)(?=[\s{(]|$)/;
 const EXPORT_EXPANSION = /(?:^|[\s;&|(])(?:export|declare|typeset)(?:\s+-[A-Za-z]+)*(?:\s+[A-Za-z_][A-Za-z0-9_]*(?:=\S*)?)*\s+["']?[$`]/;
 // The shell itself by positive list (S-B, S-D, t_c82f5ac2): only options that
 // keep the body as the code it runs — -s (also bundled), -e, -u, -x, -v, -o with
@@ -682,6 +688,10 @@ interface ShellScope {
   // Quoted delimiter, local chain, no exported environment, not in the background,
   // and an opener line that passes a failure on.
   plain: boolean;
+  // V-A (Zweitprüfung t_cdad398e): every segment on the opener line in front of
+  // the opener chain is listed (bodySafe). exit 0; bash <<'Y', exec 0<&-; …,
+  // cat >/dev/null; … in a parent body end or drain it before the shell starts.
+  before: boolean;
   lines: ScopeLine[];
   clean: boolean;
   errexit: boolean;
@@ -696,11 +706,40 @@ const BODY_LISTED = /^(?:cd|mkdir|chmod|chown|umask)$/;
 // not even with </dev/null. echo, true, false, test and pwd stay out of it.
 const SHELL_BUILTINS = /^(?:\.|:|\[|\[\[|\]\]|alias|bg|bind|break|builtin|caller|command|compgen|complete|compopt|continue|coproc|declare|dirs|disown|enable|eval|exec|exit|export|fc|fg|getopts|hash|help|history|jobs|kill|let|local|logout|mapfile|popd|printf|pushd|read|readarray|readonly|return|set|shift|shopt|source|suspend|times|trap|type|typeset|ulimit|unalias|unset|wait|if|then|else|elif|fi|case|esac|for|select|while|until|do|done|in|function|time|\{|\}|!|ssh)$/;
 const PLAIN_COMMAND = /^[A-Za-z0-9_.\/+@%-]+$/;
+// V-C (Zweitprüfung t_cdad398e): a nested shell or interpreter and a command that
+// starts another one (sudo, env, xargs, timeout …) never count, not even with
+// </dev/null: sh -c 'cat /proc/$PPID/fd/0 >/dev/null' </dev/null drains the body.
+// Fail safe, a shell named anywhere in the segment counts as well.
+const BODY_STARTERS = /^(?:env|xargs|sudo|doas|su|runuser|setpriv|setsid|nohup|timeout|nice|ionice|chrt|stdbuf|systemd-run|systemd-cat|nsenter|chroot|unshare|flock|script|watch|parallel)$/;
 const DEV_NULL_STDIN = /(?:^|\s)0*<\s*\/dev\/null(?=\s|$)/;
 
+// V-B (Zweitprüfung t_cdad398e): a write with its own heredoc counts only in the
+// form that shows its content — cat with no operand but - and -u, tee with only
+// -a/-i/-p and plain targets, install … /dev/stdin <target> with plain options —,
+// with no $ or backtick and no path below /proc or /dev but /dev/null (and
+// install's /dev/stdin). cat /proc/$$/fd/0 >/dev/null <<'E' would drain the body,
+// cat >/dev/stdin <<'E' would write into it.
+const INSTALL_FLAGS = /^-[CDpvT]+$/;
+const INSTALL_VALUES = /^-[CDpvT]*[mog]$/;
+const INSTALL_LONG = /^--(?:mode|owner|group)=[^\s]+$|^--(?:compare|preserve-timestamps|verbose|no-target-directory)$/;
+
 function heredocWrite(segment: Segment): boolean {
+  if ((segment.text.match(HEREDOC_OPENER) || []).length !== 1 || stdinReplaced(segment)) return false;
+  if (/[$`]/.test(segment.text) || /[<>]&\s*0/.test(segment.text)) return false;
+  if (segment.words.some((word) => /\/(?:proc|dev)\//.test(word) && word.replace(/^\d*(?:>>?|>\||&>)/, "") !== "/dev/null" && word !== "/dev/stdin")) return false;
   const words = commandWords(segment);
-  return /^(?:cat|tee|install)$/.test(words[0] ?? "") && (segment.text.match(HEREDOC_OPENER) || []).length === 1 && !stdinReplaced(segment);
+  const args = words.slice(1);
+  if (words[0] === "cat") return args.every((word) => word === "-" || word === "-u");
+  if (words[0] === "tee") return args.every((word) => /^-[aip]+$/.test(word) || (!word.startsWith("-") && !/[{}*?[\]]/.test(word) && word !== "/dev/stdin"));
+  if (words[0] !== "install") return false;
+  const files: string[] = [];
+  for (let i = 0; i < args.length; i += 1) {
+    if (INSTALL_VALUES.test(args[i])) { i += 1; continue; }
+    if (INSTALL_FLAGS.test(args[i]) || INSTALL_LONG.test(args[i])) continue;
+    if (args[i].startsWith("-") || /[{}*?[\]]/.test(args[i])) return false;
+    files.push(args[i]);
+  }
+  return files.length === 2 && files[0] === "/dev/stdin" && files[1] !== "/dev/stdin";
 }
 
 // The flags of set -e/-u/-x/-o pipefail; null when the words are anything else.
@@ -731,6 +770,7 @@ function bodySafe(segment: Segment): boolean {
   if (command === "install" && words.slice(1).some((word) => /^-[A-Za-z]*d|^--directory$/.test(word))) return true;
   if (heredocWrite(segment)) return true;
   if (!PLAIN_COMMAND.test(command) || SHELL_BUILTINS.test(basename(command))) return false;
+  if (SHELL_WORDS.test(basename(command)) || BODY_STARTERS.test(basename(command)) || words.some((word) => SHELL_NAME.test(word) || SHELL_NAME.test(basename(word)))) return false;
   const rest = segment.text.replace(DEV_NULL_STDIN, " ");
   return DEV_NULL_STDIN.test(segment.text) && !rest.includes("<") && !STDIN_FD.test(rest);
 }
@@ -773,7 +813,7 @@ function shellScopeTrust(scopes: ShellScope[]): void {
   const ok = (scope: ShellScope): boolean => {
     if (!known.has(scope)) {
       const opener = scope.opener;
-      known.set(scope, scope.plain && (scope.parent === null || (opener !== null && ok(scope.parent) && opener.clean && fails(opener, scope.parent))));
+      known.set(scope, scope.plain && (scope.parent === null || (opener !== null && ok(scope.parent) && opener.clean && scope.before && fails(opener, scope.parent))));
     }
     return known.get(scope)!;
   };
@@ -799,6 +839,9 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
   for (const { prefix, text } of scripts) {
     let cwd: string | null = null;
     let environment = false;
+    // A rebound cat, tee or install (cat() { true; }, hash -p /bin/true cat) on
+    // this or an earlier line: a top-level write after it shows nothing either.
+    let rebound = false;
     // U-A: the step's own bash -e and pipefail (Z. 507) until a set + or shopt -o
     // turns them off, and the depth of groups, blocks and functions at top level;
     // fail safe, a count that goes below zero is unknown for the rest of the step.
@@ -838,7 +881,8 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
       // H2: every heredoc of the line; their bodies follow one after the other.
       const openers = [...line.matchAll(/(?<!<)<<(-?)\s*(['"]?)([A-Za-z_][\w-]*)\2/g)];
       const segments = segmentsOf(line);
-      environment ||= STEP_ENVIRONMENT.test(line) || EXPORT_EXPANSION.test(line) || segments.some((segment) => (/^(?:export|declare|typeset)$/.test(segment.command) && segment.words.some((word) => /^-[A-Za-z]*f/.test(word))) || (segment.command === "set" && segment.words.some((word) => /^-[A-Za-z]*a|^allexport$/.test(word))));
+      rebound ||= REBIND.test(line);
+      environment ||= STEP_ENVIRONMENT.test(line) || rebound || EXPORT_EXPANSION.test(line) || segments.some((segment) => (/^(?:export|declare|typeset)$/.test(segment.command) && segment.words.some((word) => /^-[A-Za-z]*f/.test(word))) || (segment.command === "set" && segment.words.some((word) => /^-[A-Za-z]*a|^allexport$/.test(word))));
       const parts = segments.map((segment) => {
         const part = { segment, cwd };
         if (segment.command === "cd") {
@@ -848,7 +892,7 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
         return part;
       });
       const scope = inner?.scope ?? null;
-      const scriptLine: ScriptLine = { where, text: line, body: false, heredoc: false, trusted: !inner, parts };
+      const scriptLine: ScriptLine = { where, text: line, body: false, heredoc: false, trusted: !inner && !rebound, parts };
       let entry: ScopeLine | null = null;
       if (scope && segments.length) {
         const safe = segments.every(bodySafe);
@@ -894,7 +938,7 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
         if (shell) {
           const passes = scope ? openerPassesFailure(line, segments, start, at, scope.pipefail) : errexit && depth === 0 && openerPassesFailure(line, segments, start, at, pipefail);
           const flags = shellFlags(segments[at]);
-          body = { parent: scope, opener: entry, plain: quoted && local !== null && !environment && !background && passes, lines: [], clean: true, errexit: flags.errexit, pipefail: flags.pipefail };
+          body = { parent: scope, opener: entry, plain: quoted && local !== null && !environment && !background && passes, before: segments.slice(0, start).every(bodySafe), lines: [], clean: true, errexit: flags.errexit, pipefail: flags.pipefail };
           scopes.push(body);
         }
         bodies.push({ ...here, shell, cwd, inside: local === "moved" ? null : cwd, started: false, scope: body });
@@ -905,7 +949,9 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
         const words = line.split(/[\s;&|]+/);
         depth += words.filter((word) => /^(?:if|while|until|for|case|select|function|\{)$/.test(word)).length + (line.match(/\(/g) || []).length;
         depth -= words.filter((word) => /^(?:fi|done|esac|\})$/.test(word)).length + (line.match(/\)/g) || []).length;
-        if (depth < 0) depth = Number.POSITIVE_INFINITY;
+        // Hint of t_cdad398e: the ) of a case pattern is no closing parenthesis;
+        // fail safe, after a case the depth is unknown for the rest of the step.
+        if (depth < 0 || words.includes("case")) depth = Number.POSITIVE_INFINITY;
       }
       scriptLine.heredoc = literal;
       out.push(scriptLine);
