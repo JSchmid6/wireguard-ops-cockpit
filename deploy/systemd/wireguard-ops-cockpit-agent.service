@@ -18,6 +18,9 @@ Environment=COCKPIT_OPENCODE_CONFIG=/var/lib/wireguard-ops-agent/.config/opencod
 # (wireguard-ops-cockpit-runner.service, card t_cb81637b).
 Environment=COCKPIT_AGENT_BROKER_ROLES=planner,research,safety,verifier
 EnvironmentFile=/etc/wireguard-ops-cockpit/agent.env
+# The Claude login (CLAUDE_CODE_OAUTH_TOKEN) for planner/research only here, never
+# in the runner unit, which loads agent.env too (card t_936d9b0f). Optional.
+EnvironmentFile=-/etc/wireguard-ops-cockpit/claude.env
 RuntimeDirectory=cockpit-agent
 RuntimeDirectoryMode=0770
 ExecStart=/opt/node-v22.23.4-linux-x64/bin/node /opt/wireguard-ops-cockpit/apps/agent-broker/src/index.mjs

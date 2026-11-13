@@ -44,7 +44,7 @@ import { generateRunbookSafetyReview, type SafetyReviewRunner } from "./safety-r
 import { activationAction, activationReason, capabilityExecution, hostRunExecution, selfUpdateVerifierNote, typedActionsExecution, type TypedActionOutput, type TypedExecution } from "./self-update-activation.js";
 import { boundedVerifierPrompt } from "./verifier-prompt.js";
 import { BREAKER_WINDOW_MS, OPERATION_PATTERN, breakerKeyFor, breakerReason, evaluateBreaker } from "./circuit-breaker.js";
-import { brokerSocketForRole, runBrokerAgent } from "./agent-broker.js";
+import { BrokerAgentError, brokerSocketForRole, runBrokerAgent, runBrokerAgentWithEngine, type AgentEngine } from "./agent-broker.js";
 import { runDynamicCapability, runExecutorAction, type ExecutorActionKind } from "./executor-broker.js";
 import { borgStatusRequestDigest, createBorgStatusService } from "./borg-status.js";
 import { createRetentionService, decideRetentionChange, readApproval, retentionRequestDigest, retentionTarget } from "./borg-retention.js";
@@ -1967,15 +1967,38 @@ export async function createApp(options: AppOptions = {}) {
     windowSuffix: string,
     timeoutMs: number,
     model = config.opencodeModel,
+    jobId?: string,
   ): Promise<string> {
     if (config.agentBrokerSocket) {
-      return await runBrokerAgent(brokerSocketForRole(config, role), role, buildBrokerAgentPrompt(agent, prompt));
+      try {
+        const { output, engine } = await runBrokerAgentWithEngine(brokerSocketForRole(config, role), role, buildBrokerAgentPrompt(agent, prompt));
+        if (jobId && engine) recordAgentEngine(jobId, role, engine);
+        return output;
+      } catch (error) {
+        if (jobId && error instanceof BrokerAgentError && error.engine) recordAgentEngine(jobId, role, error.engine);
+        throw error;
+      }
     }
     executeAgentPlan(createAgentPlan(actor, agent, session.id, prompt, 30_000), actor, agent, windowSuffix, model);
     const logFile = `/tmp/opencode-${session.id.substring(0,8)}-${agent.id}${windowSuffix}.log`;
     const output = await pollAgentLog(logFile, timeoutMs);
     if (!output) throw new Error(`${role} did not finish within the execution timeout`);
     return output;
+  }
+
+  // Which engine planned or researched stays on the job (output.agentEngine),
+  // and a Claude failure that opencode (DeepSeek) stood in for is marked
+  // NOTBETRIEB in output.notbetrieb — Hermes reports it to Jochen (card
+  // t_936d9b0f). updateHermesJob carries both through every later update.
+  function recordAgentEngine(jobId: string, role: string, engine: AgentEngine): void {
+    const job = database.getJob(jobId);
+    if (!job || job.status === "withdrawn") return;
+    const engines: Record<string, AgentEngine> = { ...(job.output?.agentEngine as Record<string, AgentEngine> | undefined), [role]: engine };
+    // From the latest engine per role: a re-plan on Claude clears an older NOTBETRIEB.
+    const lines = Object.entries(engines).filter(([, value]) => value?.notbetrieb)
+      .map(([name, value]) => `NOTBETRIEB: ${name} ran on ${value.model} (opencode) because Claude failed: ${value.reason}`);
+    const { notbetrieb: _previous, ...rest } = job.output || {};
+    database.updateJob(jobId, { status: job.status, output: { ...rest, agentEngine: engines, ...(lines.length ? { notbetrieb: lines.join("\n") } : {}) } });
   }
 
   async function runIndependentVerification(
@@ -2391,7 +2414,8 @@ export async function createApp(options: AppOptions = {}) {
     // executionStartedAt markiert den Beginn der Ausführung auf dem Host; er
     // bleibt am Job, damit ein späterer Fehlschlag als echter Fehllauf zählt.
     // hostRunQueue belegt, wie lange der Job auf den Platz am Host wartete.
-    const carried = Object.fromEntries(["request", "restarts", "executionStartedAt", "hostRunQueue"].filter((key) => key in previous).map((key) => [key, previous[key]]));
+    // agentEngine/notbetrieb: welcher Motor plante, ob DeepSeek einsprang (t_936d9b0f).
+    const carried = Object.fromEntries(["request", "restarts", "executionStartedAt", "hostRunQueue", "agentEngine", "notbetrieb"].filter((key) => key in previous).map((key) => [key, previous[key]]));
     const output: Record<string, unknown> = { ...carried, ...extra, explanation: detail };
     const updated = database.updateJob(jobId, {
       status,
@@ -2456,7 +2480,7 @@ export async function createApp(options: AppOptions = {}) {
         return;
       }
       updateHermesJob(job.id, "running", explanation({ phase: "planning", intent, reason: "Planner is performing read-only research." }));
-      const raw = await runIsolatedAgent(actor, session, agent, "research", agentTask, "", 2 * 60_000);
+      const raw = await runIsolatedAgent(actor, session, agent, "research", agentTask, "", 2 * 60_000, config.opencodeModel, job.id);
       const answer = filterSensitiveContent(extractCleanOutput(raw) || extractAnswer(raw));
       if (!answer || answer.length < 20 || /^>\s*build\b/i.test(answer.trim())) {
         updateHermesJob(job.id, "failed_verification", explanation({
@@ -2543,7 +2567,7 @@ export async function createApp(options: AppOptions = {}) {
       const planner = findAgent("planner-agent", "opencode");
       if (!planner) throw new Error("planner not available");
       updateHermesJob(job.id, "running", explanation({ phase: "planning", intent, reason: "Planner is producing a structured change plan." }));
-      const plannerRaw = await runIsolatedAgent(actor, session, planner, "planner", agentTask, "", 5 * 60_000);
+      const plannerRaw = await runIsolatedAgent(actor, session, planner, "planner", agentTask, "", 5 * 60_000, config.opencodeModel, job.id);
       const planText = filterSensitiveContent(extractCleanOutput(plannerRaw));
       if (!planText || planText.length < 20) throw new Error("planner produced no reviewable plan");
 

@@ -14,12 +14,13 @@ Never add `cockpit-agent` or `cockpit-runner` to `cockpit-executor-client` or gr
 ## Secret placement
 
 - `/etc/wireguard-ops-cockpit/api.env`: envelope and executor-client secrets; no provider key
-- `/etc/wireguard-ops-cockpit/agent.env`: provider key and model selection only (read by both the agent and the runner unit)
+- `/etc/wireguard-ops-cockpit/agent.env`: provider key (`DEEPSEEK_API_KEY`) and engine/model selection only (read by both the agent and the runner unit)
+- `/etc/wireguard-ops-cockpit/claude.env`: the Claude login (`CLAUDE_CODE_OAUTH_TOKEN`) only, optional, read by the agent unit alone — never by the runner unit (`doc/setup/plan-engine-claude.md`; every shell role in the agent unit can still read it via `/proc` of its own uid)
 - `/etc/wireguard-ops-cockpit/executor.env`: executor broker secret only
 - `/home/hermes/.hermes/credentials/cockpit.token`: Hermes-owned route-scoped bearer token; Control stores only its SHA-256 hash
 - `/etc/wireguard-ops-cockpit/admin-recovery.env`: root-only recovery login, never sourced into an agent service
 
-All three files are `root:root` mode `0600`. systemd reads them before dropping identity.
+These files are `root:root` mode `0600`. systemd reads them before dropping identity.
 
 The Hermes token file is `hermes:hermes` mode `0600` because Hermes must present it, but method-and-route scopes grant no approval or audit access. Rotating the administrator password must revoke existing cookie sessions. Rotating the Hermes token replaces the previous hash for the same token label.
 

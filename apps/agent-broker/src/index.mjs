@@ -118,77 +118,207 @@ export function sessionStateDirs(workspace) {
   return { XDG_DATA_HOME: path.join(base, "data"), XDG_STATE_HOME: path.join(base, "state"), XDG_CACHE_HOME: path.join(base, "cache"), TMPDIR: path.join(base, "tmp") };
 }
 
-export function runAgent(request) {
+// The role's whole budget; with Claude in front of a fallback both share it.
+// Measured 2026-08-18: a 10-step read-only exploration with deepseek-v4-pro
+// takes almost exactly five minutes, so the old 300s default killed every
+// planning phase at the moment it finished exploring — the WordPress update
+// died mid-handoff with "completed: []". The runner budget rises with it: a
+// core+plugins update plus its backup can exceed ten minutes without anything
+// being wrong.
+export function roleBudgetMs(role) {
+  return role === "runner" ? 1800000 : role === "research" ? 120000 : 900000;
+}
+
+// Planner and research may run on Claude through the subscription (Jochen,
+// 13.11.2026, card t_936d9b0f); safety, verifier and the runner stay on
+// opencode. COCKPIT_PLAN_ENGINE=claude in agent.env switches it on; read per
+// run, so the unit's environment is the one truth.
+export const claudeRoles = new Set(["planner", "research"]);
+export function claudeSettings(env = process.env) {
+  return {
+    enabled: env.COCKPIT_PLAN_ENGINE === "claude",
+    executable: env.COCKPIT_CLAUDE_EXECUTABLE || "claude",
+    model: env.COCKPIT_CLAUDE_MODEL || "sonnet",
+  };
+}
+
+// The tools of opencode's plan agent that the two roles use: read, search,
+// shell (the unit is the boundary, AGENTS.md "plan denies only the edit tool"),
+// web for research. No edit or write tool.
+export const claudeTools = "Bash,Read,Grep,Glob,WebFetch,WebSearch";
+
+export function claudeArgs(workspace, model) {
+  // --safe-mode: no CLAUDE.md, skills, plugins, hooks, MCP servers, custom
+  // agents or commands — whatever lies on the host reaches no role (like
+  // opencode's --pure plus assertNoPlantedConfig). The role instructions come
+  // from the workspace's root-controlled AGENTS.md, as the system prompt's tail.
+  // Listing the tools in --allowedTools lets -p use them without a prompt;
+  // every other tool is refused.
+  return ["-p", "--safe-mode", "--strict-mcp-config", "--no-session-persistence", "--model", model,
+    "--tools", claudeTools, "--allowedTools", claudeTools,
+    "--append-system-prompt-file", path.join(workspace, "AGENTS.md"), "--output-format", "json"];
+}
+
+// Claude's state belongs to the run like opencode's: CLAUDE_CONFIG_DIR below
+// the workspace, so no settings, credentials file or session one run leaves
+// reaches a later role. The login is the long-lived token from
+// `claude setup-token` in claude.env, which only the agent unit loads
+// (CLAUDE_CODE_OAUTH_TOKEN); the subprocess
+// scrub keeps it out of the shell the model drives (needs bubblewrap; without
+// it Claude refuses to start and the run falls back, labelled NOTBETRIEB).
+// HOME too: Claude writes caches and its .claude.json there, and the
+// identity's home is read-only in the unit (and must not grow a .claude).
+export function claudeEnv(workspace, env = process.env) {
+  const state = sessionStateDirs(workspace);
+  const base = path.dirname(state.XDG_DATA_HOME);
+  return {
+    HOME: path.join(base, "home"),
+    PATH: env.PATH,
+    CLAUDE_CODE_OAUTH_TOKEN: env.CLAUDE_CODE_OAUTH_TOKEN,
+    CLAUDE_CONFIG_DIR: path.join(base, "claude"),
+    ...state,
+    CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: env.COCKPIT_CLAUDE_ENV_SCRUB === "0" ? "0" : "1",
+    DISABLE_AUTOUPDATER: "1",
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+    NODE_ENV: "production",
+  };
+}
+
+// Claude's JSON result: the answer and the model that really answered
+// (modelUsage), or why it did not. The reason is shown on the job: clipped,
+// one line, never a token-like string.
+export function parseClaudeResult(stdout) {
+  let value;
+  try { value = JSON.parse(stdout); } catch { return { ok: false, json: false, reason: `claude returned no JSON result (${stdout.trim().slice(0, 120) || "empty"})` }; }
+  const text = typeof value?.result === "string" ? value.result : "";
+  const models = Object.keys(value?.modelUsage || {});
+  if (value?.is_error || value?.subtype !== "success" || !text.trim()) {
+    return { ok: false, json: true, reason: text.trim() || `claude ended with ${value?.subtype || "an error"}` };
+  }
+  return { ok: true, output: text, model: models.join(",") || "unknown" };
+}
+
+export function cleanReason(text) {
+  return String(text).replace(/\s+/g, " ").replace(/[A-Za-z0-9_\-]{32,}/g, "[…]").trim().slice(0, 300);
+}
+
+// One process in its workspace with a deadline: stdout, stderr, exit code.
+function runProcess(executable, args, env, workspace, prompt, timeoutMs) {
   return new Promise((resolve) => {
-    const model = request.role === "planner" || request.role === "research" || request.role === "runner" ? plannerModel : safetyModel;
-    const opencodeAgent = request.role === "runner" ? "build" : "plan";
-    // The prompt goes on stdin: `opencode run` without a message reads the
-    // piped text as the message (opencode 1.18 run.ts, resolveRunInput). An
-    // argv element is capped at 128 KiB by Linux, and run joins argv with
-    // quotes and backslash-escaped double quotes, which altered the prompt.
-    const args = ["run", "--auto", "--pure", "--agent", opencodeAgent, ...(model ? ["--model", model] : []), "--print-logs"];
-    let workspace;
-    try {
-      workspace = createSessionWorkspace(request);
-    } catch (error) {
-      resolve({ ok: false, error: `agent workspace setup failed: ${error.message}` });
-      return;
-    }
-    const child = spawn(executable, args, {
-      cwd: workspace,
-      env: {
-        HOME: process.env.HOME,
-        PATH: process.env.PATH,
-        DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY,
-        OPENCODE_CONFIG: opencodeConfig,
-        ...sessionStateDirs(workspace),
-        // With an empty cache opencode would fetch the 6 MB models catalog on every
-        // run (measured 13.11.2026); the catalog built into the pinned release
-        // knows the production models. Providers whose key comes from the
-        // environment (agent.env) need no auth.json.
-        OPENCODE_DISABLE_MODELS_FETCH: "1",
-        // opencode installs packages with npm's config (core npm-config.ts reads
-        // the environment); npm's default cache ~/.npm lies in the read-only
-        // home, so an install would fail. The cache belongs to the run like
-        // opencode's own (card t_2a2d8e5b): what one run puts there never
-        // reaches a later role.
-        npm_config_cache: path.join(sessionStateDirs(workspace).XDG_CACHE_HOME, "npm"),
-        NODE_ENV: "production",
-      },
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    const child = spawn(executable, args, { cwd: workspace, env, stdio: ["pipe", "pipe", "pipe"] });
     // A child that dies before reading its input must not crash the broker (EPIPE).
     child.stdin.on("error", () => {});
-    child.stdin.end(request.prompt, "utf8");
+    child.stdin.end(prompt, "utf8");
     let stdout = "";
     let stderr = "";
     let settled = false;
+    let timedOut = false;
+    let forceKillTimer;
     const finish = (result) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       if (forceKillTimer) clearTimeout(forceKillTimer);
-      try { removeSessionWorkspace(workspace); }
-      catch (error) { result = { ok: false, error: `agent workspace cleanup failed: ${error.message}` }; }
-      resolve(result);
+      resolve({ ...result, stdout, stderr, timedOut });
     };
-    let forceKillTimer;
     const timer = setTimeout(() => {
+      timedOut = true;
       child.kill("SIGTERM");
       forceKillTimer = setTimeout(() => child.kill("SIGKILL"), 5000);
-    // Measured 2026-08-18: a 10-step read-only exploration with deepseek-v4-pro
-      // takes almost exactly five minutes, so the old 300s default killed every
-      // planning phase at the moment it finished exploring — the WordPress
-      // update died mid-handoff with "completed: []". The runner budget rises
-      // with it: a core+plugins update plus its backup can exceed ten minutes
-      // without anything being wrong.
-      }, request.role === "runner" ? 1800000 : request.role === "research" ? 120000 : 900000);
+    }, Math.max(1000, timeoutMs));
     child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => { if (stdout.length < 2_000_000) stdout += chunk; });
     child.stderr.on("data", (chunk) => { if (stderr.length < 200_000) stderr += chunk; });
-    child.on("error", (error) => finish({ ok: false, error: error.message }));
-    child.on("close", (code) => finish({ ok: code === 0, exitCode: code, output: stdout, error: code === 0 ? null : stderr.slice(-4000) }));
+    child.on("error", (error) => finish({ code: null, spawnError: error.message }));
+    child.on("close", (code) => finish({ code }));
   });
+}
+
+// One engine run in its own fresh workspace, removed afterwards whatever happens.
+async function inWorkspace(request, run) {
+  let workspace;
+  try {
+    workspace = createSessionWorkspace(request);
+  } catch (error) {
+    return { ok: false, error: `agent workspace setup failed: ${error.message}` };
+  }
+  let result;
+  try {
+    result = await run(workspace);
+  } finally {
+    try { removeSessionWorkspace(workspace); }
+    catch (error) { result = { ok: false, error: `agent workspace cleanup failed: ${error.message}` }; }
+  }
+  return result;
+}
+
+export async function runAgent(request) {
+  const deadline = Date.now() + roleBudgetMs(request.role);
+  const claude = claudeSettings();
+  let notbetrieb = null;
+  if (claude.enabled && claudeRoles.has(request.role)) {
+    const result = await inWorkspace(request, (workspace) => runClaude(request, workspace, claude, deadline));
+    if (!result.fallback) return result;
+    notbetrieb = result.fallback;
+    console.error(`agent ${request.requestId} ${request.role}: claude failed, NOTBETRIEB with opencode: ${notbetrieb}`);
+  }
+  // The stand-in gets a fresh workspace, checked again for planted config: what
+  // the Claude run's shell left in its workspace never reaches opencode.
+  const engine = { name: "opencode", model: opencodeModelFor(request.role) || "default", ...(notbetrieb ? { notbetrieb: true, reason: notbetrieb } : {}) };
+  const result = await inWorkspace(request, async (workspace) => {
+    const run = await runOpencode(request, workspace, deadline - Date.now());
+    if (run.spawnError) return { ok: false, error: run.spawnError };
+    return { ok: run.code === 0, exitCode: run.code, output: run.stdout, error: run.code === 0 ? null : run.stderr.slice(-4000) };
+  });
+  return { ...result, engine };
+}
+
+// Claude's answer, a failure that ends the role, or { fallback: reason }.
+async function runClaude(request, workspace, claude, deadline) {
+  const env = claudeEnv(workspace);
+  fs.mkdirSync(env.HOME, { recursive: true, mode: 0o700 });
+  const run = await runProcess(claude.executable, claudeArgs(workspace, claude.model), env, workspace, request.prompt, deadline - Date.now());
+  const parsed = parseClaudeResult(run.stdout);
+  if (parsed.ok && run.code === 0) return { ok: true, exitCode: 0, output: parsed.output, engine: { name: "claude", model: parsed.model } };
+  // A run that used its whole budget has no time left for a second engine,
+  // and its failure is no outage: it fails like any role over budget.
+  if (run.timedOut) return { ok: false, exitCode: run.code, error: "claude did not finish within the role budget", engine: { name: "claude", model: claude.model } };
+  // Without a JSON result (unknown option, sandbox start) the reason is on stderr.
+  const reason = run.spawnError || (parsed.ok ? `claude exited with ${run.code}` : parsed.json ? parsed.reason : run.stderr.trim().slice(-300) || parsed.reason);
+  return { fallback: cleanReason(reason || "claude failed") };
+}
+
+function opencodeModelFor(role) {
+  return role === "planner" || role === "research" || role === "runner" ? plannerModel : safetyModel;
+}
+
+function runOpencode(request, workspace, timeoutMs) {
+  const model = opencodeModelFor(request.role);
+  const opencodeAgent = request.role === "runner" ? "build" : "plan";
+  // The prompt goes on stdin: `opencode run` without a message reads the
+  // piped text as the message (opencode 1.18 run.ts, resolveRunInput). An
+  // argv element is capped at 128 KiB by Linux, and run joins argv with
+  // quotes and backslash-escaped double quotes, which altered the prompt.
+  const args = ["run", "--auto", "--pure", "--agent", opencodeAgent, ...(model ? ["--model", model] : []), "--print-logs"];
+  return runProcess(executable, args, {
+    HOME: process.env.HOME,
+    PATH: process.env.PATH,
+    DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY,
+    OPENCODE_CONFIG: opencodeConfig,
+    ...sessionStateDirs(workspace),
+    // With an empty cache opencode would fetch the 6 MB models catalog on every
+    // run (measured 13.11.2026); the catalog built into the pinned release
+    // knows the production models. Providers whose key comes from the
+    // environment (agent.env) need no auth.json.
+    OPENCODE_DISABLE_MODELS_FETCH: "1",
+    // opencode installs packages with npm's config (core npm-config.ts reads
+    // the environment); npm's default cache ~/.npm lies in the read-only
+    // home, so an install would fail. The cache belongs to the run like
+    // opencode's own (card t_2a2d8e5b): what one run puts there never
+    // reaches a later role.
+    npm_config_cache: path.join(sessionStateDirs(workspace).XDG_CACHE_HOME, "npm"),
+    NODE_ENV: "production",
+  }, workspace, request.prompt, timeoutMs);
 }
 
 if (process.env.NODE_ENV !== "test") {
