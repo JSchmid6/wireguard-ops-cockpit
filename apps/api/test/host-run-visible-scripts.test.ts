@@ -1427,3 +1427,39 @@ describe("hash-pinned scripts: tabs an outer <<- strips, << in arithmetic and ${
     expect(found(`n=$(( 1 + 2 ))\n(( n++ )) || true\necho "\${n:-0} $[n]" >/dev/null\n${body}\n${pin}\n${P}`)).toEqual([]);
   });
 });
+
+describe("hash-pinned scripts: a backslash at the end of an unquoted heredoc line (Hinweis B1, t_0bc8fac5)", () => {
+  const P = "/opt/x/run.sh";
+  const pin = `echo "${HASH}  ${P}" | sha256sum -c -`;
+  const found = (run: string) => hiddenPinnedScripts(manifest([{ name: "s1", run }]) as never).map(({ path }) => path);
+  // In an unquoted heredoc bash joins a line ending in an odd number of
+  // backslashes with the next before it compares the delimiter: EOF after
+  // echo hi\ ends nothing, and : <<'true' after it swallows the write.
+  const swallowed = (open: string, tab = "") => `cat > ${P} <<${open}\n${tab}echo hi\\\n${tab}EOF\n: <<'true'\n${tab}EOF\nprintf 'echo BOESE\\n' > ${P}\ntrue`;
+
+  for (const open of ["EOF", "-EOF"]) {
+    it(`B1: top level, <<${open}`, () => {
+      expect(found(`${swallowed(open)}\n${pin}\n${P}`)).toEqual([P]);
+    });
+    for (const opener of ["bash <<'X'", "cat <<'X' | sudo bash", "bash <<-'X'"]) {
+      it(`B1: in the body of ${opener}, <<${open}`, () => {
+        expect(found(`${opener}\n${swallowed(open)}\nX\n${pin}\n${P}`)).toEqual([P]);
+      });
+    }
+    it(`B1: in a stripped <<- body with tabs, <<${open}`, () => {
+      expect(found(`bash <<-'X'\n${swallowed(open, "\t").replace(/\n(?!\t)/g, "\n\t")}\n\tX\n${pin}\n${P}`)).toEqual([P]);
+    });
+  }
+
+  it("B1: three backslashes join as well", () => {
+    expect(found(`cat > ${P} <<EOF\necho hi\\\\\\\nEOF\n: <<'true'\nEOF\nprintf 'echo BOESE\\n' > ${P}\ntrue\n${pin}\n${P}`)).toEqual([P]);
+  });
+
+  it("guard: a quoted heredoc and an even number of backslashes stay free", () => {
+    for (const open of ["'EOF'", "\"EOF\"", "-'EOF'"]) {
+      expect(found(`cat > ${P} <<${open}\necho hi \\\nEOF\n${pin}\n${P}`)).toEqual([]);
+      expect(found(`bash <<'X'\ncat > ${P} <<${open}\necho hi \\\nEOF\nX\n${pin}\n${P}`)).toEqual([]);
+    }
+    expect(found(`cat > ${P} <<EOF\necho hi \\\\\nEOF\n${pin}\n${P}`)).toEqual([]);
+  });
+});
