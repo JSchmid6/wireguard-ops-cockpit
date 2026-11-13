@@ -833,12 +833,17 @@ ln -sfn "$NODE_DIR/bin/opencode" /usr/local/bin/opencode
 # Claude Code: Planer und Research laufen damit, sobald agent.env es einschaltet
 # (apps/agent-broker/src/index.mjs claudeSettings); ohne Schalter liegt es nur da.
 log "9b) Claude Code installieren (Planer/Research, Version $CLAUDE_CODE_VERSION)"
-npm install -g --silent "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
-test -x "$NODE_DIR/bin/claude" || die "claude-Binary nicht gefunden ($NODE_DIR/bin/claude)."
-chmod -R a+rX "$NODE_DIR/lib/node_modules/@anthropic-ai" 2>/dev/null || true
-# Nichts in sein Home schreiben: ein ~/.claude dort hielte jede Rolle an (assertNoPlantedConfig).
-timeout 60 runuser -u cockpit-agent -- env HOME=/nonexistent CLAUDE_CONFIG_DIR=/nonexistent/claude DISABLE_AUTOUPDATER=1 "$NODE_DIR/bin/claude" --version >/dev/null 2>&1 \
-  || die "claude --version schlägt als cockpit-agent fehl (runuser-Test)."
+# Kein Abbruch: ohne Schalter braucht niemand Claude, und ein fehlgeschlagener
+# Download darf kein Deploy/Self-Update anhalten. Ist der Schalter an, läuft der
+# Broker dann sichtbar im NOTBETRIEB (doc/setup/plan-engine-claude.md).
+if npm install -g --silent "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION" && test -x "$NODE_DIR/bin/claude"; then
+  chmod -R a+rX "$NODE_DIR/lib/node_modules/@anthropic-ai" 2>/dev/null || true
+  # Nichts in sein Home schreiben: ein ~/.claude dort hielte jede Rolle an (assertNoPlantedConfig).
+  timeout 60 runuser -u cockpit-agent -- env HOME=/nonexistent CLAUDE_CONFIG_DIR=/nonexistent/claude DISABLE_AUTOUPDATER=1 "$NODE_DIR/bin/claude" --help 2>/dev/null | grep -q -- '--safe-mode' \
+    || echo "HINWEIS: claude als cockpit-agent nicht lauffähig oder ohne --safe-mode — Planer/Research bleiben im NOTBETRIEB."
+else
+  echo "HINWEIS: Claude Code $CLAUDE_CODE_VERSION nicht installiert — Planer/Research bleiben bei COCKPIT_PLAN_ENGINE=claude im NOTBETRIEB."
+fi
 # BEGIN agent-opencode-config (test/cockpit-agent-unit-e2e-inner.sh runs exactly these lines)
 # The config of every agent role belongs to root; the agent identity, which also
 # runs the runner with build tools, only reads it. The unit keeps the home

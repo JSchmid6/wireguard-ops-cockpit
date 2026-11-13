@@ -46,6 +46,12 @@ function brokerEngine(value: unknown): AgentEngine | null {
   };
 }
 
+export class BrokerAgentError extends Error {
+  constructor(message: string, readonly engine: AgentEngine | null) {
+    super(message);
+  }
+}
+
 export async function runBrokerAgent(socketPath: string, role: AgentBrokerRole, prompt: string): Promise<string> {
   return (await runBrokerAgentWithEngine(socketPath, role, prompt)).output;
 }
@@ -68,7 +74,9 @@ export async function runBrokerAgentWithEngine(socketPath: string, role: AgentBr
     connection.on("close", () => {
       try {
         const parsed = JSON.parse(response) as { ok?: boolean; output?: string; error?: string; engine?: unknown };
-        if (!parsed.ok || typeof parsed.output !== "string") reject(new Error(parsed.error || "agent broker failed"));
+        // A failed run still names its engine: Claude failed and the stand-in too
+        // is a NOTBETRIEB the job must show (BrokerAgentError.engine).
+        if (!parsed.ok || typeof parsed.output !== "string") reject(new BrokerAgentError(parsed.error || "agent broker failed", brokerEngine(parsed.engine)));
         else resolve({ output: parsed.output, engine: brokerEngine(parsed.engine) });
       } catch (error) { reject(error); }
     });

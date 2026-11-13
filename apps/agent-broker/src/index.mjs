@@ -188,11 +188,11 @@ export function claudeEnv(workspace, env = process.env) {
 // one line, never a token-like string.
 export function parseClaudeResult(stdout) {
   let value;
-  try { value = JSON.parse(stdout); } catch { return { ok: false, reason: `claude returned no JSON result (${stdout.trim().slice(0, 120) || "empty"})` }; }
+  try { value = JSON.parse(stdout); } catch { return { ok: false, json: false, reason: `claude returned no JSON result (${stdout.trim().slice(0, 120) || "empty"})` }; }
   const text = typeof value?.result === "string" ? value.result : "";
   const models = Object.keys(value?.modelUsage || {});
   if (value?.is_error || value?.subtype !== "success" || !text.trim()) {
-    return { ok: false, reason: text.trim() || `claude ended with ${value?.subtype || "an error"}` };
+    return { ok: false, json: true, reason: text.trim() || `claude ended with ${value?.subtype || "an error"}` };
   }
   return { ok: true, output: text, model: models.join(",") || "unknown" };
 }
@@ -233,7 +233,8 @@ function runProcess(executable, args, env, workspace, prompt, timeoutMs) {
   });
 }
 
-export async function runAgent(request) {
+// One engine run in its own fresh workspace, removed afterwards whatever happens.
+async function inWorkspace(request, run) {
   let workspace;
   try {
     workspace = createSessionWorkspace(request);
@@ -242,7 +243,7 @@ export async function runAgent(request) {
   }
   let result;
   try {
-    result = await runInWorkspace(request, workspace);
+    result = await run(workspace);
   } finally {
     try { removeSessionWorkspace(workspace); }
     catch (error) { result = { ok: false, error: `agent workspace cleanup failed: ${error.message}` }; }
@@ -250,26 +251,40 @@ export async function runAgent(request) {
   return result;
 }
 
-async function runInWorkspace(request, workspace) {
+export async function runAgent(request) {
   const deadline = Date.now() + roleBudgetMs(request.role);
   const claude = claudeSettings();
   let notbetrieb = null;
   if (claude.enabled && claudeRoles.has(request.role)) {
-    const env = claudeEnv(workspace);
-    fs.mkdirSync(env.HOME, { recursive: true, mode: 0o700 });
-    const run = await runProcess(claude.executable, claudeArgs(workspace, claude.model), env, workspace, request.prompt, deadline - Date.now());
-    const parsed = parseClaudeResult(run.stdout);
-    if (parsed.ok && run.code === 0) return { ok: true, exitCode: 0, output: parsed.output, engine: { name: "claude", model: parsed.model } };
-    // A run that used its whole budget has no time left for a second engine,
-    // and its failure is no outage: it fails like any role over budget.
-    if (run.timedOut) return { ok: false, exitCode: run.code, error: "claude did not finish within the role budget", engine: { name: "claude", model: claude.model } };
-    notbetrieb = cleanReason(run.spawnError || (parsed.ok ? `claude exited with ${run.code}` : parsed.reason) || run.stderr.slice(-300) || "claude failed");
+    const result = await inWorkspace(request, (workspace) => runClaude(request, workspace, claude, deadline));
+    if (!result.fallback) return result;
+    notbetrieb = result.fallback;
     console.error(`agent ${request.requestId} ${request.role}: claude failed, NOTBETRIEB with opencode: ${notbetrieb}`);
   }
-  const run = await runOpencode(request, workspace, deadline - Date.now());
+  // The stand-in gets a fresh workspace, checked again for planted config: what
+  // the Claude run's shell left in its workspace never reaches opencode.
   const engine = { name: "opencode", model: opencodeModelFor(request.role) || "default", ...(notbetrieb ? { notbetrieb: true, reason: notbetrieb } : {}) };
-  if (run.spawnError) return { ok: false, error: run.spawnError, engine };
-  return { ok: run.code === 0, exitCode: run.code, output: run.stdout, error: run.code === 0 ? null : run.stderr.slice(-4000), engine };
+  const result = await inWorkspace(request, async (workspace) => {
+    const run = await runOpencode(request, workspace, deadline - Date.now());
+    if (run.spawnError) return { ok: false, error: run.spawnError };
+    return { ok: run.code === 0, exitCode: run.code, output: run.stdout, error: run.code === 0 ? null : run.stderr.slice(-4000) };
+  });
+  return { ...result, engine };
+}
+
+// Claude's answer, a failure that ends the role, or { fallback: reason }.
+async function runClaude(request, workspace, claude, deadline) {
+  const env = claudeEnv(workspace);
+  fs.mkdirSync(env.HOME, { recursive: true, mode: 0o700 });
+  const run = await runProcess(claude.executable, claudeArgs(workspace, claude.model), env, workspace, request.prompt, deadline - Date.now());
+  const parsed = parseClaudeResult(run.stdout);
+  if (parsed.ok && run.code === 0) return { ok: true, exitCode: 0, output: parsed.output, engine: { name: "claude", model: parsed.model } };
+  // A run that used its whole budget has no time left for a second engine,
+  // and its failure is no outage: it fails like any role over budget.
+  if (run.timedOut) return { ok: false, exitCode: run.code, error: "claude did not finish within the role budget", engine: { name: "claude", model: claude.model } };
+  // Without a JSON result (unknown option, sandbox start) the reason is on stderr.
+  const reason = run.spawnError || (parsed.ok ? `claude exited with ${run.code}` : parsed.json ? parsed.reason : run.stderr.trim().slice(-300) || parsed.reason);
+  return { fallback: cleanReason(reason || "claude failed") };
 }
 
 function opencodeModelFor(role) {

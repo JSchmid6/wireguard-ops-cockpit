@@ -44,7 +44,7 @@ import { generateRunbookSafetyReview, type SafetyReviewRunner } from "./safety-r
 import { activationAction, activationReason, capabilityExecution, hostRunExecution, selfUpdateVerifierNote, typedActionsExecution, type TypedActionOutput, type TypedExecution } from "./self-update-activation.js";
 import { boundedVerifierPrompt } from "./verifier-prompt.js";
 import { BREAKER_WINDOW_MS, OPERATION_PATTERN, breakerKeyFor, breakerReason, evaluateBreaker } from "./circuit-breaker.js";
-import { brokerSocketForRole, runBrokerAgent, runBrokerAgentWithEngine, type AgentEngine } from "./agent-broker.js";
+import { BrokerAgentError, brokerSocketForRole, runBrokerAgent, runBrokerAgentWithEngine, type AgentEngine } from "./agent-broker.js";
 import { runDynamicCapability, runExecutorAction, type ExecutorActionKind } from "./executor-broker.js";
 import { borgStatusRequestDigest, createBorgStatusService } from "./borg-status.js";
 import { createRetentionService, decideRetentionChange, readApproval, retentionRequestDigest, retentionTarget } from "./borg-retention.js";
@@ -1970,9 +1970,14 @@ export async function createApp(options: AppOptions = {}) {
     jobId?: string,
   ): Promise<string> {
     if (config.agentBrokerSocket) {
-      const { output, engine } = await runBrokerAgentWithEngine(brokerSocketForRole(config, role), role, buildBrokerAgentPrompt(agent, prompt));
-      if (jobId && engine) recordAgentEngine(jobId, role, engine);
-      return output;
+      try {
+        const { output, engine } = await runBrokerAgentWithEngine(brokerSocketForRole(config, role), role, buildBrokerAgentPrompt(agent, prompt));
+        if (jobId && engine) recordAgentEngine(jobId, role, engine);
+        return output;
+      } catch (error) {
+        if (jobId && error instanceof BrokerAgentError && error.engine) recordAgentEngine(jobId, role, error.engine);
+        throw error;
+      }
     }
     executeAgentPlan(createAgentPlan(actor, agent, session.id, prompt, 30_000), actor, agent, windowSuffix, model);
     const logFile = `/tmp/opencode-${session.id.substring(0,8)}-${agent.id}${windowSuffix}.log`;
@@ -1988,11 +1993,12 @@ export async function createApp(options: AppOptions = {}) {
   function recordAgentEngine(jobId: string, role: string, engine: AgentEngine): void {
     const job = database.getJob(jobId);
     if (!job || job.status === "withdrawn") return;
-    const engines = { ...(job.output?.agentEngine as Record<string, unknown> | undefined), [role]: engine };
-    const notbetrieb = engine.notbetrieb
-      ? { notbetrieb: `NOTBETRIEB: ${role} ran on ${engine.model} (opencode) because Claude failed: ${engine.reason}` }
-      : {};
-    database.updateJob(jobId, { status: job.status, output: { ...job.output, agentEngine: engines, ...notbetrieb } });
+    const engines: Record<string, AgentEngine> = { ...(job.output?.agentEngine as Record<string, AgentEngine> | undefined), [role]: engine };
+    // From the latest engine per role: a re-plan on Claude clears an older NOTBETRIEB.
+    const lines = Object.entries(engines).filter(([, value]) => value?.notbetrieb)
+      .map(([name, value]) => `NOTBETRIEB: ${name} ran on ${value.model} (opencode) because Claude failed: ${value.reason}`);
+    const { notbetrieb: _previous, ...rest } = job.output || {};
+    database.updateJob(jobId, { status: job.status, output: { ...rest, agentEngine: engines, ...(lines.length ? { notbetrieb: lines.join("\n") } : {}) } });
   }
 
   async function runIndependentVerification(

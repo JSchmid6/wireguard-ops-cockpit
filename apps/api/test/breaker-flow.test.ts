@@ -77,7 +77,7 @@ async function setup(overrides: Partial<AppConfig> = {}, slot: { pollMs?: number
   // The host run's outcome, switched per test step.
   // busy: so many starts the helper still refuses because another run holds the host.
   // engine: what the broker reports for the planner (t_936d9b0f); unset like an older broker.
-  const host: { status: "success" | "failed"; doorkeeper: string; busy: number; busyMessage: string; plan: string; engine?: Record<string, unknown> } = {
+  const host: { status: "success" | "failed"; doorkeeper: string; busy: number; busyMessage: string; plan: string; engine?: Record<string, unknown>; plannerFails?: boolean } = {
     status: "failed", doorkeeper: "VERDICT: pass\nNOTES: routine apt maintenance", busy: 0, busyMessage: "another host run is active: 3e06625f-0000", plan,
   };
   const executorCalls = await listen(path.join(dir, "executor.sock"), (request) => {
@@ -98,6 +98,7 @@ async function setup(overrides: Partial<AppConfig> = {}, slot: { pollMs?: number
     } }) };
   });
   const agentCalls = await listen(path.join(dir, "agent.sock"), (request) => {
+    if (request.role === "planner" && host.plannerFails) return { ok: false, error: "opencode exited with 1", ...(host.engine ? { engine: host.engine } : {}) };
     if (request.role === "planner") return { ok: true, output: host.plan, ...(host.engine ? { engine: host.engine } : {}) };
     return { ok: true, output: "VERIFICATION_STATUS: passed\nEVIDENCE: no upgradable packages\nREASON: done" };
   });
@@ -466,5 +467,11 @@ describe("change circuit breaker through the API", () => {
     expect(fallback.status).toBe("completed");
     expect(fallback.output?.agentEngine).toEqual({ planner: flow.host.engine });
     expect(fallback.output?.notbetrieb).toBe("NOTBETRIEB: planner ran on deepseek/deepseek-v4-pro (opencode) because Claude failed: Not logged in · Please run /login");
+
+    // Claude and the stand-in both fail: the failed job still says NOTBETRIEB.
+    flow.host.plannerFails = true;
+    const both = await flow.submit({ operation: "apt-both" });
+    expect(both.status).toBe("failed_execution");
+    expect(both.output?.notbetrieb).toContain("NOTBETRIEB: planner ran on deepseek/deepseek-v4-pro");
   }, 15_000);
 });
