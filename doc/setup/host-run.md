@@ -124,8 +124,10 @@ Routine: Paket-Updates aus den eingetragenen Quellen, Docker-Pulls, Kernel mit N
 GitLab-Stufen, Dienst-Neustarts.
 
 **Jedes ausgeführte Skript steht wörtlich im Plan** (05.11.2026, Befund X5 aus Job 26fb0860,
-Karte t_41cb8b49; nachgeschärft 09.11.2026 nach Zweitprüfung t_740ac6ee, Karte t_11872429, und
-11.11.2026 nach Zweitprüfung t_af29564c, Karte t_0e05c213): Ein
+Karte t_41cb8b49; nachgeschärft 09.11.2026 nach Zweitprüfung t_740ac6ee, Karte t_11872429,
+11.11.2026 nach Zweitprüfung t_af29564c, Karte t_0e05c213, und 12.11.2026 nach Zweitprüfung
+t_d3e3959f, Karte t_5d6eff99, nach Zweitprüfung t_1748d6c1, Karte t_8b84f3a6, nach Zweitprüfung
+t_b4b11e32, Karte t_fda9d997, und nach Zweitprüfung t_c82f5ac2, Karte t_429d7763): Ein
 stündlicher root-Dienst führte ein Skript aus, das der Lauf nur per Hash festnagelte
 (`printf '<sha256>  /pfad' | sha256sum -c -`); die Unit-Datei stand per Heredoc wörtlich im Plan,
 das Skript nicht — der Türsteher sah einen Hash statt Code. Seitdem lehnt schon
@@ -149,9 +151,14 @@ Die Regel im Einzelnen (`hiddenPinnedScripts` in `apps/api/src/host-run.ts`):
   `/usr/bin`, `/sbin`, `/bin`) — auch als Ziel einer Kopie oder eines Symlinks (`ln -s /opt/x/run.sh
   /usr/local/bin/runit`, `cp /opt/x/run.sh /usr/local/bin/`) —, zählt auch sein **Basisname** als Wort
   (`… sha256sum -c - && wartung`, `sudo wartung --jetzt`, `runuser -u x -- wartung`, `ExecStart=wartung`);
-  fail-safe jedes Wort, nicht nur das Befehlswort (Entscheidung 11.11.2026). Eine Zeile mit `\` am Ende
-  wird außerhalb von Heredoc-Körpern vor dem Zerlegen mit der Folgezeile verbunden; die Fundstelle ist die
-  erste Zeile (`install -m 0755 \` + `/srv/run.sh /opt/x/run.sh`, `cat /p \` + `| bash`).
+  fail-safe jedes Wort, nicht nur das Befehlswort (Entscheidung 11.11.2026). Wörter für Basisnamen und
+  relative Namen nach `cd` trennt die Regel an Leerraum, Quotes, `=` und an `<>&|;(){},\`
+  sowie Backticks (12.11.2026, R1); Quotes und Backslashes entfernt sie vorher, wie bash
+  (12.11.2026, B6: `w\artung`, `wa''rtung` zählen wie `wartung`; ein `$` direkt vor einem Quote fällt
+  vorher weg, R-B: `$'wartung'`, `$"wartung"`, `sudo $'wartung'`, `cd /opt/x && bash $'run.sh'`): `wartung>/var/log/w.log`, `wartung&>/dev/null`, `wartung</dev/null`,
+  `\wartung`, `{wartung,}`, `cd /opt/x && bash run.sh>/tmp/l` zählen wie das blanke Wort. Eine Zeile mit
+  `\` am Ende wird außerhalb von Inhalts-Heredocs vor dem Zerlegen mit der Folgezeile verbunden; die
+  Fundstelle ist die erste Zeile (`install -m 0755 \` + `/srv/run.sh /opt/x/run.sh`, `cat /p \` + `| bash`).
   Ausgenommen sind nur Befehle, die ihre Operanden nicht ausführen (`chmod`, `chown`, `stat`,
   `test`/`[`, `ls`, `cat`, `rm`, `cp`, `mv`, `ln`, `install`, `curl`, `wget`, `tar`, `grep`, `cmp` …,
   Liste `QUIET_COMMANDS`; `sed` steht nicht darauf). Vor dem Befehl werden nur Schlüsselwörter und
@@ -160,14 +167,202 @@ Die Regel im Einzelnen (`hiddenPinnedScripts` in `apps/api/src/host-run.ts`):
   Wrapper kein stiller Befehl ist — nicht, weil jede Form einzeln erkannt würde. Preis: Ein Pfad in einer
   `echo`-Meldung ohne Digest zählt auch, beim Basisnamen ebenso ein gleichlautendes Wort (`apt-get install
   wartung`, `command -v wartung`); der Planer schreibt ihn dann anders.
+  **Heredoc an eine Shell** (12.11.2026, R3): Den Körper eines Heredocs, den eine Shell ausführt
+  (`bash <<'X'`, auch ohne Leerzeichen `bash<<'X'`, `sudo bash -s <<'X'`, `sudo -s`, `sudo -i`, `su`, `runuser`,
+  `ssh`, `fish`, `source /dev/stdin <<'X'`, `. /dev/stdin <<'X'`, `cat <<'X' | bash`, auch
+  `| sudo -u root sh`), liest die Regel wie die Skriptzeilen um ihn herum — Schreibvorgänge, `cd`,
+  Fortsetzungszeilen, Heredocs darin; nur der Körper jedes anderen Heredocs (`cat > /datei`, `python3 -`,
+  auch ein Inhalts-Heredoc in einem Shell-Körper) ist Inhalt. Ein Heredoc endet nur an einer Zeile, die
+  genau sein Begrenzer ist; bei `<<-` fallen nur führende Tabs weg (H1, t_b4b11e32: ` X` oder `EOF ` beenden
+  nichts). Bei einem Shell-Körper mit `<<-` (`bash <<-'X'`) gilt das für **jede** Zeile des Körpers, auch für die
+  Zeilen eines inneren Heredocs (13.11.2026, X-A aus t_6024cbc7): bash streift die Tabs, bevor die innere Shell
+  liest, und eine Zeile `<TAB>EOF` beendet dort auch `cat > /p <<'EOF'`. Die Regel liest jede Zeile in einem
+  solchen Körper ohne führende Tabs (Inhalt, Code, Grenzen, Fortsetzungszeilen); beendet eine Zeile erst ohne
+  ihre Tabs einen offenen Heredoc, gilt fail-safe zudem ab hier nichts mehr als gezeigt (Preis: im `<<-`-Körper
+  den inneren Begrenzer ohne Tab schreiben oder den inneren Heredoc ebenfalls mit `<<-` öffnen). Stehen mehrere Heredocs auf einer Zeile, folgt die Regel jedem in seiner Reihenfolge (H2:
+  `cat <<'A' >/dev/null; ssh other <<'B'`). Ein Skript, das ein Shell-Körper per Heredoc
+  schreibt, gilt nur dann als gezeigt, wenn der Begrenzer dieses und jedes umschließenden Shell-Körpers
+  gequotet ist und jeder davon nachweislich hier läuft (12.11.2026, B1): Bei `bash <<X` expandiert die
+  aufrufende Shell `$(…)` schon beim Bau des Körpers, und was ein Körper auf einem anderen Host, in einem
+  Container oder in einer anderen Wurzel schreibt, ist nicht die Datei, die dieser Lauf hier prüft und
+  ausführt. „Hier“ ist eine Positivliste (12.11.2026, R-A aus t_b4b11e32; eine Liste fremder Opener wäre nur
+  die nächste Lücke — `qm guest exec`, `schroot`, `buildah run`, `systemd-run -M` …): Ein Körper läuft nur
+  dann hier, wenn in jedem Segment der Opener-Kette vor dem Shell-Wort nur stehen: Zuweisungen (nicht an
+  `PATH`, `ENV`, `BASH_ENV`, `SHELLOPTS`, `BASHOPTS`, `IFS`, `PS4`, `GLOBIGNORE`, `CDPATH`, `LD_*`, `BASH_*` —
+  sie wählen, welcher `cat` im Körper läuft; seit S-C, t_c82f5ac2, auch nicht an `SHELL`), Umleitungen, Schlüsselwörter, Zahlen und die lokalen Wrapper
+  `sudo`, `doas`, `su`, `runuser`, `setpriv`, `env`, `nice`, `ionice`, `chrt`, `timeout`, `stdbuf`,
+  `systemd-run`, `systemd-cat`, `nohup`, `setsid`, `exec`, `command`, `builtin`, `time` mit den Optionen
+  ihrer Positivliste (13.11.2026, T-A aus t_683da1d6: `LOCAL_WRAPPERS` nennt je Wrapper die Optionen ohne
+  und mit Wert; Werte nur nach Optionen, die laut Werkzeug einen nehmen; `su`/`runuser` dazu ein
+  Benutzername). Jede andere Option macht den Körper fremd, wie hinter dem Shell-Wort: `--help` und
+  `--version` jedes Wrappers (der Befehl läuft dann gar nicht), `sudo -V`/`-l`/`--list`/`-K`/`-S`/`-b`,
+  `doas -C`, `chrt -p`, `setpriv -d`, `setsid -f`, bei `systemd-run` `--root-directory`/`--root-image`
+  (auch mit `=`), `-S`/`--shell`, `-t`/`--pty` und `--no-block`. `systemd-run` ist nur mit `--pipe`/`-P`
+  oder `--scope` lokal, sonst liest die Unit `/dev/null` statt des Körpers. Ein Argument null mit
+  führendem `-` (`env --argv0=-bash`, `env -a -bash`, `exec -a -bash`) und `exec -l` machen bash zur
+  Login-Shell, die vorher `/etc/profile` liest: fremd wie `bash -l` (`env --argv0=ssh`, `exec -a ssh`
+  bleiben lokal). In der Opener-Kette gilt ein Wort mit `$` oder Backtick nicht als Wort (T-D:
+  `bash -s $o`, `su $u`, `su "$u"`, `runuser $u`, `sudo -u $u` — die Shell zerlegt es erst beim Lauf in
+  Optionen), ausser dem Wert einer Zuweisung (`LANG=$L bash`); ebenso fremd ist ein Segment, das eine
+  Substitution von seinem Befehl abtrennt (`env $(…) bash <<'X'`, `bash <<'X' $(…)`). Dasselbe gilt für ein
+  Wort mit Klammern oder einem Glob-Zeichen (13.11.2026, U-B aus t_f7778d43: `bash -s {-c,true}`, `bash -s {-n,}`,
+  `{-l,}`, `{--rcfile,/srv/rc}`, `su {-c,true}`, `bash -s -[c] true` — bash macht daraus erst beim Lauf
+  Optionen); fail-safe auch gequotet, ausser dem einzelnen Schlüsselwort `{` und dem Wert einer Zuweisung. Vor der
+  Pipe nur `cat` ohne Datei (außer `-`) und `tee` ohne andere Optionen als `-a`, `-i`, `-p`. Nicht hier sind deshalb auch `sudo -R`/`--chroot`/`-h`,
+  `systemd-run -M`/`--machine`/`-H`/`--host` sowie dessen `-p`/`--property` und `-E`/`--setenv` (sie können
+  `RootDirectory=`, `BindPaths=` oder `BASH_ENV=` setzen), `systemd-run --user`/`--capsule`/`-C` (eine andere
+  Umgebung), `env -S`, `su`/`runuser -c` und `-s`/`--shell`, `nsenter` und `xargs`. Ebenso nicht hier ist ein
+  Wrapper, der `$SHELL` statt einer genannten Shell startet (12.11.2026, S-C aus t_c82f5ac2): `sudo -s`,
+  `doas -s` und `su`/`runuser -m`/`-p`/`--preserve-environment` ohne Shell-Wort dahinter (`sudo -s bash` bleibt
+  lokal; `sudo -i` und `su root` starten die Login-Shell aus der Passwortdatei und bleiben lokal). Hinter dem
+  Shell-Wort gilt ebenfalls eine Positivliste (12.11.2026, S-B/S-D aus t_c82f5ac2): nur `-s` (auch gebündelt
+  wie `-xs`), `-e`, `-u`, `-x`, `-v`, `-o` mit `errexit`, `nounset`, `pipefail`, `xtrace` oder `verbose`,
+  `--noprofile` und `--norc`. Nicht hier sind damit `-c` (ein String statt des Körpers), `-n` (der Körper läuft
+  nicht), `-i`, `-l`, `--login`, `--rcfile`, `--init-file` und `-O extdebug` (sie lesen vorher Dateien, die der
+  Plan nicht zeigt). Ein Datei-Operand liest den Körper nur nach `-s` oder als `/dev/stdin`; nach `-` oder `--`
+  ist der folgende Operand das Skript (`bash -- /srv/x.sh <<'X'` führt die Datei aus, nicht den Körper).
+  Die Umleitungen müssen den Körper als stdin der Shell lassen (12.11.2026, S-A aus t_c82f5ac2): Steht im
+  Segment des Heredocs eine weitere Eingabe-Umleitung oder ein zweiter Heredoc (`bash <<'X' </srv/x.sh`, `0<`,
+  `<&3`, `<<<`, `bash <<'X' <<'Y'` — bash verwirft dann X; seit T-C, t_683da1d6, auch jede Umleitung von fd 0
+  ohne `<`: `0>&-`, `0>/dev/null`, `0>>`, `00>&-`, `0>&3`), hinter der Pipe irgendeine Eingabe-Umleitung oder
+  vor der Pipe eine Ausgabe-Umleitung (`cat <<'X' >/dev/null | bash`, `>&2`), ist der Körper nicht lokal; vor
+  der Pipe ist `cat` nur ohne Optionen außer `-` und `-u` lokal (H-e: `cat -n`/`-v` ändern den Text). Dasselbe
+  gilt auf oberster Ebene (H-c): `cat > /p <<'EOF' </srv/x.sh` und `cat > /p <<'EOF' 0>&3` schreiben die
+  Datei, nicht den Körper, und zeigen nichts; ebenso `cat` mit einem Datei-Operanden oder einer anderen
+  Option als `-`/`-u` (`cat /srv/evil.sh > /p <<'EOF'`, `cat $f > /p`, `cat -n > /p`, t_683da1d6).
+  Wechselt ein Wrapper der Opener-Kette das Verzeichnis (13.11.2026, T-B aus t_683da1d6: `env -C`/`--chdir`,
+  `sudo -D`/`--chdir`, `sudo -i`/`--login`, `su`/`runuser` mit `-`, `-l` oder `--login`, `systemd-run` ohne
+  `--same-dir`/`-d`/`--scope` — die Unit startet laut systemd.exec(5) in `/` — und `systemd-run
+  --working-directory`), bleibt der Körper lokal, beginnt aber ohne bekanntes Verzeichnis: Ein relativer
+  Schreibvorgang dort (`cat > run.sh <<'EOF'`) zählt nicht als gezeigt, ein absoluter schon, und nach dem
+  Körper gilt wieder das Verzeichnis des Aufrufers. Ein Körper, dessen Shell im Hintergrund läuft (H-a: ein einzelnes `&` auf der Zeile, `bash
+  <<'X' &`), ist nicht lokal: Pin und Aufruf danach können vor dem Schreiben laufen. Setzt oder exportiert eine frühere Zeile desselben Schritts (auch in einem Shell-Körper) eine
+  dieser Variablen (`export BASH_ENV=…`, `declare -x ENV=…`, `PATH=…`, `printf -v SHELL …`; fail-safe zählt
+  jedes blanke Wort mit dem Namen, nur `$NAME`/`${NAME}` nicht; `IFS` nicht, eine Shell übernimmt es nicht
+  aus der Umgebung), exportiert sie eine Funktion (`export -f cat`), einen Namen, den der Plan nicht zeigt
+  (`export $(cat /srv/env)`, `export "${n}H_ENV=…"`; der Wert eines benannten Exports wie
+  `export STAMP=$(date)` bleibt frei), oder schaltet sie `set -a`/`allexport` ein, ist jeder spätere Körper
+  des Schritts nicht lokal (S-D, t_683da1d6): Die Umgebung erreicht jede spätere Shell. Ebenso, wenn eine
+  Zeile des Schritts den Namen eines Openers oder Schreibers umbindet (13.11.2026, Hinweis aus t_cdad398e):
+  eine Funktion namens `bash`, `sh`, `sudo`, `cat`, `tee`, `install` oder eines lokalen Wrappers (`bash() {…}`,
+  `function sudo {…}`, `cat() { true; }`), `alias`, `unalias`, `hash`, `enable` oder `expand_aliases`; dann
+  läuft `bash <<'X'` bzw. `cat <<'X' | bash` nicht den Körper. Dasselbe gilt für einen Schreibvorgang auf
+  oberster Ebene nach einer solchen Zeile (`cat() { true; }` vor `cat > /p <<'EOF'`, auch auf main frei). Eine
+  Funktion mit anderem Namen (`retry() {…}`, `f() {…}`) bleibt frei. Jedes andere Wort (auch `ssh`, `docker exec`,
+  `pct exec`, `chroot`, ein unbekanntes Werkzeug) macht den Körper fremd. Dort zählt jeder Schreibvorgang als
+  nicht gezeigt; Überschreiben und Ausführen liest die Regel dort weiter. Preis: Ein lokaler Opener mit einer
+  hier nicht gelisteten Option, die einen Wert nimmt, oder mit `sudo -s` (`su -s /bin/bash root <<'X'`), gilt als
+  fremd, ebenso jeder Körper nach einem `export PATH=…` im selben Schritt und jede Opener-Zeile mit einer
+  Substitution (`FOO=$(…) bash <<'X'`); der Planer schreibt ihn dann schlichter (`bash <<'X'`,
+  `sudo -u root bash <<'X'`) bzw. setzt die Variable im Körper selbst.
+  **Der Körper muss den Schreibvorgang erreichen** (13.11.2026, U-A aus t_f7778d43): Eine Shell liest ihren
+  Körper von stdin. Eine Zeile davor, die stdin liest (`head -n 1 >/dev/null`, `cat >/dev/null`, `sed -n 1p`,
+  `read`, `ssh other true`), frisst die folgenden Zeilen, und `exit`, `exec`, `return` beenden nur den Körper.
+  Pin und Aufruf danach laufen dann auf der alten Datei weiter. Ein Schreibvorgang in einem Körper zeigt den
+  Inhalt deshalb nur, wenn drei Dinge gelten, alle per Positivliste:
+  1. Jede Zeile davor im selben Körper und in jedem umschließenden Körper vor dessen Opener steht auf der
+     Liste: Leerzeile, Kommentar, `set -e`/`-u`/`-x`/`-o pipefail` (auch gebündelt), `cd`, `mkdir`, `chmod`,
+     `chown`, `umask`, `install -d`, Zuweisungen ohne `$`, Schreibvorgänge mit eigenem Heredoc in der Form, die
+     den Inhalt zeigt (13.11.2026, V-B aus t_cdad398e): `cat` ohne Operanden außer `-`/`-u`, `tee` nur mit
+     `-a`/`-i`/`-p` und schlichten Zielen, `install` nur mit `-m`/`-o`/`-g`/`-D`/`-C`/`-p`/`-v`/`-T` (bzw.
+     `--mode=`, `--owner=`, `--group=`) und genau `/dev/stdin <ziel>`; das Segment enthält kein `$`, keinen
+     Backtick, keine Umleitung auf fd 0 und keinen Pfad unter `/proc/` oder `/dev/` außer `/dev/null` (und
+     `/dev/stdin` als Quelle von `install`). Sonst leert `cat /proc/$$/fd/0 >/dev/null <<'E'` die stdin-Pipe des
+     Körpers, und `cat >/dev/stdin <<'E'` schreibt in sie. Jedes andere Programm zählt nur mit `</dev/null`.
+     Builtins und Schlüsselwörter zählen nie, auch nicht mit `</dev/null`: `exit`, `exec`, `return`, `eval`,
+     `trap`, `source`, `read`, `kill` (auch `/bin/kill`), `set +e`, `if`, `{`, Funktionen. Ebenso zählen `ssh`
+     und eine verschachtelte Shell nie, auch nicht mit `</dev/null` (13.11.2026, V-C aus t_cdad398e:
+     `sh -c 'cat /proc/$PPID/fd/0 >/dev/null' </dev/null` leert den Körper): kein Befehl aus `SHELL_WORDS`
+     (Shells, `busybox`, `python`, `perl`, `ruby`, `node`, `php`, `lua`, `awk` …), kein Starter (`env`, `xargs`,
+     `sudo`, `doas`, `su`, `runuser`, `setpriv`, `setsid`, `nohup`, `timeout`, `nice`, `ionice`, `chrt`, `stdbuf`,
+     `systemd-run`, `systemd-cat`, `nsenter`, `chroot`, `unshare`, `flock`, `script`, `watch`, `parallel`) und
+     kein Segment, in dem irgendwo ein Shell-Name steht (`find … -exec sh`). Ebenso zählt ein Befehlswort mit
+     Klammern oder `$` nie. Keine Negativliste: Jedes unbekannte Werkzeug kann stdin lesen. Damit
+     sind `if false; then`, `false &&` und eine nie aufgerufene Funktion im Körper mit erledigt.
+  2. Ein Fehler vor dem Schreiben beendet den ganzen Schritt (Schritte laufen mit `bash -eo pipefail`,
+     `cockpit-host-run` Z. 507). Deshalb fängt die Opener-Zeile keinen Fehler ab: kein `||`, `&&`, `!`, kein
+     `if`/`while`, keine Gruppe `{ … }`/`( … )` und keine Funktion um sie herum, kein `set +e`/`set +o pipefail`
+     davor (auf oberster Ebene nach der Tiefenzählung; nach einem `case` ist die Tiefe fail-safe für den Rest des
+     Schritts unbekannt, weil das `)` eines Musters keine Klammer schließt, Hinweis aus t_cdad398e). Eine Pipe
+     hinter der Shell ist nur unter `pipefail` erlaubt. Ein verschachtelter Körper muss seinen
+     Eltern-Körper scheitern lassen: Dort ist `set -e` an, oder der Opener ist dessen letzter Befehl. Was auf
+     der Zeile eines verschachtelten Openers vor ihm steht, muss selbst auf der Liste aus 1 stehen (13.11.2026,
+     V-A aus t_cdad398e): bash liest die ganze Zeile samt Heredoc und führt erst dann `exit 0`, `exec true`,
+     `exec 0<&-`, `read -r _`, `cat >/dev/null`, `kill $$` oder `false` vor `bash <<'Y'` aus; der Eltern-Körper
+     endet oder ist leer, bevor die innere Shell startet. `set -e; bash <<'Y'` und `mkdir -p /opt/x; cd /opt/x;
+     bash <<'Y'` bleiben frei; `set -e` auf derselben Zeile gilt für die Frage „Opener ist letzter Befehl“ erst
+     ab der nächsten Zeile.
+  3. Scheitert der Schreibvorgang selbst, endet der Körper mit ihm. Davor ist im Körper `set -e` an (oder `-e`
+     an der Shell, `bash -euo pipefail <<'X'`), oder er ist der letzte Befehl des Körpers.
+  Ohne 2 und 3 übersprängen `kill $$`, `set -e` mit `false` oder einem scheiternden `mkdir`, ein beendendes
+  Programm mit `</dev/null` oder eine schreibgeschützte Datei hinter `bash <<'X' || true` den Schreibvorgang.
+  Damit ist auch die frühere Grenze zu `{ bash <<'X'` … `} &` bzw. `( bash <<'X'` … `) &` geschlossen. Reale
+  Pläne bleiben frei, auch mit `set -euo pipefail`, `mkdir -p`/`cd` und `apt-get … </dev/null` vor dem Heredoc.
+  Preis: Steht im Körper ohne `set -e` noch ein Befehl hinter dem Schreibvorgang, gilt das Skript als nicht
+  gezeigt; der Planer setzt dann `set -euo pipefail` an den Anfang des Körpers. Ehrliche Grenze, gleich wie main
+  auf oberster Ebene: Ein Programm mit `</dev/null` läuft als root. Es kann alles, was ein Programm vor einem
+  Schreibvorgang auf oberster Ebene auch kann, zum Beispiel einen Prozess starten, der die Datei nach dem
+  Schreiben ersetzt. Das liest der Türsteher (X5). In einem Körper ohne bekanntes Verzeichnis (T-B) zählt eine
+  relative Ausführung (`./run.sh`) fail-safe über den Basisnamen.
+  **Die Heredoc-Grenzen liest die Regel wie bash, sonst zeigt der Schritt nichts** (13.11.2026, W-A/W-B aus t_ebbf1e40): Ein `<<` in einem
+  Kommentar oder in Quotes öffnet für bash nichts (`mkdir -p /opt/x # <<'C'`, `mkdir -p '/tmp/<<C'`); die Zeilen
+  bis `C` laufen dann, etwa `exit 0`, oder auf oberster Ebene schluckt ein `: <<'Z'` den Schreibvorgang. Und bash
+  beendet den Körper von `bash <<'X'` an der ersten Zeile `X`, auch wenn sie im Inhalt eines inneren Heredocs
+  steht (`cat > /tmp/a <<'EOF'` … `X` … `: <<'X'`). Fail-safe, für jede Zeile außerhalb von Inhalt, auf oberster
+  Ebene wie im Körper: Die Regel liest Quotes (`'…'`, `"…"`, `$'…'`, auch verschachtelt in `$(…)` und Backticks)
+  und Kommentare (`#` am Wortanfang), dazu Arithmetik und Parameter-Expansion (`((…))`, `$((…))`, `$[…]`, `${…}`,
+  13.11.2026, Hinweis aus t_6024cbc7: dort ist `<<` für bash ein Shift oder Text, `echo $(( 1 << C ))` öffnet
+  nichts). Steht ein `<<` (nicht `<<<`) in einem Kommentar, in Quotes, in Arithmetik oder in `${…}`, hat ein Opener
+  nicht genau die Form `<<[-]NAME`, `<<[-]'NAME'` oder `<<[-]"NAME"` mit einem Trenner dahinter (`<<\Z`, `<<'Z'x`,
+  `<<Z.1`, `<<$Z`), endet die Zeile in einem offenen Quote oder einer offenen Arithmetik bzw. `${…}`, gibt es mehr Opener als Heredocs in den Segmenten,
+  verbindet die Regel eine Zeile mit `\` am Ende eines Kommentars mit der nächsten (für bash setzt der Kommentar
+  nichts fort), oder erreicht eine Zeile in einem Körper den Begrenzer eines umschließenden Shell-Körpers (bei
+  `<<-` auch mit führenden Tabs), dann kann die Regel die Grenzen ab hier anders lesen als bash. Ab dieser Zeile
+  gilt für den Rest des Schritts nichts mehr als gezeigt, und was bis dahin gezeigt war, zählt als überschrieben
+  (bash kann ab hier Zeilen ausführen, die die Regel für Inhalt hält). Dazu ist im Körper eine Zeile mit einem
+  Kommentar nach dem Zeilenanfang nicht auf der Liste aus 1. Die Regel aus V-B gilt zudem für jedes Programm mit
+  `</dev/null` (Hinweis aus t_ebbf1e40): kein `$`, kein Backtick und kein Pfad unter `/proc/` oder `/dev/` außer
+  `/dev/null` (`true >/proc/self/fd/0 </dev/null` kürzt den Körper, wenn er als Temp-Datei vorliegt). Preis: Ein
+  Schritt mit `"$(cat <<'EOF'`, einem mehrzeiligen String oder `<<` in einem Kommentar, in Arithmetik (`$(( 1 << 4 ))`)
+  oder in `${…}` zeigt danach kein festgenageltes Skript mehr; der Planer schreibt den Heredoc schlicht und den Kommentar ohne `<<`.
 - **Geschrieben** zählt nur der letzte Schreibvorgang vor der Ausführung, und nur, wenn er den Inhalt
   zeigt: `cat >`/`tee` mit Heredoc, `install … /dev/stdin <ziel>` mit Heredoc, `echo`/`printf` ohne
-  `$`/Backticks, eine Kopie eines so geschriebenen Skripts. Anhängen (`cat >>`, `tee -a`) an eine nicht
+  `$`/Backticks, eine Kopie eines so geschriebenen Skripts. Ein Heredoc zeigt den Inhalt nur, wenn sein
+  Begrenzer gequotet ist oder der Körper weder `$` noch Backticks enthält (12.11.2026, B5: dieselbe Regel
+  wie bei `echo`/`printf`; `cat > /p <<EOF` mit `$(curl …)` im Körper zeigt nicht, was in der Datei landet),
+  und nur außerhalb der Shell-Körper aus B1. Eine rekursive Kopie (`cp -r`/`-R`/`-a`), `rsync` und `mv`
+  heben jeden gezeigten Pfad unter dem Ziel (und unter Ziel/Basisname der Quelle) auf wie `tar -x`
+  (12.11.2026, B3: `cp -r /srv/x/. /opt/x/`, `rsync -a /srv/x/ /opt/x/`, `rm -r /opt/x && mv /srv/x /opt/x`),
+  ebenso ein Symlink, der auf ein Verzeichnis darüber umgeschaltet wird (H3, t_b4b11e32: `ln -sfn /srv/x
+  /opt/x`; nicht mit `-t` oder einem Ziel mit `/` am Ende, dort landet der Link nur im Verzeichnis). Anhängen (`cat >>`, `tee -a`) an eine nicht
   gezeigte Datei macht sie nicht sichtbar; ein späteres Überschreiben (`cp`, `mv`, `install`, `dd of=`,
   `curl -o`, `wget -O`, `> /pfad`, `tar -x`/`unzip` in das Verzeichnis) hebt den Heredoc auf. Ebenso
   jedes `sed -i`/`--in-place` auf den Pfad (Entscheidung 11.11.2026, Hinweis aus t_af29564c): Mit `$(…)`,
   Backticks oder `r /datei` ist die Änderung nicht sichtbar, und eine literale Ersetzung gehört gleich in
   den Heredoc — eine Unterscheidung nach dem sed-Skript wäre nur eine weitere Lücke.
+  Fail-safe statt Liste (12.11.2026, R2: `perl -pi`, `awk -i inplace`, `ed`, `ex`, `patch`, `truncate` …):
+  Jeder Befehl, der einen bisher gezeigten Pfad nennt (auch per Basisnamen oder relativ nach `cd`), hebt
+  den Heredoc auf — ausgenommen nur Befehle, die den Inhalt nicht ändern oder deren Schreiben die Regel
+  ohnehin liest (`KEEPS_CONTENT`: die stillen Befehle ohne `curl`, `wget`, `tar`, `unzip`, `openssl`,
+  `gpg`, dazu `echo`, `printf`, `tee`, `logger`, `shellcheck`; `sed` nur ohne `-i`/`-f` und ohne
+  Skriptwort mit `w`, `W`, `e`), und die Ausführung selbst: Der Pfad ist das Befehlswort oder folgt nur
+  auf Wrapper, POSIX-Shells, Optionen und Zuweisungen (`bash /p`, `bash -n /p`, `sudo -u root /p`,
+  `runuser -u x -- /p`, `timeout 60 /p`, `sh -c '/p'`); `sudo -e`/`--edit` ist `sudoedit` und schreibt die
+  Datei (H4, t_b4b11e32). Nach einem Interpreter, der keine POSIX-Shell ist
+  (`perl`, `ruby`, `python`, `node`, `php`, `lua`, `Rscript`, `pwsh`), zählt nur das unmittelbar folgende
+  Wort als ausgeführt, bei der awk-Familie nur das Wort direkt nach `-f` (12.11.2026, B2): Optionen wie
+  `perl -i -pe…`, `ruby -i`, `gawk --include=inplace` ändern die Datei. Ein Befehl, der den Pfad nicht
+  nennt, aber einen Vorfahren davon nennt oder in einem arbeitet (sein `cd`), wirkt ebenso auf ihn
+  (12.11.2026, B3: `cd /opt/x && patch -p1 < /srv/fix.diff`, `git -C /opt/x checkout -- .`). Ebenso eine Ausgabe, die den Pfad nennt und in
+  einen ändernden Befehl oder `xargs` geht (`echo /p | xargs perl -pi …`); in eine Shell gepipt bleibt sie
+  Ausführung. Preis: Ein gezeigtes Skript, das ein anderer Befehl zwischen Heredoc und Ausführung nennt
+  (`python3 -W ignore /p`, `python3 -u /p`, `flock /lock /p`, `setcap … /p`), zählt als überschrieben, ebenso
+  eines unter einem Verzeichnis, in dem zwischen Heredoc und Ausführung ein nicht stiller Befehl arbeitet
+  (`cd /opt/app && npm ci`, `find /opt -name …`) oder das eine rekursive Kopie, `rsync` oder `mv` trifft
+  (auch wenn es nur eine Datei hineinlegt: `mv /tmp/a.conf /opt/x/`); der Planer schreibt den Aufruf dann
+  als `python3 /p` bzw. `bash /p` oder den Heredoc nach diesen Befehlen. Ein Skript, das ein Shell-Körper
+  mit ungequotetem Begrenzer oder auf einem anderen Host schreibt, gilt als nicht gezeigt; der Planer
+  quotet den Begrenzer (`bash <<'X'`) bzw. schreibt und prüft das Skript dort, wo es läuft.
 - **Nicht unter der Regel** (Entscheidung 09.11.2026, sonst belohnt sie das Weglassen der Prüfung —
   ohne Hash wäre der Plan frei): ein Programm, das dieser Lauf selbst lädt (`curl -o`, `wget -O`) und
   prüft, sofern es kein Skript ist (Endung `.sh`, `.py` … oder Aufruf über Shell/Interpreter — ein
@@ -180,8 +375,8 @@ Ein geprüfter Download, der nur entpackt wird, und ein Skript ohne Hash bleiben
 Plan anders verbirgt (Skript von anderswo ohne Pin, Pfad aus nicht gezeigten Werten), bleibt Fokus des
 Riegels („content this plan does not show“) und X5 des Türstehers. Die Regel ist eine Planer-Hilfe, kein
 Schloss: Sie lehnt nur zusätzlich ab, der Türsteher liest jeden Lauf weiterhin selbst. Tests:
-`apps/api/test/host-run-visible-scripts.test.ts` (alle Fälle der Probe aus t_740ac6ee und der Gegenprobe
-aus t_af29564c, plus die aufgezeichneten Pläne vom 10.10.2026 als Fehlalarm-Gegenprobe).
+`apps/api/test/host-run-visible-scripts.test.ts` (alle Fälle der Probe aus t_740ac6ee, der Gegenprobe
+aus t_af29564c, der Befunde B1–B6 aus t_1748d6c1, R-A, R-B, H1–H4 aus t_b4b11e32, S-A–S-D, H-c, H-e aus t_c82f5ac2, T-A–T-D aus t_683da1d6, U-A, U-B aus t_f7778d43 und V-A–V-C samt Hinweisen aus t_cdad398e, W-A, W-B und Hinweis M aus t_ebbf1e40, X-A und Hinweis Arithmetik aus t_6024cbc7, plus die aufgezeichneten Pläne vom 10.10.2026 als Fehlalarm-Gegenprobe).
 
 ## 2a. Backup-Riegel: Backups löschen nur mit Freigabe
 

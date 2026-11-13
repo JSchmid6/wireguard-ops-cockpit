@@ -177,6 +177,9 @@ interface Segment {
   // an assignment (VAR=$(…) only captures output).
   enclosing: string | null;
   pipedInto: string | null;
+  // The simple command goes on across a substitution: a ) or backtick closes one
+  // right before it, or one opens right after it (env $(…) bash, bash <<'X' $(…)).
+  joined: boolean;
 }
 
 function basename(word: string): string {
@@ -240,7 +243,8 @@ function segmentsOf(line: string): Segment[] {
   return raw.map((item, index) => {
     const words = wordsOf(item.text);
     const next = item.sep === "|" ? raw[index + 1] : undefined;
-    return { text: item.text, words, command: commandOf(words), enclosing: item.enclosing, pipedInto: next ? commandOf(wordsOf(next.text)) : null };
+    const joined = /^(?:\)|`)$/.test(raw[index - 1]?.sep ?? "") || /^(?:\$\(|`|<\(|>\()$/.test(item.sep);
+    return { text: item.text, words, command: commandOf(words), enclosing: item.enclosing, pipedInto: next ? commandOf(wordsOf(next.text)) : null, joined };
   }).filter((segment) => segment.words.length);
 }
 
@@ -262,21 +266,35 @@ function resolve(path: string, cwd: string | null): string | null {
   return cwd ? posix.normalize(posix.join(cwd, path)) : null;
 }
 
+// Bare names in a text: split not only at blanks, quotes and "=", but also at
+// redirections, separators, groups and a leading backslash (Restbefund R1,
+// t_d3e3959f: wartung>/log, wartung&>/dev/null, wartung</dev/null, \wartung,
+// {wartung,}). The same split for relative names after cd and for PATH names.
+// Quotes and backslashes are removed before the split, as bash removes them
+// (B6, t_1748d6c1: w\artung and wa''rtung run wartung; \wartung, 'wartung' and
+// x='wartung' still name it). A $ right before a quote goes first: $'wartung' and
+// $"wartung" are ANSI-C and locale quoting and run wartung (R-B, t_b4b11e32).
+const NAME_SPLIT = /[\s=<>&|;(){},`]+/;
+
+function namesIn(text: string): string[] {
+  return text.replace(/\$(?=['"])/g, "").replace(/['"\\]/g, "").split(NAME_SPLIT).filter((word) => /^[A-Za-z0-9_+@%][A-Za-z0-9._+@%-]*$/.test(word));
+}
+
 function pathsIn(text: string, cwd: string | null): string[] {
   const found = (text.match(ABSOLUTE_PATH) || []).map((path) => posix.normalize(path));
   if (cwd) {
     for (const rel of text.match(RELATIVE_PATH) || []) found.push(posix.normalize(posix.join(cwd, rel)));
-    for (const word of text.split(/[\s'"=]+/)) if (/^[A-Za-z0-9_+@%][A-Za-z0-9._+@%-]*$/.test(word)) found.push(posix.join(cwd, word));
+    for (const word of namesIn(text)) found.push(posix.join(cwd, word));
   }
   return found.filter((path) => !DIGEST_COMMAND.test(basename(path)));
 }
 
-// Pinned paths in a PATH directory that a segment names by their bare name
+// Paths in a PATH directory that a segment names by their bare name
 // (wartung, ExecStart=wartung, sudo wartung, sh -c 'wartung'): fail safe, every
 // such word counts, not only the command word.
-function pinnedByName(text: string, pinned: Map<string, string>): string[] {
-  const names = new Set(text.split(/[\s'"=]+/).filter((word) => /^[A-Za-z0-9_+@%][A-Za-z0-9._+@%-]*$/.test(word)));
-  return [...pinned.keys()].filter((path) => PATH_DIRS.has(posix.dirname(path)) && names.has(basename(path)));
+function namedInPath(text: string, paths: Iterable<string>): string[] {
+  const names = new Set(namesIn(text));
+  return [...paths].filter((path) => PATH_DIRS.has(posix.dirname(path)) && names.has(basename(path)));
 }
 
 // Non-option operands; options listed in withArgument take the next word.
@@ -323,10 +341,13 @@ function writesOf(segment: Segment, heredoc: boolean, cwd: string | null): Write
   const index = segment.words.findIndex((word) => basename(word) === command);
   const args = index >= 0 ? plainWords(segment.words.slice(index + 1)) : [];
   const literalText = /^(?:echo|printf)$/.test(command) && !/[$`]/.test(segment.text);
+  // cat writes its heredoc only without a file operand and with no option but -u
+  // (t_683da1d6: cat /srv/evil.sh > /p <<'EOF', cat $f > /p, cat -n change it).
+  const catsBody = heredoc && command === "cat" && args.every((word) => word === "-" || word === "-u");
   for (const match of segment.text.matchAll(/(?:^|[^<>&\d])\d*(>>|>\|?|&>)\s*['"]?([^\s'";|&<>()]+)/g)) {
     const append = match[1] === ">>";
     if (match[2] === "/dev/null") continue;
-    if ((heredoc && command === "cat") || literalText) add(match[2], append ? "append" : "visible");
+    if (catsBody || literalText) add(match[2], append ? "append" : "visible");
     else if (!append && /^(?:curl|wget)$/.test(command)) add(match[2], "download");
     else if (command === "cat" && !append) {
       // cat /pinned > /other copies the pinned file under another name.
@@ -347,6 +368,16 @@ function writesOf(segment: Segment, heredoc: boolean, cwd: string | null): Write
     const sources = files.map((source) => resolve(source, cwd)).filter((source): source is string => Boolean(source));
     const into = resolve(destination, cwd);
     if (!into) return out;
+    // A recursive copy, rsync or mv replaces whole trees below the destination
+    // (B3, t_1748d6c1: cp -r /srv/x/. /opt/x/, rsync -a /srv/x/ /opt/x/, mv /srv/x /opt/x).
+    if (command === "mv" || command === "rsync" || (command === "cp" && args.some((word) => /^-[A-Za-z]*[rRa]|^--(?:recursive|archive)$/.test(word)))) {
+      out.push({ path: into, kind: "tree" });
+      for (const source of sources) out.push({ path: posix.join(into, basename(source)), kind: "tree" });
+    }
+    // A symlink on a directory above the script switches what is below it
+    // (H3, t_b4b11e32: ln -sfn /srv/x /opt/x); not when it only lands in a
+    // target directory (-t, trailing slash).
+    if (command === "ln" && !target && !destination.endsWith("/")) out.push({ path: into, kind: "tree" });
     out.push({ path: into, kind: "hidden", from: sources });
     for (const source of sources) out.push({ path: posix.join(into, basename(source)), kind: "hidden", from: [source] });
   } else if (command === "dd") {
@@ -370,40 +401,589 @@ interface ScriptLine {
   where: string;
   text: string;
   body: boolean;
+  // The line opens a heredoc whose body is its literal content: the delimiter is
+  // quoted, or the body holds neither $ nor backticks (B5, t_1748d6c1).
   heredoc: boolean;
+  // Every shell body around the line has a quoted delimiter and runs on this host
+  // in this root (B1, t_1748d6c1), and the line is sure to run in it (U-A,
+  // t_f7778d43, shellScopeTrust); top-level lines are trusted.
+  trusted: boolean;
   parts: Array<{ segment: Segment; cwd: string | null }>;
+  // W-A/W-B (Zweitprüfung t_ebbf1e40): from this line on the tool may read the
+  // step's heredoc bounds other than bash does; what it showed so far may be
+  // overwritten unseen, and nothing after it in the step shows content.
+  blind?: boolean;
+}
+
+// Commands that run a heredoc body as shell code (bash <<'X', sudo bash -s,
+// sudo -s, su, runuser, ssh, cat <<'X' | bash); "" is a segment of wrappers only.
+const HEREDOC_SHELL = /^(?:sh|bash|dash|zsh|ksh|mksh|ash|busybox|fish|csh|tcsh|su|runuser|ssh|)$/;
+// A shell named anywhere in the segment (sudo -u root sh), bare or below /bin, /usr/bin.
+const SHELL_NAME = /^(?:\/(?:usr\/)?bin\/)?(?:sh|bash|dash|zsh|ksh|mksh|ash|busybox|fish|csh|tcsh)$/;
+// source /dev/stdin and . - read the heredoc as shell code as well (B4, t_1748d6c1).
+const STDIN_FILE = /^(?:-|\/dev\/stdin|\/dev\/fd\/0|\/proc\/self\/fd\/0)$/;
+
+// Does a segment of the opener chain read the heredoc body as shell code?
+// Words are cut at "<", so bash<<'X' is bash (B4, t_1748d6c1).
+function readsShell(segment: Segment): boolean {
+  const words = plainWords(segment.words.map((word) => word.split("<")[0]).filter(Boolean));
+  const command = commandOf(words);
+  if (/^(?:source|\.)$/.test(command)) return words.some((word) => STDIN_FILE.test(word));
+  return HEREDOC_SHELL.test(command) || words.some((word) => SHELL_NAME.test(word));
+}
+
+// Wrappers that run what follows on this host in this root, each with a positive
+// list of its options (T-A, t_683da1d6): short letters without and with a value,
+// long options without and with a value. Any other option makes the body not
+// local — --help, --version, sudo -l/-K/-V, doas -C, chrt -p, systemd-run
+// --root-directory/-S/--pty, sudo -R, su -c, env -S and every option a tool adds
+// later. moves: options after which the body runs in another directory (T-B).
+// nsenter is not on it.
+type LocalWrapper = { flags: string; values: string; longFlags: string[]; longValues: string[]; dash?: boolean; numeric?: boolean; moves?: { short: string; long: string[] } };
+const LOCAL_WRAPPERS: Record<string, LocalWrapper> = {
+  sudo: { flags: "AEHnPis", values: "ugCDprtT", longFlags: ["askpass", "preserve-env", "set-home", "non-interactive", "preserve-groups", "login", "shell"], longValues: ["user", "group", "close-from", "chdir", "prompt", "role", "type", "command-timeout"], moves: { short: "Di", long: ["chdir", "login"] } },
+  doas: { flags: "ns", values: "u", longFlags: [], longValues: [] },
+  su: { flags: "lmpf", values: "gGw", longFlags: ["login", "preserve-environment", "fast"], longValues: ["group", "supp-group", "whitelist-environment"], dash: true, moves: { short: "-l", long: ["login"] } },
+  runuser: { flags: "lmpf", values: "ugGw", longFlags: ["login", "preserve-environment", "fast"], longValues: ["user", "group", "supp-group", "whitelist-environment"], dash: true, moves: { short: "-l", long: ["login"] } },
+  setpriv: { flags: "", values: "", longFlags: ["clear-groups", "keep-groups", "init-groups", "no-new-privs", "reset-env"], longValues: ["reuid", "regid", "ruid", "rgid", "euid", "egid", "groups", "inh-caps", "ambient-caps", "bounding-set", "securebits", "pdeathsig"] },
+  env: { flags: "i", values: "uCa", longFlags: ["ignore-environment"], longValues: ["unset", "chdir", "argv0"], dash: true, moves: { short: "C", long: ["chdir"] } },
+  nice: { flags: "", values: "n", longFlags: [], longValues: ["adjustment"], numeric: true },
+  ionice: { flags: "t", values: "cn", longFlags: ["ignore"], longValues: ["class", "classdata"] },
+  chrt: { flags: "bdfiorRv", values: "TPD", longFlags: ["batch", "deadline", "fifo", "idle", "other", "rr", "reset-on-fork", "verbose"], longValues: ["sched-runtime", "sched-period", "sched-deadline"] },
+  timeout: { flags: "fpv", values: "sk", longFlags: ["foreground", "preserve-status", "verbose"], longValues: ["signal", "kill-after"] },
+  stdbuf: { flags: "", values: "ioe", longFlags: [], longValues: ["input", "output", "error"] },
+  // Without --same-dir/-d or --scope the unit starts in / (systemd.exec(5)), and
+  // without --pipe/-P or --scope its stdin is /dev/null, not the body (localChain).
+  "systemd-run": { flags: "PWGqdr", values: "u", longFlags: ["pipe", "wait", "collect", "quiet", "same-dir", "remain-after-exit", "scope", "no-ask-password", "system"], longValues: ["unit", "uid", "gid", "nice", "slice", "description", "service-type", "working-directory"], moves: { short: "", long: ["working-directory"] } },
+  "systemd-cat": { flags: "", values: "tp", longFlags: [], longValues: ["identifier", "priority", "stderr-priority", "level-prefix"] },
+  nohup: { flags: "", values: "", longFlags: [], longValues: [] },
+  setsid: { flags: "cw", values: "", longFlags: ["ctty", "wait"], longValues: [] },
+  exec: { flags: "c", values: "a", longFlags: [], longValues: [] },
+  command: { flags: "p", values: "", longFlags: [], longValues: [] },
+  builtin: { flags: "", values: "", longFlags: [], longValues: [] },
+  time: { flags: "p", values: "", longFlags: [], longValues: [] },
+};
+const KEYWORDS = /^(?:if|elif|while|until|then|do|else|!|\{)$/;
+// Assignments in front of the shell, except variables that choose the code it
+// runs (PATH lookup, startup files, preloads, PS4 under xtrace, the shell that
+// sudo -s or su -m starts): with them the body's cat or tee need not be the one
+// the plan shows.
+const LOCAL_ASSIGNMENT = /^(?!(?:PATH|ENV|BASH_ENV|SHELL|SHELLOPTS|BASHOPTS|IFS|PS4|GLOBIGNORE|CDPATH|LD_[A-Z_]*|BASH_[A-Z_]*)=)[A-Za-z_][A-Za-z0-9_]*=/;
+// S-D (t_c82f5ac2): the same variables set or exported on an earlier line of the
+// step (export BASH_ENV=…, declare -x ENV=…, PATH=…, read SHELL) reach every
+// later shell body through its environment; a bare word naming one counts, fail
+// safe. Not IFS: a shell does not take it from its environment, and IFS= read is
+// common. An exported function (export -f cat) replaces the body's cat as well.
+const STEP_ENVIRONMENT = /(?<![\w${])(?:PATH|ENV|BASH_ENV|SHELL|SHELLOPTS|BASHOPTS|PS4|GLOBIGNORE|CDPATH|LD_\w*|BASH_\w*)(?!\w)/;
+// Names the plan does not show (t_683da1d6): an export whose word starts with an
+// expansion (export $(cat /srv/env), export "${n}H_ENV=…") and set -a/allexport,
+// after which every assignment and sourced file is exported. The value of a
+// named export (export FOO=$(date)) stays free.
+// Hint of t_cdad398e: a line that rebinds the name of an opener or a writer
+// (bash() { … }, function sudo, cat() { true; }, alias, hash -p, enable,
+// expand_aliases) makes every later body of the step not local, like an exported
+// environment: bash <<'X' or cat <<'X' | bash then need not run the body. A
+// function with any other name (f() { … }) stays free.
+const REBIND = /(?:^|[\s;&|(])(?:alias|unalias|hash|enable)(?=\s|;|$)|expand_aliases|(?:^|[\s;&|(])(?:function\s+)?(?:[\w.\/-]*\/)?(?:sh|bash|dash|zsh|ksh|mksh|ash|busybox|fish|csh|tcsh|cat|tee|install|source|sudo|doas|su|runuser|setpriv|env|nice|ionice|chrt|timeout|stdbuf|systemd-run|systemd-cat|nohup|setsid|exec|command|builtin|time)\s*\(\s*\)|(?:^|[\s;&|(])function\s+(?:sh|bash|dash|zsh|ksh|mksh|ash|busybox|fish|csh|tcsh|cat|tee|install|source|sudo|doas|su|runuser|setpriv|env|nice|ionice|chrt|timeout|stdbuf|systemd-run|systemd-cat|nohup|setsid|exec|command|builtin|time)(?=[\s{(]|$)/;
+const EXPORT_EXPANSION = /(?:^|[\s;&|(])(?:export|declare|typeset)(?:\s+-[A-Za-z]+)*(?:\s+[A-Za-z_][A-Za-z0-9_]*(?:=\S*)?)*\s+["']?[$`]/;
+// The shell itself by positive list (S-B, S-D, t_c82f5ac2): only options that
+// keep the body as the code it runs — -s (also bundled), -e, -u, -x, -v, -o with
+// one of SHELL_SET, --noprofile, --norc. Anything else is not local: -c runs a
+// string, -i, -l, --login, --rcfile, --init-file and -O extdebug source files the
+// plan does not show before the body, -n does not run it. After - or -- the next
+// operand is the script file; only -s or /dev/stdin read the body.
+const SHELL_SHORT = /^[-+][seuxv]*(o)?$/;
+const SHELL_SET = /^(?:errexit|nounset|pipefail|xtrace|verbose)$/;
+const SHELL_LONG = /^--(?:noprofile|norc)$/;
+const STDIN_PATH = /^(?:\/dev\/stdin|\/dev\/fd\/0|\/proc\/self\/fd\/0)$/;
+// S-A (t_c82f5ac2): a heredoc opener, to tell it from other redirections.
+const HEREDOC_OPENER = /(?<!<)<<-?\s*(['"]?)[A-Za-z_][\w-]*\1/g;
+
+// T-C (t_683da1d6): a redirection of fd 0 without "<" (0>&-, 0>/dev/null, 00>&-,
+// 0>&3) replaces the body's stdin as well.
+const STDIN_FD = /(?:^|[\s;&|(])0+[<>]/;
+
+// Does another stdin redirection or a second heredoc on the segment replace its
+// heredoc (bash <<'X' </srv/evil.sh, 0<, <&3, <<<, 0>&-, bash <<'X' <<'Y')?
+function stdinReplaced(segment: Segment): boolean {
+  const rest = segment.text.replace(HEREDOC_OPENER, "");
+  return (segment.text.match(HEREDOC_OPENER) || []).length > 1 || rest.includes("<") || STDIN_FD.test(rest);
+}
+
+function shellReadsBody(words: string[], from: number): boolean {
+  let stdin = false;
+  for (let at = from; at < words.length; at += 1) {
+    const word = words[at];
+    if (word === "-" || word === "--") return stdin || at + 1 >= words.length || STDIN_PATH.test(words[at + 1]);
+    if (SHELL_LONG.test(word)) continue;
+    const short = word.match(SHELL_SHORT);
+    if (short) {
+      if (word.startsWith("-") && word.includes("s")) stdin = true;
+      if (short[1]) { if (!SHELL_SET.test(words[at + 1] ?? "")) return false; at += 1; }
+      continue;
+    }
+    if (word.startsWith("-") || word.startsWith("+")) return false;
+    return stdin || STDIN_PATH.test(word);
+  }
+  return true;
+}
+
+// Words of a segment without redirections; a word glued to one (bash<<'X') keeps its front.
+function commandWords(segment: Segment): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < segment.words.length; i += 1) {
+    const word = segment.words[i];
+    if (/^\d*(?:>>?|<<?-?|<<<|&>>?|>\||[<>]&)$/.test(word)) { i += 1; continue; }
+    if (/^\d*(?:[<>]|&>)/.test(word)) continue;
+    out.push(word.split(/[<>]/)[0]);
+  }
+  return out;
+}
+
+// An option of a wrapper at words[i] by its positive list (T-A, t_683da1d6): the
+// words it consumes, its short letters, its long name and its value; null when
+// the wrapper does not list it.
+type WrapperOption = { used: number; short: string; long: string | null; value: string | undefined };
+
+function wrapperOption(words: string[], i: number, spec: LocalWrapper): WrapperOption | null {
+  const word = words[i];
+  if (word === "--") return { used: 1, short: "", long: null, value: undefined };
+  if (word === "-") return spec.dash ? { used: 1, short: "-", long: null, value: undefined } : null;
+  if (spec.numeric && /^-\d+$/.test(word)) return { used: 1, short: "", long: null, value: undefined };
+  if (word.startsWith("--")) {
+    const eq = word.indexOf("=");
+    const name = eq < 0 ? word.slice(2) : word.slice(2, eq);
+    if (spec.longValues.includes(name)) {
+      if (eq >= 0) return { used: 1, short: "", long: name, value: word.slice(eq + 1) };
+      return i + 1 < words.length ? { used: 2, short: "", long: name, value: words[i + 1] } : null;
+    }
+    // sudo --preserve-env=LIST keeps a list of the caller's variables.
+    if (spec.longFlags.includes(name) && (eq < 0 || name === "preserve-env")) return { used: 1, short: "", long: name, value: undefined };
+    return null;
+  }
+  if (!word.startsWith("-")) return null;
+  let short = "";
+  const letters = word.slice(1);
+  for (let at = 0; at < letters.length; at += 1) {
+    const letter = letters[at];
+    short += letter;
+    if (spec.values.includes(letter)) {
+      if (at + 1 < letters.length) return { used: 1, short, long: null, value: letters.slice(at + 1) };
+      return i + 1 < words.length ? { used: 2, short, long: null, value: words[i + 1] } : null;
+    }
+    if (!spec.flags.includes(letter)) return null;
+  }
+  return { used: 1, short, long: null, value: undefined };
+}
+
+// S-C (t_c82f5ac2): sudo -s, doas -s and su/runuser -m, -p,
+// --preserve-environment start $SHELL instead of a shell the plan names.
+function startsShellVariable(spec: LocalWrapper, option: WrapperOption): boolean {
+  if (spec === LOCAL_WRAPPERS.sudo || spec === LOCAL_WRAPPERS.doas) return option.short.includes("s") || option.long === "shell";
+  if (spec === LOCAL_WRAPPERS.su || spec === LOCAL_WRAPPERS.runuser) return /[mp]/.test(option.short) || option.long === "preserve-environment";
+  return false;
+}
+
+// Argument zero with a leading "-" (env --argv0=-bash, exec -a -bash) makes bash a
+// login shell that sources /etc/profile first, like bash -l (t_683da1d6).
+function loginArgv0(spec: LocalWrapper, option: WrapperOption): boolean {
+  const argv0 = (spec === LOCAL_WRAPPERS.env && (option.long === "argv0" || option.short.endsWith("a"))) || (spec === LOCAL_WRAPPERS.exec && option.short.endsWith("a"));
+  return argv0 && (option.value ?? "").startsWith("-");
+}
+
+// R-A (Zweitprüfung t_b4b11e32): a positive list instead of a list of remote
+// openers. A shell body is local only when every segment of the opener chain
+// holds nothing but assignments, redirections, keywords, numbers, the local
+// wrappers above with their listed options, cat/tee in front of the pipe, and the
+// shell with options that still read stdin. Any other word (qm guest exec,
+// schroot, systemd-run -M, ssh, an unknown tool, sudo --help) makes the body run
+// elsewhere. A word with $ or a backtick is not read as a word at all (T-D,
+// t_683da1d6: bash -s $o, su $u split into options at run time), except the value
+// of an assignment; nor is a segment that a substitution splits off its command
+// (env $(…) bash <<'X', bash <<'X' $(…), segmentsOf cuts there). The same holds
+// for a word with braces or a glob character (U-B, t_f7778d43: bash -s {-c,true},
+// su {-c,true}, bash -s -[c] expand to options at run time); fail safe, quoted or
+// not, except the lone keyword { and the value of an assignment.
+// The redirections must leave the body as the shell's stdin (S-A, t_c82f5ac2;
+// T-C, t_683da1d6): the heredoc's segment holds no other stdin redirection, fd 0
+// redirection or heredoc, a segment behind the pipe none at all, and a segment in
+// front of the pipe no output redirection (cat <<'X' >/dev/null | bash runs
+// nothing of the body).
+// Result: null when not local, "moved" when a wrapper changes the directory the
+// body runs in (T-B, t_683da1d6: env -C, sudo -D/-i, su -/-l, systemd-run without
+// --same-dir/--scope or with --working-directory), else "here".
+function localChain(chain: Segment[]): "here" | "moved" | null {
+  let moved = false;
+  const local = chain.every((segment, index) => {
+    if (segment.joined || (index === 0 ? stdinReplaced(segment) : segment.text.includes("<") || STDIN_FD.test(segment.text))) return false;
+    const words = commandWords(segment);
+    if (words.some((word) => (/[$`*?[\]]/.test(word) || (/[{}]/.test(word) && word !== "{")) && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(word))) return false;
+    // In front of the pipe only cat without files and options but - and -u (H-e:
+    // cat -n, -E, -v change the text), and tee with -a, -i, -p, which passes its input on.
+    if (index < chain.length - 1) return !segment.text.includes(">") && ((words[0] === "cat" && words.slice(1).every((word) => word === "-" || word === "-u")) || (words[0] === "tee" && words.slice(1).every((word) => !word.startsWith("-") || /^-[aip]+$/.test(word))));
+    let wrapper: LocalWrapper | null = null;
+    let user = false;
+    let shellVariable = false;
+    // systemd-run keeps the caller's directory only with --same-dir/-d or --scope,
+    // and passes the body on only with --pipe/-P or --scope.
+    let unitDir = false;
+    let unitStdin = false;
+    const leave = () => {
+      if (wrapper !== LOCAL_WRAPPERS["systemd-run"]) return true;
+      if (!unitDir) moved = true;
+      return unitStdin;
+    };
+    for (let i = 0; i < words.length; i += 1) {
+      const word = words[i];
+      const name = basename(word);
+      if (LOCAL_ASSIGNMENT.test(word) || KEYWORDS.test(word) || /^\d+(?:\.\d+)?[smhd]?$/.test(word)) continue;
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) return false;
+      if (word.startsWith("-") || word.startsWith("+")) {
+        if (!wrapper) return false;
+        const option = wrapperOption(words, i, wrapper);
+        if (!option || loginArgv0(wrapper, option)) return false;
+        if (startsShellVariable(wrapper, option)) shellVariable = true;
+        const moves = wrapper.moves;
+        if (moves && ([...option.short].some((letter) => moves.short.includes(letter)) || (option.long !== null && moves.long.includes(option.long)))) moved = true;
+        if (wrapper === LOCAL_WRAPPERS["systemd-run"] && (option.short.includes("d") || option.long === "same-dir" || option.long === "scope")) unitDir = true;
+        if (wrapper === LOCAL_WRAPPERS["systemd-run"] && (option.short.includes("P") || option.long === "pipe" || option.long === "scope")) unitStdin = true;
+        i += option.used - 1;
+        continue;
+      }
+      if (SHELL_NAME.test(word)) {
+        if (!leave()) return false;
+        if (name === "busybox") { if (!/^(?:sh|ash|bash)$/.test(words[i + 1] ?? "")) return false; i += 1; }
+        return shellReadsBody(words, i + 1);
+      }
+      if (/^(?:source|\.)$/.test(word)) { if (!leave()) return false; return STDIN_FILE.test(words[i + 1] ?? ""); }
+      if (LOCAL_WRAPPERS[name] && (word === name || PATH_DIRS.has(posix.dirname(word)))) { if (!leave()) return false; wrapper = LOCAL_WRAPPERS[name]; user = false; unitDir = false; unitStdin = false; continue; }
+      // su/runuser take one user name when no -u named it (su root, su - postgres).
+      if (wrapper && (wrapper === LOCAL_WRAPPERS.su || wrapper === LOCAL_WRAPPERS.runuser) && !user && !words.slice(0, i).some((w) => /^-[A-Za-z]*u$|^--user/.test(w)) && words[i - 1] !== "--") { user = true; continue; }
+      return false;
+    }
+    return leave() && !shellVariable;
+  });
+  return local ? (moved ? "moved" : "here") : null;
+}
+
+// U-A (Zweitprüfung t_f7778d43): a shell body reads its code from stdin, so a
+// line in it that reads stdin (head, cat, sed, ssh, read) eats the lines after
+// it, and exit, exec, return end only the body — the pin and the call behind it
+// still run, on the old file. A write in a body therefore shows its content only
+// when the body is sure to reach it, by positive list:
+// - every line before it in the body, and in every body around it before that
+//   body's opener, is listed (bodySafe): blank, comment, set -e/-u/-x/-o pipefail,
+//   cd, mkdir, chmod, chown, umask, install -d, assignments without $, a write with
+//   its own heredoc, or another program (not a shell builtin or keyword, not
+//   ssh/kill/read) with stdin from /dev/null. if, &&, functions, a nested shell
+//   are not on it;
+// - a failure before it ends the whole step (the runner's bash -e, Z. 507): the
+//   opener line neither tolerates a failure (||, &&, !, if, a group, a function,
+//   set +e before) nor masks it (a pipe without pipefail), and a nested body's
+//   opener fails its parent body, which fails the step in turn;
+// - its own failure ends the body with it: set -e is on in the body before it
+//   (or as an option of the shell), or it is the body's last command.
+// Without the last two, kill $$, set -e + false or an unwritable file behind
+// "bash <<'X' || true" would skip the write and leave the old file to the pin.
+interface ShellScope {
+  parent: ShellScope | null;
+  // The parent's line that opens this body.
+  opener: ScopeLine | null;
+  // Quoted delimiter, local chain, no exported environment, not in the background,
+  // and an opener line that passes a failure on.
+  plain: boolean;
+  // V-A (Zweitprüfung t_cdad398e): every segment on the opener line in front of
+  // the opener chain is listed (bodySafe). exit 0; bash <<'Y', exec 0<&-; …,
+  // cat >/dev/null; … in a parent body end or drain it before the shell starts.
+  before: boolean;
+  lines: ScopeLine[];
+  clean: boolean;
+  errexit: boolean;
+  pipefail: boolean;
+}
+interface ScopeLine { line: ScriptLine; clean: boolean; safe: boolean; errexit: boolean; ends: boolean }
+
+// Commands that may come before a write in a body without stdin redirected.
+const BODY_LISTED = /^(?:cd|mkdir|chmod|chown|umask)$/;
+// Builtins and keywords steer the shell itself (exit, exec, eval, trap, read,
+// source, set, shopt, printf -v …) and ssh reads stdin on its own: never listed,
+// not even with </dev/null. echo, true, false, test and pwd stay out of it.
+const SHELL_BUILTINS = /^(?:\.|:|\[|\[\[|\]\]|alias|bg|bind|break|builtin|caller|command|compgen|complete|compopt|continue|coproc|declare|dirs|disown|enable|eval|exec|exit|export|fc|fg|getopts|hash|help|history|jobs|kill|let|local|logout|mapfile|popd|printf|pushd|read|readarray|readonly|return|set|shift|shopt|source|suspend|times|trap|type|typeset|ulimit|unalias|unset|wait|if|then|else|elif|fi|case|esac|for|select|while|until|do|done|in|function|time|\{|\}|!|ssh)$/;
+const PLAIN_COMMAND = /^[A-Za-z0-9_.\/+@%-]+$/;
+// V-C (Zweitprüfung t_cdad398e): a nested shell or interpreter and a command that
+// starts another one (sudo, env, xargs, timeout …) never count, not even with
+// </dev/null: sh -c 'cat /proc/$PPID/fd/0 >/dev/null' </dev/null drains the body.
+// Fail safe, a shell named anywhere in the segment counts as well.
+const BODY_STARTERS = /^(?:env|xargs|sudo|doas|su|runuser|setpriv|setsid|nohup|timeout|nice|ionice|chrt|stdbuf|systemd-run|systemd-cat|nsenter|chroot|unshare|flock|script|watch|parallel)$/;
+const DEV_NULL_STDIN = /(?:^|\s)0*<\s*\/dev\/null(?=\s|$)/;
+
+// V-B (Zweitprüfung t_cdad398e): a write with its own heredoc counts only in the
+// form that shows its content — cat with no operand but - and -u, tee with only
+// -a/-i/-p and plain targets, install … /dev/stdin <target> with plain options —,
+// with no $ or backtick and no path below /proc or /dev but /dev/null (and
+// install's /dev/stdin). cat /proc/$$/fd/0 >/dev/null <<'E' would drain the body,
+// cat >/dev/stdin <<'E' would write into it.
+const INSTALL_FLAGS = /^-[CDpvT]+$/;
+const INSTALL_VALUES = /^-[CDpvT]*[mog]$/;
+const INSTALL_LONG = /^--(?:mode|owner|group)=[^\s]+$|^--(?:compare|preserve-timestamps|verbose|no-target-directory)$/;
+
+function heredocWrite(segment: Segment): boolean {
+  if ((segment.text.match(HEREDOC_OPENER) || []).length !== 1 || stdinReplaced(segment)) return false;
+  if (/[$`]/.test(segment.text) || /[<>]&\s*0/.test(segment.text)) return false;
+  if (segment.words.some((word) => /\/(?:proc|dev)\//.test(word) && word.replace(/^\d*(?:>>?|>\||&>)/, "") !== "/dev/null" && word !== "/dev/stdin")) return false;
+  const words = commandWords(segment);
+  const args = words.slice(1);
+  if (words[0] === "cat") return args.every((word) => word === "-" || word === "-u");
+  if (words[0] === "tee") return args.every((word) => /^-[aip]+$/.test(word) || (!word.startsWith("-") && !/[{}*?[\]]/.test(word) && word !== "/dev/stdin"));
+  if (words[0] !== "install") return false;
+  const files: string[] = [];
+  for (let i = 0; i < args.length; i += 1) {
+    if (INSTALL_VALUES.test(args[i])) { i += 1; continue; }
+    if (INSTALL_FLAGS.test(args[i]) || INSTALL_LONG.test(args[i])) continue;
+    if (args[i].startsWith("-") || /[{}*?[\]]/.test(args[i])) return false;
+    files.push(args[i]);
+  }
+  return files.length === 2 && files[0] === "/dev/stdin" && files[1] !== "/dev/stdin";
+}
+
+// The flags of set -e/-u/-x/-o pipefail; null when the words are anything else.
+function setFlags(words: string[]): { errexit: boolean; pipefail: boolean } | null {
+  const flags = { errexit: false, pipefail: false };
+  for (let i = 0; i < words.length; i += 1) {
+    const letters = words[i].match(/^-([euxo]+)$/)?.[1];
+    if (!letters) return null;
+    if (letters.includes("e")) flags.errexit = true;
+    if (letters.includes("o")) {
+      const name = words[i + 1] ?? "";
+      if (!/^(?:pipefail|errexit|nounset|xtrace)$/.test(name)) return null;
+      if (name === "pipefail") flags.pipefail = true;
+      if (name === "errexit") flags.errexit = true;
+      i += 1;
+    }
+  }
+  return flags;
+}
+
+function bodySafe(segment: Segment): boolean {
+  const words = commandWords(segment);
+  if (!words.length) return false;
+  if (words.every((word) => LOCAL_ASSIGNMENT.test(word))) return !/[$`]/.test(segment.text);
+  const command = words[0];
+  if (command === "set") return setFlags(words.slice(1)) !== null;
+  if (BODY_LISTED.test(command)) return true;
+  if (command === "install" && words.slice(1).some((word) => /^-[A-Za-z]*d|^--directory$/.test(word))) return true;
+  if (heredocWrite(segment)) return true;
+  if (!PLAIN_COMMAND.test(command) || SHELL_BUILTINS.test(basename(command))) return false;
+  if (SHELL_WORDS.test(basename(command)) || BODY_STARTERS.test(basename(command)) || words.some((word) => SHELL_NAME.test(word) || SHELL_NAME.test(basename(word)))) return false;
+  // Hint of t_ebbf1e40: the rule of V-B for every program with </dev/null —
+  // true >/proc/self/fd/0 </dev/null, cat /proc/$$/fd/0 </dev/null.
+  if (/[$`]/.test(segment.text) || segment.words.some((word) => /\/(?:proc|dev)\//.test(word) && word.replace(/^\d*(?:<|>>?|>\||&>)/, "") !== "/dev/null")) return false;
+  const rest = segment.text.replace(DEV_NULL_STDIN, " ");
+  return DEV_NULL_STDIN.test(segment.text) && !rest.includes("<") && !STDIN_FD.test(rest);
+}
+
+// Does the line end with the write or the shell it opens, so that its status is
+// the line's (no ||, no !, no background)?
+function lineEnds(line: string, segments: Segment[]): boolean {
+  const last = segments[segments.length - 1];
+  return Boolean(last) && !/\|\||(?:^|\s)!\s|(?<![&>|<])&(?![&>])/.test(line) && (heredocWrite(last) || readsShell(last));
+}
+
+// The opener line passes a failure of its body on: no ||, &&, ! or group, no
+// keyword in front, and a pipe behind the shell only under pipefail.
+function openerPassesFailure(line: string, segments: Segment[], start: number, at: number, pipefail: boolean): boolean {
+  if (/\|\||&&/.test(line) || /(?:^|[^$<>])\(/.test(line) || /(?:^|[\s;&|])[{!}](?:\s|;|$)/.test(line)) return false;
+  if (segments.slice(0, at + 1).some((segment) => KEYWORDS.test(segment.words[0] ?? "") || /^(?:for|case|select|function|until|while|if)$/.test(segment.words[0] ?? ""))) return false;
+  return start <= at && (segments[at].pipedInto === null || pipefail);
+}
+
+// The shell's own -e / -o errexit / -o pipefail at the opener (bash -euo pipefail <<'X').
+function shellFlags(segment: Segment): { errexit: boolean; pipefail: boolean } {
+  const words = commandWords(segment);
+  const at = words.findIndex((word) => SHELL_NAME.test(word));
+  const flags = { errexit: false, pipefail: false };
+  if (at < 0) return flags;
+  for (let i = at + 1; i < words.length && /^-[A-Za-z]+$/.test(words[i]); i += 1) {
+    if (words[i].includes("e")) flags.errexit = true;
+    if (words[i].endsWith("o")) {
+      if (words[i + 1] === "errexit") flags.errexit = true;
+      if (words[i + 1] === "pipefail") flags.pipefail = true;
+      i += 1;
+    }
+  }
+  return flags;
+}
+
+function shellScopeTrust(scopes: ShellScope[]): void {
+  const known = new Map<ShellScope, boolean>();
+  const fails = (entry: ScopeLine, scope: ShellScope) => entry.errexit || (entry === scope.lines[scope.lines.length - 1] && entry.ends);
+  const ok = (scope: ShellScope): boolean => {
+    if (!known.has(scope)) {
+      const opener = scope.opener;
+      known.set(scope, scope.plain && (scope.parent === null || (opener !== null && ok(scope.parent) && opener.clean && scope.before && fails(opener, scope.parent))));
+    }
+    return known.get(scope)!;
+  };
+  for (const scope of scopes) {
+    for (const entry of scope.lines) entry.line.trusted = ok(scope) && entry.clean && entry.safe && fails(entry, scope);
+  }
+}
+
+// W-A (Zweitprüfung t_ebbf1e40): where bash sees quotes, comments and heredoc
+// openers on a line. Every << (not <<<) with its context: code, or inside quotes
+// or a comment, where bash opens nothing; whether a comment starts after the
+// line's beginning; whether the line ends inside a quote, so the next line goes
+// on with the string. $( … ) and backticks nest, also inside double quotes.
+// Hint of t_6024cbc7: in ((…)), $((…)), $[…] and ${…} a << is a shift or text
+// for bash; fail safe, a << anywhere inside them is no code, and a line that
+// ends inside one counts as ending inside a quote.
+const ARITHMETIC = new Set(["((", "[", "{"]);
+const STRICT_OPENER = /^<<-?[ \t]*(?:'[A-Za-z_][\w-]*'|"[A-Za-z_][\w-]*"|[A-Za-z_][\w-]*)(?=[\s;&|()<>]|$)/;
+
+function shellLex(text: string): { heredocs: Array<{ at: number; code: boolean }>; comment: boolean; quoted: boolean } {
+  const heredocs: Array<{ at: number; code: boolean }> = [];
+  const stack: string[] = [];
+  let comment = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    const top = stack[stack.length - 1];
+    if (text.startsWith("<<", i) && text[i - 1] !== "<") {
+      if (text[i + 2] === "<") { i += 2; continue; }
+      heredocs.push({ at: i, code: (top === undefined || top === "(" || top === "`") && !stack.some((item) => ARITHMETIC.has(item)) });
+      i += 1;
+      continue;
+    }
+    if (top === "'") { if (ch === "'") stack.pop(); continue; }
+    if (top === "$'") { if (ch === "\\") i += 1; else if (ch === "'") stack.pop(); continue; }
+    if (top === "\"") {
+      if (ch === "\\") i += 1;
+      else if (ch === "\"") stack.pop();
+      else if (text.startsWith("$((", i)) { stack.push("(("); i += 2; }
+      else if (text.startsWith("$[", i)) { stack.push("["); i += 1; }
+      else if (text.startsWith("${", i)) { stack.push("{"); i += 1; }
+      else if (text.startsWith("$(", i)) { stack.push("("); i += 1; }
+      else if (ch === "`") stack.push("`");
+      continue;
+    }
+    if (ch === "\\") { i += 1; continue; }
+    if (ch === "#" && (i === 0 || /[\s;&|()<>]/.test(text[i - 1]))) {
+      // The rest of the line is a comment; a << in it opens nothing.
+      if (text.slice(0, i).trim()) comment = true;
+      for (let at = text.indexOf("<<", i); at >= 0; at = text.indexOf("<<", at + 2)) heredocs.push({ at, code: false });
+      break;
+    }
+    if (ch === "'") stack.push("'");
+    else if (text.startsWith("$'", i)) { stack.push("$'"); i += 1; }
+    else if (ch === "\"") stack.push("\"");
+    else if (text.startsWith("((", i)) { stack.push("(("); i += 1; }
+    else if (text.startsWith("$[", i)) { stack.push("["); i += 1; }
+    else if (text.startsWith("${", i)) { stack.push("{"); i += 1; }
+    else if (ch === "(") stack.push("(");
+    else if (ch === ")") { if (top === "(") stack.pop(); else if (top === "((" && text[i + 1] === ")") { stack.pop(); i += 1; } }
+    else if (ch === "]") { if (top === "[") stack.pop(); }
+    else if (ch === "}") { if (top === "{") stack.pop(); }
+    else if (ch === "`") { if (top === "`") stack.pop(); else stack.push("`"); }
+  }
+  return { heredocs, comment, quoted: stack.some((item) => item === "'" || item === "$'" || item === "\"" || ARITHMETIC.has(item)) };
+}
+
+// Does the tool read this line's heredoc openers as bash does? Fail safe: every
+// << is code and has the plain form <<[-]['"]NAME['"] followed by a separator
+// (not <<\EOF, <<'Z'x, <<Z.1, <<$Z), the line does not end inside a quote, and
+// the openers found over the whole line are exactly these.
+function openersReadable(line: string, openers: number): boolean {
+  const lexed = shellLex(line);
+  if (lexed.quoted || lexed.heredocs.some(({ code }) => !code)) return false;
+  return lexed.heredocs.length === openers && lexed.heredocs.every(({ at }) => STRICT_OPENER.test(line.slice(at)));
 }
 
 // Lines of all steps and checks in order; heredoc bodies are marked, whole-line
 // comments and heredoc terminators dropped, a line ending in a backslash joined
-// with the next (outside heredoc bodies; the first line's number stays), and each
-// segment carries the working directory a cd before it set (per step).
+// with the next (outside content bodies; the first line's number stays), and each
+// segment carries the working directory a cd before it set (per step). The body
+// of a heredoc that a shell runs (Restbefund R3, t_d3e3959f) is read like the
+// script around it — writes, continued lines, cd, heredocs inside it —, only the
+// body of any other heredoc is content.
 function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): ScriptLine[] {
   const scripts = [
     ...manifest.steps.flatMap((step, index) => step.reboot ? [] : [{ prefix: `S${index + 1}`, text: step.run || "" }]),
     ...manifest.checks.map((check, index) => ({ prefix: `C${index + 1}`, text: check.run })),
   ];
   const out: ScriptLine[] = [];
+  const scopes: ShellScope[] = [];
   for (const { prefix, text } of scripts) {
     let cwd: string | null = null;
-    let delimiter: string | null = null;
+    let environment = false;
+    // A rebound cat, tee or install (cat() { true; }, hash -p /bin/true cat) on
+    // this or an earlier line: a top-level write after it shows nothing either.
+    let rebound = false;
+    // U-A: the step's own bash -e and pipefail (Z. 507) until a set + or shopt -o
+    // turns them off, and the depth of groups, blocks and functions at top level;
+    // fail safe, a count that goes below zero is unknown for the rest of the step.
+    let errexit = true;
+    let pipefail = true;
+    let depth = 0;
+    // W-A/W-B: once the tool may read the heredoc bounds other than bash, the
+    // rest of the step shows nothing (ScriptLine.blind).
+    let blind = false;
+    // cwd: the directory after the body; inside: the one its first line runs in
+    // (null after a wrapper that changes it, T-B, t_683da1d6); started: the body
+    // has begun (bodies of one line follow one after the other); scope: the
+    // shell body (U-A, null for content).
+    type Open = { delimiter: string; tabs: boolean; shell: boolean; cwd: string | null; inside: string | null; started: boolean; scope: ShellScope | null };
+    const open: Open[] = [];
     const rows = text.split("\n");
+    // H1: a heredoc ends only at a line that is exactly its delimiter; <<- strips leading tabs only.
+    const ends = (row: string | undefined, here: { delimiter: string; tabs: boolean } | undefined) => Boolean(here) && row !== undefined && (here!.tabs ? row.replace(/^\t+/, "") : row) === here!.delimiter;
     for (let index = 0; index < rows.length; index += 1) {
-      let line = rows[index];
+      // X-A (Zweitprüfung t_6024cbc7): bash strips the leading tabs of every line
+      // of a <<- body before the shell reading it sees the line, also the lines of
+      // a heredoc inside it. While a begun shell body with <<- is open, the tool
+      // reads each line as that shell gets it: content, code, bounds, continued lines.
+      const stripped = open.some((here) => here.started && here.shell && here.tabs);
+      const view = (row: string) => stripped ? row.replace(/^\t+/, "") : row;
+      let line = view(rows[index]);
       const where = `${prefix}:L${index + 1}`;
-      if (delimiter !== null) {
-        if (line.trim() === delimiter) { delimiter = null; continue; }
-        if (/^\s*#/.test(line) || CHECKSUM_ENTRY.test(line)) { out.push({ where, text: line, body: true, heredoc: false, parts: [] }); continue; }
-        out.push({ where, text: line, body: true, heredoc: false, parts: segmentsOf(line).map((segment) => ({ segment, cwd: null })) });
+      const inner = open[open.length - 1];
+      // Fail safe on top: a tab prefix that, stripped, ends an open heredoc it
+      // would not end as written makes the rest of the step show nothing.
+      if (!blind && line !== rows[index] && open.some((here) => ends(line, here) && !ends(rows[index], here))) {
+        blind = true;
+        out.push({ where, text: line, body: true, heredoc: false, trusted: false, parts: [], blind: true });
+      }
+      // W-B (Zweitprüfung t_ebbf1e40): bash ends a shell body at the first line
+      // that is its delimiter, also inside a heredoc in the body; the tool's stack
+      // would read on. Fail safe: the body and all in it, and the rest of the step.
+      if (!blind && open.slice(0, -1).some((here) => here.started && ends(line, here))) {
+        blind = true;
+        out.push({ where, text: line, body: true, heredoc: false, trusted: false, parts: [], blind: true });
+      }
+      if (inner && ends(line, inner)) {
+        open.pop();
+        if (inner.shell) cwd = inner.cwd;
+        const next = open[open.length - 1];
+        if (next && !next.started) { next.started = true; if (next.shell) cwd = next.inside; }
+        continue;
+      }
+      if (inner && !inner.shell) {
+        if (/^\s*#/.test(line) || CHECKSUM_ENTRY.test(line)) { out.push({ where, text: line, body: true, heredoc: false, trusted: false, parts: [] }); continue; }
+        out.push({ where, text: line, body: true, heredoc: false, trusted: false, parts: segmentsOf(line).map((segment) => ({ segment, cwd: null })) });
         continue;
       }
       if (/^\s*#/.test(line)) continue;
-      while (/(?:^|[^\\])(?:\\\\)*\\$/.test(line) && index + 1 < rows.length) {
+      const blindBefore = blind;
+      while (/(?:^|[^\\])(?:\\\\)*\\$/.test(line) && index + 1 < rows.length && !ends(view(rows[index + 1]), inner)) {
+        // W-A: a backslash at the end of a comment continues nothing for bash.
+        if (shellLex(line).comment) blind = true;
         index += 1;
-        line = `${line.slice(0, -1)} ${rows[index]}`;
+        line = `${line.slice(0, -1)} ${view(rows[index])}`;
       }
-      const open = line.match(/(?<!<)<<-?\s*(['"]?)([A-Za-z_][\w-]*)\1/);
-      const parts = segmentsOf(line).map((segment) => {
+      // H2: every heredoc of the line; their bodies follow one after the other.
+      const openers = [...line.matchAll(/(?<!<)<<(-?)\s*(['"]?)([A-Za-z_][\w-]*)\2/g)];
+      const segments = segmentsOf(line);
+      rebound ||= REBIND.test(line);
+      environment ||= STEP_ENVIRONMENT.test(line) || rebound || EXPORT_EXPANSION.test(line) || segments.some((segment) => (/^(?:export|declare|typeset)$/.test(segment.command) && segment.words.some((word) => /^-[A-Za-z]*f/.test(word))) || (segment.command === "set" && segment.words.some((word) => /^-[A-Za-z]*a|^allexport$/.test(word))));
+      const parts = segments.map((segment) => {
         const part = { segment, cwd };
         if (segment.command === "cd") {
           const target = operands(segment.words.slice(segment.words.indexOf("cd") + 1), /^$/)[0];
@@ -411,10 +991,82 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
         }
         return part;
       });
-      out.push({ where, text: line, body: false, heredoc: Boolean(open), parts });
-      if (open) delimiter = open[2];
+      // The segment each heredoc belongs to, in order of the line.
+      const owners = segments.flatMap((segment, at) => [...segment.text.matchAll(/(?<!<)<<-?\s*(['"]?)[A-Za-z_][\w-]*\1/g)].map(() => at));
+      // W-A (Zweitprüfung t_ebbf1e40): a << in a comment or in quotes, an opener of
+      // another form, or more openers than heredocs in the segments.
+      if (!openersReadable(line, openers.length) || owners.length !== openers.length) blind = true;
+      const scope = inner?.scope ?? null;
+      const scriptLine: ScriptLine = { where, text: line, body: false, heredoc: false, trusted: !inner && !rebound && !blind, parts };
+      if (blind && !blindBefore) scriptLine.blind = true;
+      let entry: ScopeLine | null = null;
+      if (scope && segments.length) {
+        // W-A: a comment after the line's beginning makes a body line unlisted.
+        const safe = !blind && !shellLex(line).comment && segments.every(bodySafe);
+        entry = { line: scriptLine, clean: scope.clean, safe, errexit: scope.errexit, ends: lineEnds(line, segments) };
+        scope.lines.push(entry);
+        scope.clean &&= safe;
+        for (const segment of segments) {
+          const words = commandWords(segment);
+          if (words[0] !== "set") continue;
+          const flags = setFlags(words.slice(1));
+          if (!flags) { scope.errexit = false; scope.pipefail = false; continue; }
+          scope.errexit ||= flags.errexit;
+          scope.pipefail ||= flags.pipefail;
+        }
+      }
+      // H-a (t_c82f5ac2): a shell sent to the background (bash <<'X' &) runs beside
+      // the pin and the call that follow; fail safe, a lone & anywhere on the line counts.
+      const background = /(?<![&>|<])&(?![&>])/.test(line);
+      const bodies: Open[] = [];
+      // H-c (t_c82f5ac2): cat > /p <<'EOF' </srv/evil.sh writes the file, not the body.
+      let literal = openers.length > 0 && !segments.some((segment) => segment.text.match(HEREDOC_OPENER) && stdinReplaced(segment));
+      let from = index + 1;
+      for (const [k, opener] of openers.entries()) {
+        const here = { delimiter: opener[3], tabs: opener[1] === "-" };
+        const quoted = Boolean(opener[2]);
+        let end = rows.findIndex((row, at) => at >= from && ends(view(row), here));
+        if (end < 0) end = rows.length;
+        // The line's heredoc content counts as literal only when every body on it is (B5, t_1748d6c1).
+        literal = literal && (quoted || !/[$`]/.test(rows.slice(from, end).map(view).join("\n")));
+        from = end + 1;
+        // The shell that reads the body: the command with the heredoc or one its output is piped into.
+        const start = owners.length === openers.length ? owners[k] : Math.max(0, segments.findIndex((segment) => segment.text.includes("<<")));
+        let shell = false;
+        let at = start;
+        for (; at < segments.length; at += 1) {
+          shell = readsShell(segments[at]);
+          if (shell || segments[at].pipedInto === null) break;
+        }
+        const local = shell ? localChain(segments.slice(start, at + 1)) : null;
+        let body: ShellScope | null = null;
+        if (shell) {
+          const passes = scope ? openerPassesFailure(line, segments, start, at, scope.pipefail) : errexit && depth === 0 && openerPassesFailure(line, segments, start, at, pipefail);
+          const flags = shellFlags(segments[at]);
+          body = { parent: scope, opener: entry, plain: quoted && local !== null && !environment && !background && passes && !blind, before: segments.slice(0, start).every(bodySafe), lines: [], clean: true, errexit: flags.errexit, pipefail: flags.pipefail };
+          scopes.push(body);
+        }
+        bodies.push({ ...here, shell, cwd, inside: local === "moved" ? null : cwd, started: false, scope: body });
+      }
+      if (!inner) {
+        // set +e, set +o pipefail, shopt -u -o errexit: the step goes on after a failure.
+        if (segments.some((segment) => (segment.command === "set" && segment.words.some((word) => word.startsWith("+"))) || (segment.command === "shopt" && segment.words.includes("-o")))) { errexit = false; pipefail = false; }
+        const words = line.split(/[\s;&|]+/);
+        depth += words.filter((word) => /^(?:if|while|until|for|case|select|function|\{)$/.test(word)).length + (line.match(/\(/g) || []).length;
+        depth -= words.filter((word) => /^(?:fi|done|esac|\})$/.test(word)).length + (line.match(/\)/g) || []).length;
+        // Hint of t_cdad398e: the ) of a case pattern is no closing parenthesis;
+        // fail safe, after a case the depth is unknown for the rest of the step.
+        if (depth < 0 || words.includes("case")) depth = Number.POSITIVE_INFINITY;
+      }
+      scriptLine.heredoc = literal;
+      out.push(scriptLine);
+      // The first heredoc's body comes first, so it goes on top of the stack.
+      open.push(...bodies.reverse());
+      const first = open[open.length - 1];
+      if (bodies.length && !first.started) { first.started = true; if (first.shell) cwd = first.inside; }
     }
   }
+  shellScopeTrust(scopes);
   return out;
 }
 
@@ -455,6 +1107,60 @@ function pinnedPaths(lines: ScriptLine[]): Map<string, string> {
   return pinned;
 }
 
+// Commands that do not change the content of a path they name; what they write
+// by redirect, tee, cp/mv/install/ln is read by writesOf. Not on it, because they
+// write through an option writesOf does not read: curl, wget, tar, unzip, openssl, gpg.
+const KEEPS_CONTENT = /^(?:chmod|chown|chgrp|stat|test|\[|\[\[|ls|cat|rm|cp|mv|install|touch|file|du|readlink|realpath|ln|grep|egrep|fgrep|diff|cmp|head|tail|wc|cut|mkdir|rmdir|dirname|basename|cd|gpgv|sha(?:1|224|256|384|512)sum|b2sum|md5sum|shasum|cksum|echo|printf|tee|logger|shellcheck)$/;
+// Wrappers in front of a run and the options whose value they take (sudo -u root, runuser -u x --, nice -n 5).
+const RUN_WRAPPERS = /^(?:runuser|su|nsenter|setpriv)$/;
+const OPTION_WITH_VALUE = /^-(?:[ugnt]|-user|-group)$/;
+
+// Restbefund R2 (t_d3e3959f): perl -pi, awk -i inplace, ed, ex, patch, truncate …
+// edit a file in place like sed -i, and a list of them would only be the next gap.
+// Fail safe: a segment whose command is not on KEEPS_CONTENT, or whose output goes
+// into one or into xargs, and that names a path this run has shown, takes the
+// heredoc back — unless it runs that path: the path is the command, or follows
+// only wrappers, POSIX shells, options and assignments (bash /p,
+// sudo -u root /p, sh -c '/p'), or comes right after another interpreter (B2). sed only reads without -i, -f and without a
+// script word holding w, W or e (sed -n 1p /p stays free).
+function changesContent(segment: Segment): boolean {
+  if (segment.command !== "sed") return !KEEPS_CONTENT.test(segment.command);
+  const args = segment.words.slice(segment.words.findIndex((word) => basename(word) === "sed") + 1);
+  return args.some((word) => /^-[A-Za-z]*[if]|^--(?:in-place|file)/.test(word) || (!/^-[A-Za-z]+$/.test(word) && !/^\.{0,2}\//.test(word) && /[wWe]/.test(word)));
+}
+
+function edits(segment: Segment, receiver: Segment | undefined): boolean {
+  if (changesContent(segment)) return true;
+  if (segment.pipedInto === null || !receiver || HEREDOC_SHELL.test(receiver.command)) return false;
+  return receiver.words.some((word) => /^(?:xargs|parallel)$/.test(basename(word))) || changesContent(receiver);
+}
+
+// Interpreters that are no POSIX shell: their options may edit the file they
+// name (perl -i -pe…, ruby -i, gawk --include=inplace), so the path runs only as
+// the word right after them, for the awk family only right after -f (B2, t_1748d6c1).
+const INTERPRETERS = /^(?:python[\d.]*|perl[\d.]*|ruby[\d.]*|node|nodejs|php[\d.]*|lua[\d.]*|Rscript|pwsh)$/;
+const AWKS = /^(?:awk|gawk|mawk|nawk)$/;
+
+function executes(segment: Segment, path: string, cwd: string | null): boolean {
+  const words = segment.words.map((word) => word.replace(/\\/g, "").split(/[<>&|;]/)[0]);
+  const names = (word: string | undefined) => word !== undefined && (resolve(word, cwd) === path || (PATH_DIRS.has(posix.dirname(path)) && word === basename(path)));
+  let sudo = false;
+  for (let i = 0; i < words.length; i += 1) {
+    const word = words[i];
+    if (names(word)) return true;
+    // sudo -e is sudoedit: it writes the file with an editor of the caller's choice (H4, t_b4b11e32).
+    if (sudo && (/^-[A-Za-z]*e/.test(word) || word === "--edit")) return false;
+    if (word.startsWith("-")) { if (OPTION_WITH_VALUE.test(word) && !names(words[i + 1])) i += 1; continue; }
+    const name = basename(word);
+    if (name === "sudo") sudo = true;
+    if (INTERPRETERS.test(name)) return names(words[i + 1]);
+    if (AWKS.test(name)) return words[i + 1] === "-f" && names(words[i + 2]);
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word) || /^\d+[smhd]?$/.test(word) || PREFIX_WORDS.test(name) || SHELL_WORDS.test(name) || RUN_WRAPPERS.test(name)) continue;
+    return false;
+  }
+  return false;
+}
+
 export function hiddenPinnedScripts(manifest: Pick<HostRunManifest, "steps" | "checks">): HiddenPinnedScript[] {
   const lines = manifestLines(manifest);
   const pinned = pinnedPaths(lines);
@@ -463,28 +1169,48 @@ export function hiddenPinnedScripts(manifest: Pick<HostRunManifest, "steps" | "c
   const found: HiddenPinnedScript[] = [];
   const seen = new Set<string>();
   for (const line of lines) {
+    // W-A/W-B: bash may run what the tool takes for content from here on, also
+    // over a shown path; fail safe, nothing shown so far stays shown.
+    if (line.blind) {
+      for (const [path, item] of state) if (item.kind === "visible") state.set(path, { kind: "hidden", where: line.where, visibleBefore: true });
+    }
     if (!line.body) {
-      for (const { segment, cwd } of line.parts) {
+      for (const [index, { segment, cwd }] of line.parts.entries()) {
         for (const write of writesOf(segment, line.heredoc, cwd)) {
+          // In a shell body with an unquoted delimiter, or one that runs on another
+          // host, in a container or another root, nothing written is the content the
+          // plan shows for this host (B1, t_1748d6c1); overwrites and runs are read on.
+          const shows = line.trusted;
           const before = state.get(write.path);
           if (write.kind === "append") {
-            if (before?.kind === "visible") continue;
+            if (before?.kind === "visible" && shows) continue;
             state.set(write.path, { kind: "hidden", where: line.where, visibleBefore: false });
           } else if (write.kind === "tree") {
             const prefix = write.path.endsWith("/") ? write.path : `${write.path}/`;
             for (const path of new Set([...state.keys(), ...pinned.keys()])) {
-              if (path.startsWith(prefix)) state.set(path, { kind: "hidden", where: line.where, visibleBefore: state.get(path)?.kind === "visible" });
+              if (path.startsWith(prefix)) state.set(path, { kind: "hidden", where: line.where, visibleBefore: state.get(path)?.kind === "visible" || Boolean(state.get(path)?.visibleBefore) });
             }
           } else if (write.from) {
             // A copy of a pinned file is pinned as well; its content is as visible as its sources'.
             const pinnedSource = write.from.map((source) => pinned.get(source)).find(Boolean);
             if (pinnedSource && !pinned.has(write.path)) pinned.set(write.path, pinnedSource);
             const kinds = write.from.map((source) => state.get(source)?.kind);
-            const kind = kinds.length && kinds.every((item) => item === "visible") ? "visible" : kinds.length && kinds.every((item) => item === "download") ? "download" : "hidden";
+            const kind = !shows ? "hidden" : kinds.length && kinds.every((item) => item === "visible") ? "visible" : kinds.length && kinds.every((item) => item === "download") ? "download" : "hidden";
             state.set(write.path, { kind, where: line.where, visibleBefore: before?.kind === "visible" || Boolean(before?.visibleBefore) });
           } else {
-            state.set(write.path, { kind: write.kind, where: line.where, visibleBefore: before?.kind === "visible" || Boolean(before?.visibleBefore) });
+            state.set(write.path, { kind: shows ? write.kind : "hidden", where: line.where, visibleBefore: before?.kind === "visible" || Boolean(before?.visibleBefore) });
           }
+        }
+        if (!edits(segment, line.parts[index + 1]?.segment)) continue;
+        const visible = [...state].filter(([, item]) => item.kind === "visible").map(([path]) => path);
+        const named = pathsIn(segment.text, cwd);
+        // It also works on a shown path when it names an ancestor of it or runs in
+        // one (B3, t_1748d6c1: cd /opt/x && patch -p1 < /srv/fix.diff, git -C /opt/x checkout -- .).
+        const ancestors = [...named, ...(cwd ? [cwd] : [])].map((dir) => dir.endsWith("/") ? dir : `${dir}/`);
+        const below = visible.filter((path) => ancestors.some((dir) => path.startsWith(dir)));
+        for (const path of new Set([...named, ...namedInPath(segment.text, visible), ...below])) {
+          if (state.get(path)?.kind !== "visible" || executes(segment, path, cwd)) continue;
+          state.set(path, { kind: "hidden", where: line.where, visibleBefore: true });
         }
       }
       // sed -i edits in place and its change is not shown (a $( … ) in the script
@@ -499,7 +1225,11 @@ export function hiddenPinnedScripts(manifest: Pick<HostRunManifest, "steps" | "c
     }
     for (const { segment, cwd } of line.parts) {
       if (!runs(segment)) continue;
-      for (const path of [...pathsIn(segment.text, cwd), ...pinnedByName(segment.text, pinned)]) {
+      // In an unknown directory (a body behind env -C, T-B) a relative path counts
+      // by its base name, fail safe (Hinweis t_f7778d43: cd /opt/x … ./run.sh).
+      const relative = cwd ? [] : (segment.text.match(RELATIVE_PATH) || []).map(basename);
+      const byName = [...pinned.keys()].filter((path) => relative.includes(basename(path)));
+      for (const path of [...pathsIn(segment.text, cwd), ...namedInPath(segment.text, pinned.keys()), ...byName]) {
         const pinnedAt = pinned.get(path);
         if (!pinnedAt || seen.has(path)) continue;
         const written = state.get(path);
