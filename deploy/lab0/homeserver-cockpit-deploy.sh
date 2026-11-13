@@ -184,6 +184,40 @@ esac
 free_kb=$(df -Pk /opt | awk 'NR==2{print $4}')
 [ "$free_kb" -ge 5000000 ] || die "Weniger als 5 GB frei unter /opt (${free_kb} KB). Erst Platz schaffen."
 
+# Altlasten, die der Agent-Broker verweigert (assertNoPlantedConfig, dieselben Namen;
+# ein Test vergleicht die Listen und diesen Block mit dem VPS-Deploy): von der
+# Session-Wurzel bis / und im globalen Konfigordner des Agenten. Liegt eine davon da,
+# stoppt der Broker JEDE Rolle, auch Planer und Türsteher — das Cockpit könnte sich
+# weder reparieren noch zurückrollen. Geprüft, bevor irgendetwas installiert wird:
+# der laufende Stand bleibt, root verschiebt die genannten Pfade (nicht löschen) und
+# deployt erneut.
+# >>> planted-config-preflight
+readonly PLANTED_PROJECT_NAMES=(opencode.json opencode.jsonc .opencode AGENTS.md CLAUDE.md CONTEXT.md .claude .agents .git .gitconfig .npmrc)
+readonly PLANTED_GLOBAL_NAMES=(opencode.json config.json config AGENTS.md agent agents command commands mode modes plugin plugins tool tools skill skills)
+planted_config_preflight() { # planted_config_preflight <host root> <agent home>
+  local root="$1" home="$2" dir name found=()
+  dir="$home/sessions"
+  while :; do
+    for name in "${PLANTED_PROJECT_NAMES[@]}"; do
+      if [ -e "$root${dir%/}/$name" ] || [ -L "$root${dir%/}/$name" ]; then found+=("${dir%/}/$name"); fi
+    done
+    [ "$dir" = / ] && break
+    dir="$(dirname -- "$dir")"
+  done
+  for name in "${PLANTED_GLOBAL_NAMES[@]}"; do
+    if [ -e "$root$home/.config/opencode/$name" ] || [ -L "$root$home/.config/opencode/$name" ]; then found+=("$home/.config/opencode/$name"); fi
+  done
+  if [ -e "$root$home/.config/git" ] || [ -L "$root$home/.config/git" ]; then found+=("$home/.config/git"); fi
+  [ "${#found[@]}" -eq 0 ] && return 0
+  printf 'opencode would load %s into every role\n' "${found[@]}"
+  return 1
+}
+# <<< planted-config-preflight
+if ! planted_report="$(planted_config_preflight "" "$AGENT_DIR")"; then
+  printf '%s\n' "$planted_report" >&2
+  die "Der Agent-Broker würde mit diesen Altlasten jede Rolle verweigern. Als root beiseite schieben, dann erneut deployen. Nichts geändert."
+fi
+
 mkdir -p "$SECRETS_DIR"; chmod 700 "$SECRETS_DIR"
 
 # ---------------------------------------------------------------------------

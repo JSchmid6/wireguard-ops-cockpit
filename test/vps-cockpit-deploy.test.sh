@@ -17,7 +17,8 @@
 # The pinned Node runtime: installed from .node-version when the host lacks it
 # (real tarball, checksum against a SHASUMS256.txt fixture, before the build),
 # not downloaded again when it is there, and 70 + rollback on a checksum mismatch,
-# a failed download or a .node-version that is not one clean x.y.z.
+# a failed download or a .node-version that is not one clean x.y.z. Leftover opencode
+# config the agent broker refuses stops the deploy with 71 before anything is installed.
 #
 # Everything lives below one fresh mktemp directory under /tmp; the harness
 # refuses to run otherwise. Call as root (install -o root):
@@ -254,6 +255,13 @@ check "Download scheitert: Rückfall ehrlich als unvollständig gemeldet" '[ "$(
 fresh_host ohne-runtime; make_dist; code=0; deploy "$C" now || code=$?
 check ".node-version unsauber: Exit 70, kein Pfad/URL daraus gebaut" '[ "$code" = 70 ] && [ ! -e "$FIX/root/opt" ] && grep -q "does not name one Node version" "$FIX/out.log"'
 check ".node-version unsauber: Rückfall auf A" '[ "$(git -C "$FIX/repo" rev-parse HEAD)" = "$A" ]'
+
+# 14: leftover opencode config the broker refuses (here /AGENTS.md of the host) -> 71
+# before anything is installed: the running stand keeps working (t_b4ec0027)
+fresh_host; : > "$FIX/root/AGENTS.md"; (cd "$FIX/root" && find . -type f -exec sha256sum {} + | sort) > "$FIX/vorher.sums"; code=0; deploy "$B" now || code=$?
+check "Altlast: Exit 71, Pfad genannt" '[ "$code" = 71 ] && grep -q "FAILED: opencode would load /AGENTS.md into every role" "$FIX/out.log"'
+check "Altlast: Host-Dateien bytegenau, kein Neustart, kein state.json" '[ "$(after_sums)" = "$(cat "$FIX/vorher.sums")" ] && ! grep -q "^systemctl restart" "$FIX/calls.log" && [ ! -e "$FIX/root/var/lib/wireguard-ops-cockpit/self-update/state.json" ]'
+check "Altlast: Rückfall auf A, vor dem Bau abgebrochen" '[ "$(git -C "$FIX/repo" rev-parse HEAD)" = "$A" ] && ! grep -q "^docker compose" "$FIX/calls.log" && grep -q "rollback complete" "$FIX/out.log"'
 
 echo
 [ "$fails" = 0 ] && echo "alles grün" || { echo "$fails rot"; exit 1; }
