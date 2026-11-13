@@ -182,6 +182,11 @@ interface Segment {
   joined: boolean;
   // The separator behind it (";", "|", "&&", "$(", "<(", ">(", ")", "`", "").
   sep: string;
+  // Index of its pipeline on the line: ;, &, && and || end one (|& does not),
+  // substitutions and groups do not (X5 B1–B5, t_a533d05c).
+  pipe: number;
+  // Inside a >( … ) (X5 B6, t_a533d05c): what it reads is output written there.
+  write: boolean;
 }
 
 function basename(word: string): string {
@@ -207,7 +212,15 @@ function commandOf(words: string[]): string {
 function enclosingOf(text: string): string {
   const words = wordsOf(text);
   if (!words.length) return "$(";
-  return commandOf(words) || (/[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=["']?\S*$/.test(text) ? "" : "$(");
+  const assigning = /[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=["']?\S*$/.test(text);
+  // X5 B7 (Zweitprüfung t_fa3d3327, Karte t_a533d05c): a word with an escape in
+  // $'…' ($'\x62ash' <(…)) may name any command; fail safe, as in shellWords.
+  if (/(?:^|\s)\$'[^']*\\/.test(text)) return "$(";
+  // X5 B8: a[0]=1 $(…) and x="a b" $(…) only assign before it; the output runs
+  // as a command. Quoted strings collapse first, so "a b" stays one word.
+  const bare = text.replace(/'[^']*'|"[^"]*"/g, "q").trim().split(/\s+/).filter((word) => word && !/^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=/.test(word));
+  if (!assigning && !commandOf(bare)) return "$(";
+  return commandOf(words) || (assigning ? "" : "$(");
 }
 
 // Simple commands of one line, split at ; & && || | ( ) $( <( >( and backticks.
@@ -217,40 +230,56 @@ function enclosingOf(text: string): string {
 function splitLine(line: string): { segments: Segment[]; open: Array<string | null> } {
   const exec = line.match(/^\s*Exec[A-Za-z]*\s*=\s*[-@:+!|]*(.*)$/);
   const code = exec ? exec[1] : line;
-  const raw: Array<{ text: string; enclosing: string | null; sep: string }> = [];
+  const raw: Array<{ text: string; enclosing: string | null; sep: string; write: boolean; quoted: boolean }> = [];
   const stack: Array<string | null> = [];
+  // The opener of each open substitution or group, parallel to stack (>( for B6).
+  const kinds: string[] = [];
   let current = "";
   let backtick = false;
+  // Quotes only decide where a pipeline ends (a ; in '…' ends none, B1); fail
+  // safe, a separator inside "$(…)" counts as quoted and ends none either.
+  let single = false;
+  let double = false;
+  let escaped = false;
+  let backslashes = 0;
   const top = (): string | null => (stack.length ? stack[stack.length - 1] : null);
-  const close = (sep: string) => { raw.push({ text: current, enclosing: top(), sep }); current = ""; };
+  const close = (sep: string) => { raw.push({ text: current, enclosing: top(), sep, write: kinds.includes(">("), quoted: single || double || escaped }); current = ""; };
   for (let i = 0; i < code.length; i += 1) {
     const ch = code[i];
+    escaped = !single && backslashes % 2 === 1;
+    backslashes = ch === "\\" ? backslashes + 1 : 0;
+    if (ch === "'" && !double && !escaped) single = !single;
+    else if (ch === '"' && !single && !escaped) double = !double;
     const two = code.slice(i, i + 2);
     if (two === "&&" || two === "||") { close(two); i += 1; continue; }
     if (two === "$(" || two === "<(" || two === ">(") {
       const outer = enclosingOf(current);
       close(two);
       stack.push(outer);
+      kinds.push(two);
       i += 1;
       continue;
     }
     if (ch === "`") {
-      if (backtick) { close(ch); stack.pop(); } else { const outer = enclosingOf(current); close(ch); stack.push(outer); }
+      if (backtick) { close(ch); stack.pop(); kinds.pop(); } else { const outer = enclosingOf(current); close(ch); stack.push(outer); kinds.push(ch); }
       backtick = !backtick;
       continue;
     }
-    if (ch === "(") { close(ch); stack.push(top()); continue; }
-    if (ch === ")") { close(ch); stack.pop(); continue; }
+    if (ch === "(") { close(ch); stack.push(top()); kinds.push(ch); continue; }
+    if (ch === ")") { close(ch); stack.pop(); kinds.pop(); continue; }
     if (ch === "&" && (code[i - 1] === ">" || code[i - 1] === "<" || code[i + 1] === ">")) { current += ch; continue; }
     if (ch === ";" || ch === "|" || ch === "&") { close(ch); continue; }
     current += ch;
   }
   close("");
+  let pipe = 0;
   const segments = raw.map((item, index) => {
     const words = wordsOf(item.text);
     const next = item.sep === "|" ? raw[index + 1] : undefined;
     const joined = /^(?:\)|`)$/.test(raw[index - 1]?.sep ?? "") || /^(?:\$\(|`|<\(|>\()$/.test(item.sep);
-    return { text: item.text, words, command: commandOf(words), enclosing: item.enclosing, pipedInto: next ? commandOf(wordsOf(next.text)) : null, joined, sep: item.sep };
+    const segment = { text: item.text, words, command: commandOf(words), enclosing: item.enclosing, pipedInto: next ? commandOf(wordsOf(next.text)) : null, joined, sep: item.sep, pipe, write: item.write };
+    if (!item.quoted && /^(?:;|&|&&|\|\||)$/.test(item.sep) && !(item.sep === "&" && !item.text.trim() && raw[index - 1]?.sep === "|")) pipe += 1;
+    return segment;
   }).filter((segment) => segment.words.length);
   return { segments, open: stack };
 }
@@ -936,21 +965,40 @@ const CONTINUED = /(?:^|[^\\])(?:\\\\)*\\$/;
 // bash, bash <(f)), a substitution a shell or eval reads that stays open over
 // the line's end (bash <( + newline). Fail safe: the rest of the step shows
 // nothing (ScriptLine.blind).
-const COMPOUND_OUT = /(?:^|[\s;&|])(?:\}|\)|done|fi|esac)\s*(?:\d*(?:>>?|<<?|>&|<&|&>>?)\s*\S+\s*)*(?:\|&?|>\s*>\()/g;
+// Nachtrag (Zweitprüfung t_fa3d3327, Karte t_a533d05c): the whole pipeline behind
+// the closer or the call counts, not only its first command (B1/B2: } | tee
+// /dev/null | bash, f | cat | bash), whatever redirections the closer has (B4: }
+// 2>"/tmp/a b" | bash, } 2>$(…) | bash), and a command there that runs a
+// substitution as code (B5: } | source <(cat), | eval "$(cat)"). A function call
+// is read like bash (B2: \f, 'f'). Besides: a >( … ) that a shell reads, anywhere
+// on the line (B6: exec > >(bash)), and a | at the line's end (B3: the pipeline
+// goes on after the heredoc bodies, } |⏎bash, cat <<'X' |⏎…⏎X⏎bash).
+const CLOSER = /(?:^|[\s;&|])(?:\}|\)|done|fi|esac)(?=[\s;&|<>]|$)/g;
 const FUNCTION_NAME = /(?:^|[\s;&|(){])(?:function\s+([^\s(){};&|<>]+)|([^\s(){};&|<>$`'"=]+)\s*\(\s*\))/g;
 
+// A segment that reads its input or a substitution's output as shell code; one of
+// redirections only (} > /tmp/log, done < <(…)) runs nothing. Fail safe, a command
+// a value names (} | xargs $SH -c, f | $BASH) may be a shell.
+function codeReader(segment: Segment): boolean {
+  const words = plainWords(shellWords(segment).map((word) => word.split("<")[0]).filter(Boolean));
+  return (words.length > 0 && (readsShell(segment) || /[$`]/.test(commandOf(words)))) || runsCode(segment.enclosing);
+}
+
+// Does a shell read what segments[at] puts out: a substitution a shell or eval
+// reads (bash <(f), $(f)), or a command behind a | or >( of its pipeline that
+// reads code (f() { … } itself is a definition, no call).
 function feedsShell(segments: Segment[], at: number): boolean {
-  const segment = segments[at];
-  const next = segments[at + 1];
-  return runsCode(segment.enclosing) || (Boolean(next) && (segment.sep === "|" || segment.sep === ">(") && readsShell(next));
+  return runsCode(segments[at].enclosing) || segments.some((segment, k) => k > at && segment.pipe === segments[at].pipe && segments.slice(at, k).some((before) => before.sep === "|" || before.sep === ">(") && codeReader(segment));
 }
 
 function shellReadsUnseen(line: string, segments: Segment[], open: Array<string | null>, functions: Set<string>): boolean {
   if (open.some(runsCode)) return true;
-  if (segments.some((segment, at) => functions.has(segment.command) && feedsShell(segments, at))) return true;
-  for (const match of line.matchAll(COMPOUND_OUT)) {
-    const after = segmentsOf(line.slice(match.index + match[0].length))[0];
-    if (after && readsShell(after)) return true;
+  if (/(?<!\|)\|&?\s*$/.test(line)) return true;
+  if (segments.some((segment) => segment.write && codeReader(segment))) return true;
+  if (segments.some((segment, at) => functions.has(segment.command.replace(/\$(?=['"])/g, "").replace(/['"\\]/g, "")) && feedsShell(segments, at))) return true;
+  for (const match of line.matchAll(CLOSER)) {
+    const after = segmentsOf(line.slice(match.index + match[0].length));
+    if (after.some((segment) => segment.pipe === 0 && codeReader(segment))) return true;
   }
   return false;
 }
@@ -1109,8 +1157,10 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
         // then ends in cat, so localChain makes the body not local: its writes show
         // nothing, its overwrites and runs are read.
         for (; at < segments.length; at += 1) {
-          shell = readsShell(segments[at]) || runsCode(segments[at].enclosing) || (segments[at].sep === ">(" && at + 1 < segments.length && readsShell(segments[at + 1]));
-          if (shell || segments[at].pipedInto === null) break;
+          shell = readsShell(segments[at]) || runsCode(segments[at].enclosing);
+          // Nachtrag t_a533d05c (B5): the chain follows the whole pipeline, also
+          // into substitutions behind the pipe (| source <(cat), | eval "$(cat)").
+          if (shell || segments[at + 1]?.pipe !== segments[at].pipe) break;
         }
         // R1 (Zweitprüfung t_42ae4123): bash expands an unquoted body before the shell
         // reads it, \\ becomes \ and the inner shell joins echo foo\\ with a # line;

@@ -1556,3 +1556,88 @@ describe("hash-pinned scripts: a heredoc a shell reads by way of a group, a func
     expect(found(`cat <<'X' | bash\nset -e\n${shown}\nX\n${pin}\n${P}`)).toEqual([]);
   });
 });
+
+describe("hash-pinned scripts: the whole pipeline behind a group or function, | at the line's end, exec > >(bash), $'\\x62ash' <(…), a[0]=1 $(…) (X5 Nachtrag, t_a533d05c)", () => {
+  const P = "/opt/x/run.sh";
+  const pin = `echo "${HASH}  ${P}" | sha256sum -c -`;
+  const found = (run: string) => hiddenPinnedScripts(manifest([{ name: "s1", run }]) as never).map(({ path }) => path);
+  const shown = `cat > ${P} <<'EOF'\necho gut\nEOF`;
+  const evil = `cp /tmp/boese ${P}`;
+  // Zweitprüfung t_fa3d3327 (B1–B8): real bash runs the cp, the tool took it for
+  // content. Gegenprobe with bash: /opt/data/out/t_fa3d3327/h, /opt/data/out/t_a533d05c.
+  const forms = (q: string): Array<[string, string]> => {
+    const fn = `f() {\ncat <<${q}\n${evil}\nX\n}\n`;
+    return [
+      // B1: the whole pipeline behind the closer, not only its first command
+      ["} | tee /dev/null | bash", `{ cat <<${q}\n${evil}\nX\n} | tee /dev/null | bash`],
+      ["} | cat | bash", `{ cat <<${q}\n${evil}\nX\n} | cat | bash`],
+      ["} |& tee /dev/null | bash", `{ cat <<${q}\n${evil}\nX\n} |& tee /dev/null | bash`],
+      ["while … done | tee /dev/null | bash", `while true; do cat <<${q}\n${evil}\nX\nbreak; done | tee /dev/null | bash`],
+      ["} | tr '\\n' ';' | xargs -0 bash -c", `{ cat <<${q}\n${evil}\nX\n} | tr '\\n' ';' | xargs -0 bash -c`],
+      ["} | { bash; }", `{ cat <<${q}\n${evil}\nX\n} | { bash; }`],
+      ["} | tee >(bash) >/dev/null", `{ cat <<${q}\n${evil}\nX\n} | tee >(bash) >/dev/null`],
+      ["} | xargs -0 $SH -c (a value names the shell)", `SH=bash\n{ cat <<${q}\n${evil}\nX\n} | xargs -0 $SH -c`],
+      // B2: the same behind a function call, and the call read like bash
+      ["f | tee /dev/null | bash", `${fn}f | tee /dev/null | bash`],
+      ["\\f | bash", `${fn}\\f | bash`],
+      ["'f' | bash", `${fn}'f' | bash`],
+      ["f | (bash)", `${fn}f | (bash)`],
+      ["f | tee >(bash) >/dev/null", `${fn}f | tee >(bash) >/dev/null`],
+      // B3: | at the line's end, the pipeline goes on after the bodies
+      ["} |⏎bash", `{ cat <<${q}\n${evil}\nX\n} |\nbash`],
+      ["cat <<X |⏎ body ⏎ bash", `cat <<${q} |\n${evil}\nX\nbash`],
+      ["cat <<X |&⏎ body ⏎ bash", `cat <<${q} |&\n${evil}\nX\nbash`],
+      ["for … done |⏎bash", `for i in 1; do cat <<${q}\n${evil}\nX\ndone |\nbash`],
+      // B4: any redirection at the closer
+      ["} 2>\"/tmp/a b\" | bash", `{ cat <<${q}\n${evil}\nX\n} 2>"/tmp/a b" | bash`],
+      ["} 2>$(echo /dev/null) | bash", `{ cat <<${q}\n${evil}\nX\n} 2>$(echo /dev/null) | bash`],
+      ["} 2>\"/tmp/a b\" |& bash", `{ cat <<${q}\n${evil}\nX\n} 2>"/tmp/a b" |& bash`],
+      // B5: a substitution behind the pipe that runs as code
+      ["cat <<X | source <(cat)", `cat <<${q} | source <(cat)\n${evil}\nX`],
+      ["cat <<X | . <(cat)", `cat <<${q} | . <(cat)\n${evil}\nX`],
+      ["cat <<X | eval \"$(cat)\"", `cat <<${q} | eval "$(cat)"\n${evil}\nX`],
+      ["cat <<X | tee /dev/null | source <(cat)", `cat <<${q} | tee /dev/null | source <(cat)\n${evil}\nX`],
+      ["cat <<X | bash <(cat)", `cat <<${q} | bash <(cat)\n${evil}\nX`],
+      ["} | source <(cat)", `{ cat <<${q}\n${evil}\nX\n} | source <(cat)`],
+      ["} | cat - | eval \"$(cat)\"", `{ cat <<${q}\n${evil}\nX\n} | cat - | eval "$(cat)"`],
+      // B6: a >( … ) a shell reads, anywhere on the line
+      ["exec > >(bash); cat <<X", `exec > >(bash)\ncat <<${q}\n${evil}\nX`],
+      ["exec 1> >(sh); cat <<X", `exec 1> >(sh)\ncat <<${q}\n${evil}\nX`],
+      ["exec 2> >(bash); cat <<X >&2", `exec 2> >(bash)\ncat <<${q} >&2\n${evil}\nX`],
+      ["exec {fd}> >(bash)", `exec {fd}> >(bash)\ncat <<${q} >&$fd\n${evil}\nX`],
+      ["exec > >(sudo bash)", `exec > >(sudo bash)\ncat <<${q}\n${evil}\nX`],
+      ["exec > >(eval \"$(cat)\")", `exec > >(eval "$(cat)")\ncat <<${q}\n${evil}\nX`],
+      // B7: $'…\…' around a substitution
+      ["$'\\x62ash' <(cat <<X)", `$'\\x62ash' <(cat <<${q}\n${evil}\nX\n)`],
+      ["$'\\x62ash' < <(cat <<X)", `$'\\x62ash' < <(cat <<${q}\n${evil}\nX\n)`],
+      ["$'\\x62ash' -s < <(cat <<X)", `$'\\x62ash' -s < <(cat <<${q}\n${evil}\nX\n)`],
+      // B8: assignments only in front of the substitution
+      ["a[0]=1 $(cat <<X)", `a[0]=1 $(cat <<${q}\n${evil}\nX\n)`],
+      ["x=\"a b\" $(cat <<X)", `x="a b" $(cat <<${q}\n${evil}\nX\n)`],
+      ["a[1]+=x $(cat <<X)", `a[1]+=x $(cat <<${q}\n${evil}\nX\n)`],
+      ["x='a b' y=1 $(cat <<X)", `x='a b' y=1 $(cat <<${q}\n${evil}\nX\n)`],
+      ["x[0]=\"a b\" $(cat <<X)", `x[0]="a b" $(cat <<${q}\n${evil}\nX\n)`],
+    ];
+  };
+  for (const q of ["X", "'X'"]) {
+    for (const [name, run] of forms(q)) {
+      it(`X5 Nachtrag: ${name} (${q === "X" ? "unquoted" : "quoted"})`, () => {
+        expect(found(`${shown}\n${run}\n${pin}\n${P}`)).toEqual([P]);
+      });
+    }
+  }
+
+  it("X5 Nachtrag B6: exec > >(bash) after the pin as well", () => {
+    expect(found(`${shown}\n${pin}\nexec > >(bash)\ncat <<'X'\n${evil}\nX\n${P}`)).toEqual([P]);
+  });
+
+  it("guard: a pipeline that ends before the shell, a redirection into a file, || at the line's end and assignments stay free", () => {
+    expect(found(`${shown}\n{ cat <<'X'\nhallo\nX\n} 2>"/tmp/a b" > /tmp/log; echo ok\n${pin}\n${P}`)).toEqual([]);
+    expect(found(`${shown}\n{ cat <<'X'\nhallo\nX\n} | tee /tmp/log | grep -c x\n${pin}\n${P}`)).toEqual([]);
+    expect(found(`${shown}\nf() { echo hi; }\nf | tee /tmp/log | grep -c x\n${pin}\n${P}`)).toEqual([]);
+    expect(found(`${shown}\nexec > >(tee /tmp/log)\n${pin}\n${P}`)).toEqual([]);
+    expect(found(`${shown}\ntrue ||\n  echo nie\n${pin}\n${P}`)).toEqual([]);
+    expect(found(`${shown}\na[0]=$(cat <<'X'\nhallo\nX\n)\nx="a b"\n${pin}\n${P}`)).toEqual([]);
+    expect(found(`${shown}\nprintf '%s\\n' "a;b" | tee /tmp/l\n${pin}\n${P}`)).toEqual([]);
+  });
+});
