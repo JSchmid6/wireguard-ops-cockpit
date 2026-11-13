@@ -102,6 +102,10 @@ readonly TABLE=(
   "deploy/systemd/email-archive-auto-deploy.service|$UNITS/email-archive-auto-deploy.service|644"
   "deploy/systemd/email-archive-auto-deploy.timer|$UNITS/email-archive-auto-deploy.timer|644"
   "deploy/vps/wireguard-ops-cockpit-web.service|$UNITS/wireguard-ops-cockpit-web.service|644"
+  # The agent unit keeps its home read-only; opencode then needs this file in its config
+  # directory (it writes it on start otherwise and fails). The config itself is not
+  # installed here (the VPS keeps its own); the read-only home protects it.
+  "deploy/config/opencode-config-dir.gitignore|$ROOT/var/lib/wireguard-ops-agent/.config/opencode/.gitignore|644"
   # The general host door (doc/setup/host-run.md): its root helper and the
   # boot-time continuation of runs that asked for a reboot.
   "deploy/helpers/cockpit-host-run|$LIB/cockpit-host-run.mjs|755"

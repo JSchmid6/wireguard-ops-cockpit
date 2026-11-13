@@ -771,9 +771,18 @@ runuser -u cockpit-agent -- test -x "$NODE_DIR/bin/opencode" \
 timeout 60 runuser -u cockpit-agent -- env HOME="$AGENT_DIR" "$NODE_DIR/bin/opencode" --version >/dev/null 2>&1 \
   || die "opencode --version schlägt als cockpit-agent fehl (runuser-Test)."
 ln -sfn "$NODE_DIR/bin/opencode" /usr/local/bin/opencode
-install -d -m 0750 -o cockpit-agent -g cockpit-agent-client "$AGENT_DIR/.config/opencode"
-install -m 600 -o cockpit-agent -g cockpit-agent-client \
+# BEGIN agent-opencode-config (test/cockpit-agent-unit-e2e-inner.sh runs exactly these lines)
+# The config of every agent role belongs to root; the agent identity, which also
+# runs the runner with build tools, only reads it. The unit keeps the home
+# read-only on top (wireguard-ops-cockpit-agent.service). opencode writes
+# .gitignore into its config directory on every start unless it exists and
+# fails on a read-only one, so the deploy places it.
+install -d -m 0750 -o root -g cockpit-agent-client "$AGENT_DIR/.config" "$AGENT_DIR/.config/opencode"
+install -m 640 -o root -g cockpit-agent-client \
   "$COCKPIT_DIR/deploy/config/opencode-agent.jsonc" "$AGENT_DIR/.config/opencode/opencode.jsonc"
+install -m 640 -o root -g cockpit-agent-client \
+  "$COCKPIT_DIR/deploy/config/opencode-config-dir.gitignore" "$AGENT_DIR/.config/opencode/.gitignore"
+# END agent-opencode-config
 
 # ---------------------------------------------------------------------------
 # 10) Web-Frontend über nginx (nur WG-IP; Port/TLS aus Ist-Zustand, Re-Run-sicher)

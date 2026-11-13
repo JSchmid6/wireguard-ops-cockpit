@@ -45,8 +45,33 @@ export function cleanupStaleWorkspaces(root = workspaceRoot, now = Date.now()) {
   }
 }
 
+// opencode 1.18 looks for project config, instructions and skills from the
+// workspace up to "/" (no git repository there; a .git would make it one), and
+// loads config, agents, commands, skills and tools (code, also with --pure) from
+// its global config directory. Whatever lies there reaches every role, also
+// safety and verifier. The unit keeps the home read-only, so the session root is
+// the one such level the agent identity can still write; the other checks catch
+// what a run left behind before the home was read-only (t_62992d58). Fail closed.
+const projectConfigNames = ["opencode.json", "opencode.jsonc", ".opencode", "AGENTS.md", "CLAUDE.md", "CONTEXT.md", ".claude", ".agents", ".git", ".gitconfig"];
+const globalConfigNames = ["opencode.json", "config.json", "AGENTS.md", "agent", "agents", "command", "commands", "mode", "modes", "plugin", "plugins", "tool", "tools", "skill", "skills"];
+
+function present(file) {
+  try { fs.lstatSync(file); return true; } catch (error) { if (error.code === "ENOENT") return false; throw error; }
+}
+
+export function assertNoPlantedConfig(root = workspaceRoot, configDir = path.join(process.env.XDG_CONFIG_HOME || path.join(process.env.HOME || "/nonexistent", ".config"), "opencode")) {
+  const found = [];
+  for (let dir = path.resolve(root); ; dir = path.dirname(dir)) {
+    found.push(...projectConfigNames.map((name) => path.join(dir, name)).filter(present));
+    if (path.dirname(dir) === dir) break;
+  }
+  found.push(...globalConfigNames.map((name) => path.join(configDir, name)).filter(present));
+  if (found.length) throw new Error(`opencode would load ${found.join(", ")} into every role; refusing to start an agent until root removes it`);
+}
+
 export function createSessionWorkspace(request, root = workspaceRoot) {
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+  assertNoPlantedConfig(root);
   const workspace = fs.mkdtempSync(path.join(root, `agent-${request.requestId}-${request.role}-`));
   fs.chmodSync(workspace, 0o700);
   const common = fs.readFileSync(new URL("AGENTS.md", contextRoot), "utf8");
