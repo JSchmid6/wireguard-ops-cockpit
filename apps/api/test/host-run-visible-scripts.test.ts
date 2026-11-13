@@ -780,3 +780,188 @@ describe("hash-pinned scripts: redirections, shell operands, $SHELL and startup 
     expect(hiddenPinnedScripts(manifest([{ name: "s1", run: `bash <<'X'\n${body}\nX\n${pin}\n${P}` }, { name: "s2", run: "export BASH_ENV=/srv/e" }]) as never)).toEqual([]);
   });
 });
+
+describe("hash-pinned scripts: wrapper options by positive list, directory, fd 0 and expansions at the opener (Befund t_683da1d6)", () => {
+  const P = "/opt/x/run.sh";
+  const pin = `echo "${HASH}  ${P}" | sha256sum -c -`;
+  const body = `cat > ${P} <<'EOF'\necho hi\nEOF`;
+  const hidden = (run: string) => hiddenPinnedScripts(manifest([{ name: "s1", run }]) as never);
+  const opened = (opener: string, before = "") => hidden(`${before}${opener}\n${body}\nX\n${pin}\n${P}`);
+  // The body writes run.sh relative to the directory it runs in.
+  const relative = (opener: string) => hidden(`cd /opt/x\n${opener}\ncat > run.sh <<'EOF'\necho hi\nEOF\nX\n${pin}\n${P}`);
+
+  const wrappers = ["sudo", "doas", "su", "runuser", "setpriv", "env", "nice", "ionice", "chrt", "timeout", "stdbuf", "systemd-run", "systemd-cat", "nohup", "setsid"];
+  const unlisted = [
+    ...wrappers.flatMap((wrapper) => [`${wrapper} --help bash <<'X'`, `${wrapper} --version bash <<'X'`]),
+    "sudo -V bash <<'X'",
+    "sudo -l bash <<'X'",
+    "sudo --list bash <<'X'",
+    "sudo -K bash <<'X'",
+    "sudo -S bash <<'X'",
+    "sudo -b bash <<'X'",
+    "doas -C /etc/doas.conf bash <<'X'",
+    "chrt -p 10 bash <<'X'",
+    "setpriv -d bash <<'X'",
+    "setsid -f bash <<'X'",
+    "systemd-run --pipe --root-directory=/srv/r bash <<'X'",
+    "systemd-run --pipe --root-directory /srv/r bash <<'X'",
+    "systemd-run --pipe --root-image=/srv/i.raw bash <<'X'",
+    "systemd-run --pipe --root-image /srv/i.raw bash <<'X'",
+    "systemd-run -S <<'X'",
+    "systemd-run --shell <<'X'",
+    "systemd-run --pty bash <<'X'",
+    "systemd-run -t bash <<'X'",
+    "systemd-run bash <<'X'",
+    "systemd-run --wait bash <<'X'",
+    "systemd-run --pipe --no-block bash <<'X'",
+    "cat <<'X' | systemd-run -u x bash",
+    "env --argv0=-bash bash <<'X'",
+    "env --argv0 -bash bash <<'X'",
+    "exec -a -bash bash <<'X'",
+    "exec -a-bash bash <<'X'",
+    "exec -l bash <<'X'",
+  ];
+  for (const opener of unlisted) {
+    it(`T-A: a wrapper option outside its positive list makes the body not local: ${opener}`, () => {
+      expect(opened(opener)).toEqual([{ path: P, pinnedAt: "S1:L6", executedAt: "S1:L7" }]);
+    });
+  }
+
+  const moved = [
+    "env -C /tmp bash <<'X'",
+    "env --chdir=/tmp bash <<'X'",
+    "env --chdir /tmp bash <<'X'",
+    "sudo -D /tmp bash <<'X'",
+    "sudo --chdir=/tmp bash <<'X'",
+    "sudo -i <<'X'",
+    "sudo --login <<'X'",
+    "su - root <<'X'",
+    "su -l root <<'X'",
+    "su --login root <<'X'",
+    "runuser -l root <<'X'",
+    "systemd-run --pipe bash <<'X'",
+    "systemd-run --pipe --working-directory=/tmp bash <<'X'",
+    "systemd-run --pipe --same-dir --working-directory=/tmp bash <<'X'",
+    "cat <<'X' | env -C /tmp bash",
+  ];
+  for (const opener of moved) {
+    it(`T-B: a relative write behind a wrapper that changes the directory is not the shown file: ${opener}`, () => {
+      expect(relative(opener)).toEqual([{ path: P, pinnedAt: "S1:L7", executedAt: "S1:L8" }]);
+    });
+  }
+
+  for (const opener of ["bash <<'X'", "sudo -u root bash <<'X'", "systemd-run --pipe --same-dir bash <<'X'", "systemd-run --pipe -d bash <<'X'", "systemd-run --scope bash <<'X'", "su root <<'X'"]) {
+    it(`T-B guard: a relative write behind a wrapper that keeps the directory stays shown: ${opener}`, () => {
+      expect(relative(opener)).toEqual([]);
+    });
+  }
+
+  it("T-B guard: after a body in another directory the caller's directory holds again", () => {
+    expect(hidden(`cd /opt/x\nenv -C /tmp bash <<'X'\ntrue\nX\ncat > run.sh <<'EOF'\necho hi\nEOF\n${pin}\n${P}`)).toEqual([]);
+  });
+
+  it("T-B: the second body of a line starts in the directory of its own wrapper", () => {
+    expect(hidden(`cd /opt/x\ncat > /tmp/a <<'A'; env -C /tmp bash <<'X'\nhi\nA\ncat > run.sh <<'EOF'\necho hi\nEOF\nX\n${pin}\n${P}`)).toHaveLength(1);
+  });
+
+  const fd0 = [
+    "bash <<'X' 0>&-",
+    "bash <<'X' 0>/dev/null",
+    "bash <<'X' 0>>/srv/x",
+    "bash <<'X' 00>&-",
+    "bash <<'X' 0>&3",
+    "bash 0>&- <<'X'",
+    "sudo bash <<'X' 0>&-",
+    "cat <<'X' | bash 0>&-",
+    "cat <<'X' | bash 0>&3",
+  ];
+  for (const opener of fd0) {
+    it(`T-C: a redirection of fd 0 without < replaces the body's stdin: ${opener}`, () => {
+      expect(opened(opener)).toEqual([{ path: P, pinnedAt: "S1:L6", executedAt: "S1:L7" }]);
+    });
+  }
+
+  it("T-C: the same after exec 3</srv/evil.sh, and on a top-level heredoc", () => {
+    expect(opened("bash <<'X' 0>&3", "exec 3</srv/evil.sh\n")).toHaveLength(1);
+    expect(hidden(`exec 3</srv/evil.sh\ncat > ${P} <<'EOF' 0>&3\necho hi\nEOF\n${pin}\n${P}`)).toHaveLength(1);
+    expect(hidden(`cat > ${P} <<'EOF' 0>&-\necho hi\nEOF\n${pin}\n${P}`)).toHaveLength(1);
+  });
+
+  const expanded = [
+    "bash -s $o <<'X'",
+    "bash -s ${o} <<'X'",
+    "sudo -u root bash -s $o <<'X'",
+    "su $u <<'X'",
+    "su \"$u\" <<'X'",
+    "runuser $u <<'X'",
+    "sudo -u $u bash <<'X'",
+    "env `echo -C /tmp` bash <<'X'",
+    "env $(echo -C /tmp) bash <<'X'",
+    "ssh $(echo other) bash <<'X'",
+    "bash <<'X' $(echo -c true)",
+    "bash <<'X' `echo -c true`",
+  ];
+  for (const opener of expanded) {
+    it(`T-D: an expansion in the opener chain is not read as a word: ${opener}`, () => {
+      expect(opened(opener, "o='-c true'; u='-c true'\n")).toHaveLength(1);
+    });
+  }
+
+  const unshown = [
+    `cat /srv/evil.sh > ${P} <<'EOF'\necho hi\nEOF\n${pin}\n${P}`,
+    `f=/srv/evil.sh\ncat $f > ${P} <<'EOF'\necho hi\nEOF\n${pin}\n${P}`,
+    `cat -n > ${P} <<'EOF'\necho hi\nEOF\n${pin}\n${P}`,
+    `export $(cat /srv/env)\nbash <<'X'\n${body}\nX\n${pin}\n${P}`,
+    `set -a; . /srv/env; set +a\nbash <<'X'\n${body}\nX\n${pin}\n${P}`,
+    `n=BAS; export "\${n}H_ENV=/srv/e"\nbash <<'X'\n${body}\nX\n${pin}\n${P}`,
+  ];
+  for (const run of unshown) {
+    it(`hints: a file operand of cat and names the plan does not export by name: ${JSON.stringify(run.split("\n").slice(0, 2).join("; "))}`, () => {
+      expect(hidden(run)).toHaveLength(1);
+    });
+  }
+
+  const guards = [
+    "bash <<'X'",
+    "sudo -u root bash <<'X'",
+    "cat <<'X' | sudo bash",
+    "timeout 60 bash <<'X'",
+    "systemd-run --pipe bash <<'X'",
+    "bash -s <<'X'",
+    "sudo -i <<'X'",
+    "su root <<'X'",
+    "su - root <<'X'",
+    "setpriv --reuid 0 bash <<'X'",
+    "setpriv --reuid=0 --regid=0 --init-groups bash <<'X'",
+    "chrt -f 10 bash <<'X'",
+    "env --argv0=ssh bash <<'X'",
+    "exec -a ssh bash <<'X'",
+    "systemd-run --pipe -uM bash <<'X'",
+    "systemd-run --pipe --wait --collect --unit=x --same-dir bash <<'X'",
+    "systemd-run -PWG bash <<'X'",
+    "systemd-run --scope bash <<'X'",
+    "ionice -c 3 nice -n 10 bash <<'X'",
+    "nice -10 bash <<'X'",
+    "stdbuf -oL bash <<'X'",
+    "sudo -E -H -n -u root bash <<'X'",
+    "env -i FOO=1 bash <<'X'",
+    "timeout -k 5 --foreground 60 bash <<'X'",
+    "cat <<'X' | tee -a /var/log/run.log | bash",
+    "bash <<'X' 2>&1",
+    "bash <<'X' >&2",
+  ];
+  for (const opener of guards) {
+    it(`T-A–T-D guard: a local body with listed options stays shown: ${opener}`, () => {
+      expect(opened(opener)).toEqual([]);
+    });
+  }
+
+  it("T-D guard: the value of an assignment and of a named export may expand", () => {
+    expect(opened("LANG=$L bash <<'X'")).toEqual([]);
+    expect(opened("bash <<'X'", "export STAMP=$(date +%s)\n")).toEqual([]);
+  });
+
+  it("hint guard: cat - and cat -u still write their heredoc", () => {
+    expect(hidden(`cat - > ${P} <<'EOF'\necho hi\nEOF\n${pin}\n${P}`)).toEqual([]);
+  });
+});
