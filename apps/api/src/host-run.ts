@@ -897,6 +897,9 @@ function openersReadable(line: string, openers: number): boolean {
   return lexed.heredocs.length === openers && lexed.heredocs.every(({ at }) => STRICT_OPENER.test(line.slice(at)));
 }
 
+// A line ending in an odd number of backslashes: bash joins it with the next.
+const CONTINUED = /(?:^|[^\\])(?:\\\\)*\\$/;
+
 // Lines of all steps and checks in order; heredoc bodies are marked, whole-line
 // comments and heredoc terminators dropped, a line ending in a backslash joined
 // with the next (outside content bodies; the first line's number stays), and each
@@ -972,7 +975,7 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
       }
       if (/^\s*#/.test(line)) continue;
       const blindBefore = blind;
-      while (/(?:^|[^\\])(?:\\\\)*\\$/.test(line) && index + 1 < rows.length && !ends(view(rows[index + 1]), inner)) {
+      while (CONTINUED.test(line) && index + 1 < rows.length && !ends(view(rows[index + 1]), inner)) {
         // W-A: a backslash at the end of a comment continues nothing for bash.
         if (shellLex(line).comment) blind = true;
         index += 1;
@@ -996,6 +999,18 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
       // W-A (Zweitprüfung t_ebbf1e40): a << in a comment or in quotes, an opener of
       // another form, or more openers than heredocs in the segments.
       if (!openersReadable(line, openers.length) || owners.length !== openers.length) blind = true;
+      // The rows of each heredoc's body; the bodies follow one after the other.
+      const bounds: { from: number; end: number }[] = [];
+      for (const opener of openers) {
+        const from = bounds.length ? bounds[bounds.length - 1].end + 1 : index + 1;
+        const here = { delimiter: opener[3], tabs: opener[1] === "-" };
+        const end = rows.findIndex((row, at) => at >= from && ends(view(row), here));
+        bounds.push({ from, end: end < 0 ? rows.length : end });
+        // Hinweis B1 (Zweitprüfung t_0bc8fac5): in an unquoted heredoc bash joins a
+        // line ending in a backslash with the next before it compares the delimiter,
+        // so echo hi\ before EOF ends nothing. Fail safe: the rest of the step.
+        if (!opener[2] && rows.slice(from, bounds[bounds.length - 1].end).some((row) => CONTINUED.test(row))) blind = true;
+      }
       const scope = inner?.scope ?? null;
       const scriptLine: ScriptLine = { where, text: line, body: false, heredoc: false, trusted: !inner && !rebound && !blind, parts };
       if (blind && !blindBefore) scriptLine.blind = true;
@@ -1021,15 +1036,12 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
       const bodies: Open[] = [];
       // H-c (t_c82f5ac2): cat > /p <<'EOF' </srv/evil.sh writes the file, not the body.
       let literal = openers.length > 0 && !segments.some((segment) => segment.text.match(HEREDOC_OPENER) && stdinReplaced(segment));
-      let from = index + 1;
       for (const [k, opener] of openers.entries()) {
         const here = { delimiter: opener[3], tabs: opener[1] === "-" };
         const quoted = Boolean(opener[2]);
-        let end = rows.findIndex((row, at) => at >= from && ends(view(row), here));
-        if (end < 0) end = rows.length;
+        const { from, end } = bounds[k];
         // The line's heredoc content counts as literal only when every body on it is (B5, t_1748d6c1).
         literal = literal && (quoted || !/[$`]/.test(rows.slice(from, end).map(view).join("\n")));
-        from = end + 1;
         // The shell that reads the body: the command with the heredoc or one its output is piped into.
         const start = owners.length === openers.length ? owners[k] : Math.max(0, segments.findIndex((segment) => segment.text.includes("<<")));
         let shell = false;
@@ -1037,6 +1049,14 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
         for (; at < segments.length; at += 1) {
           shell = readsShell(segments[at]);
           if (shell || segments[at].pipedInto === null) break;
+        }
+        // R1 (Zweitprüfung t_42ae4123): bash expands an unquoted body before the shell
+        // reads it, \\ becomes \ and the inner shell joins echo foo\\ with a # line;
+        // $ and backticks can put a \ or code there as well (B=\; echo foo$B).
+        // Fail safe: any \, $ or backtick in it, the rest of the step shows nothing.
+        if (shell && !quoted && /[\\$`]/.test(rows.slice(from, end).map(view).join("\n"))) {
+          if (!blind) scriptLine.blind = true;
+          blind = true;
         }
         const local = shell ? localChain(segments.slice(start, at + 1)) : null;
         let body: ShellScope | null = null;
