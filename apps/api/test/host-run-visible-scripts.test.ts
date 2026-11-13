@@ -1264,3 +1264,110 @@ describe("hash-pinned scripts: the line of a nested opener, the form of a write,
     expect(found(`case b in a)\nbash <<'X'\n${body}\nX\n;; esac\n${pin}\n${P}`)).toEqual([P]);
   });
 });
+
+describe("hash-pinned scripts: heredoc bounds read as bash reads them (Befund t_ebbf1e40)", () => {
+  const P = "/opt/x/run.sh";
+  const pin = `echo "${HASH}  ${P}" | sha256sum -c -`;
+  const body = `cat > ${P} <<'EOF'\necho hi\nEOF`;
+  const hidden = (run: string) => hiddenPinnedScripts(manifest([{ name: "s1", run }]) as never);
+  const found = (run: string) => hidden(run).map(({ path }) => path);
+  const outer = (opener: string, inner: string) => found(`${opener}\n${inner}\nX\n${pin}\n${P}`);
+
+  // W-A: a << in a comment or in quotes opens nothing for bash; the lines up to C run.
+  const comments = [
+    "mkdir -p /opt/x # <<'C'\nexit 0\nC",
+    "set -euo pipefail\ncd /opt/x # <<'C'\nexit 0\nC",
+    "mkdir -p '/tmp/<<C'\nexit 0\nC",
+    "mkdir -p \"/tmp/<<C\"\nexit 0\nC",
+    "mkdir -p /tmp/a\\<<C\nexit 0\nC",
+  ];
+  for (const opener of ["bash <<'X'", "cat <<'X' | sudo bash", "sudo -u root bash <<'X'"]) {
+    for (const pre of comments) {
+      it(`W-A: a << in a comment or in quotes opens no heredoc in a body: ${opener} / ${pre.split("\n").slice(-3, -2)[0]}`, () => {
+        expect(outer(opener, `${pre}\n${body}`)).toEqual([P]);
+      });
+    }
+  }
+
+  // Hint M: the same at top level; : <<'Z' swallows the write the tool takes for code.
+  it("W-A (hint M): a << in a comment or in quotes at top level", () => {
+    expect(found(`mkdir -p /opt/x # <<'C'\n: <<'Z'\nC\n${body}\nZ\n${pin}\n${P}`)).toEqual([P]);
+    expect(found(`mkdir -p '/tmp/<<C'\n: <<'Z'\nC\n${body}\nZ\n${pin}\n${P}`)).toEqual([P]);
+    expect(found(`mkdir -p /opt/x # <<'C'\nexit 0\nC\n${body}\n${pin}\n${P}`)).toEqual([P]);
+  });
+
+  // Other forms bash reads differently: the delimiter goes on after the quote or
+  // holds a dot, a backslash quotes it, the << sits in a quote inside $( … )
+  // inside double quotes.
+  const forms = [
+    `: <<'Z'x\nZ\n${body}\nZx`,
+    `: <<Z.1\nZ\n${body}\nZ.1`,
+    `: <<\\Z\n${body}\nZ`,
+    `echo "$(echo "<<C")"\n: <<'Z'\nC\n${body}\nZ`,
+  ];
+  for (const pre of forms) {
+    it(`W-A: an opener of another form or bounds bash reads otherwise show nothing after it: ${pre.split("\n")[0]}`, () => {
+      expect(found(`${pre}\n${pin}\n${P}`)).toEqual([P]);
+      expect(outer("bash <<'X'", `${pre}`)).toEqual([P]);
+    });
+  }
+
+  it("W-A: a comment ending in a backslash in a body continues nothing", () => {
+    expect(outer("bash <<'X'", `mkdir -p /opt/x # \\\nexit 0\n${body}`)).toEqual([P]);
+  });
+
+  it("W-A: a body line with a comment after its beginning is unlisted", () => {
+    expect(outer("bash <<'X'", `mkdir -p /opt/x # Ziel\n${body}`)).toEqual([P]);
+  });
+
+  // W-B: bash ends the body of bash <<'X' at the first line X, also inside the
+  // content of a heredoc in the body; : <<'X' then swallows the write.
+  for (const opener of ["bash <<'X'", "cat <<'X' | sudo bash"]) {
+    it(`W-B: the outer delimiter in the content of an inner heredoc ends the body: ${opener}`, () => {
+      expect(outer(opener, `cat > /tmp/a <<'EOF'\nX\n: <<'X'\nEOF\n${body}`)).toEqual([P]);
+    });
+  }
+
+  it("W-B: an earlier write in the body and the rest of the step show nothing either", () => {
+    expect(found(`bash <<'X'\n${body}\ncat > /tmp/a <<'EOF'\nX\ncp /srv/evil.sh ${P}\nEOF\nX\n${pin}\n${P}`)).toEqual([P]);
+    expect(found(`bash <<'X'\nbash <<'Y'\n${body}\nX\nY\nX\n${pin}\n${P}`)).toEqual([P]);
+    expect(found(`bash <<-'X'\ncat > /tmp/a <<'EOF'\n\t\tX\n: <<'X'\nEOF\n${body}\nX\n${pin}\n${P}`)).toEqual([P]);
+  });
+
+  // Hint: the rule of V-B for every program with </dev/null.
+  it("hint: a program with </dev/null and a /proc or /dev path or a $ is unlisted", () => {
+    expect(outer("bash <<'X'", `true >/proc/self/fd/0 </dev/null\n${body}`)).toEqual([P]);
+    expect(outer("bash <<'X'", `cat /proc/$$/fd/0 >/dev/null </dev/null\n${body}`)).toEqual([P]);
+    expect(outer("bash <<'X'", `cp /dev/stdin /tmp/x </dev/null\n${body}`)).toEqual([P]);
+  });
+
+  const guards = [
+    "bash <<'X'",
+    "sudo -u root bash <<'X'",
+    "cat <<'X' | sudo bash",
+    "timeout 60 bash <<'X'",
+    "systemd-run --pipe bash <<'X'",
+    "bash -s <<'X'",
+    "sudo -i <<'X'",
+    "su root <<'X'",
+    "setpriv --reuid 0 bash <<'X'",
+    "chrt -f 10 bash <<'X'",
+    "env --argv0=ssh bash <<'X'",
+    "exec -a ssh bash <<'X'",
+    "systemd-run --pipe -uM bash <<'X'",
+  ];
+  for (const opener of guards) {
+    it(`guard: real bodies stay free: ${opener}`, () => {
+      expect(outer(opener, body)).toEqual([]);
+      expect(outer(opener, `set -euo pipefail\nmkdir -p /opt/x\ncd /opt/x\napt-get update -q </dev/null\n${body}`)).toEqual([]);
+      expect(outer(opener, `set -euo pipefail\ncat > /etc/x.conf <<'EOF'\nkey = "a # b <<c"\nEOF\n${body}`)).toEqual([]);
+    });
+  }
+
+  it("guard: comments, quotes and here-strings without a << opener stay free", () => {
+    expect(found(`mkdir -p /opt/x # Zielordner\n${body}\n${pin}\n${P}`)).toEqual([]);
+    expect(found(`echo "a # b" >/dev/null\ngrep -q x <<<"$v" || true\n${body}\n${pin}\n${P}`)).toEqual([]);
+    expect(found(`cat <<'A' >/dev/null; bash <<'X'\nfoo\nA\n${body}\nX\n${pin}\n${P}`)).toEqual([]);
+    expect(found(`bash <<-'X'\n\tcat > ${P} <<-'EOF'\n\techo hi\n\tEOF\n\tX\n${pin}\n${P}`)).toEqual([]);
+  });
+});

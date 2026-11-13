@@ -409,6 +409,10 @@ interface ScriptLine {
   // t_f7778d43, shellScopeTrust); top-level lines are trusted.
   trusted: boolean;
   parts: Array<{ segment: Segment; cwd: string | null }>;
+  // W-A/W-B (Zweitprüfung t_ebbf1e40): from this line on the tool may read the
+  // step's heredoc bounds other than bash does; what it showed so far may be
+  // overwritten unseen, and nothing after it in the step shows content.
+  blind?: boolean;
 }
 
 // Commands that run a heredoc body as shell code (bash <<'X', sudo bash -s,
@@ -771,6 +775,9 @@ function bodySafe(segment: Segment): boolean {
   if (heredocWrite(segment)) return true;
   if (!PLAIN_COMMAND.test(command) || SHELL_BUILTINS.test(basename(command))) return false;
   if (SHELL_WORDS.test(basename(command)) || BODY_STARTERS.test(basename(command)) || words.some((word) => SHELL_NAME.test(word) || SHELL_NAME.test(basename(word)))) return false;
+  // Hint of t_ebbf1e40: the rule of V-B for every program with </dev/null —
+  // true >/proc/self/fd/0 </dev/null, cat /proc/$$/fd/0 </dev/null.
+  if (/[$`]/.test(segment.text) || segment.words.some((word) => /\/(?:proc|dev)\//.test(word) && word.replace(/^\d*(?:<|>>?|>\||&>)/, "") !== "/dev/null")) return false;
   const rest = segment.text.replace(DEV_NULL_STDIN, " ");
   return DEV_NULL_STDIN.test(segment.text) && !rest.includes("<") && !STDIN_FD.test(rest);
 }
@@ -822,6 +829,62 @@ function shellScopeTrust(scopes: ShellScope[]): void {
   }
 }
 
+// W-A (Zweitprüfung t_ebbf1e40): where bash sees quotes, comments and heredoc
+// openers on a line. Every << (not <<<) with its context: code, or inside quotes
+// or a comment, where bash opens nothing; whether a comment starts after the
+// line's beginning; whether the line ends inside a quote, so the next line goes
+// on with the string. $( … ) and backticks nest, also inside double quotes.
+const STRICT_OPENER = /^<<-?[ \t]*(?:'[A-Za-z_][\w-]*'|"[A-Za-z_][\w-]*"|[A-Za-z_][\w-]*)(?=[\s;&|()<>]|$)/;
+
+function shellLex(text: string): { heredocs: Array<{ at: number; code: boolean }>; comment: boolean; quoted: boolean } {
+  const heredocs: Array<{ at: number; code: boolean }> = [];
+  const stack: string[] = [];
+  let comment = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    const top = stack[stack.length - 1];
+    if (text.startsWith("<<", i) && text[i - 1] !== "<") {
+      if (text[i + 2] === "<") { i += 2; continue; }
+      heredocs.push({ at: i, code: top === undefined || top === "(" || top === "`" });
+      i += 1;
+      continue;
+    }
+    if (top === "'") { if (ch === "'") stack.pop(); continue; }
+    if (top === "$'") { if (ch === "\\") i += 1; else if (ch === "'") stack.pop(); continue; }
+    if (top === "\"") {
+      if (ch === "\\") i += 1;
+      else if (ch === "\"") stack.pop();
+      else if (text.startsWith("$(", i)) { stack.push("("); i += 1; }
+      else if (ch === "`") stack.push("`");
+      continue;
+    }
+    if (ch === "\\") { i += 1; continue; }
+    if (ch === "#" && (i === 0 || /[\s;&|()<>]/.test(text[i - 1]))) {
+      // The rest of the line is a comment; a << in it opens nothing.
+      if (text.slice(0, i).trim()) comment = true;
+      for (let at = text.indexOf("<<", i); at >= 0; at = text.indexOf("<<", at + 2)) heredocs.push({ at, code: false });
+      break;
+    }
+    if (ch === "'") stack.push("'");
+    else if (text.startsWith("$'", i)) { stack.push("$'"); i += 1; }
+    else if (ch === "\"") stack.push("\"");
+    else if (ch === "(") stack.push("(");
+    else if (ch === ")") { if (top === "(") stack.pop(); }
+    else if (ch === "`") { if (top === "`") stack.pop(); else stack.push("`"); }
+  }
+  return { heredocs, comment, quoted: stack.some((item) => item === "'" || item === "$'" || item === "\"") };
+}
+
+// Does the tool read this line's heredoc openers as bash does? Fail safe: every
+// << is code and has the plain form <<[-]['"]NAME['"] followed by a separator
+// (not <<\EOF, <<'Z'x, <<Z.1, <<$Z), the line does not end inside a quote, and
+// the openers found over the whole line are exactly these.
+function openersReadable(line: string, openers: number): boolean {
+  const lexed = shellLex(line);
+  if (lexed.quoted || lexed.heredocs.some(({ code }) => !code)) return false;
+  return lexed.heredocs.length === openers && lexed.heredocs.every(({ at }) => STRICT_OPENER.test(line.slice(at)));
+}
+
 // Lines of all steps and checks in order; heredoc bodies are marked, whole-line
 // comments and heredoc terminators dropped, a line ending in a backslash joined
 // with the next (outside content bodies; the first line's number stays), and each
@@ -848,6 +911,9 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
     let errexit = true;
     let pipefail = true;
     let depth = 0;
+    // W-A/W-B: once the tool may read the heredoc bounds other than bash, the
+    // rest of the step shows nothing (ScriptLine.blind).
+    let blind = false;
     // cwd: the directory after the body; inside: the one its first line runs in
     // (null after a wrapper that changes it, T-B, t_683da1d6); started: the body
     // has begun (bodies of one line follow one after the other); scope: the
@@ -861,6 +927,13 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
       let line = rows[index];
       const where = `${prefix}:L${index + 1}`;
       const inner = open[open.length - 1];
+      // W-B (Zweitprüfung t_ebbf1e40): bash ends a shell body at the first line
+      // that is its delimiter, also inside a heredoc in the body; the tool's stack
+      // would read on. Fail safe: the body and all in it, and the rest of the step.
+      if (!blind && open.slice(0, -1).some((here) => here.started && ends(line, here))) {
+        blind = true;
+        out.push({ where, text: line, body: true, heredoc: false, trusted: false, parts: [], blind: true });
+      }
       if (inner && ends(line, inner)) {
         open.pop();
         if (inner.shell) cwd = inner.cwd;
@@ -874,7 +947,10 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
         continue;
       }
       if (/^\s*#/.test(line)) continue;
+      const blindBefore = blind;
       while (/(?:^|[^\\])(?:\\\\)*\\$/.test(line) && index + 1 < rows.length && !ends(rows[index + 1], inner)) {
+        // W-A: a backslash at the end of a comment continues nothing for bash.
+        if (shellLex(line).comment) blind = true;
         index += 1;
         line = `${line.slice(0, -1)} ${rows[index]}`;
       }
@@ -891,11 +967,18 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
         }
         return part;
       });
+      // The segment each heredoc belongs to, in order of the line.
+      const owners = segments.flatMap((segment, at) => [...segment.text.matchAll(/(?<!<)<<-?\s*(['"]?)[A-Za-z_][\w-]*\1/g)].map(() => at));
+      // W-A (Zweitprüfung t_ebbf1e40): a << in a comment or in quotes, an opener of
+      // another form, or more openers than heredocs in the segments.
+      if (!openersReadable(line, openers.length) || owners.length !== openers.length) blind = true;
       const scope = inner?.scope ?? null;
-      const scriptLine: ScriptLine = { where, text: line, body: false, heredoc: false, trusted: !inner && !rebound, parts };
+      const scriptLine: ScriptLine = { where, text: line, body: false, heredoc: false, trusted: !inner && !rebound && !blind, parts };
+      if (blind && !blindBefore) scriptLine.blind = true;
       let entry: ScopeLine | null = null;
       if (scope && segments.length) {
-        const safe = segments.every(bodySafe);
+        // W-A: a comment after the line's beginning makes a body line unlisted.
+        const safe = !blind && !shellLex(line).comment && segments.every(bodySafe);
         entry = { line: scriptLine, clean: scope.clean, safe, errexit: scope.errexit, ends: lineEnds(line, segments) };
         scope.lines.push(entry);
         scope.clean &&= safe;
@@ -908,8 +991,6 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
           scope.pipefail ||= flags.pipefail;
         }
       }
-      // The segment each heredoc belongs to, in order of the line.
-      const owners = segments.flatMap((segment, at) => [...segment.text.matchAll(/(?<!<)<<-?\s*(['"]?)[A-Za-z_][\w-]*\1/g)].map(() => at));
       // H-a (t_c82f5ac2): a shell sent to the background (bash <<'X' &) runs beside
       // the pin and the call that follow; fail safe, a lone & anywhere on the line counts.
       const background = /(?<![&>|<])&(?![&>])/.test(line);
@@ -938,7 +1019,7 @@ function manifestLines(manifest: Pick<HostRunManifest, "steps" | "checks">): Scr
         if (shell) {
           const passes = scope ? openerPassesFailure(line, segments, start, at, scope.pipefail) : errexit && depth === 0 && openerPassesFailure(line, segments, start, at, pipefail);
           const flags = shellFlags(segments[at]);
-          body = { parent: scope, opener: entry, plain: quoted && local !== null && !environment && !background && passes, before: segments.slice(0, start).every(bodySafe), lines: [], clean: true, errexit: flags.errexit, pipefail: flags.pipefail };
+          body = { parent: scope, opener: entry, plain: quoted && local !== null && !environment && !background && passes && !blind, before: segments.slice(0, start).every(bodySafe), lines: [], clean: true, errexit: flags.errexit, pipefail: flags.pipefail };
           scopes.push(body);
         }
         bodies.push({ ...here, shell, cwd, inside: local === "moved" ? null : cwd, started: false, scope: body });
@@ -1064,6 +1145,11 @@ export function hiddenPinnedScripts(manifest: Pick<HostRunManifest, "steps" | "c
   const found: HiddenPinnedScript[] = [];
   const seen = new Set<string>();
   for (const line of lines) {
+    // W-A/W-B: bash may run what the tool takes for content from here on, also
+    // over a shown path; fail safe, nothing shown so far stays shown.
+    if (line.blind) {
+      for (const [path, item] of state) if (item.kind === "visible") state.set(path, { kind: "hidden", where: line.where, visibleBefore: true });
+    }
     if (!line.body) {
       for (const [index, { segment, cwd }] of line.parts.entries()) {
         for (const write of writesOf(segment, line.heredoc, cwd)) {

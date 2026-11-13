@@ -299,6 +299,25 @@ Die Regel im Einzelnen (`hiddenPinnedScripts` in `apps/api/src/host-run.ts`):
   Schreibvorgang auf oberster Ebene auch kann, zum Beispiel einen Prozess starten, der die Datei nach dem
   Schreiben ersetzt. Das liest der Türsteher (X5). In einem Körper ohne bekanntes Verzeichnis (T-B) zählt eine
   relative Ausführung (`./run.sh`) fail-safe über den Basisnamen.
+  **Die Heredoc-Grenzen liest die Regel wie bash** (13.11.2026, W-A/W-B aus t_ebbf1e40): Ein `<<` in einem
+  Kommentar oder in Quotes öffnet für bash nichts (`mkdir -p /opt/x # <<'C'`, `mkdir -p '/tmp/<<C'`); die Zeilen
+  bis `C` laufen dann, etwa `exit 0`, oder auf oberster Ebene schluckt ein `: <<'Z'` den Schreibvorgang. Und bash
+  beendet den Körper von `bash <<'X'` an der ersten Zeile `X`, auch wenn sie im Inhalt eines inneren Heredocs
+  steht (`cat > /tmp/a <<'EOF'` … `X` … `: <<'X'`). Fail-safe, für jede Zeile außerhalb von Inhalt, auf oberster
+  Ebene wie im Körper: Die Regel liest Quotes (`'…'`, `"…"`, `$'…'`, auch verschachtelt in `$(…)` und Backticks)
+  und Kommentare (`#` am Wortanfang). Steht ein `<<` (nicht `<<<`) in einem Kommentar oder in Quotes, hat ein Opener
+  nicht genau die Form `<<[-]NAME`, `<<[-]'NAME'` oder `<<[-]"NAME"` mit einem Trenner dahinter (`<<\Z`, `<<'Z'x`,
+  `<<Z.1`, `<<$Z`), endet die Zeile in einem offenen Quote, gibt es mehr Opener als Heredocs in den Segmenten,
+  verbindet die Regel eine Zeile mit `\` am Ende eines Kommentars mit der nächsten (für bash setzt der Kommentar
+  nichts fort), oder erreicht eine Zeile in einem Körper den Begrenzer eines umschließenden Shell-Körpers (bei
+  `<<-` auch mit führenden Tabs), dann kann die Regel die Grenzen ab hier anders lesen als bash. Ab dieser Zeile
+  gilt für den Rest des Schritts nichts mehr als gezeigt, und was bis dahin gezeigt war, zählt als überschrieben
+  (bash kann ab hier Zeilen ausführen, die die Regel für Inhalt hält). Dazu ist im Körper eine Zeile mit einem
+  Kommentar nach dem Zeilenanfang nicht auf der Liste aus 1. Die Regel aus V-B gilt zudem für jedes Programm mit
+  `</dev/null` (Hinweis aus t_ebbf1e40): kein `$`, kein Backtick und kein Pfad unter `/proc/` oder `/dev/` außer
+  `/dev/null` (`true >/proc/self/fd/0 </dev/null` kürzt den Körper, wenn er als Temp-Datei vorliegt). Preis: Ein
+  Schritt mit `"$(cat <<'EOF'`, einem mehrzeiligen String oder `<<` in einem Kommentar zeigt danach kein
+  festgenageltes Skript mehr; der Planer schreibt den Heredoc schlicht und den Kommentar ohne `<<`.
 - **Geschrieben** zählt nur der letzte Schreibvorgang vor der Ausführung, und nur, wenn er den Inhalt
   zeigt: `cat >`/`tee` mit Heredoc, `install … /dev/stdin <ziel>` mit Heredoc, `echo`/`printf` ohne
   `$`/Backticks, eine Kopie eines so geschriebenen Skripts. Ein Heredoc zeigt den Inhalt nur, wenn sein
@@ -350,7 +369,7 @@ Plan anders verbirgt (Skript von anderswo ohne Pin, Pfad aus nicht gezeigten Wer
 Riegels („content this plan does not show“) und X5 des Türstehers. Die Regel ist eine Planer-Hilfe, kein
 Schloss: Sie lehnt nur zusätzlich ab, der Türsteher liest jeden Lauf weiterhin selbst. Tests:
 `apps/api/test/host-run-visible-scripts.test.ts` (alle Fälle der Probe aus t_740ac6ee, der Gegenprobe
-aus t_af29564c, der Befunde B1–B6 aus t_1748d6c1, R-A, R-B, H1–H4 aus t_b4b11e32, S-A–S-D, H-c, H-e aus t_c82f5ac2, T-A–T-D aus t_683da1d6, U-A, U-B aus t_f7778d43 und V-A–V-C samt Hinweisen aus t_cdad398e, plus die aufgezeichneten Pläne vom 10.10.2026 als Fehlalarm-Gegenprobe).
+aus t_af29564c, der Befunde B1–B6 aus t_1748d6c1, R-A, R-B, H1–H4 aus t_b4b11e32, S-A–S-D, H-c, H-e aus t_c82f5ac2, T-A–T-D aus t_683da1d6, U-A, U-B aus t_f7778d43 und V-A–V-C samt Hinweisen aus t_cdad398e, W-A, W-B und Hinweis M aus t_ebbf1e40, plus die aufgezeichneten Pläne vom 10.10.2026 als Fehlalarm-Gegenprobe).
 
 ## 2a. Backup-Riegel: Backups löschen nur mit Freigabe
 
