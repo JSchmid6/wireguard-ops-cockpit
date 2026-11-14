@@ -168,7 +168,8 @@ export function claudeArgs(workspace, model) {
 // it Claude refuses to start and the run falls back, labelled NOTBETRIEB).
 // HOME too: Claude writes caches and its .claude.json there, and the
 // identity's home is read-only in the unit (and must not grow a .claude).
-export function claudeEnv(workspace, env = process.env) {
+// TMPDIR is the run's short directory in /tmp (createClaudeTmpdir, below).
+export function claudeEnv(workspace, tmpdir, env = process.env) {
   const state = sessionStateDirs(workspace);
   const base = path.dirname(state.XDG_DATA_HOME);
   return {
@@ -177,11 +178,43 @@ export function claudeEnv(workspace, env = process.env) {
     CLAUDE_CODE_OAUTH_TOKEN: env.CLAUDE_CODE_OAUTH_TOKEN,
     CLAUDE_CONFIG_DIR: path.join(base, "claude"),
     ...state,
+    TMPDIR: tmpdir,
     CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: env.COCKPIT_CLAUDE_ENV_SCRUB === "0" ? "0" : "1",
     DISABLE_AUTOUPDATER: "1",
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
     NODE_ENV: "production",
   };
+}
+
+// Claude's sandbox binds two Unix sockets in TMPDIR (socat UNIX-LISTEN:
+// <tmpdir>/claude-http-<16 hex>.sock and claude-socks-…, Claude Code 2.1.311);
+// sun_path holds 107 characters plus NUL. Below the workspace
+// (/var/lib/wireguard-ops-agent/sessions/agent-<uuid>-research-XXXXXX/.run-state/tmp)
+// the socket path is ~145 characters, socat cannot bind, and the sandbox
+// refuses to start ("Failed to create bridge sockets", card t_8b92ed2f). So a
+// Claude run gets its own short TMPDIR in /tmp: private to the agent unit
+// (PrivateTmp=true, emptied on every restart), created per run with mode 0700
+// and removed with the run's workspace. State still belongs to the run.
+export const unixSocketPathMax = 107;
+export const claudeTmpRoot = "/tmp";
+export function claudeSocketPathLength(tmpdir) {
+  return Math.max(...["http", "socks"].map((kind) => path.join(tmpdir, `claude-${kind}-${"0".repeat(16)}.sock`).length));
+}
+export function createClaudeTmpdir(root = claudeTmpRoot) {
+  const tmpdir = fs.mkdtempSync(path.join(root, "cockpit-claude-"));
+  fs.chmodSync(tmpdir, 0o700);
+  if (claudeSocketPathLength(tmpdir) > unixSocketPathMax) {
+    removeClaudeTmpdir(tmpdir, root);
+    throw new Error(`claude's sandbox sockets below ${tmpdir} would exceed ${unixSocketPathMax} characters`);
+  }
+  return tmpdir;
+}
+export function removeClaudeTmpdir(tmpdir, root = claudeTmpRoot) {
+  const resolved = path.resolve(tmpdir);
+  if (path.dirname(resolved) !== path.resolve(root) || !path.basename(resolved).startsWith("cockpit-claude-")) {
+    throw new Error("refusing to remove a claude temp directory outside its root");
+  }
+  fs.rmSync(resolved, { recursive: true, force: true });
 }
 
 // Claude's JSON result: the answer and the model that really answered
@@ -275,7 +308,19 @@ export async function runAgent(request) {
 
 // Claude's answer, a failure that ends the role, or { fallback: reason }.
 async function runClaude(request, workspace, claude, deadline) {
-  const env = claudeEnv(workspace);
+  let tmpdir;
+  try { tmpdir = createClaudeTmpdir(); } catch (error) { return { fallback: cleanReason(`claude temp directory: ${error.message}`) }; }
+  try {
+    return await runClaudeIn(request, workspace, tmpdir, claude, deadline);
+  } finally {
+    // A failed removal leaves only a 0700 directory in the unit's private /tmp,
+    // which the next restart empties; it must not turn an answer into a failure.
+    try { removeClaudeTmpdir(tmpdir); } catch (error) { console.error(`agent ${request.requestId}: claude temp directory cleanup failed: ${error.message}`); }
+  }
+}
+
+async function runClaudeIn(request, workspace, tmpdir, claude, deadline) {
+  const env = claudeEnv(workspace, tmpdir);
   fs.mkdirSync(env.HOME, { recursive: true, mode: 0o700 });
   const run = await runProcess(claude.executable, claudeArgs(workspace, claude.model), env, workspace, request.prompt, deadline - Date.now());
   const parsed = parseClaudeResult(run.stdout);

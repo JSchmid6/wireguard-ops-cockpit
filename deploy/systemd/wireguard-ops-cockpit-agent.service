@@ -36,7 +36,8 @@ ProtectProc=invisible
 # Writable are only the session workspaces, never the home: the config, agent
 # definitions, AGENTS.md and .opencode there are what every later role (safety,
 # verifier) loads. opencode's own state lives in each workspace and goes with it
-# (the broker sets XDG_DATA/STATE/CACHE_HOME and TMPDIR per run).
+# (the broker sets XDG_DATA/STATE/CACHE_HOME and TMPDIR per run; a Claude run
+# gets a short TMPDIR in this unit's private /tmp for its sandbox sockets).
 StateDirectory=wireguard-ops-agent/sessions
 StateDirectoryMode=0700
 ReadWritePaths=/run/cockpit-agent
