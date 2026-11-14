@@ -402,6 +402,8 @@ info="args=$* home=$HOME config=$CLAUDE_CONFIG_DIR tmp=$TMPDIR scrub=$CLAUDE_COD
 node -e 'process.stdout.write(JSON.stringify({type:"result",subtype:"success",is_error:false,result:process.argv[1],modelUsage:{"claude-sonnet-5-5":{}}}))' "$info"
 `, { mode: 0o755 });
   const saved = { ...process.env };
+  const claudeTmpdirs = () => fs.readdirSync("/tmp").filter((name) => name.startsWith("cockpit-claude-"));
+  const tmpdirsBefore = claudeTmpdirs();
   Object.assign(process.env, { COCKPIT_PLAN_ENGINE: "claude", COCKPIT_CLAUDE_EXECUTABLE: fakeClaude, CLAUDE_CODE_OAUTH_TOKEN: "test-token", DEEPSEEK_API_KEY: "test-key" });
   try {
     for (const role of ["planner", "research"]) {
@@ -439,6 +441,8 @@ node -e 'process.stdout.write(JSON.stringify({type:"result",subtype:"success",is
     assert.equal(planted.engine.notbetrieb, true);
     fs.rmSync(path.join(process.env.COCKPIT_AGENT_WORKSPACE_ROOT, "opencode.json"));
     assert.deepEqual(fs.readdirSync(process.env.COCKPIT_AGENT_WORKSPACE_ROOT), []);
+    // Every failed Claude run removed its short TMPDIR too, not only the answered ones.
+    assert.deepEqual(claudeTmpdirs().filter((name) => !tmpdirsBefore.includes(name)), []);
     // Safety and verifier never go to Claude, and are no NOTBETRIEB.
     for (const role of ["safety", "verifier"]) {
       const review = await runAgent({ requestId: "c1a0de00-2", role, prompt: "review" });
