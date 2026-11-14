@@ -19,6 +19,9 @@
 # not downloaded again when it is there, and 70 + rollback on a checksum mismatch,
 # a failed download or a .node-version that is not one clean x.y.z. Leftover opencode
 # config the agent or runner broker refuses stops the deploy with 71 before the checkout.
+# The AppArmor profile bwrap-userns-restrict (card t_79e9f6d6): installed and loaded,
+# unloaded again on a rollback when it was absent, the previous one reloaded when it was
+# there, left alone (neither written nor loaded) while a package owns it.
 #
 # Everything lives below one fresh mktemp directory under /tmp; the harness
 # refuses to run otherwise. Call as root (install -o root):
@@ -104,6 +107,24 @@ echo "accounts \$*" >> "$FIX/calls.log"
 if [ "\$1" = getent ]; then [ -e "$FIX/runner-exists" ] && exit 0; exit 2; fi
 exit 0
 EOF
+# apparmor_parser: logged together with the first line of the file it is given (what
+# -r loads), "fail-parser" makes it fail, and like the real one it fails when the file
+# is missing (-R reads the profile names from it); dpkg-query: "pkg-owned" makes the
+# profile path belong to a package.
+cat > "$FIX/stub/apparmor_parser" <<EOF
+#!/bin/bash
+echo "apparmor_parser \$*" >> "$FIX/calls.log"
+echo "apparmor_parser-loads \$(head -n 1 "\$2" 2>/dev/null || echo MISSING)" >> "$FIX/calls.log"
+[ -e "$FIX/fail-parser" ] && exit 1
+[ -e "\$2" ] || exit 1
+exit 0
+EOF
+cat > "$FIX/stub/dpkg-query" <<EOF
+#!/bin/bash
+echo "dpkg-query \$*" >> "$FIX/calls.log"
+[ -e "$FIX/pkg-owned" ] && { echo "apparmor: \$2"; exit 0; }
+exit 1
+EOF
 chmod 755 "$FIX/stub/"*
 
 # --- the pinned Node runtime: fixture host tree and a nodejs.org-like release ---
@@ -136,7 +157,7 @@ targets() { grep -oE '^  "[^"|]+\|[^"|]+\|' "$SCRIPT" | cut -d'|' -f2 | sed -E \
   -e 's#\$UNITS#/etc/systemd/system#' -e 's#\$SUDOERS#/etc/sudoers.d/cockpit-executor#' -e 's#^\$ROOT##'; }
 fresh_host() { # fresh_host [ohne-runtime] — half the targets with old bytes, the other half absent; repo at A
   rm -rf "$FIX/root" "$FIX/repo" "$FIX/calls.log" "$FIX/fail-visudo" "$FIX/fail-build" "$FIX/fail-webbuild" "$FIX/web-active" \
-    "$FIX/web-built" "$FIX/web-swapped" "$FIX/web-stale" "$FIX/fail-webps" "$FIX/runner-exists"
+    "$FIX/web-built" "$FIX/web-swapped" "$FIX/web-stale" "$FIX/fail-webps" "$FIX/runner-exists" "$FIX/fail-parser" "$FIX/pkg-owned"
   mkdir -p "$FIX/root/var/lib/wireguard-ops-cockpit"; chmod 750 "$FIX/root/var/lib/wireguard-ops-cockpit"
   # A host that already carries the pinned runtime (the normal case) unless the
   # case is about installing it.
@@ -160,6 +181,7 @@ deploy() { # deploy <sha> [mode]
     VPS_DEPLOY_ROOT="$FIX/root" VPS_DEPLOY_REPO="$FIX/repo" VPS_DEPLOY_ORIGIN="$FIX/origin.git" \
     VPS_DEPLOY_SYSTEMCTL="$FIX/stub/systemctl" VPS_DEPLOY_VISUDO="$FIX/stub/visudo" VPS_DEPLOY_DOCKER="$FIX/stub/docker" \
     VPS_DEPLOY_ACCOUNTS="$FIX/stub/accounts" \
+    VPS_DEPLOY_APPARMOR_PARSER="$FIX/stub/apparmor_parser" VPS_DEPLOY_DPKG_QUERY="$FIX/stub/dpkg-query" \
     VPS_DEPLOY_NODE_DIST="file://$FIX/dist" \
     VPS_DEPLOY_BUILD="[ -x $FIX/root/opt/node-v$NODE_V-linux-x64/bin/node ] || { echo 'build: the pinned runtime is missing (bin/with-runtime would exit 69)' >&2; exit 69; }; [ ! -e $FIX/fail-build ] || [ \"\$(git rev-parse HEAD)\" != $B ]" \
     bash "$FIX/repo/deploy/vps/vps-cockpit-deploy.sh" > "$FIX/out.log" 2>&1
@@ -292,6 +314,32 @@ fresh_host; mkdir -p "$FIX/root/var/lib/wireguard-ops-runner/.config/opencode/to
 (cd "$FIX/root" && find . -type f -exec sha256sum {} + | sort) > "$FIX/vorher.sums"; code=0; deploy "$B" now || code=$?
 check "Altlast Runner-Home: Exit 71, Pfad genannt" '[ "$code" = 71 ] && grep -q "FAILED: opencode would load /var/lib/wireguard-ops-runner/.config/opencode/tools into every role" "$FIX/out.log"'
 check "Altlast Runner-Home: nichts angefasst, Stand A" '[ "$(after_sums)" = "$(cat "$FIX/vorher.sums")" ] && [ ! -s "$FIX/calls.log" ] && [ "$(git -C "$FIX/repo" rev-parse HEAD)" = "$A" ]'
+
+# 16-19: the AppArmor profile bwrap-userns-restrict (t_79e9f6d6)
+P=/etc/apparmor.d/bwrap-userns-restrict
+fresh_host; rm -f "$FIX/root$P"; code=0; deploy "$B" defer || code=$?
+check "bwrap-Profil: installiert (root, 0644) und geladen" '[ "$code" = 0 ] && [ "$(stat -c "%U %a" "$FIX/root$P")" = "root 644" ] && grep -q "^B deploy/apparmor/bwrap-userns-restrict" "$FIX/root$P" && grep -qx "apparmor_parser -r $FIX/root$P" "$FIX/calls.log"'
+check "bwrap-Profil: der echte Paketpfad gefragt, nicht der Fixture-Pfad" 'grep -qx "dpkg-query -S $P" "$FIX/calls.log"'
+check "bwrap-Profil: Repo-Datei bytegleich mit Ubuntus Profil (sha256)" '[ "$(sha256sum < "$HERE/../deploy/apparmor/bwrap-userns-restrict" | cut -d" " -f1)" = 634d3d3427c483f123cb5ed53b71ea13040187e07d9f67ca74421d42a6170f0e ]'
+
+fresh_host; rm -f "$FIX/root$P"; (cd "$FIX/root" && find . -type f -exec sha256sum {} + | sort) > "$FIX/vorher.sums"
+: > "$FIX/fail-webbuild"; code=0; deploy "$B" now || code=$?
+check "bwrap-Profil fehlte, Rückfall: erst entladen, dann Datei weg" '[ "$code" != 0 ] && grep -qx "apparmor_parser -R $FIX/root$P" "$FIX/calls.log" && [ ! -e "$FIX/root$P" ] && [ "$(after_sums)" = "$(cat "$FIX/vorher.sums")" ] && grep -q "rollback complete" "$FIX/out.log"'
+
+fresh_host; mkdir -p "$FIX/root/etc/apparmor.d"; echo "ALT $P" > "$FIX/root$P"; (cd "$FIX/root" && find . -type f -exec sha256sum {} + | sort) > "$FIX/vorher.sums"
+: > "$FIX/fail-webbuild"; code=0; deploy "$B" now || code=$?
+check "bwrap-Profil war da, Rückfall: alte Bytes zurück und wieder geladen, nicht entladen" '[ "$code" != 0 ] && [ "$(cat "$FIX/root$P")" = "ALT $P" ] && [ "$(grep -cx "apparmor_parser -r $FIX/root$P" "$FIX/calls.log")" = 2 ] && [ "$(grep "^apparmor_parser-loads" "$FIX/calls.log" | tr "\n" "|")" = "apparmor_parser-loads B deploy/apparmor/bwrap-userns-restrict|apparmor_parser-loads ALT $P|" ] && ! grep -q "^apparmor_parser -R" "$FIX/calls.log" && grep -q "rollback complete" "$FIX/out.log"'
+
+fresh_host; mkdir -p "$FIX/root/etc/apparmor.d"; echo "PAKET $P" > "$FIX/root$P"; : > "$FIX/pkg-owned"; code=0; deploy "$B" defer || code=$?
+check "bwrap-Profil gehört einem Paket: unberührt, nicht geladen" '[ "$code" = 0 ] && [ "$(cat "$FIX/root$P")" = "PAKET $P" ] && ! grep -q "^apparmor_parser" "$FIX/calls.log" && grep -q "belongs to a package" "$FIX/out.log"'
+
+fresh_host; mkdir -p "$FIX/root/etc/apparmor.d"; echo "ALT $P" > "$FIX/root$P"; (cd "$FIX/root" && find . -type f -exec sha256sum {} + | sort) > "$FIX/vorher.sums"
+: > "$FIX/fail-parser"; code=0; deploy "$B" defer || code=$?
+check "bwrap-Profil (vorhanden) lädt nicht: Deploy scheitert, Dateien bytegenau zurück" '[ "$code" != 0 ] && [ "$(cat "$FIX/root$P")" = "ALT $P" ] && [ "$(after_sums)" = "$(cat "$FIX/vorher.sums")" ] && ! grep -q "^apparmor_parser -R" "$FIX/calls.log"'
+
+fresh_host; rm -f "$FIX/root$P"; (cd "$FIX/root" && find . -type f -exec sha256sum {} + | sort) > "$FIX/vorher.sums"
+: > "$FIX/fail-parser"; code=0; deploy "$B" defer || code=$?
+check "bwrap-Profil (fehlte) lädt nicht: Deploy scheitert, Datei wieder weg, nichts entladen" '[ "$code" != 0 ] && [ ! -e "$FIX/root$P" ] && [ "$(after_sums)" = "$(cat "$FIX/vorher.sums")" ] && ! grep -q "^apparmor_parser -R" "$FIX/calls.log" && grep -q "rollback complete" "$FIX/out.log"'
 
 echo
 [ "$fails" = 0 ] && echo "alles grün" || { echo "$fails rot"; exit 1; }

@@ -844,6 +844,27 @@ if npm install -g --silent "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION" && t
 else
   echo "HINWEIS: Claude Code $CLAUDE_CODE_VERSION nicht installiert — Planer/Research bleiben bei COCKPIT_PLAN_ENGINE=claude im NOTBETRIEB."
 fi
+# bwrap unter Ubuntus userns-Härtung (kernel.apparmor_restrict_unprivileged_userns=1):
+# ohne das Profil bwrap-userns-restrict darf bwrap im neuen userns keine uid_map
+# schreiben, und Claudes Sandbox startet nicht (Karte t_79e9f6d6,
+# doc/setup/plan-engine-claude.md). Ubuntu ab 25.04 liefert es im Paket apparmor —
+# dann bleibt es unberührt; nur wo es fehlt, kommt die Repo-Kopie (dieselben Bytes).
+# Ohne die Härtung (box/Debian) ist nichts zu tun. Kein Abbruch, wie bei 9b.
+BWRAP_PROFILE=/etc/apparmor.d/bwrap-userns-restrict
+if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || true)" != 1 ]; then
+  echo "bwrap-userns-restrict: keine userns-Härtung aktiv — nicht nötig."
+elif [ -e "$BWRAP_PROFILE" ]; then
+  echo "bwrap-userns-restrict: vorhanden ($(dpkg-query -S "$BWRAP_PROFILE" 2>/dev/null | cut -d: -f1 || true)) — unverändert."
+elif dpkg-query -S "$BWRAP_PROFILE" >/dev/null 2>&1; then
+  # Paketpfad, aber die Datei fehlt (bewusst gelöscht?): nicht mit der Repo-Kopie überschreiben.
+  echo "HINWEIS: bwrap-userns-restrict gehört einem Paket, fehlt aber — nicht ersetzt; Claude läuft ohne Shell bzw. im NOTBETRIEB."
+elif install -m 0644 -o root -g root "$COCKPIT_DIR/deploy/apparmor/bwrap-userns-restrict" "$BWRAP_PROFILE" \
+     && apparmor_parser -r "$BWRAP_PROFILE"; then
+  echo "bwrap-userns-restrict: aus dem Repo installiert und geladen."
+else
+  rm -f "$BWRAP_PROFILE"   # ein nicht ladbares Profil bleibt nicht für den nächsten Boot liegen
+  echo "HINWEIS: bwrap-userns-restrict nicht geladen — Claude läuft ohne Shell bzw. im NOTBETRIEB."
+fi
 # BEGIN agent-opencode-config (test/cockpit-agent-unit-e2e-inner.sh runs exactly these lines)
 # The config of every agent role belongs to root; the agent identity, which also
 # runs the runner with build tools, only reads it. The unit keeps the home

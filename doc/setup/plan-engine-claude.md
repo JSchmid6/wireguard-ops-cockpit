@@ -48,11 +48,58 @@ Bash,Read,Grep,Glob,WebFetch,WebSearch --allowedTools <dieselben> --append-syste
   Socketpfad dennoch zu lang (`createClaudeTmpdir` prüft es), startet Claude nicht, und der Lauf
   fällt mit Grund auf opencode zurück (NOTBETRIEB). Ehrliche Grenze wie beim Arbeitsordner: `/tmp`
   der Unit teilen alle Rollen der Identität `cockpit-agent`; 0700 schützt nur vor anderen Nutzern.
+- bwrap braucht unter Ubuntus userns-Härtung das AppArmor-Profil `bwrap-userns-restrict`
+  (Abschnitt „bwrap und AppArmor“ unten).
 - Das Kind bekommt nur `PATH`, den Claude-Login und diese Pfade, **nicht** `DEEPSEEK_API_KEY`.
 - `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`: Claude hält seinen Login aus der Shell, die das Modell
   bedient (braucht `bubblewrap`). Startet Claude so nicht, fällt der Lauf auf opencode zurück
   (NOTBETRIEB mit Grund) — ein stilles Abschalten gibt es nicht.
 - Ergebnis: der Text aus `result`, das Modell aus `modelUsage` (z. B. `claude-sonnet-5-5`).
+
+## bwrap und AppArmor (Karte t_79e9f6d6)
+
+Ubuntu setzt `kernel.apparmor_restrict_unprivileged_userns=1`: Ein Programm ohne eigenes Profil,
+das einen User-Namespace anlegt, landet im Profil `unprivileged_userns` und verliert darin jede
+Capability. bwrap kann dann seine `uid_map` nicht schreiben, und Claudes Sandbox bricht mit
+„bwrap: setting up uid map: Permission denied“ ab. Beleg VPS, Kernel-Audit 14.11.2026:
+`apparmor="DENIED" … profile="unprivileged_userns" name="proc/<pid>/uid_map" comm="bwrap"` und
+`DENIED capable … capname="setpcap"`. Ubuntu ab 25.04 bringt dafür im Paket `apparmor` das Profil
+`/etc/apparmor.d/bwrap-userns-restrict` mit (Lab0, dpkg: `apparmor`). Ubuntu 24.04 (VPS) hat es
+nicht, auch nicht unter `extra-profiles` (geprüft am Paket `4.0.1really4.0.1-0ubuntu0.24.04.9`).
+
+**Weg:** Genau dieses Profil, bytegleich aus `apparmor_4.1.0~beta5-0ubuntu14.2` (Ubuntu 25.04),
+liegt als `deploy/apparmor/bwrap-userns-restrict` im Repo (sha256 `634d3d34…f0e`, `abi <abi/4.0>`).
+Der Parser von 24.04 übersetzt es. Es enthält zwei Profile: `bwrap` (für `/usr/bin/bwrap`) darf
+User-Namespaces anlegen und hat darin Capabilities. Alles, was bwrap startet, läuft gestapelt unter
+`&bwrap//&unpriv_bwrap`, und `unpriv_bwrap` hat `audit deny capability`. Die Kinder, also auch die
+Shell des Modells, bekommen im Namespace keine Capabilities. Die Härtung bleibt für alle anderen
+Programme an, der sysctl bleibt 1.
+
+- VPS: Das Profil ist ein Eintrag der Tabelle in `deploy/vps/vps-cockpit-deploy.sh`. Das Deploy lädt es
+  mit `apparmor_parser -r`. Beim Rückfall entlädt es das Profil wieder (`-R`), wenn die Datei vorher
+  fehlte, sonst lädt es die alten Bytes neu. Gehört der Pfad einem Paket (nach einem Release-Upgrade),
+  bleibt die Datei unberührt. Erstmals ausgerollt per host-run, Job `17877b84` (14.11.2026). Eine
+  Probe als `nobody` (`bwrap --unshare-user … id -u` → `65534`) lief danach durch.
+- Lab0/box: `homeserver-cockpit-deploy.sh` (Schritt 9b) legt die Repo-Kopie nur hin, wenn die Härtung
+  aktiv ist UND die Datei fehlt. Lab0 hat sie aus dem Paket, die box (Debian) hat die Härtung nicht.
+  Dort ändert sich nichts.
+- Rückweg von Hand: `apparmor_parser -R /etc/apparmor.d/bwrap-userns-restrict`, dann die Datei löschen.
+
+**Verworfen:** `kernel.apparmor_restrict_unprivileged_userns=0` würde die Härtung für jedes Programm
+abschalten. Ein eigenes Profil für `claude` oder die Agent-Unit mit `userns` bzw. `flags=(unconfined)`
+würde dem ganzen Claude-Prozessbaum Capabilities im Namespace geben, nicht nur bwrap. Und es wäre
+ein Profil, das niemand außer uns pflegt.
+
+**Ehrliche Grenze:** Das Profil `bwrap` selbst ist weit gefasst (`allow capability`, Dateien,
+mount, Netz). Die Grenze ist das Stapeln auf `unpriv_bwrap` für alles, was bwrap ausführt. Jeder Nutzer
+des Hosts kann nun über bwrap einen User-Namespace anlegen, wie auf einem Ubuntu ab 25.04 auch.
+
+**Messhinweis (`id -un` „leer“, 14.11.2026):** Weder bwrap noch die Sandbox verschluckt die Ausgabe.
+Gibt Research eine Antwort ohne `## `-Überschrift zurück, schickt die API sie durch den
+Runner-Zweig von `extractCleanOutput` (`apps/api/src/app.ts`). Der verwirft Zeilen unter 30 Zeichen,
+die mit einem Kleinbuchstaben beginnen (`cockpit-agent`, `rc=0`, `apparmor\t4.1…`). Belegt auf Lab0 und
+VPS: `id -un` kam leer an, `id -un | od -c` dagegen vollständig, und eine Antwort mit Überschriften
+enthielt `cockpit-agent`. Bis das behoben ist, Messläufe mit Überschriften oder `od`/`base64` anfordern.
 
 ## NOTBETRIEB
 
