@@ -94,12 +94,14 @@ ein Profil, das niemand außer uns pflegt.
 mount, Netz). Die Grenze ist das Stapeln auf `unpriv_bwrap` für alles, was bwrap ausführt. Jeder Nutzer
 des Hosts kann nun über bwrap einen User-Namespace anlegen, wie auf einem Ubuntu ab 25.04 auch.
 
-**Messhinweis (`id -un` „leer“, 14.11.2026):** Weder bwrap noch die Sandbox verschluckt die Ausgabe.
-Gibt Research eine Antwort ohne `## `-Überschrift zurück, schickt die API sie durch den
-Runner-Zweig von `extractCleanOutput` (`apps/api/src/app.ts`). Der verwirft Zeilen unter 30 Zeichen,
-die mit einem Kleinbuchstaben beginnen (`cockpit-agent`, `rc=0`, `apparmor\t4.1…`). Belegt auf Lab0 und
-VPS: `id -un` kam leer an, `id -un | od -c` dagegen vollständig, und eine Antwort mit Überschriften
-enthielt `cockpit-agent`. Bis das behoben ist, Messläufe mit Überschriften oder `od`/`base64` anfordern.
+**Messhinweis (`id -un` „leer“, 14.11.2026) — behoben (Karte t_f7cc608e):** Weder bwrap noch die
+Sandbox verschluckte die Ausgabe. Research-Antworten ohne `## `-Überschrift liefen durch den
+Runner-Zweig von `extractCleanOutput` (`apps/api/src/app.ts`), der Zeilen unter 30 Zeichen mit
+Kleinbuchstaben am Anfang verwarf (`cockpit-agent`, `rc=0`, `apparmor\t4.1…`). Seitdem bleibt eine
+Research-Antwort wörtlich (`extractResearchAnswer`): Weg fallen nur opencodes Log-Rauschen
+(`timestamp=`, `tee:`, `> build `, ANSI-Farben) und, was `filterSensitiveContent` schwärzt. Dasselbe
+gilt für einen Plan ohne Zaun und ohne Überschrift (`extractPlannerText`); mit Zaun oder Überschrift
+schneidet der Planer weiter dort. Messläufe brauchen keine Überschriften oder `od`/`base64` mehr.
 
 ## NOTBETRIEB
 

@@ -1826,11 +1826,44 @@ export async function createApp(options: AppOptions = {}) {
       .trim();
   }
 
+  // opencode's log noise around a model answer (ANSI colours, log lines, the
+  // "> build · model" banner); everything else is the model's own text.
+  function stripAgentNoise(raw: string): string {
+    return raw
+      .replace(/\x1b\[[0-9;]*m/g, "")
+      .split(/\r?\n/)
+      .filter((line) => !/^(?:timestamp=|tee:|> build )/.test(line))
+      .join("\n")
+      .trim();
+  }
+
+  // A research answer is evidence the caller reads word for word (card
+  // t_f7cc608e: the runner's line filter dropped "cockpit-agent" and "rc=0"
+  // from answers without a "## " heading). Only the opencode noise goes; the
+  // old tmux log path is first cut to the answer between its loop markers.
+  function extractResearchAnswer(raw: string): string {
+    return stripAgentNoise(raw.includes("disposing instance") ? extractAnswer(raw) : raw);
+  }
+
+  // The planner's text from its manifest fence or first section on, or the
+  // whole answer without noise when it has neither (never the runner filter).
+  function extractPlannerText(raw: string): string {
+    return cutModelOutput(raw) ?? stripAgentNoise(raw);
+  }
+
   function extractCleanOutput(raw: string): string {
-    const noTimestamps = raw
+    return cutModelOutput(raw) ?? filterRunnerOutput(raw);
+  }
+
+  function withoutLogLines(raw: string): string {
+    return raw
       .split("\n")
       .filter(l => !l.startsWith("timestamp=") && !l.startsWith("tee:") && l.trim() !== "")
       .join("\n");
+  }
+
+  function cutModelOutput(raw: string): string | null {
+    const noTimestamps = withoutLogLines(raw);
     // Planner output: preserve a dynamic capability fence even when it precedes legacy markdown sections.
     const fenceStart = noTimestamps.search(
       /(?:^|\n)```(?:capability|host-run|json)?\s*\n(?=\s*\{[\s\S]{0,1000}?"version"\s*:\s*"cockpit-(?:capability|host-run)\/v1")/i
@@ -1867,8 +1900,12 @@ export async function createApp(options: AppOptions = {}) {
       }
       return output.trim();
     }
-    // Runner output: strip ALL debug fragments, keep only command output
-    return noTimestamps
+    return null;
+  }
+
+  // Runner output: strip ALL debug fragments, keep only command output
+  function filterRunnerOutput(raw: string): string {
+    return withoutLogLines(raw)
       .split("\n")
       .filter(l => {
         const t = l.trim();
@@ -2481,7 +2518,7 @@ export async function createApp(options: AppOptions = {}) {
       }
       updateHermesJob(job.id, "running", explanation({ phase: "planning", intent, reason: "Planner is performing read-only research." }));
       const raw = await runIsolatedAgent(actor, session, agent, "research", agentTask, "", 2 * 60_000, config.opencodeModel, job.id);
-      const answer = filterSensitiveContent(extractCleanOutput(raw) || extractAnswer(raw));
+      const answer = filterSensitiveContent(extractResearchAnswer(raw));
       if (!answer || answer.length < 20 || /^>\s*build\b/i.test(answer.trim())) {
         updateHermesJob(job.id, "failed_verification", explanation({
           phase: "finished", intent,
@@ -2568,7 +2605,7 @@ export async function createApp(options: AppOptions = {}) {
       if (!planner) throw new Error("planner not available");
       updateHermesJob(job.id, "running", explanation({ phase: "planning", intent, reason: "Planner is producing a structured change plan." }));
       const plannerRaw = await runIsolatedAgent(actor, session, planner, "planner", agentTask, "", 5 * 60_000, config.opencodeModel, job.id);
-      const planText = filterSensitiveContent(extractCleanOutput(plannerRaw));
+      const planText = filterSensitiveContent(extractPlannerText(plannerRaw));
       if (!planText || planText.length < 20) throw new Error("planner produced no reviewable plan");
 
       const proposalDir = path.join(path.dirname(config.dbPath), "proposals");
