@@ -107,12 +107,16 @@ echo "accounts \$*" >> "$FIX/calls.log"
 if [ "\$1" = getent ]; then [ -e "$FIX/runner-exists" ] && exit 0; exit 2; fi
 exit 0
 EOF
-# apparmor_parser: logged, "fail-parser" makes it fail; dpkg-query: "pkg-owned" makes the
+# apparmor_parser: logged together with the first line of the file it is given (what
+# -r loads), "fail-parser" makes it fail, and like the real one it fails when the file
+# is missing (-R reads the profile names from it); dpkg-query: "pkg-owned" makes the
 # profile path belong to a package.
 cat > "$FIX/stub/apparmor_parser" <<EOF
 #!/bin/bash
 echo "apparmor_parser \$*" >> "$FIX/calls.log"
+echo "apparmor_parser-loads \$(head -n 1 "\$2" 2>/dev/null || echo MISSING)" >> "$FIX/calls.log"
 [ -e "$FIX/fail-parser" ] && exit 1
+[ -e "\$2" ] || exit 1
 exit 0
 EOF
 cat > "$FIX/stub/dpkg-query" <<EOF
@@ -324,13 +328,18 @@ check "bwrap-Profil fehlte, Rückfall: erst entladen, dann Datei weg" '[ "$code"
 
 fresh_host; mkdir -p "$FIX/root/etc/apparmor.d"; echo "ALT $P" > "$FIX/root$P"; (cd "$FIX/root" && find . -type f -exec sha256sum {} + | sort) > "$FIX/vorher.sums"
 : > "$FIX/fail-webbuild"; code=0; deploy "$B" now || code=$?
-check "bwrap-Profil war da, Rückfall: alte Bytes zurück und wieder geladen, nicht entladen" '[ "$code" != 0 ] && [ "$(cat "$FIX/root$P")" = "ALT $P" ] && [ "$(grep "^apparmor_parser" "$FIX/calls.log" | tail -n 1)" = "apparmor_parser -r $FIX/root$P" ] && ! grep -q "^apparmor_parser -R" "$FIX/calls.log" && grep -q "rollback complete" "$FIX/out.log"'
+check "bwrap-Profil war da, Rückfall: alte Bytes zurück und wieder geladen, nicht entladen" '[ "$code" != 0 ] && [ "$(cat "$FIX/root$P")" = "ALT $P" ] && [ "$(grep -cx "apparmor_parser -r $FIX/root$P" "$FIX/calls.log")" = 2 ] && [ "$(grep "^apparmor_parser-loads" "$FIX/calls.log" | tr "\n" "|")" = "apparmor_parser-loads B deploy/apparmor/bwrap-userns-restrict|apparmor_parser-loads ALT $P|" ] && ! grep -q "^apparmor_parser -R" "$FIX/calls.log" && grep -q "rollback complete" "$FIX/out.log"'
 
 fresh_host; mkdir -p "$FIX/root/etc/apparmor.d"; echo "PAKET $P" > "$FIX/root$P"; : > "$FIX/pkg-owned"; code=0; deploy "$B" defer || code=$?
 check "bwrap-Profil gehört einem Paket: unberührt, nicht geladen" '[ "$code" = 0 ] && [ "$(cat "$FIX/root$P")" = "PAKET $P" ] && ! grep -q "^apparmor_parser" "$FIX/calls.log" && grep -q "belongs to a package" "$FIX/out.log"'
 
-fresh_host; : > "$FIX/fail-parser"; code=0; deploy "$B" defer || code=$?
-check "bwrap-Profil lädt nicht: Deploy scheitert, Dateien bytegenau zurück" '[ "$code" != 0 ] && [ "$(after_sums)" = "$(cat "$FIX/vorher.sums")" ] && ! grep -q "^apparmor_parser -R" "$FIX/calls.log"'
+fresh_host; mkdir -p "$FIX/root/etc/apparmor.d"; echo "ALT $P" > "$FIX/root$P"; (cd "$FIX/root" && find . -type f -exec sha256sum {} + | sort) > "$FIX/vorher.sums"
+: > "$FIX/fail-parser"; code=0; deploy "$B" defer || code=$?
+check "bwrap-Profil (vorhanden) lädt nicht: Deploy scheitert, Dateien bytegenau zurück" '[ "$code" != 0 ] && [ "$(cat "$FIX/root$P")" = "ALT $P" ] && [ "$(after_sums)" = "$(cat "$FIX/vorher.sums")" ] && ! grep -q "^apparmor_parser -R" "$FIX/calls.log"'
+
+fresh_host; rm -f "$FIX/root$P"; (cd "$FIX/root" && find . -type f -exec sha256sum {} + | sort) > "$FIX/vorher.sums"
+: > "$FIX/fail-parser"; code=0; deploy "$B" defer || code=$?
+check "bwrap-Profil (fehlte) lädt nicht: Deploy scheitert, Datei wieder weg, nichts entladen" '[ "$code" != 0 ] && [ ! -e "$FIX/root$P" ] && [ "$(after_sums)" = "$(cat "$FIX/vorher.sums")" ] && ! grep -q "^apparmor_parser -R" "$FIX/calls.log" && grep -q "rollback complete" "$FIX/out.log"'
 
 echo
 [ "$fails" = 0 ] && echo "alles grün" || { echo "$fails rot"; exit 1; }

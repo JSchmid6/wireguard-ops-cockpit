@@ -855,6 +855,9 @@ if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null |
   echo "bwrap-userns-restrict: keine userns-Härtung aktiv — nicht nötig."
 elif [ -e "$BWRAP_PROFILE" ]; then
   echo "bwrap-userns-restrict: vorhanden ($(dpkg-query -S "$BWRAP_PROFILE" 2>/dev/null | cut -d: -f1 || true)) — unverändert."
+elif dpkg-query -S "$BWRAP_PROFILE" >/dev/null 2>&1; then
+  # Paketpfad, aber die Datei fehlt (bewusst gelöscht?): nicht mit der Repo-Kopie überschreiben.
+  echo "HINWEIS: bwrap-userns-restrict gehört einem Paket, fehlt aber — nicht ersetzt; Claude läuft ohne Shell bzw. im NOTBETRIEB."
 elif install -m 0644 -o root -g root "$COCKPIT_DIR/deploy/apparmor/bwrap-userns-restrict" "$BWRAP_PROFILE" \
      && apparmor_parser -r "$BWRAP_PROFILE"; then
   echo "bwrap-userns-restrict: aus dem Repo installiert und geladen."
