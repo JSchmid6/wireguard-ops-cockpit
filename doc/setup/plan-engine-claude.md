@@ -29,9 +29,25 @@ Bash,Read,Grep,Glob,WebFetch,WebSearch --allowedTools <dieselben> --append-syste
   kommt aus der root-kontrollierten `AGENTS.md` des Arbeitsordners als Schluss des Systemprompts.
 - Werkzeuge wie opencodes `plan`: lesen, suchen, Shell, Web; kein Edit/Write. Die Grenze bleibt die
   Unit (AGENTS.md, „plan denies only the edit tool“).
-- Zustand je Lauf: `HOME`, `CLAUDE_CONFIG_DIR`, `XDG_*_HOME` und `TMPDIR` liegen unter
+- Zustand je Lauf: `HOME`, `CLAUDE_CONFIG_DIR` und `XDG_*_HOME` liegen unter
   `<workspace>/.run-state/` und gehen mit dem Arbeitsordner. Das Home der Identität bleibt
   schreibgeschützt und bekommt kein `.claude`.
+- `TMPDIR` ist ein eigenes, kurzes Verzeichnis je Lauf: `/tmp/cockpit-claude-XXXXXX` (mkdtemp,
+  0700), entfernt am Ende des Claude-Laufs, also zusammen mit dem Arbeitsordner (Karte
+  t_8b92ed2f). Grund: Claudes Sandbox bindet zwei Unix-Sockets
+  `<TMPDIR>/claude-http-<16 hex>.sock` und `claude-socks-…` (socat, Claude Code 2.1.311), und
+  `sun_path` fasst 107 Zeichen. Unter dem Arbeitsordner
+  (`/var/lib/wireguard-ops-agent/sessions/agent-<uuid>-research-XXXXXX/.run-state/tmp`) wurden es
+  ~145, socat konnte nicht binden, und jeder Lauf endete mit „Sandbox is required but failed to
+  initialize: Failed to create bridge sockets after 5 attempts“ (Messläufe 14.11.2026 auf VPS,
+  Lab0 und Box) — das Bash-Werkzeug fehlte, Research war blind. Jetzt sind es 61 Zeichen.
+  `/tmp` ist in der Agent-Unit privat (`PrivateTmp=true`) und wird bei jedem Neustart der Unit
+  geleert; was ein abgebrochener Lauf liegen lässt, verschwindet spätestens dort. Ein kürzerer
+  Arbeitsordnername wurde verworfen: Wurzel, Request-ID (bis 64 Zeichen) und Rolle lassen unter
+  `/var/lib/…` keine verlässliche Reserve, und der Name trägt die Zuordnung Lauf ↔ Job. Würde der
+  Socketpfad dennoch zu lang (`createClaudeTmpdir` prüft es), startet Claude nicht, und der Lauf
+  fällt mit Grund auf opencode zurück (NOTBETRIEB). Ehrliche Grenze wie beim Arbeitsordner: `/tmp`
+  der Unit teilen alle Rollen der Identität `cockpit-agent`; 0700 schützt nur vor anderen Nutzern.
 - Das Kind bekommt nur `PATH`, den Claude-Login und diese Pfade, **nicht** `DEEPSEEK_API_KEY`.
 - `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`: Claude hält seinen Login aus der Shell, die das Modell
   bedient (braucht `bubblewrap`). Startet Claude so nicht, fällt der Lauf auf opencode zurück

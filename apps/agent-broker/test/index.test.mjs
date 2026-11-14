@@ -17,7 +17,7 @@ process.env.COCKPIT_AGENT_WORKSPACE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(),
 process.env.HOME = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-agent-home-"));
 // The check derives it from HOME alone, like opencode, which gets no XDG_CONFIG_HOME.
 process.env.XDG_CONFIG_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "cockpit-agent-xdg-"));
-const { assertNoPlantedConfig, cleanReason, cleanupStaleWorkspaces, parseClaudeResult, createSessionWorkspace, globalConfigNames, parseServedRoles, projectConfigNames, removeSessionWorkspace, runAgent, sessionStateDirs, validateRequest } = await import("../src/index.mjs");
+const { assertNoPlantedConfig, claudeSocketPathLength, claudeTmpRoot, cleanReason, cleanupStaleWorkspaces, createClaudeTmpdir, parseClaudeResult, createSessionWorkspace, globalConfigNames, parseServedRoles, projectConfigNames, removeSessionWorkspace, runAgent, sessionStateDirs, validateRequest } = await import("../src/index.mjs");
 const { PROMPT_LIMITS, promptLimit, promptLimitProblem } = await import("../src/prompt-limits.mjs");
 test.after(() => {
   fs.rmSync(process.env.COCKPIT_AGENT_WORKSPACE_ROOT, { recursive: true, force: true });
@@ -397,7 +397,8 @@ case "$PWD" in
 esac
 prompt=$(cat)
 test -d "$HOME" || exit 4
-info="args=$* home=$HOME config=$CLAUDE_CONFIG_DIR scrub=$CLAUDE_CODE_SUBPROCESS_ENV_SCRUB token=\${CLAUDE_CODE_OAUTH_TOKEN:+set} deepseek=\${DEEPSEEK_API_KEY:+set} prompt=$prompt"
+test -d "$TMPDIR" || exit 5
+info="args=$* home=$HOME config=$CLAUDE_CONFIG_DIR tmp=$TMPDIR scrub=$CLAUDE_CODE_SUBPROCESS_ENV_SCRUB token=\${CLAUDE_CODE_OAUTH_TOKEN:+set} deepseek=\${DEEPSEEK_API_KEY:+set} prompt=$prompt"
 node -e 'process.stdout.write(JSON.stringify({type:"result",subtype:"success",is_error:false,result:process.argv[1],modelUsage:{"claude-sonnet-5-5":{}}}))' "$info"
 `, { mode: 0o755 });
   const saved = { ...process.env };
@@ -410,7 +411,10 @@ node -e 'process.stdout.write(JSON.stringify({type:"result",subtype:"success",is
       assert.match(result.output, /^args=-p --safe-mode --strict-mcp-config --no-session-persistence --model sonnet --tools Bash,Read,Grep,Glob,WebFetch,WebSearch --allowedTools Bash,Read,Grep,Glob,WebFetch,WebSearch --append-system-prompt-file \S+\/AGENTS\.md --output-format json /);
       // Claude's state belongs to the run; the token reaches it, the DeepSeek key does not.
       const state = `${process.env.COCKPIT_AGENT_WORKSPACE_ROOT}/agent-c1a0de00-1-${role}-[^/]+/\\.run-state`;
-      assert.match(result.output, new RegExp(` home=${state}/home config=${state}/claude `));
+      assert.match(result.output, new RegExp(` home=${state}/home config=${state}/claude tmp=/tmp/cockpit-claude-[^/ ]+ `));
+      // The short TMPDIR goes with the run.
+      const tmpdir = result.output.match(/ tmp=(\S+) /)[1];
+      assert.equal(fs.existsSync(tmpdir), false);
       assert.match(result.output, / scrub=1 token=set deepseek= prompt=plan it$/);
       assert.deepEqual(fs.readdirSync(process.env.COCKPIT_AGENT_WORKSPACE_ROOT), []);
     }
@@ -458,4 +462,30 @@ test("Claude's result is parsed for the answer and the model that answered; reas
   assert.equal(parseClaudeResult("").ok, false);
   assert.equal(parseClaudeResult('{"subtype":"success","is_error":false,"result":"  "}').ok, false);
   assert.equal(cleanReason(`bad token sk-ant-oat01-${"a".repeat(40)}\n next`), "bad token […] next");
+});
+
+test("Claude's sandbox sockets fit sun_path: TMPDIR + /claude-socks-<16 hex>.sock stays within 107 characters", () => {
+  // The socket path for a given TMPDIR, measured on the longer of the two names.
+  assert.equal(claudeSocketPathLength("/tmp/x"), "/tmp/x/claude-socks-0123456789abcdef.sock".length);
+  // The cause (card t_8b92ed2f): below the production workspace it does not fit.
+  const workspaceTmp = `/var/lib/wireguard-ops-agent/sessions/agent-${"0".repeat(8)}-${"0".repeat(4)}-${"0".repeat(4)}-${"0".repeat(4)}-${"0".repeat(12)}-research-XXXXXX/.run-state/tmp`;
+  assert.ok(claudeSocketPathLength(workspaceTmp) > 107);
+  // The run's own directory does, with room to spare, and is private.
+  assert.equal(claudeTmpRoot, "/tmp");
+  const tmpdir = createClaudeTmpdir();
+  try {
+    assert.match(tmpdir, /^\/tmp\/cockpit-claude-[A-Za-z0-9]{6}$/);
+    assert.ok(claudeSocketPathLength(tmpdir) <= 107 - 32, `${claudeSocketPathLength(tmpdir)} characters`);
+    assert.equal(fs.statSync(tmpdir).mode & 0o777, 0o700);
+  } finally {
+    fs.rmSync(tmpdir, { recursive: true, force: true });
+  }
+  // A root too deep is refused before Claude starts (the run falls back, labelled).
+  const deep = fs.mkdtempSync(path.join(os.tmpdir(), "x".repeat(60)));
+  try {
+    assert.throws(() => createClaudeTmpdir(deep), /would exceed 107 characters/);
+    assert.deepEqual(fs.readdirSync(deep), []);
+  } finally {
+    fs.rmSync(deep, { recursive: true, force: true });
+  }
 });
