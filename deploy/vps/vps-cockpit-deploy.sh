@@ -25,7 +25,9 @@
 #     state.json (with the built web image id), the web image, the enable links of the web
 #     and runner units, the runner's system account (cockpit-runner, group
 #     cockpit-runner-client, no sudo; created once, never removed by a rollback) and a
-#     backup directory that it removes on success.
+#     backup directory that it removes on success. Outside the file system it loads
+#     the table's AppArmor profile bwrap-userns-restrict into the kernel
+#     (apparmor_parser -r; a rollback unloads it again when it was absent before).
 #   * It never switches the running web container: the web unit does that when it
 #     is restarted, which the runner does together with the four services at the
 #     activation (defer), or this script does at the end (mode now).
@@ -35,7 +37,7 @@
 #     and the script exits non-zero with the original error code.
 #
 # Harness hooks (VPS_DEPLOY_ROOT, _REPO, _ORIGIN, _SYSTEMCTL, _VISUDO, _DOCKER,
-# _BUILD, _NODE_DIST, _ACCOUNTS) redirect host paths and tools for
+# _BUILD, _NODE_DIST, _ACCOUNTS, _APPARMOR_PARSER, _DPKG_QUERY) redirect host paths and tools for
 # test/vps-cockpit-deploy.test.sh. The self-update runner starts this script with
 # a fixed, clean environment (PATH, HOME, REPO_COMMIT, COCKPIT_RESTART_MODE), so
 # they never apply on that path.
@@ -51,6 +53,8 @@ readonly VISUDO="${VPS_DEPLOY_VISUDO:-visudo}"
 readonly DOCKER="${VPS_DEPLOY_DOCKER:-docker}"
 # getent/groupadd/useradd run through this command when set (harness only).
 readonly ACCOUNTS="${VPS_DEPLOY_ACCOUNTS:-}"
+readonly APPARMOR_PARSER="${VPS_DEPLOY_APPARMOR_PARSER:-apparmor_parser}"
+readonly DPKG_QUERY="${VPS_DEPLOY_DPKG_QUERY:-dpkg-query}"
 readonly LIB="$ROOT/usr/local/lib/wireguard-ops-cockpit"
 readonly SBIN="$ROOT/usr/local/sbin"
 readonly UNITS="$ROOT/etc/systemd/system"
@@ -58,6 +62,13 @@ readonly SUDOERS="$ROOT/etc/sudoers.d/cockpit-executor"
 readonly STATE_DIR="$ROOT/var/lib/wireguard-ops-cockpit/self-update"
 readonly CONFIG="$ROOT/etc/wireguard-ops-cockpit/self-update.env"
 readonly WEB_URL=http://10.0.0.1:8080
+# Ubuntu's AppArmor profile for bwrap under kernel.apparmor_restrict_unprivileged_userns=1
+# (card t_79e9f6d6, doc/setup/plan-engine-claude.md): 24.04's apparmor package lacks it,
+# so Claude's sandbox could not write its uid_map. A table entry like the others, plus
+# loading it into the kernel (and unloading it again on a rollback when it was absent).
+readonly BWRAP_PROFILE="$ROOT/etc/apparmor.d/bwrap-userns-restrict"
+BWRAP_ABSENT=0   # the profile file did not exist before this deploy
+BWRAP_LOADED=0   # this deploy loaded the repository's profile into the kernel
 # The pinned Node runtime: its version is the deployed commit's .node-version, the
 # same file bin/with-runtime and the systemd units read. The script installs it
 # below $NODE_BASE when the host lacks it (see install_runtime).
@@ -128,6 +139,9 @@ readonly TABLE=(
   # Instanzrolle der Tür (Netz je Rolle, doc/setup/host-run.md): vps = borg-Frische +
   # Hoster-Snapshot. Ohne diese Datei scheitert jeder verändernde Lauf im Preflight.
   "deploy/vps/instance-role.env|$ROOT/etc/wireguard-ops-cockpit/instance-role.env|600"
+  # Byte-identical to Ubuntu's (apparmor 4.1.0~beta5-0ubuntu14.2); skipped while a
+  # package owns that path (a later release ships it), see install_table.
+  "deploy/apparmor/bwrap-userns-restrict|$ROOT/etc/apparmor.d/bwrap-userns-restrict|644"
 )
 
 log() { echo "[vps-cockpit-deploy $(date -u +%H:%M:%S)] $*"; }
@@ -282,6 +296,7 @@ self_update_env() { # the runner's configuration on this host
 
 save_targets() { # every target: its bytes, or the fact that it did not exist
   local entry target index=0
+  [ -e "$BWRAP_PROFILE" ] || BWRAP_ABSENT=1
   for entry in "${TABLE[@]}" "self-update.env|$CONFIG|644"; do
     target="${entry#*|}"; target="${target%|*}"
     if [ -e "$target" ]; then cp -a -- "$target" "$BACKUP/$index"; else : > "$BACKUP/$index.absent"; fi
@@ -309,6 +324,10 @@ install_table() {
   ensure_runner_identity
   for entry in "${TABLE[@]}"; do
     source="${entry%%|*}"; rest="${entry#*|}"; target="${rest%|*}"; mode="${rest##*|}"
+    if [ "$target" = "$BWRAP_PROFILE" ] && "$DPKG_QUERY" -S "${BWRAP_PROFILE#"$ROOT"}" >/dev/null 2>&1; then
+      log "bwrap-userns-restrict belongs to a package here; left as it is"
+      continue
+    fi
     install -D -o root -g root -m "$mode" "$source" "$target"
   done
   install -d -m 0755 -o root -g root "$(dirname "$CONFIG")"
@@ -316,6 +335,7 @@ install_table() {
   install -o root -g root -m 644 "$BACKUP/self-update.env.new" "$CONFIG"
   "$VISUDO" -c >/dev/null
   "$SYSTEMCTL" daemon-reload
+  load_bwrap_profile
   "$SYSTEMCTL" enable --quiet wireguard-ops-cockpit-web.service
   # Started by the restart of SERVICES (now or at the activation) and pulled in by the
   # API (Requires= in brokers.conf); nothing switches before that.
@@ -326,6 +346,14 @@ install_table() {
   # first install (or a boot where it failed) and happens BEFORE the new web image exists,
   # so it (re)creates the container from the image that is running now.
   "$SYSTEMCTL" is-active --quiet wireguard-ops-cockpit-web.service || "$SYSTEMCTL" start wireguard-ops-cockpit-web.service
+}
+
+load_bwrap_profile() { # into the kernel now; apparmor.service loads the file at boot
+  # Skipped when a package owns the file (install_table left it): the package loads it.
+  "$DPKG_QUERY" -S "${BWRAP_PROFILE#"$ROOT"}" >/dev/null 2>&1 && return 0
+  "$APPARMOR_PARSER" -r "$BWRAP_PROFILE"
+  BWRAP_LOADED=1
+  log "AppArmor profiles bwrap and unpriv_bwrap loaded from $BWRAP_PROFILE"
 }
 
 build_web() { # new image under the compose tag; the old id is kept for the rollback
@@ -369,7 +397,14 @@ rollback() {
   set +e
   log "FAILED (exit $code) — rolling back to $OLD"
   if [ "$INSTALLED" = 1 ]; then
+    # A profile this deploy brought and loaded leaves the kernel before its file goes.
+    if [ "$BWRAP_LOADED" = 1 ] && [ "$BWRAP_ABSENT" = 1 ]; then
+      if "$APPARMOR_PARSER" -R "$BWRAP_PROFILE"; then log "rollback: bwrap profile unloaded"; else log "rollback: unloading the bwrap profile FAILED"; step_failed=1; fi
+    fi
     if restore_targets; then log "rollback: installed files restored"; else log "rollback: restoring installed files FAILED"; step_failed=1; fi
+    if [ "$BWRAP_LOADED" = 1 ] && [ "$BWRAP_ABSENT" = 0 ]; then
+      if "$APPARMOR_PARSER" -r "$BWRAP_PROFILE"; then log "rollback: previous bwrap profile loaded again"; else log "rollback: reloading the previous bwrap profile FAILED"; step_failed=1; fi
+    fi
     "$VISUDO" -c >/dev/null 2>&1 || { log "rollback: sudoers check FAILED after restore"; step_failed=1; }
     if [ ! -e "$UNITS/wireguard-ops-cockpit-web.service" ]; then
       rm -f -- "$UNITS/multi-user.target.wants/wireguard-ops-cockpit-web.service" || step_failed=1
