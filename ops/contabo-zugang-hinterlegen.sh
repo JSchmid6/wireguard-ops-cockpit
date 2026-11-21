@@ -9,8 +9,15 @@
 #
 # Die Datei liest nur root und, je Schritt lesend eingehaengt, der Helfer
 # cockpit-vps-snapshot im Sandkasten des Executors. Wer sie hat, kann die
-# Maschine zurueckrollen — deshalb ist /etc/wireguard-ops-cockpit im Cockpit
-# eine harte Grenze und taucht in keinem Plan auf.
+# Maschine zurueckrollen — deshalb ist jedes Lesen oder Schreiben in
+# /etc/wireguard-ops-cockpit ein X1-Befund des Tuerstehers, der als
+# blocked_user_approval an den Operator geht (seit 13.11. keine harte Grenze und
+# kein Textmuster mehr, doc/setup/host-run.md).
+#
+# Das hier ist der RUECKFALL fuer den Handweg als root. Der heutige Weg (seit 21.11.):
+# Rotation per hermes-plugin-cockpit/contabo_rotation.py (Karte t_2dfb43c7), danach
+# host-run "contabo-zugang-aus-tresor" (Vorlage Job a93bee29) mit Jochens Klick;
+# Rueckweg dort: contabo.env.vorher (doc/setup/host-run.md, "Hoster-Zugang").
 #
 # Aufruf als root:   bash contabo-zugang-hinterlegen.sh
 set -euo pipefail

@@ -747,6 +747,29 @@ Reviewer-Prompt dort am schärfsten, und deshalb gilt das Lesen der Cockpit-eige
 (Envelope-Secret, Hoster-Zugang) immer als Befund — wer sie hat, braucht weder Tür noch
 Türsteher.
 
+**Hoster-Zugang (`/etc/wireguard-ops-cockpit/contabo.env`) rotieren** (Stand 13.11./21.11.,
+Karten t_656be9cd, t_954b10b2, t_2dfb43c7). `/etc/wireguard-ops-cockpit` ist keine Textmuster-
+Grenze mehr (seit 13.11. gibt es keine); Lesen oder Schreiben dort ist ein X1-Befund des
+Türstehers und geht als `blocked_user_approval` an den Operator — ein Klick, kein Stopp.
+Der heutige Weg: Die Hermes-Seite rotiert das Client-Secret per API
+(`hermes-plugin-cockpit`, `contabo_rotation.py`, seit 21.11.) und legt den neuen Wert im Tresor
+ab, ohne dass er durch ein Modell läuft. Danach bestellt sie den host-run
+„contabo-zugang-aus-tresor“ (Vorlage: Cockpit-Job a93bee29 vom 20.11.), der `contabo.env`
+aus den Tresor-Einträgen neu schreibt; ihn gibt der Operator mit seinem Klick frei.
+`ops/contabo-zugang-hinterlegen.sh` bleibt als Rückfall für den Handweg als root.
+
+- **Henne-Ei:** Ein ändernder Lauf legt vorher einen Maschinen-Snapshot beim Hoster an
+  (`cockpit-vps-snapshot`, Schritt 2 der Rolle vps). Genau dafür braucht er den Zugang, den der
+  Lauf erst neu schreibt; nach einer Rotation ist der alte Stand ungültig, der Snapshot scheitert,
+  und der Lauf käme nie bis zum Schreiben. Der Lauf deklariert sich deshalb `mutates: false`,
+  obwohl er eine Datei schreibt. Das ist offen so benannt: Der Türsteher kann das als
+  X5-Befund (Behauptung stimmt nicht) melden, und der Operator-Klick deckt es. Einen
+  deterministischen Riegel dafür gibt es bewusst nicht (siehe `mutates: false` unten). Der
+  nächste ändernde Lauf zeigt, ob der Snapshot mit dem neuen Zugang wieder geht.
+- **Rückweg:** Vor dem Überschreiben bleibt der alte Stand als
+  `/etc/wireguard-ops-cockpit/contabo.env.vorher` liegen; Zurück ist ein `mv`.
+  Der Lauf schreibt und gibt keine Werte aus; die Schwärzung kennt die Werte aus `contabo.env`.
+
 Weitere bekannte Grenzen:
 
 - Der Türsteher ist ein Sprachmodell. Er kann einen verschleierten Abfluss übersehen; die
